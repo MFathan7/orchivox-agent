@@ -1,0 +1,43 @@
+import { any, array, boolean, fn, object, optional, record, string, unknown } from '@scalar/validation';
+const openApiExtensionSchema = object({
+    name: string({
+        typeComment: 'Name of specification extension property. Has to start with \`x-\`.',
+    }),
+    component: unknown({
+        typeComment: 'Vue component to render the specification extension',
+    }),
+    renderer: optional(unknown({
+        typeComment: 'Custom renderer to render the specification extension',
+    })),
+});
+const viewComponentSchema = object({
+    component: unknown({
+        typeComment: 'Vue component to render in the view',
+    }),
+    renderer: optional(unknown({
+        typeComment: 'Custom renderer to render the view component (e.g., ReactRenderer)',
+    })),
+    props: optional(record(string(), any()), {
+        typeComment: 'Additional props to pass to the component',
+    }),
+    sidebar: optional(object({
+        show: boolean(),
+        label: string(),
+    }), {
+        typeComment: 'Sidebar configuration. Set show: true to display in sidebar.',
+    }),
+});
+const viewsSchema = object({
+    'content.start': optional(array(viewComponentSchema), {
+        typeComment: 'Components to render before the Introduction/Info section',
+    }),
+    'content.end': optional(array(viewComponentSchema), {
+        typeComment: 'Components to render at specific views in the API Reference',
+    }),
+});
+const lifecycleHooksSchema = object({
+    onInit: optional(fn()),
+    onConfigChange: optional(fn()),
+    onDestroy: optional(fn()),
+});
+export const apiReferencePluginSchema = fn();

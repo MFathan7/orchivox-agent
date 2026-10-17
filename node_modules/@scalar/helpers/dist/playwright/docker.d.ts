@@ -1,0 +1,27 @@
+import type { FullConfig } from '@playwright/test';
+export type WebServer = NonNullable<FullConfig['webServer']>;
+/** Default playwright version */
+export declare const DEFAULT_PLAYWRIGHT_VERSION = "1.62.1";
+/** Options for getting a docker server */
+type GetDockerServerOptions = {
+    version: string;
+    port: number;
+} & Partial<WebServer>;
+/**
+ * Builds a Playwright {@link https://playwright.dev/docs/test-webserver | webServer} config
+ * that starts the browser-side `playwright run-server` inside
+ * {@link https://hub.docker.com/r/scalarapi/playwright-runner | `scalarapi/playwright-runner`}.
+ *
+ * **Important:** The `version` must stay aligned with the workspace `@playwright/test` major/minor
+ * so the client and container speak the same protocol.
+ *
+ * The server runs with `--unsafe` so that it honours the launch options the test runner sends it.
+ * Playwright always forwards the config's `launchOptions` across the connection as an
+ * `x-playwright-launch-options` header, but the server discards the risky fields — `args` among
+ * them — unless it was started with `--unsafe`. Without it, anything set in `use.launchOptions`
+ * takes effect in CI, where the browser is launched directly, and is silently ignored locally,
+ * so the same test renders two different ways and snapshots taken locally do not match CI.
+ */
+export declare const getDockerServer: (opts?: Partial<GetDockerServerOptions>) => WebServer;
+export {};
+//# sourceMappingURL=docker.d.ts.map

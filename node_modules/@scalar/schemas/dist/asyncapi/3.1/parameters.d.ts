@@ -1,0 +1,2 @@
+export declare const asyncApiParametersObject: import("@scalar/validation").RecordSchema<import("@scalar/validation").StringSchema, import("@scalar/validation").Schema>;
+//# sourceMappingURL=parameters.d.ts.map

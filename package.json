@@ -1,0 +1,34 @@
+{
+  "name": "orchivox-agent",
+  "version": "0.1.0",
+  "description": "Personal AI coding agent runtime: IDE-grade code editing, isolated Git worktree subagents, time-traveling stream rules, and a dual-direction OpenAPI and OpenClaude gateway.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "serve": "bun run src/server.ts",
+    "build:binary": "bun build ./src/index.ts --compile --outfile orchivox",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/zod-openapi": "^1.6.3",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@scalar/hono-api-reference": "^0.12.13",
+    "chalk": "^6.0.1",
+    "diff": "^9.0.0",
+    "hono": "^4.13.13",
+    "ink": "^8.0.0",
+    "react": "^19.3.1",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "@types/react": "^19.3.0",
+    "typescript": "^5.9.3"
+  }
+}

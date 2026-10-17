@@ -1,0 +1,105 @@
+# Values written as ${NAME} are replaced from environment variables at load time.
+# A placeholder that resolves to nothing drops that key, so optional fields stay absent.
+version: 1
+
+providers:
+  openai_primary:
+    kind: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    models:
+      - gpt-4.1
+      - gpt-4.1-mini
+    timeout_ms: 60000
+    enabled: true
+
+  openclaude_gateway:
+    kind: openclaude
+    base_url: https://gateway.example.net/openclaude
+    api_key: ${OPENCLAUDE_API_KEY}
+    models:
+      - claude-sonnet-4-5
+      - claude-haiku-4-5
+    headers: {}
+    timeout_ms: 60000
+    enabled: true
+
+  ollama_local:
+    kind: ollama
+    base_url: http://127.0.0.1:11434
+    models:
+      - qwen2.5-coder:7b
+      - llama3.2:3b
+    timeout_ms: 120000
+    enabled: true
+
+  openrouter:
+    kind: openrouter
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+    models:
+      - openai/gpt-4.1-mini
+      - qwen/qwen-2.5-coder-32b-instruct
+    timeout_ms: 60000
+    enabled: false
+
+roles:
+  main_model:
+    provider: openai_primary
+    model: gpt-4.1
+  fast_model:
+    provider: ollama_local
+    model: llama3.2:3b
+  advisor_model:
+    provider: openclaude_gateway
+    model: claude-haiku-4-5
+
+inbound_server:
+  port: 8787
+  api_key: ${ORCHIVOX_INBOUND_KEY}
+  enable_openapi: true
+  enable_openclaude: true
+
+lsp:
+  servers:
+    typescript:
+      command: typescript-language-server
+      args: ["--stdio"]
+      root_markers: ["tsconfig.json", "jsconfig.json", "package.json", "bunfig.toml"]
+    python:
+      command: pylsp
+      root_markers: ["pyproject.toml", "setup.py", "requirements.txt"]
+    rust:
+      command: rust-analyzer
+      root_markers: ["Cargo.toml"]
+    go:
+      command: gopls
+      root_markers: ["go.mod"]
+
+mcp:
+  servers:
+    workspace_files:
+      transport: stdio
+      command: bunx
+      args: ["@modelcontextprotocol/server-filesystem", "./workspace"]
+    docs_lookup:
+      transport: http
+      url: https://mcp.example.net/docs
+      headers:
+        Authorization: Bearer ${MCP_DOCS_TOKEN}
+      enabled: false
+
+sandbox:
+  permissions:
+    filesystem:
+      read: ["**/*"]
+      write: []
+      deny: [".git/**", ".env", ".env.*"]
+    network:
+      allow: []
+      deny: []
+    commands:
+      allow: []
+      deny: []
+      # escalate decides what happens when a sandboxed action hits a rule that needs a human call.
+      escalate: ask

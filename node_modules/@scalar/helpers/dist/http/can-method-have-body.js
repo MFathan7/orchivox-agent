@@ -1,0 +1,28 @@
+import { isElectron } from '../general/is-electron.js';
+import { HTTP_TOKEN } from './http-token.js';
+import { isForbiddenHttpMethod } from './is-forbidden-http-method.js';
+import { isHttpMethod } from './is-http-method.js';
+/** HTTP Methods which can have a body */
+export const BODY_METHODS = new Set(['post', 'put', 'patch', 'delete', 'query']);
+/**
+ * Whether Scalar can send this method with a body in the current runtime.
+ * Browser-forbidden methods are excluded along with methods whose bodies are unsupported.
+ *
+ * When running inside Electron, all requests are also allowed to have a body because the underlying
+ * undici implementation does not reject it, which matches the behavior users expect from desktop API clients.
+ */
+export const canMethodHaveBody = (method, skipElectron = false) => {
+    const normalized = method.toLowerCase();
+    // For electron we allow any method to have a body
+    if (isElectron() && !skipElectron) {
+        return true;
+    }
+    // Extension methods can carry bodies too; keep the existing policy for standard OpenAPI methods.
+    const isExtensionMethod = !isHttpMethod(method) && HTTP_TOKEN.test(method);
+    return !isForbiddenHttpMethod(method) && (BODY_METHODS.has(normalized) || isExtensionMethod);
+};
+/*** We must purge body from requests that cannot accept it, skips the electron check */
+export const buildSafeBodyRequest = (url, init) => new Request(url, {
+    ...init,
+    body: canMethodHaveBody(init.method ?? 'GET', true) ? init.body : null,
+});

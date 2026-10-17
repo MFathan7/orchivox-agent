@@ -1,0 +1,2 @@
+export declare const securityRequirement: import("@scalar/validation").RecordSchema<import("@scalar/validation").StringSchema, import("@scalar/validation").ArraySchema<import("@scalar/validation").StringSchema>>;
+//# sourceMappingURL=security-requirement.d.ts.map
