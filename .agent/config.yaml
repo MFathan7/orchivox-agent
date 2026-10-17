@@ -7,6 +7,10 @@ providers:
     kind: openai
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY}
+    # pricing fills cost_usd on the usage event; use the real per-million USD rates for the model.
+    # pricing:
+    #   input_usd_per_million_tokens: 0
+    #   output_usd_per_million_tokens: 0
     models:
       - gpt-4.1
       - gpt-4.1-mini
@@ -26,7 +30,7 @@ providers:
 
   ollama_local:
     kind: ollama
-    base_url: http://127.0.0.1:11434
+    base_url: http://127.0.0.1:11434/v1
     models:
       - qwen2.5-coder:7b
       - llama3.2:3b
@@ -88,6 +92,16 @@ mcp:
       headers:
         Authorization: Bearer ${MCP_DOCS_TOKEN}
       enabled: false
+
+# Hook commands run in bash with ORCHIVOX_HOOK_PHASE, ORCHIVOX_TOOL_NAME, and
+# ORCHIVOX_FILE_PATH exported; a failing pre_tool_use command blocks the tool call.
+hooks:
+  pre_tool_use: []
+  post_tool_use:
+    - match: hash_edit
+      command: bunx prettier --write "$ORCHIVOX_FILE_PATH"
+      timeout_ms: 60000
+  on_stop: []
 
 sandbox:
   permissions:

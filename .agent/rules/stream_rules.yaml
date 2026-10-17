@@ -1,0 +1,21 @@
+# appliesToGlob is matched against the request target_path, both the full path and the file name.
+- id: no-todo-comments
+  name: No TODO comments in source files
+  appliesToGlob: "*.ts"
+  triggerRegex: '//\s*TODO:'
+  action: abort_and_retry
+  reminderMessage: Tulis implementasi yang lengkap tanpa komentar TODO
+
+- id: no-console-log
+  name: No console.log in source files
+  appliesToGlob: "*.ts"
+  triggerRegex: 'console\.log\('
+  action: abort_and_retry
+  reminderMessage: Gunakan kanal logging proyek, jangan console.log
+
+- id: no-any-type
+  name: No any type in TypeScript files
+  appliesToGlob: "*.ts"
+  triggerRegex: 'any\b'
+  action: abort_and_retry
+  reminderMessage: Gunakan tipe yang spesifik, jangan any

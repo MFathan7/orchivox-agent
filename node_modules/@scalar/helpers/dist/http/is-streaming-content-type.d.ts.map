@@ -1,1 +1,0 @@
-{"version":3,"file":"is-streaming-content-type.d.ts","sourceRoot":"","sources":["../../src/http/is-streaming-content-type.ts"],"names":[],"mappings":"AAEA,qFAAqF;AACrF,eAAO,MAAM,eAAe,GAC1B,aAAa,MAAM,GAAG,IAAI,GAAG,SAAS,KACrC,YAAY,GAAG,UAAU,GAAG,KAAK,GAAG,WAAW,GAAG,SAYpD,CAAA;AAED,0EAA0E;AAC1E,eAAO,MAAM,sBAAsB,GAAI,aAAa,MAAM,GAAG,IAAI,GAAG,SAAS,KAAG,OACpC,CAAA"}

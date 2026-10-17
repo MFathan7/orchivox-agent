@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+/out-tsc/
+
+# Compiled binary (bun build --compile)
+orchivox
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets.yaml
+secrets.json
+credentials.json
+.netrc
+.npmrc
+.token
+*.token
+
+# Runtime state
+.agent/memory.db
+.agent/memory.db-shm
+.agent/memory.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+bun-debug.log*
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Editor and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local agent tooling state
+.commandcode/
