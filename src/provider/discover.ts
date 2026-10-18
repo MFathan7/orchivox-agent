@@ -1,4 +1,4 @@
-import type { ProviderKind } from "../config/loader";
+import { inferModelCapabilities, type ProviderKind } from "../config/loader";
 import { OpenAICompatProvider } from "./openai-compat";
 
 export interface DiscoveredProvider {
@@ -43,7 +43,11 @@ async function fetchOllamaTags(tagsUrl: string): Promise<string[]> {
 
 async function probe(target: LocalTarget): Promise<DiscoveredProvider | undefined> {
   try {
-    const provider = new OpenAICompatProvider({ baseUrl: target.baseUrl });
+    const provider = new OpenAICompatProvider({
+      baseUrl: target.baseUrl,
+      kind: target.kind,
+      capabilities: inferModelCapabilities(target.kind, ""),
+    });
     const models = await provider.listModels(AbortSignal.timeout(PROBE_TIMEOUT_MS));
     if (models.length > 0) {
       return { id: target.id, name: target.name, kind: target.kind, baseUrl: target.baseUrl, models };

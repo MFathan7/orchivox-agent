@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import type { ModelCapabilities } from "../config/loader";
 import {
   computeCostUsd,
   toolParametersToJsonSchema,
@@ -18,6 +19,7 @@ export interface AnthropicCompatProviderOptions {
   headers?: Record<string, string>;
   model?: string;
   pricing?: TokenPricing;
+  capabilities: ModelCapabilities;
 }
 
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -122,6 +124,7 @@ export class AnthropicCompatProvider implements LLMProvider {
   private readonly extraHeaders: Record<string, string>;
   private readonly model: string | undefined;
   private readonly pricing: TokenPricing | undefined;
+  private readonly capabilities: ModelCapabilities;
 
   constructor(options: AnthropicCompatProviderOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -129,6 +132,7 @@ export class AnthropicCompatProvider implements LLMProvider {
     this.extraHeaders = options.headers ?? {};
     this.model = options.model;
     this.pricing = options.pricing;
+    this.capabilities = options.capabilities;
   }
 
   async *streamChat(req: ChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown> {
@@ -140,7 +144,7 @@ export class AnthropicCompatProvider implements LLMProvider {
       response = await fetch(`${this.baseUrl}/v1/messages`, {
         method: "POST",
         headers: this.requestHeaders(),
-        body: JSON.stringify(buildMessagesPayload(req, model)),
+        body: JSON.stringify(buildMessagesPayload(req, model, this.capabilities)),
         signal,
       });
     } catch (error) {
@@ -358,7 +362,11 @@ export class AnthropicCompatProvider implements LLMProvider {
   }
 }
 
-function buildMessagesPayload(req: ChatRequest, model: string): Record<string, unknown> {
+export function buildMessagesPayload(
+  req: ChatRequest,
+  model: string,
+  capabilities: ModelCapabilities,
+): Record<string, unknown> {
   const { system, messages } = toAnthropicMessages(req);
   const payload: Record<string, unknown> = {
     model,
@@ -380,9 +388,17 @@ function buildMessagesPayload(req: ChatRequest, model: string): Record<string, u
       type: req.tool_choice === "required" ? "any" : req.tool_choice === "none" ? "none" : "auto",
     };
   }
-  if (req.reasoning_effort) {
-    const mapped = req.reasoning_effort === "high" ? 8192 : req.reasoning_effort === "medium" ? 4096 : 1024;
-    const budget = Math.min(mapped, Math.max(1024, req.max_tokens - 1024));
+  if (req.reasoning_effort && capabilities.reasoning) {
+    const minBudget = capabilities.reasoning_budget_min ?? 1024;
+    const maxBudget = capabilities.reasoning_budget_max ?? 8192;
+    const requested =
+      req.reasoning_effort === "high"
+        ? maxBudget
+        : req.reasoning_effort === "medium"
+          ? Math.min(4096, maxBudget)
+          : Math.min(1024, maxBudget);
+    const headroom = Math.max(minBudget, req.max_tokens - 1024);
+    const budget = Math.max(minBudget, Math.min(requested, maxBudget, headroom));
     payload.thinking = { type: "enabled", budget_tokens: budget };
     payload.max_tokens = Math.max(req.max_tokens, budget + 1024);
     payload.temperature = 1;

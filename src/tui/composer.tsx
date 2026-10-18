@@ -7,6 +7,7 @@ import type { AgentMode } from "../types/schema";
 import { formatLine, readText, splitLines } from "../tools/hashline-edit";
 import {
   AutocompletePopup,
+  BUILTIN_SLASH_COMMANDS,
   queryAutocomplete,
   type AutocompleteItem,
   type TriggerContext,
@@ -37,6 +38,14 @@ const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGES_PER_MESSAGE = 4;
+
+const INSTANT_COMMANDS = new Set<string>([
+  ...BUILTIN_SLASH_COMMANDS.filter((command) => command.args === undefined).map(
+    (command) => command.name,
+  ),
+  "/mode",
+  "/reasoning",
+]);
 
 export function imageMimeType(filePath: string): string | undefined {
   const dot = filePath.lastIndexOf(".");
@@ -597,8 +606,8 @@ export function PromptComposer(props: PromptComposerProps) {
     setAutocompleteItems([]);
   };
 
-  const handleFinalSubmit = async (): Promise<void> => {
-    const trimmed = text.trim();
+  const handleFinalSubmit = async (explicitText?: string): Promise<void> => {
+    const trimmed = (explicitText ?? text).trim();
     if (!trimmed) return;
 
     const lower = trimmed.toLowerCase();
@@ -629,6 +638,18 @@ export function PromptComposer(props: PromptComposerProps) {
     }
   };
 
+  const submitExactCommand = (item: AutocompleteItem): boolean => {
+    if (!autocompleteContext || autocompleteContext.trigger !== "command") return false;
+    if (item.trigger !== "command") return false;
+    const typed = `/${autocompleteContext.query.trim().toLowerCase()}`;
+    if (item.label.toLowerCase() !== typed) return false;
+    if (!INSTANT_COMMANDS.has(item.label)) return false;
+    setAutocompleteContext(null);
+    setAutocompleteItems([]);
+    void handleFinalSubmit(item.label);
+    return true;
+  };
+
   useInput((input, key) => {
     if (disabled) return;
 
@@ -652,6 +673,7 @@ export function PromptComposer(props: PromptComposerProps) {
       if (key.tab || key.return) {
         const selected = autocompleteItems[autocompleteSelected];
         if (selected) {
+          if (key.return && submitExactCommand(selected)) return;
           handleInsertAutocomplete(selected);
           return;
         }
@@ -663,7 +685,7 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
-    if ((key.meta && input === "a") || sequence === "\u001ba") {
+    if ((key.meta && input === "a") || sequence === "\u001ba" || sequence === "\x1b[27;3;97~") {
       onOpenHub?.();
       return;
     }
@@ -693,6 +715,7 @@ export function PromptComposer(props: PromptComposerProps) {
       sequence === "\x1b[13;2u" ||
       sequence === "\x1b[27;2;13~" ||
       sequence === "\x1b[13;5u" ||
+      sequence === "\x1b[27;3;13~" ||
       sequence === "\x1b[27;5;13~";
 
     const isBackslashNewline =
@@ -733,7 +756,8 @@ export function PromptComposer(props: PromptComposerProps) {
       (key.meta && input === "b") ||
       sequence === "\x1b[1;5D" ||
       sequence === "\x1b[5D" ||
-      sequence === "\x1bb";
+      sequence === "\x1bb" ||
+      sequence === "\x1b[27;3;98~";
     if (isWordMoveLeft) {
       setCursorPos(findPreviousWordStart(text, cursorPos));
       return;
@@ -744,7 +768,8 @@ export function PromptComposer(props: PromptComposerProps) {
       (key.meta && input === "f") ||
       sequence === "\x1b[1;5C" ||
       sequence === "\x1b[5C" ||
-      sequence === "\x1bf";
+      sequence === "\x1bf" ||
+      sequence === "\x1b[27;3;102~";
     if (isWordMoveRight) {
       setCursorPos(findNextWordEnd(text, cursorPos));
       return;

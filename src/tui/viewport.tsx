@@ -285,10 +285,6 @@ export function ScrollableChatViewport({
                     </Text>
                   ))}
                 </Box>
-              ) : entry.text ? (
-                <Box marginY={0} flexDirection="column">
-                  <MarkdownView content={liveText} theme={theme} />
-                </Box>
               ) : null}
               {entry.thinking ? (
                 <ThinkingBlock
@@ -346,6 +342,11 @@ export function ScrollableChatViewport({
                     theme={theme}
                   />
                 )
+              ) : null}
+              {entry.role === "assistant" && entry.text ? (
+                <Box marginY={0} flexDirection="column">
+                  <MarkdownView content={liveText} theme={theme} />
+                </Box>
               ) : null}
             </Box>
           );

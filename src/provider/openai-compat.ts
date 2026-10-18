@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import type { ModelCapabilities, ProviderKind } from "../config/loader";
 import {
   computeCostUsd,
   toolParametersToJsonSchema,
@@ -18,7 +19,8 @@ export interface OpenAICompatProviderOptions {
   headers?: Record<string, string>;
   model?: string;
   pricing?: TokenPricing;
-  enableReasoningEffort?: boolean;
+  kind: ProviderKind;
+  capabilities: ModelCapabilities;
 }
 
 const OpenAiToolCallFragmentSchema = z.object({
@@ -98,7 +100,8 @@ export class OpenAICompatProvider implements LLMProvider {
   private readonly extraHeaders: Record<string, string>;
   private readonly model: string | undefined;
   private readonly pricing: TokenPricing | undefined;
-  private readonly enableReasoningEffort: boolean;
+  private readonly kind: ProviderKind;
+  private readonly capabilities: ModelCapabilities;
 
   constructor(options: OpenAICompatProviderOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -106,7 +109,8 @@ export class OpenAICompatProvider implements LLMProvider {
     this.extraHeaders = options.headers ?? {};
     this.model = options.model;
     this.pricing = options.pricing;
-    this.enableReasoningEffort = options.enableReasoningEffort ?? false;
+    this.kind = options.kind;
+    this.capabilities = options.capabilities;
   }
 
   async *streamChat(req: ChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown> {
@@ -118,7 +122,7 @@ export class OpenAICompatProvider implements LLMProvider {
       response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: "POST",
         headers: this.requestHeaders(),
-        body: JSON.stringify(buildChatPayload(req, model, this.enableReasoningEffort)),
+        body: JSON.stringify(buildChatPayload(req, model, this.kind, this.capabilities)),
         signal,
       });
     } catch (error) {
@@ -252,18 +256,34 @@ export class OpenAICompatProvider implements LLMProvider {
   }
 }
 
-function buildChatPayload(req: ChatRequest, model: string, enableReasoningEffort: boolean): Record<string, unknown> {
+export function buildChatPayload(
+  req: ChatRequest,
+  model: string,
+  kind: ProviderKind,
+  capabilities: ModelCapabilities,
+): Record<string, unknown> {
+  const basename = model.split("/").pop() ?? model;
+  const reasoningFamily = capabilities.temperature === false || /^(o[1-9]|gpt-5)/i.test(basename);
   const payload: Record<string, unknown> = {
     model,
-    messages: toOpenAiMessages(req),
-    max_tokens: req.max_tokens,
+    messages: toOpenAiMessages(req, capabilities.vision ? "auto" : undefined),
     stream: true,
     stream_options: { include_usage: true },
   };
-  if (req.temperature !== undefined) payload.temperature = req.temperature;
-  if (req.top_p !== undefined) payload.top_p = req.top_p;
+  if (kind === "openai" && reasoningFamily) payload.max_completion_tokens = req.max_tokens;
+  else payload.max_tokens = req.max_tokens;
+  if (capabilities.temperature && !reasoningFamily) {
+    if (req.temperature !== undefined) payload.temperature = req.temperature;
+    if (req.top_p !== undefined) payload.top_p = req.top_p;
+  }
   if (req.stop_sequences.length > 0) payload.stop = req.stop_sequences;
-  if (req.reasoning_effort && enableReasoningEffort) payload.reasoning_effort = req.reasoning_effort;
+  if (req.reasoning_effort && capabilities.reasoning) {
+    if (kind === "openrouter") payload.reasoning = { effort: req.reasoning_effort };
+    else payload.reasoning_effort = req.reasoning_effort;
+  }
+  if (req.response_format && capabilities.structured_output) {
+    payload.response_format = req.response_format;
+  }
   if (req.tools.length > 0) {
     payload.tools = req.tools.map((tool) => ({
       type: "function",
@@ -275,11 +295,15 @@ function buildChatPayload(req: ChatRequest, model: string, enableReasoningEffort
       },
     }));
     payload.tool_choice = req.tool_choice;
+    if (capabilities.parallel_tool_calls) payload.parallel_tool_calls = true;
   }
   return payload;
 }
 
-export function toOpenAiMessages(req: ChatRequest): OpenAiMessage[] {
+export function toOpenAiMessages(
+  req: ChatRequest,
+  defaultImageDetail?: "auto" | "low" | "high",
+): OpenAiMessage[] {
   const messages: OpenAiMessage[] = [];
   if (req.system) messages.push({ role: "system", content: req.system });
 
@@ -334,7 +358,9 @@ export function toOpenAiMessages(req: ChatRequest): OpenAiMessage[] {
             type: "image_url",
             image_url: {
               url: `data:${block.source.media_type};base64,${block.source.data}`,
-              ...(block.detail ? { detail: block.detail } : {}),
+              ...(block.detail ?? defaultImageDetail
+                ? { detail: block.detail ?? defaultImageDetail }
+                : {}),
             },
           });
           break;

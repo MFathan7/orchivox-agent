@@ -4,7 +4,9 @@ import { Box, Text, useInput } from "ink";
 import type { MemoryDatabase, MessageSearchHit, SessionRecord } from "../memory/sqlite";
 import type { RestoreResult, SnapshotEntry, SnapshotHistory, SnapshotManager } from "../vcs/snapshot";
 import type { Message } from "../types/schema";
+import { truncateText } from "./format";
 import { getTheme, type Theme } from "./theme";
+import { useTerminalSize } from "./viewport";
 
 export type SessionModalTab = "sessions" | "fork" | "timeline";
 
@@ -65,8 +67,8 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
   const [searchQuery, setSearchQuery] = React.useState("");
   const [searchHits, setSearchHits] = React.useState<MessageSearchHit[]>([]);
   const [sessionIndex, setSessionIndex] = React.useState(0);
-  const [previewMessages, setPreviewMessages] = React.useState<Message[]>([]);
   const [statusNotice, setStatusNotice] = React.useState<string | undefined>();
+  const { columns } = useTerminalSize();
 
   // Tab 2 state
   const [turnIndex, setTurnIndex] = React.useState(0);
@@ -104,30 +106,6 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
       setSessionIndex(0);
     }
   }, [database, searchQuery, activeTab]);
-
-  React.useEffect(() => {
-    if (activeTab === "sessions") {
-      let targetId: string | undefined;
-      if (searchHits.length > 0) {
-        const hit = searchHits[sessionIndex];
-        targetId = hit?.sessionId;
-      } else if (sessions.length > 0) {
-        const s = sessions[sessionIndex];
-        targetId = s?.id;
-      }
-
-      if (targetId) {
-        try {
-          const msgs = database.loadMessages(targetId);
-          setPreviewMessages(msgs);
-        } catch {
-          setPreviewMessages([]);
-        }
-      } else {
-        setPreviewMessages([]);
-      }
-    }
-  }, [database, sessions, searchHits, sessionIndex, activeTab]);
 
   React.useEffect(() => {
     if (activeTab === "timeline") {
@@ -345,66 +323,48 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             ) : null}
           </Box>
 
-          <Box flexDirection="row" marginY={1}>
-            <Box flexDirection="column" width="50%" paddingRight={1}>
-              <Text bold color={theme.modes.plan.primary}>
-                {searchHits.length > 0
-                  ? `Search Results (${searchHits.length})`
-                  : `Session History (${sessions.length})`}
-              </Text>
-              {searchHits.length > 0 ? (
-                searchHits.slice(0, 8).map((hit, idx) => {
-                  const isSelected = idx === sessionIndex;
-                  return (
-                    <Box key={`hit-${hit.messageId}-${idx}`}>
-                      <Text color={isSelected ? theme.accent : undefined} bold={isSelected}>
+          <Box flexDirection="column" marginY={1}>
+            <Text bold color={theme.modes.plan.primary}>
+              {searchHits.length > 0
+                ? `Search Results (${searchHits.length})`
+                : `Session History (${sessions.length})`}
+            </Text>
+            {searchHits.length > 0 ? (
+              searchHits.slice(0, 10).map((hit, idx) => {
+                const isSelected = idx === sessionIndex;
+                const label = `● ${hit.role.toUpperCase()}: ${hit.snippet}`;
+                return (
+                  <Text
+                    key={`hit-${hit.messageId}-${idx}`}
+                    color={isSelected ? theme.accent : theme.muted}
+                    bold={isSelected}
+                    wrap="truncate"
+                  >
+                    {isSelected ? "❯ " : "  "}
+                    {truncateText(label, Math.max(24, columns - 12))}
+                  </Text>
+                );
+              })
+            ) : sessions.length === 0 ? (
+              <Text dimColor>No conversation sessions found.</Text>
+            ) : (
+              sessions.slice(0, 10).map((sess, idx) => {
+                const isSelected = idx === sessionIndex;
+                const isCurrent = sess.id === activeSessionId;
+                return (
+                  <Box key={sess.id} justifyContent="space-between">
+                    <Box>
+                      <Text color={isSelected ? theme.accent : undefined} bold={isSelected} wrap="truncate">
                         {isSelected ? "❯ " : "  "}
-                        ● {hit.role.toUpperCase()}: {hit.snippet}
+                        {truncateText(sess.title, Math.max(16, columns - 34))}
                       </Text>
+                      {isCurrent ? <Text color={theme.modes.build.primary}> (active)</Text> : null}
                     </Box>
-                  );
-                })
-              ) : sessions.length === 0 ? (
-                <Text dimColor>No conversation sessions found.</Text>
-              ) : (
-                sessions.slice(0, 8).map((sess, idx) => {
-                  const isSelected = idx === sessionIndex;
-                  const isCurrent = sess.id === activeSessionId;
-                  return (
-                    <Box key={sess.id} justifyContent="space-between">
-                      <Box>
-                        <Text color={isSelected ? theme.accent : undefined} bold={isSelected}>
-                          {isSelected ? "❯ " : "  "}
-                          {sess.title.slice(0, 26)}
-                        </Text>
-                        {isCurrent ? <Text color={theme.modes.build.primary}> (active)</Text> : null}
-                      </Box>
-                      <Text dimColor>
-                        {formatTimestamp(sess.updatedAt)} · {sess.mode}
-                      </Text>
-                    </Box>
-                  );
-                })
-              )}
-            </Box>
-
-            <Box flexDirection="column" width="50%" borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
-              <Text bold color={theme.accent}>
-                Session Message Preview
-              </Text>
-              {previewMessages.length === 0 ? (
-                <Text dimColor>(No messages in this session)</Text>
-              ) : (
-                previewMessages.slice(-6).map((msg, idx) => (
-                  <Box key={`prev-${msg.id}-${idx}`}>
-                    <Text color={msg.role === "user" ? theme.accent : theme.text}>
-                      {msg.role === "user" ? "User: " : "AI: "}
-                      {getMessageText(msg).slice(0, 50)}...
-                    </Text>
+                    <Text dimColor>{formatTimestamp(sess.updatedAt)}</Text>
                   </Box>
-                ))
-              )}
-            </Box>
+                );
+              })
+            )}
           </Box>
 
           <Box justifyContent="space-between">

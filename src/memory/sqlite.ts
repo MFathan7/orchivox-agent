@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 
+import { COMPACT_LABEL } from "../agent/compaction";
 import type { AgentMode, Message, Role, Usage } from "../types/schema";
 import type { TaskItem, TaskStore } from "../agent/task-board";
 
@@ -13,6 +14,14 @@ export interface SessionRecord {
   updatedAt: number;
   totalTokens: number;
   totalCostUsd: number;
+}
+
+export interface SessionCompaction {
+  summary: string;
+  tail_start_message_id?: string;
+  before_tokens: number;
+  after_tokens: number;
+  created_at: number;
 }
 
 export interface HindsightNoteRecord {
@@ -88,7 +97,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   total_tokens INTEGER NOT NULL DEFAULT 0,
-  total_cost_usd REAL NOT NULL DEFAULT 0
+  total_cost_usd REAL NOT NULL DEFAULT 0,
+  compaction_json TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -144,6 +154,10 @@ export class MemoryDatabase implements TaskStore {
     if (!taskColumns.some((column) => column.name === "mode")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN mode TEXT;");
     }
+    const sessionColumns = this.db.query("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+    if (!sessionColumns.some((column) => column.name === "compaction_json")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN compaction_json TEXT;");
+    }
   }
 
   createSession(input: { id?: string; title: string; mode: AgentMode }): SessionRecord {
@@ -176,6 +190,33 @@ export class MemoryDatabase implements TaskStore {
     return this.getSession(id) as SessionRecord;
   }
 
+  saveCompaction(sessionId: string, compaction: SessionCompaction): void {
+    const result = this.db
+      .query("UPDATE sessions SET compaction_json = ?, updated_at = ? WHERE id = ?")
+      .run(JSON.stringify(compaction), Date.now(), sessionId);
+    if (result.changes === 0) throw new Error(`unknown session "${sessionId}"`);
+  }
+
+  getCompaction(sessionId: string): SessionCompaction | undefined {
+    const row = this.db.query("SELECT compaction_json FROM sessions WHERE id = ?").get(sessionId) as
+      | { compaction_json: string | null }
+      | null;
+    if (!row?.compaction_json) return undefined;
+    try {
+      const parsed = JSON.parse(row.compaction_json) as SessionCompaction;
+      if (!parsed || typeof parsed.summary !== "string") return undefined;
+      return parsed;
+    } catch {
+      return undefined;
+    }
+  }
+
+  clearCompaction(sessionId: string): void {
+    this.db
+      .query("UPDATE sessions SET compaction_json = NULL, updated_at = ? WHERE id = ?")
+      .run(Date.now(), sessionId);
+  }
+
   addSessionUsage(id: string, tokens: number, costUsd: number): void {
     this.db
       .query(
@@ -195,7 +236,7 @@ export class MemoryDatabase implements TaskStore {
   forkSession(sourceSessionId: string, upToMessageId?: string, newTitle?: string): SessionRecord {
     const source = this.getSession(sourceSessionId);
     if (!source) throw new Error(`source session "${sourceSessionId}" not found`);
-    const allMessages = this.loadMessages(sourceSessionId);
+    const allMessages = this.loadFullMessages(sourceSessionId);
     let slice = allMessages;
     if (upToMessageId) {
       const idx = allMessages.findIndex((m) => m.id === upToMessageId);
@@ -207,13 +248,29 @@ export class MemoryDatabase implements TaskStore {
       title: newTitle ?? `${source.title} (fork)`,
       mode: source.mode,
     });
+    const idMap = new Map<string, string>();
     for (const msg of slice) {
+      const newId = `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      idMap.set(msg.id, newId);
       this.saveMessage(forked.id, {
-        id: `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        id: newId,
         role: msg.role,
         content: msg.content,
         created_at: msg.created_at,
       });
+    }
+    if (!upToMessageId) {
+      const compaction = this.getCompaction(sourceSessionId);
+      const mappedTail = compaction?.tail_start_message_id
+        ? idMap.get(compaction.tail_start_message_id)
+        : undefined;
+      if (compaction && mappedTail) {
+        this.saveCompaction(forked.id, {
+          ...compaction,
+          tail_start_message_id: mappedTail,
+          created_at: Date.now(),
+        });
+      }
     }
     return forked;
   }
@@ -233,6 +290,19 @@ export class MemoryDatabase implements TaskStore {
   }
 
   loadMessages(sessionId: string): Message[] {
+    const rows = this.loadFullMessages(sessionId);
+    const compaction = this.getCompaction(sessionId);
+    if (!compaction) return rows;
+    if (compaction.tail_start_message_id) {
+      const index = rows.findIndex((message) => message.id === compaction.tail_start_message_id);
+      if (index !== -1) {
+        return [summaryMessage(compaction), ...rows.slice(index)];
+      }
+    }
+    return rows;
+  }
+
+  loadFullMessages(sessionId: string): Message[] {
     const rows = this.db
       .query("SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC")
       .all(sessionId) as unknown as MessageRow[];
@@ -389,6 +459,15 @@ function toSession(row: SessionRow): SessionRecord {
     updatedAt: row.updated_at,
     totalTokens: row.total_tokens,
     totalCostUsd: row.total_cost_usd,
+  };
+}
+
+function summaryMessage(compaction: SessionCompaction): Message {
+  return {
+    id: `compaction-${compaction.created_at.toString(36)}`,
+    role: "system",
+    content: [{ type: "text", text: `${COMPACT_LABEL}\n${compaction.summary}` }],
+    created_at: compaction.created_at,
   };
 }
 

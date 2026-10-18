@@ -16,8 +16,10 @@ import {
   type ConfigRole,
 } from "../config/writer";
 import { discoverLocalProviders, type DiscoveredProvider } from "../provider/discover";
+import { inspectOllamaModel } from "../provider/ollama-introspect";
 import type { ProviderRouter } from "../provider/router";
 import { filterFuzzy } from "./autocomplete";
+import { REASONING_LEVELS, type ReasoningEffortLevel } from "./command-palette";
 import { getTheme, type Theme } from "./theme";
 
 const PROVIDER_KINDS = ProviderKindSchema.options;
@@ -63,13 +65,27 @@ const PLATFORM_PRESETS: PlatformPreset[] = [
   { id: "custom", name: "Custom base URL", kind: "openai", baseUrl: "" },
 ];
 
-const CAPABILITY_FIELDS = ["tool_calling", "reasoning", "vision", "context_window", "max_output"] as const;
+const CAPABILITY_FIELDS = [
+  "tool_calling",
+  "reasoning",
+  "vision",
+  "structured_output",
+  "temperature",
+  "pdf",
+  "parallel_tool_calls",
+  "context_window",
+  "max_output",
+] as const;
 type CapabilityField = (typeof CAPABILITY_FIELDS)[number];
 
 interface CapabilitiesDraft {
   tool_calling: boolean;
   reasoning: boolean;
   vision: boolean;
+  structured_output: boolean;
+  temperature: boolean;
+  pdf: boolean;
+  parallel_tool_calls: boolean;
   context_window: string;
   max_output: string;
 }
@@ -78,6 +94,10 @@ const EMPTY_CAPABILITIES_DRAFT: CapabilitiesDraft = {
   tool_calling: true,
   reasoning: false,
   vision: false,
+  structured_output: false,
+  temperature: true,
+  pdf: false,
+  parallel_tool_calls: true,
   context_window: "",
   max_output: "",
 };
@@ -87,9 +107,17 @@ function draftFromCapabilities(capabilities: ModelCapabilities): CapabilitiesDra
     tool_calling: capabilities.tool_calling,
     reasoning: capabilities.reasoning,
     vision: capabilities.vision,
+    structured_output: capabilities.structured_output,
+    temperature: capabilities.temperature,
+    pdf: capabilities.pdf,
+    parallel_tool_calls: capabilities.parallel_tool_calls,
     context_window: capabilities.context_window !== undefined ? String(capabilities.context_window) : "",
     max_output: capabilities.max_output !== undefined ? String(capabilities.max_output) : "",
   };
+}
+
+function isCapabilityBoolean(field: CapabilityField): field is Exclude<CapabilityField, "context_window" | "max_output"> {
+  return field !== "context_window" && field !== "max_output";
 }
 
 type DiscoverEntry =
@@ -111,6 +139,8 @@ export interface ModelConfigModalProps {
   onClose: () => void;
   onSaved?: (message: string) => void;
   onRoleChange?: (role: ConfigRole, provider: string, model: string) => void;
+  reasoningEffort?: ReasoningEffortLevel;
+  onReasoningChange?: (effort: ReasoningEffortLevel) => void;
 }
 
 function kindIndex(kind: ProviderKind): number {
@@ -148,15 +178,18 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     onClose,
     onSaved,
     onRoleChange,
+    reasoningEffort = "medium",
+    onReasoningChange,
   } = props;
 
-  const [view, setView] = React.useState<"discover" | "assign" | "connect" | "capabilities">("discover");
+  const [view, setView] = React.useState<"discover" | "assign" | "connect" | "capabilities" | "reasoning">("discover");
   const [targetRole, setTargetRole] = React.useState<ConfigRole>("main");
   const [query, setQuery] = React.useState("");
   const [selectedIndex, setSelectedIndex] = React.useState(0);
   const [discovered, setDiscovered] = React.useState<DiscoveredProvider[]>([]);
   const [discovering, setDiscovering] = React.useState(true);
   const [discoverIndex, setDiscoverIndex] = React.useState(0);
+  const [reasoningIndex, setReasoningIndex] = React.useState(0);
   const [form, setForm] = React.useState<ProviderForm>(EMPTY_FORM);
   const [field, setField] = React.useState(0);
   const [status, setStatus] = React.useState<string | undefined>();
@@ -166,6 +199,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   const [capField, setCapField] = React.useState(0);
   const [capDraft, setCapDraft] = React.useState<CapabilitiesDraft>(EMPTY_CAPABILITIES_DRAFT);
   const [capOverride, setCapOverride] = React.useState(false);
+  const [capSource, setCapSource] = React.useState<string>("inferred");
   const [, forceRender] = React.useReducer((value: number) => value + 1, 0);
 
   const providers = router.listProviders();
@@ -267,10 +301,20 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       onRoleChange?.(targetRole, provider, model);
       setStatus(`${targetRole} now uses ${provider} / ${model}`);
       setError(undefined);
-      setView("discover");
-      forceRender();
       setQuery("");
       setSelectedIndex(0);
+      forceRender();
+      if (targetRole === "main") {
+        setReasoningIndex(
+          Math.max(
+            0,
+            REASONING_LEVELS.findIndex((level) => level.id === reasoningEffort),
+          ),
+        );
+        setView("reasoning");
+      } else {
+        onClose();
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -281,11 +325,25 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       const capabilities = router.capabilitiesFor(provider, model);
       setCapTarget({ provider, model });
       setCapDraft(draftFromCapabilities(capabilities));
+      setCapSource(capabilities.source ?? "inferred");
       setCapOverride(Boolean(router.capabilitiesOverrideFor(provider, model)));
       setCapField(0);
       setStatus(undefined);
       setError(undefined);
       setView("capabilities");
+
+      const summary = router.listProviders().find((entry) => entry.name === provider);
+      if (summary?.kind === "ollama") {
+        void inspectOllamaModel(summary.baseUrl, model)
+          .then((live) => {
+            if (!live) return;
+            const refreshed = router.capabilitiesFor(provider, model);
+            setCapDraft(draftFromCapabilities(refreshed));
+            setCapSource(refreshed.source ?? "inferred");
+            forceRender();
+          })
+          .catch(() => undefined);
+      }
     } catch (cause) {
       setError(describeError(cause));
     }
@@ -297,6 +355,10 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       tool_calling: capDraft.tool_calling,
       reasoning: capDraft.reasoning,
       vision: capDraft.vision,
+      structured_output: capDraft.structured_output,
+      temperature: capDraft.temperature,
+      pdf: capDraft.pdf,
+      parallel_tool_calls: capDraft.parallel_tool_calls,
     };
     const contextWindow = Number.parseInt(capDraft.context_window, 10);
     if (Number.isFinite(contextWindow) && contextWindow > 0) patch.context_window = contextWindow;
@@ -323,8 +385,9 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       router.setModelCapabilities(capTarget.provider, capTarget.model, undefined);
       const capabilities = router.capabilitiesFor(capTarget.provider, capTarget.model);
       setCapDraft(draftFromCapabilities(capabilities));
+      setCapSource(capabilities.source ?? "inferred");
       setCapOverride(false);
-      setStatus("reset to inferred capabilities");
+      setStatus("reset to automatic capabilities");
       setError(undefined);
       onSaved?.(`capabilities reset for ${capTarget.model}`);
       forceRender();
@@ -409,6 +472,31 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   useInput((input, key) => {
     if (busy) {
       if (key.escape) onClose();
+      return;
+    }
+
+    if (view === "reasoning") {
+      if (key.escape) {
+        onClose();
+        return;
+      }
+      if (key.upArrow) {
+        setReasoningIndex((value) =>
+          value > 0 ? value - 1 : Math.max(0, REASONING_LEVELS.length - 1),
+        );
+        return;
+      }
+      if (key.downArrow) {
+        setReasoningIndex((value) =>
+          value < REASONING_LEVELS.length - 1 ? value + 1 : 0,
+        );
+        return;
+      }
+      if (key.return) {
+        const level = REASONING_LEVELS[reasoningIndex];
+        if (level) onReasoningChange?.(level.id);
+        onClose();
+      }
       return;
     }
 
@@ -514,13 +602,9 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       }
 
       const fieldName: CapabilityField = CAPABILITY_FIELDS[capField] ?? "tool_calling";
-      if (fieldName === "tool_calling" || fieldName === "reasoning" || fieldName === "vision") {
+      if (isCapabilityBoolean(fieldName)) {
         if (key.return || input === " ") {
-          setCapDraft((previous) => {
-            if (fieldName === "tool_calling") return { ...previous, tool_calling: !previous.tool_calling };
-            if (fieldName === "reasoning") return { ...previous, reasoning: !previous.reasoning };
-            return { ...previous, vision: !previous.vision };
-          });
+          setCapDraft((previous) => ({ ...previous, [fieldName]: !previous[fieldName] }));
         }
         return;
       }
@@ -763,6 +847,38 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     );
   }
 
+  if (view === "reasoning") {
+    const active = router.getRole(targetRole);
+    const clamped = Math.max(0, Math.min(REASONING_LEVELS.length - 1, reasoningIndex));
+
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <Box justifyContent="space-between">
+          <Text bold color={theme.text}>Thinking effort</Text>
+          <Text color={theme.muted}>Esc skip</Text>
+        </Box>
+        <Text color={theme.muted}>
+          {active ? `${targetRole} now uses ${active.provider} / ${active.model}` : "Model assigned"}
+        </Text>
+        {REASONING_LEVELS.map((level, index) => {
+          const isActive = index === clamped;
+          const isCurrent = level.id === reasoningEffort;
+          return (
+            <Text key={level.id}>
+              <Text color={isActive ? theme.accent : theme.muted}>{isActive ? "❯ " : "  "}</Text>
+              <Text bold={isActive} color={theme.text}>{level.label.padEnd(8)}</Text>
+              <Text color={theme.muted}>
+                {level.description}
+                {isCurrent ? " · current" : ""}
+              </Text>
+            </Text>
+          );
+        })}
+        <Text color={theme.muted}>Up/Down move · Enter select · Esc skip</Text>
+      </Box>
+    );
+  }
+
   if (view === "capabilities") {
     if (!capTarget) {
       return (
@@ -775,6 +891,10 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       { field: "tool_calling", label: "Tool calling", value: capDraft.tool_calling ? "on" : "off" },
       { field: "reasoning", label: "Reasoning", value: capDraft.reasoning ? "on" : "off" },
       { field: "vision", label: "Vision", value: capDraft.vision ? "on" : "off" },
+      { field: "structured_output", label: "Structured output", value: capDraft.structured_output ? "on" : "off" },
+      { field: "temperature", label: "Temperature", value: capDraft.temperature ? "on" : "off" },
+      { field: "pdf", label: "PDF input", value: capDraft.pdf ? "on" : "off" },
+      { field: "parallel_tool_calls", label: "Parallel tools", value: capDraft.parallel_tool_calls ? "on" : "off" },
       { field: "context_window", label: "Context window", value: capDraft.context_window || "(auto)" },
       { field: "max_output", label: "Max output", value: capDraft.max_output || "(auto)" },
     ];
@@ -789,7 +909,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
           {capTarget.provider} / {capTarget.model}
         </Text>
         <Text color={capOverride ? theme.modes.build.primary : theme.muted}>
-          {capOverride ? "override" : "auto (inferred)"} · s save · r reset
+          {capOverride ? "override" : `auto (${capSource})`} · s save · r reset
         </Text>
         {rows.map((row, index) => {
           const isActive = index === capField;

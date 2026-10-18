@@ -12,7 +12,8 @@ import type { RestoreResult, SnapshotManager } from "../vcs/snapshot";
 import type { ConfigRole } from "../config/writer";
 import { AgentHub, type AgentHubTab } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
-import { CommandPaletteModal, type ReasoningEffortLevel } from "./command-palette";
+import { ChoiceModal } from "./choice-modal";
+import { CommandPaletteModal, REASONING_LEVELS, type ReasoningEffortLevel } from "./command-palette";
 import { PromptComposer, type FileAttachmentRef } from "./composer";
 import { HelpOverlay } from "./help-overlay";
 import { OrchivoxLogo } from "./logo";
@@ -147,6 +148,16 @@ const MODE_HINTS: Record<AgentMode, string> = {
   ultrawork: "autonomous",
 };
 
+const MODE_CHOICES: Array<{ id: AgentMode; label: string; description: string }> = [
+  { id: "plan", label: "Plan", description: "Read-only. Inspect and plan, no file changes." },
+  { id: "build", label: "Build", description: "Normal work. File changes ask for approval." },
+  {
+    id: "ultrawork",
+    label: "Ultrawork",
+    description: "Autonomous. Keeps working without stopping for approval.",
+  },
+];
+
 export function interpretInput(text: string): InputAction {
   const trimmed = text.trim();
   if (trimmed.startsWith("/")) {
@@ -252,6 +263,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const [internalHubTab, setInternalHubTab] = React.useState<AgentHubTab>("workers");
   const [internalPaletteOpen, setInternalPaletteOpen] = React.useState(false);
   const [internalSessionTab, setInternalSessionTab] = React.useState<SessionModalTab | null>(null);
+  const [modePickerOpen, setModePickerOpen] = React.useState(false);
+  const [reasoningPickerOpen, setReasoningPickerOpen] = React.useState(false);
 
   const helpOpen = props.helpOpen ?? internalHelpOpen;
   const setHelpOpen = (open: boolean) => {
@@ -325,7 +338,15 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   };
 
   const hasModalOpen =
-    Boolean(props.pendingApproval) || helpOpen || modelsOpen || skillsOpen || paletteOpen || Boolean(sessionTab) || hubOpen;
+    Boolean(props.pendingApproval) ||
+    helpOpen ||
+    modelsOpen ||
+    skillsOpen ||
+    paletteOpen ||
+    Boolean(sessionTab) ||
+    hubOpen ||
+    modePickerOpen ||
+    reasoningPickerOpen;
 
   useInput((input, key) => {
     if (key.escape) {
@@ -410,6 +431,49 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             height={Math.max(10, terminalSize.rows - 8)}
             onClose={() => setHelpOpen(false)}
           />
+        ) : modePickerOpen ? (
+          <ChoiceModal
+            title="Mode"
+            subtitle={`Current: ${mode}`}
+            options={MODE_CHOICES.map((choice) => ({
+              id: choice.id,
+              label: choice.label,
+              description: choice.description,
+              current: choice.id === mode,
+            }))}
+            initialIndex={Math.max(0, MODE_CHOICES.findIndex((choice) => choice.id === mode))}
+            width={innerWidth}
+            theme={theme}
+            onSelect={(id) => {
+              setMode(id as AgentMode);
+              setModePickerOpen(false);
+            }}
+            onCancel={() => setModePickerOpen(false)}
+          />
+        ) : reasoningPickerOpen ? (
+          <ChoiceModal
+            title="Thinking effort"
+            subtitle={`Current: ${props.reasoningEffort ?? "medium"}`}
+            options={REASONING_LEVELS.map((level) => ({
+              id: level.id,
+              label: level.label,
+              description: level.description,
+              current: level.id === (props.reasoningEffort ?? "medium"),
+            }))}
+            initialIndex={Math.max(
+              0,
+              REASONING_LEVELS.findIndex(
+                (level) => level.id === (props.reasoningEffort ?? "medium"),
+              ),
+            )}
+            width={innerWidth}
+            theme={theme}
+            onSelect={(id) => {
+              props.onReasoningEffortChange?.(id as ReasoningEffortLevel);
+              setReasoningPickerOpen(false);
+            }}
+            onCancel={() => setReasoningPickerOpen(false)}
+          />
         ) : skillsOpen ? (
           <SkillsModal
             skills={props.skills ?? []}
@@ -427,6 +491,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onClose={() => setModelsOpen(false)}
             onSaved={(message) => onStatusMessage?.(message)}
             onRoleChange={onRoleChange}
+            reasoningEffort={props.reasoningEffort}
+            onReasoningChange={props.onReasoningEffortChange}
           />
         ) : paletteOpen && props.router ? (
           <CommandPaletteModal
@@ -551,6 +617,14 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               if (action.kind === "command") {
                 if (action.command === "/help") {
                   setHelpOpen(true);
+                  return;
+                }
+                if (action.command === "/mode" && (action.args ?? "").trim().length === 0) {
+                  setModePickerOpen(true);
+                  return;
+                }
+                if (action.command === "/reasoning" && (action.args ?? "").trim().length === 0) {
+                  setReasoningPickerOpen(true);
                   return;
                 }
                 if (action.command === "/models") {

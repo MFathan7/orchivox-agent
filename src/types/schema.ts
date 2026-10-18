@@ -113,6 +113,7 @@ export const ChatRequestSchema = z.object({
   max_tokens: z.number().int().positive(),
   stop_sequences: z.array(z.string().min(1)).default([]),
   reasoning_effort: z.enum(["low", "medium", "high"]).optional(),
+  response_format: z.record(z.string(), z.unknown()).optional(),
 });
 export type ChatRequest = z.infer<typeof ChatRequestSchema>;
 
@@ -371,6 +372,16 @@ export const SkillActivatedEventSchema = z.object({
 });
 export type SkillActivatedEvent = z.infer<typeof SkillActivatedEventSchema>;
 
+export const CompactionEventSchema = z.object({
+  type: z.literal("compaction"),
+  reason: z.enum(["auto", "manual", "retry"]),
+  before_tokens: z.number().int().nonnegative(),
+  after_tokens: z.number().int().nonnegative(),
+  summary_tokens: z.number().int().nonnegative().default(0),
+  summary: z.string().optional(),
+});
+export type CompactionEvent = z.infer<typeof CompactionEventSchema>;
+
 export const StreamEventSchema = z.discriminatedUnion("type", [
   TokenEventSchema,
   ThinkingTokenEventSchema,
@@ -387,6 +398,7 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   ToolEndEventSchema,
   FileChangeEventSchema,
   SkillActivatedEventSchema,
+  CompactionEventSchema,
 ]);
 export type StreamEvent = z.infer<typeof StreamEventSchema>;
 

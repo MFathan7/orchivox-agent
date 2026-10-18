@@ -46,11 +46,24 @@ providers:
       - qwen/qwen-2.5-coder-32b-instruct
     timeout_ms: 60000
     enabled: false
+  ollama:
+    kind: ollama
+    base_url: http://127.0.0.1:11434/v1
+    models:
+      - qwen3.5:9b
+      - haervwe/GLM-4.6V-Flash-9B:latest
+      - qwen2.5-coder:7b
+      - hermes3:latest
+      - gemma4:12b-it-qat
+    model_capabilities: {}
+    headers: {}
+    timeout_ms: 60000
+    enabled: true
 
 roles:
   main_model:
-    provider: openai_primary
-    model: gpt-4.1
+    provider: ollama
+    model: qwen3.5:9b
   fast_model:
     provider: ollama_local
     model: llama3.2:3b
@@ -68,24 +81,24 @@ lsp:
   servers:
     typescript:
       command: typescript-language-server
-      args: ["--stdio"]
-      root_markers: ["tsconfig.json", "jsconfig.json", "package.json", "bunfig.toml"]
+      args: [ "--stdio" ]
+      root_markers: [ "tsconfig.json", "jsconfig.json", "package.json", "bunfig.toml" ]
     python:
       command: pylsp
-      root_markers: ["pyproject.toml", "setup.py", "requirements.txt"]
+      root_markers: [ "pyproject.toml", "setup.py", "requirements.txt" ]
     rust:
       command: rust-analyzer
-      root_markers: ["Cargo.toml"]
+      root_markers: [ "Cargo.toml" ]
     go:
       command: gopls
-      root_markers: ["go.mod"]
+      root_markers: [ "go.mod" ]
 
 mcp:
   servers:
     workspace_files:
       transport: stdio
       command: bunx
-      args: ["@modelcontextprotocol/server-filesystem", "."]
+      args: [ "@modelcontextprotocol/server-filesystem", "." ]
     docs_lookup:
       transport: http
       url: https://mcp.example.net/docs
@@ -106,9 +119,9 @@ hooks:
 sandbox:
   permissions:
     filesystem:
-      read: ["**/*"]
+      read: [ "**/*" ]
       write: []
-      deny: [".git/**", ".env", ".env.*"]
+      deny: [ ".git/**", ".env", ".env.*" ]
     network:
       allow: []
       deny: []

@@ -1,6 +1,8 @@
 import { resolveModelCapabilities, type AppConfig, type ModelCapabilities, type ModelCapabilitiesPatch, type ProviderProfile } from "../config/loader";
 import type { ChatRequest, StreamEvent } from "../types/schema";
 import { AnthropicCompatProvider } from "./anthropic-compat";
+import { catalogProviderForKind, findCatalogModel, type ModelCatalog } from "./model-catalog";
+import { getCachedOllamaCapabilities } from "./ollama-introspect";
 import { OpenAICompatProvider } from "./openai-compat";
 
 export interface LLMProvider {
@@ -27,10 +29,12 @@ const ROLE_MODEL_KEYS: Record<ProviderRole, "main_model" | "fast_model" | "advis
 
 export class ProviderRouter {
   private readonly config: AppConfig;
+  private readonly catalog: ModelCatalog | undefined;
   private readonly instances = new Map<string, LLMProvider>();
 
-  constructor(config: AppConfig) {
+  constructor(config: AppConfig, options: { catalog?: ModelCatalog } = {}) {
     this.config = config;
+    this.catalog = options.catalog;
   }
 
   get(role: ProviderRole): LLMProvider {
@@ -63,13 +67,32 @@ export class ProviderRouter {
   capabilitiesFor(providerName: string, model?: string): ModelCapabilities {
     const profile = this.config.providers[providerName];
     if (!profile) throw new Error(`unknown provider profile "${providerName}"`);
-    return resolveModelCapabilities(profile, model);
+    return this.capabilitiesForProfile(profile, model);
+  }
+
+  capabilitiesForProfile(profile: ProviderProfile, model?: string): ModelCapabilities {
+    const key = model ?? profile.models[0] ?? "";
+    const catalogProvider = catalogProviderForKind(profile.kind, profile.catalog_provider);
+    const catalogModel = findCatalogModel(this.catalog, catalogProvider, key);
+    const ollama = profile.kind === "ollama" ? getCachedOllamaCapabilities(profile.base_url, key) : undefined;
+    return resolveModelCapabilities(profile, model, { catalogModel, ollama });
   }
 
   capabilitiesForRole(role: ProviderRole): ModelCapabilities {
     const ref = this.getRole(role);
     if (!ref) {
-      return { tool_calling: true, reasoning: false, vision: false, context_window: 32_768, max_output: 4_096 };
+      return {
+        tool_calling: true,
+        reasoning: false,
+        vision: false,
+        context_window: 32_768,
+        max_output: 4_096,
+        structured_output: false,
+        temperature: true,
+        pdf: false,
+        parallel_tool_calls: true,
+        source: "inferred",
+      };
     }
     return this.capabilitiesFor(ref.provider, ref.model);
   }
@@ -106,7 +129,8 @@ export class ProviderRouter {
   }
 
   async testProvider(profile: ProviderProfile): Promise<string[]> {
-    const provider = createProvider(profile, profile.models[0]);
+    const model = profile.models[0];
+    const provider = createProvider(profile, model, this.capabilitiesForProfile(profile, model));
     return provider.listModels(AbortSignal.timeout(8000));
   }
 
@@ -122,20 +146,25 @@ export class ProviderRouter {
     const key = `${profileName}\u0000${boundModel ?? ""}`;
     const cached = this.instances.get(key);
     if (cached) return cached;
-    const created = createProvider(profile, boundModel);
+    const created = createProvider(profile, boundModel, this.capabilitiesForProfile(profile, boundModel));
     this.instances.set(key, created);
     return created;
   }
 }
 
-function createProvider(profile: ProviderProfile, model: string | undefined): LLMProvider {
+function createProvider(
+  profile: ProviderProfile,
+  model: string | undefined,
+  capabilities: ModelCapabilities,
+): LLMProvider {
   const options = {
     baseUrl: profile.base_url,
     apiKey: profile.api_key,
     headers: profile.headers,
     model,
     pricing: profile.pricing,
-    enableReasoningEffort: profile.kind === "openai",
+    kind: profile.kind,
+    capabilities,
   };
   switch (profile.kind) {
     case "openai":

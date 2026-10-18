@@ -33,6 +33,23 @@ export class RulesLoader {
     return sections.join("\n\n");
   }
 
+  async getGlobalRules(): Promise<string> {
+    const candidates = [
+      `${this.root}/AGENTS.md`,
+      `${this.root}/CLAUDE.md`,
+      `${this.root}/.agent/rules/general.md`,
+    ];
+    const sections: string[] = [];
+    for (const candidate of candidates) {
+      if (this.injected.has(candidate)) continue;
+      if (!(await pathExists(candidate))) continue;
+      this.injected.add(candidate);
+      const content = (await Bun.file(candidate).text()).trimEnd();
+      if (content.length > 0) sections.push(`# ${labelFor(candidate, this.root)}\n${content}`);
+    }
+    return sections.join("\n\n");
+  }
+
   reset(): void {
     this.injected.clear();
   }

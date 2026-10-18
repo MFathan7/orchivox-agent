@@ -6,7 +6,7 @@ import type {
   AgentProfile,
   IAgentRunner,
 } from "../api/server";
-import type { AppConfig } from "../config/loader";
+import type { AppConfig, CompactionConfig } from "../config/loader";
 import { structuredPatch } from "diff";
 import { registerAstTools } from "../ide/ast-compress";
 import { registerCodeIntelTools } from "../ide/code-intel";
@@ -54,12 +54,14 @@ import {
 import type { SnapshotManager } from "../vcs/snapshot";
 import type { WorktreeManager } from "../vcs/worktree";
 import { AdvisorReviewer } from "./advisor";
+import { compactMessages, estimateTextTokens, estimateToolsTokens, extractSummary } from "./compaction";
 import { CustomCommandEngine } from "./custom-commands";
 import { HookRunner, type PluginLoadReport } from "./hooks";
 import { GranularPermissionEngine } from "./permissions";
 import { SpecialistAgentRegistry, type SpecialistAgentProfile } from "./specialist-agents";
 import { SkillRegistry } from "./skills";
 import { SubagentManager, type SubagentTaskInput, type SubagentTaskResult, type SubagentWorkerState } from "./subagent";
+import { buildSystemPrompt } from "./system-prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
 import { runWithTurnContext } from "./turn-context";
 import { SKILL_ALWAYS_ALLOWED_TOOLS, SkillToolPolicy } from "./skill-policy";
@@ -96,27 +98,6 @@ const SUBAGENT_BLOCKED_TOOLS = new Set([
   "task_wait",
 ]);
 
-const MODE_PROMPTS: Record<AgentMode, string> = {
-  plan: [
-    "You are in PLAN mode (Prometheus), acting as the lead architect.",
-    "Interview the user with focused architecture questions when requirements are unclear,",
-    "then produce a detailed implementation plan.",
-    "Use only read-only tools and never modify files.",
-  ].join(" "),
-  build: [
-    "You are in BUILD mode.",
-    "Implement the requested changes completely, verify them with the available tools,",
-    "and only stop once the work is done and verified.",
-  ].join(" "),
-  ultrawork: [
-    "You are in ULTRAWORK mode.",
-    "Track the work with todo_write and keep making progress with tools",
-    "until every todo item is completed.",
-    "For independent work, create tasks with task_create (ready tasks start automatically)",
-    "and inspect progress with task_list.",
-  ].join(" "),
-};
-
 export class AgentOrchestrator implements IAgentRunner {
   readonly todos = new TodoEngine();
   readonly hooks: HookRunner;
@@ -139,6 +120,9 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly root: string;
   private readonly maxTurns: number;
   private readonly contextTokenBudget: number;
+  private readonly compactionConfig: CompactionConfig;
+  private branch: string | undefined;
+  private globalRules = "";
   private readonly taskRequests = new Map<string, AgentTaskRequest>();
   private readonly pendingDiagnostics = new Map<string, string>();
 
@@ -151,6 +135,8 @@ export class AgentOrchestrator implements IAgentRunner {
     this.root = options.repoRoot ?? globalThis.process.cwd();
     this.maxTurns = options.maxTurns ?? 40;
     this.contextTokenBudget = options.contextTokenBudget ?? 200_000;
+    this.compactionConfig =
+      options.config?.compaction ?? { auto: true, keep_tokens: 15_000, buffer_ratio: 0.1 };
     this.permissions = options.permissions ?? new GranularPermissionEngine({ repoRoot: this.root });
     this.registry = new ToolRegistry({ permissions: this.permissions });
     this.hindsight = new HindsightMemory(options.database);
@@ -178,7 +164,21 @@ export class AgentOrchestrator implements IAgentRunner {
     await this.customCommands.ensureDefaults();
     await this.specialistAgents.ensureDefaults();
     await this.skills.load(true);
+    this.globalRules = await this.rules.getGlobalRules();
+    const branch = await runGit(this.root, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true });
+    this.branch = branch.exitCode === 0 ? branch.stdout.trim() || undefined : undefined;
     return this.hooks.loadUserPlugins(this.registry);
+  }
+
+  estimateContextOverhead(mode: AgentMode): number {
+    const system = buildSystemPrompt({
+      mode,
+      repoRoot: this.root,
+      branch: this.branch,
+      agentInstructions: this.globalRules,
+      skillsIndex: this.skills.buildIndexPrompt(),
+    });
+    return estimateTextTokens(system) + estimateToolsTokens(this.registry.listDefinitions());
   }
 
   async runOnce(request: AgentRunRequest): Promise<AgentRunResult> {
@@ -346,9 +346,15 @@ export class AgentOrchestrator implements IAgentRunner {
     const provider = this.router.get(roleName);
     const capabilities = this.router.capabilitiesForRole(roleName);
     if (!capabilities.vision) messages = stripImageBlocks(messages);
-    const system = [activeSpecialist?.systemPrompt, request.system, MODE_PROMPTS[mode], this.skills.buildIndexPrompt()]
-      .filter(Boolean)
-      .join("\n\n");
+    const system = buildSystemPrompt({
+      mode,
+      repoRoot: this.root,
+      branch: this.branch,
+      agentInstructions: this.globalRules,
+      specialistPrompt: activeSpecialist?.systemPrompt,
+      skillsIndex: this.skills.buildIndexPrompt(),
+      extra: request.system,
+    });
     let tools = this.combineTools(request.tools);
     if (!capabilities.tool_calling) tools = [];
     if (activeSpecialist) {
@@ -360,19 +366,42 @@ export class AgentOrchestrator implements IAgentRunner {
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
 
-    const budget = activeSpecialist?.thinkingBudget ?? 0;
-    const requestedMaxTokens = budget > 0
-      ? Math.max(request.max_tokens ?? 4096, budget + 2048)
+    const specialistBudget = activeSpecialist?.thinkingBudget ?? 0;
+    const capabilityBudget = capabilities.reasoning ? (capabilities.reasoning_budget_max ?? 8192) : 0;
+    const reasoningBudget = Math.max(specialistBudget, capabilityBudget);
+    const requestedMaxTokens = reasoningBudget > 0
+      ? Math.max(request.max_tokens ?? 4096, reasoningBudget + 2048)
       : (request.max_tokens ?? 4096);
     const maxTokens = capabilities.max_output
       ? Math.min(requestedMaxTokens, capabilities.max_output)
       : requestedMaxTokens;
-    const contextBudget = capabilities.context_window
-      ? Math.floor(capabilities.context_window * 0.75)
-      : this.contextTokenBudget;
+    const contextWindow = capabilities.context_window ?? this.contextTokenBudget;
+    const overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
+    let compactedRetry = false;
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
-      messages = await this.hindsight.compactMessagesIfNeeded(messages, contextBudget, provider);
+      if (this.compactionConfig.auto) {
+        const compaction = await compactMessages(messages, {
+          provider,
+          contextWindow,
+          keepTokens: this.compactionConfig.keep_tokens,
+          bufferTokens: this.compactionConfig.buffer_tokens,
+          bufferRatio: this.compactionConfig.buffer_ratio,
+          overheadTokens,
+          previousSummary: extractSummary(messages),
+        });
+        if (compaction.didCompact) {
+          messages = compaction.messages;
+          sink({
+            type: "compaction",
+            reason: "auto",
+            before_tokens: compaction.beforeTokens,
+            after_tokens: compaction.afterTokens,
+            summary_tokens: compaction.summaryTokens,
+            summary: compaction.summary,
+          });
+        }
+      }
 
       const advisorNote = this.advisor.consumeNote();
       if (advisorNote) {
@@ -390,11 +419,14 @@ export class AgentOrchestrator implements IAgentRunner {
         temperature: request.temperature,
         top_p: request.top_p,
         stop_sequences: request.stop_sequences,
-        reasoning_effort: capabilities.reasoning ? request.reasoning_effort : undefined,
+        reasoning_effort: capabilities.reasoning
+          ? clampReasoningEffort(request.reasoning_effort, capabilities.reasoning_efforts)
+          : undefined,
       });
 
       const accumulator = new TurnAccumulator();
       let turnError: string | undefined;
+      let contextOverflow = false;
       for await (const event of provider.streamChat(chatRequest, signal)) {
         switch (event.type) {
           case "token":
@@ -418,6 +450,7 @@ export class AgentOrchestrator implements IAgentRunner {
             break;
           case "error":
             turnError = event.message;
+            if (isContextOverflow(event.message)) contextOverflow = true;
             sink(event);
             break;
           case "done":
@@ -428,6 +461,32 @@ export class AgentOrchestrator implements IAgentRunner {
             break;
           default:
             break;
+        }
+      }
+
+      if (contextOverflow && !compactedRetry && !accumulator.hasOutput()) {
+        compactedRetry = true;
+        const forced = await compactMessages(messages, {
+          provider,
+          contextWindow,
+          keepTokens: this.compactionConfig.keep_tokens,
+          bufferTokens: this.compactionConfig.buffer_tokens,
+          bufferRatio: this.compactionConfig.buffer_ratio,
+          overheadTokens,
+          previousSummary: extractSummary(messages),
+          force: true,
+        });
+        if (forced.didCompact) {
+          messages = forced.messages;
+          sink({
+            type: "compaction",
+            reason: "retry",
+            before_tokens: forced.beforeTokens,
+            after_tokens: forced.afterTokens,
+            summary_tokens: forced.summaryTokens,
+            summary: forced.summary,
+          });
+          continue;
         }
       }
 
@@ -703,6 +762,15 @@ export class AgentOrchestrator implements IAgentRunner {
     const subagentMaxTokens = capabilities.max_output
       ? Math.min(requestedMaxTokens, capabilities.max_output)
       : requestedMaxTokens;
+    const effectiveMode = input.mode ?? (specialist?.readOnly ? "plan" : "build");
+    const subagentSystem = buildSystemPrompt({
+      mode: effectiveMode,
+      repoRoot: this.root,
+      branch: this.branch,
+      agentInstructions: this.globalRules,
+      specialistPrompt: specialist?.systemPrompt,
+      skillsIndex: this.skills.buildIndexPrompt(),
+    });
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
       for (const instruction of input.drainSteerings()) {
@@ -712,7 +780,7 @@ export class AgentOrchestrator implements IAgentRunner {
 
       const accumulator = new TurnAccumulator();
       const chatRequest = ChatRequestSchema.parse({
-        system: [specialist?.systemPrompt, this.skills.buildIndexPrompt()].filter(Boolean).join("\n\n"),
+        system: subagentSystem,
         messages,
         tools,
         tool_choice: tools.length > 0 ? "auto" : "none",
@@ -746,7 +814,6 @@ export class AgentOrchestrator implements IAgentRunner {
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         input.onTranscript(`[tool] ${call.name}`);
-        const effectiveMode = input.mode ?? (specialist?.readOnly ? "plan" : "build");
         const result = await this.registry.run(call, effectiveMode);
         messages.push(
           toolResultMessage(call, typeof result.content === "string" ? result.content : JSON.stringify(result.content), result.is_error),
@@ -827,6 +894,10 @@ class TurnAccumulator {
   addThinking(text: string, signature?: string): void {
     this.thinking += text;
     if (signature) this.thinkingSignature = signature;
+  }
+
+  hasOutput(): boolean {
+    return this.text.length > 0 || this.thinking.length > 0 || this.drafts.size > 0;
   }
 
   addDelta(event: ToolCallDeltaEvent): void {
@@ -947,6 +1018,30 @@ function summarizeArguments(args: Record<string, unknown>): string {
 function firstLine(text: string): string {
   const line = text.split("\n", 1)[0] ?? "";
   return line.length > 120 ? `${line.slice(0, 117)}...` : line;
+}
+
+function isContextOverflow(message: string): boolean {
+  return /context length|context_length_exceeded|too many tokens|maximum context|prompt is too long|reduce the length of the messages|request too large/i.test(
+    message,
+  );
+}
+
+function clampReasoningEffort(
+  requested: "low" | "medium" | "high" | undefined,
+  supported: string[] | undefined,
+): "low" | "medium" | "high" | undefined {  if (!requested) return undefined;
+  if (!supported || supported.length === 0) return requested;
+  const normalized = new Set(supported.map((value) => value.toLowerCase()));
+  if (normalized.has(requested)) return requested;
+  const order: Array<"low" | "medium" | "high"> = ["low", "medium", "high"];
+  const requestedIndex = order.indexOf(requested);
+  for (let index = requestedIndex - 1; index >= 0; index -= 1) {
+    if (normalized.has(order[index])) return order[index];
+  }
+  for (let index = requestedIndex + 1; index < order.length; index += 1) {
+    if (normalized.has(order[index])) return order[index];
+  }
+  return undefined;
 }
 
 function zeroUsage(): Usage {

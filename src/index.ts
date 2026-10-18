@@ -9,17 +9,20 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
+import { compactMessages, extractSummary } from "./agent/compaction";
+import { generateSessionTitle, messageText } from "./agent/session-title";
 import type { SkillDocument } from "./agent/skills";
 import type { ApprovalDecision, ApprovalRequest } from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
 import { loadConfig, type AppConfig } from "./config/loader";
 import { LSPClient } from "./ide/lsp-client";
-import { HindsightMemory } from "./memory/hindsight";
 import { RulesLoader } from "./memory/rules-loader";
 import { MemoryDatabase, type SessionRecord } from "./memory/sqlite";
 import { McpClientManager } from "./mcp/client";
 import { McpToolServer } from "./mcp/server";
 import { InterceptedProvider, loadStreamRules, type StreamRule } from "./provider/interceptor";
+import { loadModelCatalogSync, refreshModelCatalog, type ModelCatalog } from "./provider/model-catalog";
+import { warmOllamaProvider } from "./provider/ollama-introspect";
 import { ProviderRouter, type LLMProvider } from "./provider/router";
 import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
 import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
@@ -148,8 +151,8 @@ class InterceptingRouter extends ProviderRouter {
   private readonly streamRules: StreamRule[];
   private readonly wrappers = new Map<LLMProvider, LLMProvider>();
 
-  constructor(config: AppConfig, streamRules: StreamRule[]) {
-    super(config);
+  constructor(config: AppConfig, streamRules: StreamRule[], catalog?: ModelCatalog) {
+    super(config, { catalog });
     this.streamRules = streamRules;
   }
 
@@ -159,6 +162,11 @@ class InterceptingRouter extends ProviderRouter {
 
   provider(profileName: string, model?: string): LLMProvider {
     return this.wrap(super.provider(profileName, model));
+  }
+
+  refresh(): void {
+    super.refresh();
+    this.wrappers.clear();
   }
 
   private wrap(inner: LLMProvider): LLMProvider {
@@ -178,7 +186,14 @@ export async function bootstrap(options: { repoRoot?: string } = {}): Promise<Ru
   const database = new MemoryDatabase(`${root}/.agent/memory.db`);
   const rules = new RulesLoader({ rootPath: root });
   const streamRules = await loadStreamRules(`${root}/.agent/rules/stream_rules.yaml`);
-  const router = new InterceptingRouter(config, streamRules);
+  const catalog = loadModelCatalogSync();
+  const router = new InterceptingRouter(config, streamRules, catalog);
+  void refreshModelCatalog(catalog).then(() => router.refresh()).catch(() => undefined);
+  for (const profile of Object.values(config.providers)) {
+    if (profile.kind === "ollama" && profile.enabled) {
+      void warmOllamaProvider(profile).then(() => router.refresh()).catch(() => undefined);
+    }
+  }
   const snapshots = new SnapshotManager({ repoRoot: root });
   const worktrees = new WorktreeManager({ repoRoot: root });
   const lsp = await startLspClient(config, root);
@@ -323,7 +338,8 @@ async function runTuiSession(
   runtime: RuntimeHandle,
   print: (text: string) => void,
 ): Promise<{ close: () => Promise<void> }> {
-  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J");
+  // xterm modifyOtherKeys level 1: makes Shift+Enter distinct from Enter.
+  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[>4;1m");
 
   const projectName = basename(globalThis.process.cwd());
   const root = globalThis.process.cwd();
@@ -399,6 +415,38 @@ async function runTuiSession(
     state.sessionId = session.id;
     state.sessionEpoch += 1;
     return session.id;
+  };
+
+  const titleGeneratedFor = new Set<string>();
+
+  const maybeGenerateSessionTitle = async (sessionId: string, messages: Message[]): Promise<void> => {
+    if (titleGeneratedFor.has(sessionId)) return;
+    titleGeneratedFor.add(sessionId);
+
+    const session = runtime.database.getSession(sessionId);
+    if (!session) return;
+    const firstUser = messages.find((message) => message.role === "user" && messageText(message).length > 0);
+    if (!firstUser) return;
+    if (session.title !== sessionTitle(messageText(firstUser))) return;
+
+    const roles: Array<"fast" | "main"> = runtime.router.getRole("fast") ? ["fast", "main"] : ["main"];
+    for (const role of roles) {
+      let provider: LLMProvider;
+      try {
+        provider = runtime.router.get(role);
+      } catch {
+        continue;
+      }
+      const title = await generateSessionTitle({ messages, provider });
+      if (!title) continue;
+      try {
+        runtime.database.updateSession(sessionId, { title });
+        rerender();
+      } catch {
+        // Title generation is best effort.
+      }
+      return;
+    }
   };
 
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -519,8 +567,9 @@ async function runTuiSession(
       state.liveEntry = undefined;
       state.modifiedFiles.clear();
       const msgs = runtime.database.loadMessages(sessionId);
+      const history = runtime.database.loadFullMessages(sessionId);
       state.messages = msgs;
-      state.entries = msgs.map((m, idx) => ({
+      state.entries = history.map((m, idx) => ({
         id: `entry-${idx + 1}`,
         role: m.role === "system" ? "system" : m.role === "assistant" ? "assistant" : "user",
         text: m.content
@@ -528,7 +577,7 @@ async function runTuiSession(
           .filter(Boolean)
           .join(" "),
       }));
-      state.counter = msgs.length;
+      state.counter = history.length;
       const sess = runtime.database.getSession(sessionId);
       if (sess) state.mode = sess.mode;
       state.totalTokens = sess?.totalTokens ?? 0;
@@ -556,8 +605,9 @@ async function runTuiSession(
       state.totalPromptTokens = 0;
       state.totalCompletionTokens = 0;
       const msgs = runtime.database.loadMessages(forked.id);
+      const history = runtime.database.loadFullMessages(forked.id);
       state.messages = msgs;
-      state.entries = msgs.map((m, idx) => ({
+      state.entries = history.map((m, idx) => ({
         id: `entry-${idx + 1}`,
         role: m.role === "system" ? "system" : m.role === "assistant" ? "assistant" : "user",
         text: m.content
@@ -565,7 +615,7 @@ async function runTuiSession(
           .filter(Boolean)
           .join(" "),
       }));
-      state.counter = msgs.length;
+      state.counter = history.length;
       pushEntry("system", `session forked to: ${forked.title}`);
       rerender();
     },
@@ -683,6 +733,39 @@ async function runTuiSession(
     }
     state.busy = true;
     state.streamingText = "";
+    const compactionConfig = runtime.config.compaction;
+    if (compactionConfig.auto) {
+      try {
+        const provider = runtime.router.get("main");
+        const capabilities = runtime.router.capabilitiesForRole("main");
+        const compaction = await compactMessages(state.messages, {
+          provider,
+          contextWindow: capabilities.context_window,
+          keepTokens: compactionConfig.keep_tokens,
+          bufferTokens: compactionConfig.buffer_tokens,
+          bufferRatio: compactionConfig.buffer_ratio,
+          overheadTokens: runtime.orchestrator.estimateContextOverhead(state.mode),
+          previousSummary: extractSummary(state.messages),
+        });
+        if (compaction.didCompact) {
+          state.messages = compaction.messages;
+          runtime.database.saveCompaction(sessionId, {
+            summary: compaction.summary ?? "",
+            tail_start_message_id: compaction.tailStartMessageId,
+            before_tokens: compaction.beforeTokens,
+            after_tokens: compaction.afterTokens,
+            created_at: Date.now(),
+          });
+          pushEntry(
+            "system",
+            `Context compacted: ${formatTokenCount(compaction.beforeTokens)} -> ${formatTokenCount(compaction.afterTokens)} tokens`,
+          );
+          rerender();
+        }
+      } catch {
+        // Compaction is best effort; the turn can still proceed.
+      }
+    }
     const liveEntry: ChatEntryView = {
       id: "live",
       role: "assistant",
@@ -777,6 +860,12 @@ async function runTuiSession(
         } else if (event.type === "bg_process_update") {
           pushEntry("system", `[bg_process ${event.processId}] ${event.status}`);
           renderLive(true);
+        } else if (event.type === "compaction") {
+          pushEntry(
+            "system",
+            `Context compacted: ${formatTokenCount(event.before_tokens)} -> ${formatTokenCount(event.after_tokens)} tokens`,
+          );
+          renderLive(true);
         } else if (event.type === "error") {
           pushEntry("system", `provider error: ${event.message}`);
           renderLive(true);
@@ -816,6 +905,7 @@ async function runTuiSession(
       } catch {
         // Ignore database save error if session not found.
       }
+      void maybeGenerateSessionTitle(sessionId, [...state.messages]);
     } catch (error) {
       pushEntry("system", `turn failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -985,12 +1075,59 @@ async function runTuiSession(
         break;
       }
       case "/compact": {
+        if (state.busy) {
+          setNotice("Cancel the running turn before compacting.", 8000);
+          break;
+        }
+        let provider: LLMProvider;
         try {
-          const memory = new HindsightMemory(runtime.database);
-          state.messages = await memory.compactMessagesIfNeeded(state.messages, 200_000, runtime.router.get("main"));
-          pushEntry("system", `compacted: ${state.messages.length} message(s) in context`);
+          provider = runtime.router.get("main");
         } catch (error) {
           pushEntry("system", `compact failed: ${error instanceof Error ? error.message : String(error)}`);
+          break;
+        }
+        const compactionConfig = runtime.config.compaction;
+        const capabilities = runtime.router.capabilitiesForRole("main");
+        state.busy = true;
+        setNotice("Compacting session context...", 30_000);
+        rerender();
+        try {
+          const result = await compactMessages(state.messages, {
+            provider,
+            contextWindow: capabilities.context_window,
+            keepTokens: compactionConfig.keep_tokens,
+            bufferTokens: compactionConfig.buffer_tokens,
+            bufferRatio: compactionConfig.buffer_ratio,
+            overheadTokens: runtime.orchestrator.estimateContextOverhead(state.mode),
+            previousSummary: extractSummary(state.messages),
+            force: true,
+          });
+          if (!result.didCompact) {
+            pushEntry("system", "nothing to compact");
+            setNotice("Nothing to compact", 4000);
+          } else {
+            state.messages = result.messages;
+            if (state.sessionId) {
+              runtime.database.saveCompaction(state.sessionId, {
+                summary: result.summary ?? "",
+                tail_start_message_id: result.tailStartMessageId,
+                before_tokens: result.beforeTokens,
+                after_tokens: result.afterTokens,
+                created_at: Date.now(),
+              });
+            }
+            pushEntry(
+              "system",
+              `Context compacted: ${formatTokenCount(result.beforeTokens)} -> ${formatTokenCount(result.afterTokens)} tokens (removed ${result.removedMessages} message(s))`,
+            );
+            setNotice("Context compacted", 4000);
+          }
+        } catch (error) {
+          pushEntry("system", `compact failed: ${error instanceof Error ? error.message : String(error)}`);
+          setNotice("Compaction failed", 6000);
+        } finally {
+          state.busy = false;
+          rerender();
         }
         break;
       }
@@ -1102,7 +1239,8 @@ async function runTuiSession(
   const cleanupSignals = () => {
     if (noticeTimer) clearTimeout(noticeTimer);
     clearInterval(activityTimer);
-    process.stdout.write("\x1b[?1049l");
+    synced.uninstall();
+    process.stdout.write("\x1b[>4;0m\x1b[?1049l");
     void runtime.close().then(() => {
       process.exit(0);
     });
@@ -1116,7 +1254,7 @@ async function runTuiSession(
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);
-  process.stdout.write("\x1b[?1049l");
+  process.stdout.write("\x1b[>4;0m\x1b[?1049l");
   await relay?.close();
   await runtime.close();
   print("session closed");

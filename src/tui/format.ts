@@ -15,3 +15,10 @@ export function formatCost(costUsd: number): string {
   if (costUsd < 0.0001) return "<$0.0001";
   return `$${costUsd.toFixed(4)}`;
 }
+
+export function truncateText(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  if (text.length <= maxWidth) return text;
+  if (maxWidth <= 3) return text.slice(0, maxWidth);
+  return `${text.slice(0, maxWidth - 3)}...`;
+}
