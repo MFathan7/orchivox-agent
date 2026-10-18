@@ -28,74 +28,74 @@ export interface ExpandedCustomCommand {
 const DEFAULT_COMMANDS: Record<string, { frontmatter: CustomCommandFrontmatter; template: string }> = {
   "review.md": {
     frontmatter: {
-      description: "Code review perubahan git dengan fokus keamanan, performa, dan edge cases",
+      description: "Review git changes focusing on security, performance, and edge cases",
       agent: "oracle",
       model: "advisor",
       subtask: false,
     },
-    template: `Lakukan review menyeluruh terhadap perubahan kode git berikut ini.
-Fokuskan pada:
-1. Keamanan dan penanganan input kotor / edge cases
-2. Efisiensi algoritma dan potensi bottleneck performa
-3. Kepatuhan arsitektur, modularitas, dan prinsip clean code
+    template: `Perform a thorough review of the following git code changes.
+Focus on:
+1. Security and sanitized input handling / edge cases
+2. Algorithmic efficiency and potential performance bottlenecks
+3. Architectural consistency, modularity, and clean code principles
 
-### Status Git:
+### Git Status:
 \`\`\`
 !\`git status -s\`
 \`\`\`
 
-### Diff Git:
+### Git Diff:
 \`\`\`
 !\`git diff HEAD\`
 \`\`\`
 
-Instruksi tambahan pengguna:
+Additional user instructions:
 $ARGUMENTS`,
   },
   "fix-tests.md": {
     frontmatter: {
-      description: "Jalankan test suite, analisis kegagalan, dan perbaiki kode yang rusak",
+      description: "Run the test suite, analyze failures, and fix broken code",
       agent: "sisyphus",
       model: "main",
       subtask: false,
     },
-    template: `Jalankan test suite dan selesaikan seluruh kegagalan pengujian sampai semua test lulus 100%.
+    template: `Run the test suite and resolve all test failures until all tests pass 100%.
 
-### Hasil Test Saat Ini:
+### Current Test Results:
 \`\`\`
 !\`bun test\`
 \`\`\`
 
-Instruksi tambahan:
+Additional instructions:
 $ARGUMENTS`,
   },
   "refactor.md": {
     frontmatter: {
-      description: "Refaktor kode untuk meningkatkan modularitas, keterbacaan, dan konsistensi",
+      description: "Refactor code to improve modularity, readability, and consistency",
       agent: "oracle",
       model: "advisor",
       subtask: false,
     },
-    template: `Analisis dan lakukan refactoring terstruktur pada target berkas atau modul berikut:
+    template: `Analyze and perform structured refactoring on the following target file or module:
 Target: $1
-Fokus: $ARGUMENTS
+Focus: $ARGUMENTS
 
-Pedoman:
-1. Jangan merusak antarmuka publik atau perilaku yang sudah ada.
-2. Jaga kebersihan arsitektur dan hapus kode usang atau duplikasi.
-3. Pastikan kode tetap lulus pengujian dan typecheck.`,
+Guidelines:
+1. Do not break public interfaces or existing behavior.
+2. Maintain clean architecture and eliminate dead code or duplication.
+3. Ensure code continues to pass tests and typechecks.`,
   },
   "init-rules.md": {
     frontmatter: {
-      description: "Analisis dependensi dan struktur proyek lalu inisialisasi aturan agen di .agent/rules/",
+      description: "Analyze project dependencies and structure, then initialize agent rules in .agent/rules/",
       agent: "librarian",
       model: "main",
       subtask: false,
     },
-    template: `Analisis struktur proyek, dependensi, dan konvensi kode di repositori ini.
-Buat atau perbarui file aturan arsitektur di direktori \`.agent/rules/\`.
+    template: `Analyze project structure, dependencies, and code conventions in this repository.
+Create or update architecture rule files in the \`.agent/rules/\` directory.
 
-Detail tambahan:
+Additional details:
 $ARGUMENTS`,
   },
 };

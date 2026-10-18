@@ -292,7 +292,7 @@ export function PromptComposer(props: PromptComposerProps) {
     mode = "build",
     theme = getTheme("tokyonight"),
     repoRoot,
-    placeholder = "Ketik instruksi, / untuk command, @ untuk file, # untuk simbol...",
+    placeholder = "Type a prompt, / for commands, @ for files, # for symbols...",
     historyFilePath,
     disabled = false,
     onSubmit,
@@ -529,21 +529,24 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
-    if (key.backspace) {
+    const isForwardDelete = input === "\x1b[3~";
+    const isBackspace = Boolean(key.backspace || key.delete || input === "\x7f" || input === "\b");
+
+    if (isForwardDelete) {
+      if (cursorPos < text.length) {
+        const before = text.slice(0, cursorPos);
+        const after = text.slice(cursorPos + 1);
+        setText(`${before}${after}`);
+      }
+      return;
+    }
+
+    if (isBackspace) {
       if (cursorPos > 0) {
         const before = text.slice(0, cursorPos - 1);
         const after = text.slice(cursorPos);
         setText(`${before}${after}`);
         setCursorPos(cursorPos - 1);
-      }
-      return;
-    }
-
-    if (key.delete) {
-      if (cursorPos < text.length) {
-        const before = text.slice(0, cursorPos);
-        const after = text.slice(cursorPos + 1);
-        setText(`${before}${after}`);
       }
       return;
     }
@@ -557,7 +560,7 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
-    if (!key.ctrl && !key.meta && input.length > 0 && input >= " ") {
+    if (!key.ctrl && !key.meta && !isBackspace && !isForwardDelete && input.length > 0 && input >= " " && input !== "\x7f") {
       const before = text.slice(0, cursorPos);
       const after = text.slice(cursorPos);
       setText(`${before}${input}${after}`);
@@ -584,18 +587,18 @@ export function PromptComposer(props: PromptComposerProps) {
       {attachedFiles.length > 0 ? (
         <Box flexDirection="row" gap={1} marginBottom={0} paddingX={1}>
           <Text bold color={theme.accent}>
-            [LAMPIRAN FILE]:
+            Attached files:
           </Text>
           {attachedFiles.map((file) => (
             <Text
               key={file.raw}
               color={file.exists ? theme.modes.build.primary : theme.modes.ultrawork.secondary}
             >
-              [{file.raw} ~{file.tokens} tok]
+              {file.raw} (~{file.tokens} tok)
             </Text>
           ))}
           <Text dimColor>
-            (Total ~{totalTokens} tok otomatis disuntikkan saat Enter)
+            (~{totalTokens} tokens injected on Enter)
           </Text>
         </Box>
       ) : null}
@@ -651,10 +654,10 @@ export function PromptComposer(props: PromptComposerProps) {
 
       <Box justifyContent="space-between" paddingX={1}>
         <Text dimColor>
-          Tab: Mode | @: Lampirkan File | /: Command | Ctrl+P: Palette | Alt+A: Subagents | Ctrl+O: Detail Tool
+          Tab Mode  |  @ Attach File  |  / Command  |  Ctrl+P Palette  |  Alt+A Subagents  |  Ctrl+O Details
         </Text>
         <Text dimColor>
-          Shift+Enter / \+Enter: Baris Baru | Enter: Kirim
+          Shift+Enter New Line  |  Enter Send
         </Text>
       </Box>
     </Box>

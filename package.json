@@ -7,6 +7,10 @@
   "engines": {
     "bun": ">=1.1.0"
   },
+  "bin": {
+    "orchivox": "./bin/orchivox.js",
+    "orchvox": "./bin/orchivox.js"
+  },
   "scripts": {
     "start": "bun run src/index.ts",
     "serve": "bun run src/server.ts",

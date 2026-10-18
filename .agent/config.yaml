@@ -85,7 +85,7 @@ mcp:
     workspace_files:
       transport: stdio
       command: bunx
-      args: ["@modelcontextprotocol/server-filesystem", "./workspace"]
+      args: ["@modelcontextprotocol/server-filesystem", "."]
     docs_lookup:
       transport: http
       url: https://mcp.example.net/docs

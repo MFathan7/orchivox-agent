@@ -30,11 +30,11 @@ export interface CommandPaletteModalProps {
 }
 
 export const REASONING_LEVELS: Array<{ id: ReasoningEffortLevel; label: string; description: string; tokens: number }> = [
-  { id: "off", label: "Off", description: "Tanpa thinking block tambahan (0 token)", tokens: 0 },
-  { id: "low", label: "Low", description: "Penalaran ringkas cepat (2.048 token)", tokens: 2048 },
-  { id: "medium", label: "Medium", description: "Penalaran standar terstruktur (8.192 token)", tokens: 8192 },
-  { id: "high", label: "High", description: "Penalaran mendalam untuk arsitektur (16.384 token)", tokens: 16384 },
-  { id: "max", label: "Max", description: "Penalaran maksimal untuk pemecahan masalah rumit (32.768 token)", tokens: 32768 },
+  { id: "off", label: "Off", description: "No thinking tokens (0 tokens)", tokens: 0 },
+  { id: "low", label: "Low", description: "Concise and fast reasoning (2,048 tokens)", tokens: 2048 },
+  { id: "medium", label: "Medium", description: "Standard structured reasoning (8,192 tokens)", tokens: 8192 },
+  { id: "high", label: "High", description: "Deep reasoning for complex architecture (16,384 tokens)", tokens: 16384 },
+  { id: "max", label: "Max", description: "Maximum reasoning for difficult tasks (32,768 tokens)", tokens: 32768 },
 ];
 
 export function CommandPaletteModal(props: CommandPaletteModalProps) {
@@ -66,9 +66,9 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
         list.push({
           id: `model-${role}-${entry.provider}-${entry.model}`,
           category: "model",
-          title: `Set [${role.toUpperCase()}] -> ${entry.provider}: ${entry.model}`,
+          title: `Set ${role.toUpperCase()} -> ${entry.provider}: ${entry.model}`,
           subtitle: `${entry.kind} provider`,
-          badge: isCurrent ? "AKTIF" : undefined,
+          badge: isCurrent ? "ACTIVE" : undefined,
           isCurrent,
           onExecute: () => {
             router.setRole(role, entry.provider, entry.model);
@@ -86,7 +86,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
         category: "reasoning",
         title: `Thinking Effort: ${lvl.label}`,
         subtitle: lvl.description,
-        badge: isCurrent ? "AKTIF" : undefined,
+        badge: isCurrent ? "ACTIVE" : undefined,
         isCurrent,
         onExecute: () => {
           onSelectReasoning?.(lvl.id);
@@ -100,9 +100,9 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       list.push({
         id: `theme-${th}`,
         category: "theme",
-        title: `Ganti Tema: ${th}`,
-        subtitle: `Preset visual warna terminal ${th}`,
-        badge: isCurrent ? "AKTIF" : undefined,
+        title: `Change Theme: ${th}`,
+        subtitle: `Terminal color theme preset for ${th}`,
+        badge: isCurrent ? "ACTIVE" : undefined,
         isCurrent,
         onExecute: () => {
           onSelectTheme?.(th);
@@ -116,7 +116,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
         id: "action-commit",
         category: "action",
         title: "Atomic Git Commit (/commit)",
-        subtitle: "Pecah modifikasi file menjadi commit atomik",
+        subtitle: "Split working tree changes into atomic commits",
         onExecute: () => {
           onAction?.("/commit");
           onClose();
@@ -126,7 +126,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
         id: "action-compact",
         category: "action",
         title: "Compact Context Window (/compact)",
-        subtitle: "Ringkas riwayat percakapan untuk menghemat token",
+        subtitle: "Summarize conversation history to save context tokens",
         onExecute: () => {
           onAction?.("/compact");
           onClose();
@@ -135,8 +135,8 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       {
         id: "action-plugins",
         category: "action",
-        title: "Daftar Plugin Aktif (/plugins)",
-        subtitle: "Tinjau status plugin yang sedang dimuat",
+        title: "List Active Plugins (/plugins)",
+        subtitle: "Inspect status of loaded agent plugins",
         onExecute: () => {
           onAction?.("/plugins");
           onClose();
@@ -146,7 +146,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
         id: "action-sidebar",
         category: "action",
         title: "Toggle Workspace Sidebar (Ctrl+B)",
-        subtitle: "Tampilkan atau sembunyikan sidebar status kanan",
+        subtitle: "Show or hide the right workspace status sidebar",
         onExecute: () => {
           onAction?.("toggle_sidebar");
           onClose();
@@ -155,8 +155,8 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       {
         id: "action-hub",
         category: "action",
-        title: "Buka Subagent Hub (Alt+A)",
-        subtitle: "Kelola pekerja subagent dan orkestrasi task paralel",
+        title: "Open Subagent Hub (Alt+A)",
+        subtitle: "Manage background subagent workers and steering",
         onExecute: () => {
           onAction?.("open_hub");
           onClose();
@@ -166,7 +166,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
         id: "action-sessions",
         category: "action",
         title: "Session Time-Travel Manager (Ctrl+S)",
-        subtitle: "Cari riwayat percakapan lama atau fork percakapan",
+        subtitle: "Browse past conversations, fork sessions, or restore snapshots",
         onExecute: () => {
           onAction?.("open_sessions");
           onClose();
@@ -217,13 +217,15 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       return;
     }
 
-    if (key.backspace || key.delete) {
+    const isBackspace = Boolean(key.backspace || key.delete || input === "\x7f" || input === "\b" || input === "\x1b[3~");
+
+    if (isBackspace) {
       setQuery((prev) => prev.slice(0, -1));
       setSelectedIndex(0);
       return;
     }
 
-    if (!key.ctrl && !key.meta && input.length > 0 && input >= " ") {
+    if (!key.ctrl && !key.meta && !isBackspace && input.length > 0 && input >= " " && input !== "\x7f") {
       setQuery((prev) => prev + input);
       setSelectedIndex(0);
     }
@@ -239,10 +241,10 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     >
       <Box justifyContent="space-between" marginBottom={0}>
         <Text bold color={theme.accent}>
-          [COMMAND PALETTE &amp; SETTINGS]
+          COMMAND PALETTE &amp; SETTINGS
         </Text>
         <Text dimColor>
-          {filteredItems.length} opsi tersedia | Esc: Tutup
+          {filteredItems.length} options available  |  Esc Close
         </Text>
       </Box>
 
@@ -253,13 +255,13 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
         <Text>{query}</Text>
         <Text inverse color={theme.accent}> </Text>
         {query.length === 0 ? (
-          <Text dimColor>Ketik untuk mencari model, reasoning, tema, atau aksi...</Text>
+          <Text dimColor>Type to search models, reasoning, themes, or actions...</Text>
         ) : null}
       </Box>
 
       <Box flexDirection="column" marginY={1}>
         {visibleItems.length === 0 ? (
-          <Text dimColor>Tidak ada aksi yang cocok dengan kata kunci.</Text>
+          <Text dimColor>No actions match your search.</Text>
         ) : (
           visibleItems.map((item, idx) => {
             const actualIndex = startIndex + idx;
@@ -275,17 +277,17 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
               <Box key={item.id} justifyContent="space-between">
                 <Box>
                   <Text color={isSelected ? theme.accent : undefined} bold={isSelected}>
-                    {isSelected ? "> " : "  "}
+                    {isSelected ? "❯ " : "  "}
                   </Text>
-                  <Text color={catColor}>[{item.category.toUpperCase()}] </Text>
+                  <Text color={catColor}>{item.category.toUpperCase()} </Text>
                   <Text color={isSelected ? theme.accent : undefined} bold={isSelected}>
                     {item.title}
                   </Text>
-                  {item.subtitle ? <Text dimColor> - {item.subtitle}</Text> : null}
+                  {item.subtitle ? <Text dimColor> · {item.subtitle}</Text> : null}
                 </Box>
                 {item.badge ? (
                   <Text color={theme.modes.build.primary} bold>
-                    [{item.badge}]
+                    {item.badge}
                   </Text>
                 ) : null}
               </Box>
@@ -296,10 +298,10 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
 
       <Box justifyContent="space-between">
         <Text dimColor>
-          Navigasi: Up/Down | Pilih: Enter | Tutup: Esc
+          Navigate: Up/Down · Select: Enter · Close: Esc
         </Text>
         <Text dimColor>
-          {clampedIndex + 1} dari {filteredItems.length}
+          {clampedIndex + 1} of {filteredItems.length}
         </Text>
       </Box>
     </Box>

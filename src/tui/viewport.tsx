@@ -3,6 +3,7 @@ import { Box, Text, useInput } from "ink";
 
 import type { ChatEntryView, WriteTarget } from "./app";
 import { DiffView, ThinkingBlock, ToolCallBadge } from "./diff-view";
+import { WelcomeBanner } from "./logo";
 import { MarkdownView } from "./markdown";
 import { getTheme, type Theme } from "./theme";
 
@@ -61,7 +62,7 @@ export interface SplitPaneViewportProps extends ScrollableChatViewportProps {
   initialSidebarVisible?: boolean;
 }
 
-export const AUTO_SCROLL_PAUSED = "[AUTO-SCROLL PAUSED - Tekan End / G untuk ke bawah]";
+export const AUTO_SCROLL_PAUSED = "AUTO-SCROLL PAUSED · Press End / G to jump to bottom";
 
 export class AlternateScreen {
   private readonly target: ScreenTarget;
@@ -203,9 +204,16 @@ export function ScrollableChatViewport({
 
   const visible = selectWindow(entries, width, height, offsetFromBottom, collapsed);
 
+  React.useEffect(() => {
+    setOffsetFromBottom(0);
+  }, [entries.length]);
+
   return (
     <Box flexDirection="column" height={height}>
       <Box flexDirection="column" flexGrow={1}>
+        {entries.length === 0 && !streamingText ? (
+          <WelcomeBanner theme={theme} />
+        ) : null}
         {visible.map((entry) => (
           <Box key={entry.id} flexDirection="column">
             {entry.role === "user" ? (

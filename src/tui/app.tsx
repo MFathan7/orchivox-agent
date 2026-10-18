@@ -11,6 +11,7 @@ import { AgentHub } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
 import { CommandPaletteModal, type ReasoningEffortLevel } from "./command-palette";
 import { PromptComposer } from "./composer";
+import { OrchivoxLogo } from "./logo";
 import { SessionTimeTravelModal, type SessionModalTab } from "./session-modal";
 import { ThemeProvider, getTheme, type ThemeName } from "./theme";
 import {
@@ -93,9 +94,9 @@ export interface OrchivoxAppProps {
 
 const MODE_ORDER: AgentMode[] = ["plan", "build", "ultrawork"];
 const MODE_STYLES: Record<AgentMode, { label: string; color: string; accent: string }> = {
-  plan: { label: "[PLAN / PROMETHEUS MODE]", color: "blue", accent: "magenta" },
-  build: { label: "[BUILD MODE]", color: "green", accent: "green" },
-  ultrawork: { label: "[ULTRAWORK MODE]", color: "yellow", accent: "red" },
+  plan: { label: "PLAN / PROMETHEUS MODE", color: "blue", accent: "magenta" },
+  build: { label: "BUILD MODE", color: "green", accent: "green" },
+  ultrawork: { label: "ULTRAWORK MODE", color: "yellow", accent: "red" },
 };
 
 export function interpretInput(text: string): InputAction {
@@ -282,18 +283,21 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     task: w.task,
   }));
 
-  const totalWidth = terminalSize.columns;
-  const viewportHeight = Math.max(10, terminalSize.rows - 10);
-  const chatWidth = sidebarVisible ? Math.max(20, Math.floor(totalWidth * 0.72)) : totalWidth;
-  const sidebarWidth = sidebarVisible ? Math.max(20, totalWidth - chatWidth) : 0;
+  const innerWidth = Math.max(40, terminalSize.columns - 4);
+  const viewportHeight = Math.max(6, terminalSize.rows - 10);
+  const chatWidth = sidebarVisible ? Math.max(20, Math.floor(innerWidth * 0.72)) : innerWidth;
+  const sidebarWidth = sidebarVisible ? Math.max(20, innerWidth - chatWidth) : 0;
 
   return (
     <ThemeProvider theme={props.currentTheme ?? "tokyonight"}>
       <Box flexDirection="column" borderStyle="round" borderColor={style.color} paddingX={1}>
         <Box justifyContent="space-between">
-          <Text bold color={theme.text}>
-            {projectName} | branch: {branch} | MCP: {mcpCount} | plugins: {pluginCount}
-          </Text>
+          <Box gap={1}>
+            <OrchivoxLogo variant="compact" />
+            <Text bold color={theme.text}>
+              {projectName} | branch: {branch} | MCP: {mcpCount} | plugins: {pluginCount}
+            </Text>
+          </Box>
           <Text color={theme.text}>
             {totalTokens} tok | <Text color={theme.syntax.number}>{formatCost(totalCostUsd)}</Text>
           </Text>
@@ -345,7 +349,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onClose={() => setSessionTab(null)}
           />
         ) : (
-          <Box width={totalWidth}>
+          <Box width={innerWidth}>
             <Box width={chatWidth} flexDirection="column">
               <ScrollableChatViewport
                 entries={entries}
@@ -400,6 +404,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 }
                 if (action.command === "/timeline") {
                   setSessionTab("timeline");
+                  return;
+                }
+                if (action.command === "/hub") {
+                  setHubOpen(true);
                   return;
                 }
               }

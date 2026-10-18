@@ -27,7 +27,7 @@ export interface SpecialistMention {
 export const BUILTIN_SPECIALISTS: Record<string, Omit<SpecialistAgentProfile, "source">> = {
   sisyphus: {
     name: "sisyphus",
-    description: "Primary orchestrator yang memimpin eksekusi, memverifikasi hasil dengan test & LSP, dan menjaga Todo sampai 100% tuntas.",
+    description: "Primary orchestrator leading execution, verifying results with tests & LSP, and tracking todos to 100% completion.",
     roleModel: "main",
     readOnly: false,
     systemPrompt: `You are Sisyphus, the relentless Primary Orchestrator.
@@ -40,7 +40,7 @@ Key behaviors:
   },
   oracle: {
     name: "oracle",
-    description: "Principal Architect & Debugger untuk analisis arsitektur mendalam, trade-off desain, dan pencarian root-cause bug sulit.",
+    description: "Principal architect & debugger for deep architectural analysis, design trade-offs, and root-cause debugging.",
     roleModel: "advisor",
     readOnly: true,
     thinkingBudget: 16000,
@@ -66,7 +66,7 @@ Key principles:
   },
   librarian: {
     name: "librarian",
-    description: "Spesialis riset dokumentasi eksternal, repositori GitHub, dan bedah paper ArXiv/PDF menggunakan web search dan fetch.",
+    description: "Documentation and research specialist for external libraries, GitHub repositories, and papers using web search and fetch.",
     roleModel: "fast",
     readOnly: true,
     allowedTools: ["read_file", "glob_files", "grep_search", "web_search", "web_fetch", "json_query"],
@@ -79,7 +79,7 @@ Key principles:
   },
   explore: {
     name: "explore",
-    description: "Fast Codebase Scout untuk pemindaian paralel cepat dengan glob_files, grep_search, dan read_skeleton tanpa modifikasi file.",
+    description: "Fast codebase scout for rapid parallel scanning with glob_files, grep_search, and read_skeleton without modifying files.",
     roleModel: "fast",
     readOnly: true,
     allowedTools: [
@@ -100,7 +100,7 @@ Key principles:
   },
   "frontend-ui": {
     name: "frontend-ui",
-    description: "Spesialis komponen antarmuka, tata letak presisi, dan aksesibilitas ramah pengguna.",
+    description: "User interface specialist for precise layouts, terminal components, and accessibility.",
     roleModel: "main",
     readOnly: false,
     systemPrompt: `You are Frontend-UI, the Specialist for User Interfaces, Styling, and Accessibility.

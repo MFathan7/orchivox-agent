@@ -45,16 +45,24 @@ export interface AutocompletePopupProps {
 }
 
 export const BUILTIN_SLASH_COMMANDS: Array<{ name: string; args?: string; description: string }> = [
-  { name: "/undo", description: "Batalkan perubahan file ke snapshot sebelumnya" },
-  { name: "/redo", description: "Terapkan kembali snapshot yang dibatalkan" },
-  { name: "/commit", description: "Pecah perubahan git menjadi atomic commit terstruktur" },
-  { name: "/compact", description: "Ringkas riwayat percakapan untuk menghemat context window" },
-  { name: "/plugins", description: "Tampilkan daftar plugin agent yang sedang aktif" },
-  { name: "/collab", description: "Buka sesi siaran kolaborasi relay terminal" },
-  { name: "/clear", description: "Bersihkan layar riwayat chat" },
-  { name: "/mode", args: "[plan|build|ultrawork]", description: "Ganti mode kerja agent" },
-  { name: "/theme", args: "[tokyonight|catppuccin|gruvbox|monochrome]", description: "Ganti tema visual terminal" },
-  { name: "/help", description: "Tampilkan panduan perintah dan tombol shortcut" },
+  { name: "/help", description: "Display slash commands guide and keyboard shortcuts" },
+  { name: "/mode", args: "[plan|build|ultrawork]", description: "Switch or inspect agent execution mode" },
+  { name: "/theme", args: "[tokyonight|catppuccin|gruvbox|monochrome]", description: "Change or inspect terminal visual theme" },
+  { name: "/reasoning", args: "[off|low|medium|high|max]", description: "Adjust thinking model reasoning effort level" },
+  { name: "/palette", description: "Open command palette for models, themes, and reasoning" },
+  { name: "/model", description: "Open provider and model routing settings" },
+  { name: "/sessions", description: "Open session manager and past conversation search" },
+  { name: "/fork", description: "Fork active conversation from a specific turn" },
+  { name: "/timeline", description: "Open VCS snapshot history timeline" },
+  { name: "/hub", description: "Open subagent manager to inspect or stop workers" },
+  { name: "/undo", description: "Undo file modifications to the previous snapshot" },
+  { name: "/redo", description: "Re-apply reverted snapshot" },
+  { name: "/commit", description: "Analyze git diff and create atomic commits" },
+  { name: "/compact", description: "Compact conversation history to save context tokens" },
+  { name: "/plugins", description: "List loaded and active agent plugins" },
+  { name: "/collab", description: "Start live terminal sharing relay session" },
+  { name: "/clear", description: "Clear chat screen" },
+  { name: "/exit", description: "Exit Orchivox" },
 ];
 
 const IGNORED_SCAN_DIRS = new Set([
@@ -466,10 +474,10 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
     >
       <Box justifyContent="space-between">
         <Text bold color={triggerColor}>
-          [{triggerLabel}]
+          {triggerLabel}
         </Text>
         <Text dimColor>
-          {clampedSelected + 1} dari {items.length} opsi
+          {clampedSelected + 1} of {items.length} options
         </Text>
       </Box>
 
@@ -482,11 +490,11 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
             <Box key={item.id} justifyContent="space-between">
               <Box>
                 <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
-                  {isSelected ? "> " : "  "}
+                  {isSelected ? "❯ " : "  "}
                   {item.label}
                 </Text>
                 {item.kind ? (
-                  <Text color={theme.muted}> [{item.kind}]</Text>
+                  <Text color={theme.muted}> ({item.kind})</Text>
                 ) : null}
                 {item.detail ? (
                   <Text dimColor> {item.detail}</Text>
@@ -506,7 +514,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
 
       <Box marginTop={0}>
         <Text dimColor>
-          Navigasi: Up/Down | Sisipkan: Tab/Enter | Tutup: Esc
+          Navigate: Up/Down · Insert: Tab/Enter · Dismiss: Esc
         </Text>
       </Box>
     </Box>

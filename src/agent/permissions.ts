@@ -119,7 +119,7 @@ export function evaluateShellRisk(command: string, cwd: string): ShellRiskDetail
         command: trimmed,
         cwd,
         riskLevel: "critical",
-        warning: "Perintah fatal berpotensi merusak sistem atau repositori secara permanen.",
+        warning: "Fatal command may permanently damage the system or repository.",
       };
     }
   }
@@ -130,7 +130,7 @@ export function evaluateShellRisk(command: string, cwd: string): ShellRiskDetail
         command: trimmed,
         cwd,
         riskLevel: "high",
-        warning: "Perintah ini menghapus atau menimpa file/riwayat secara tidak dapat dikembalikan.",
+        warning: "This command deletes or overwrites files/history irreversibly.",
       };
     }
   }
@@ -141,7 +141,7 @@ export function evaluateShellRisk(command: string, cwd: string): ShellRiskDetail
         command: trimmed,
         cwd,
         riskLevel: "medium",
-        warning: "Perintah ini mengubah dependensi atau struktur cabang git.",
+        warning: "This command modifies dependencies or git branch structure.",
       };
     }
   }
@@ -207,8 +207,8 @@ export async function calculateDiffPreview(
         filePath: rawPath,
         oldText,
         newText,
-        oldLabel: `${rawPath} (saat ini)`,
-        newLabel: `${rawPath} (usulan ${hunks.length} hunk edit)`,
+        oldLabel: `${rawPath} (current)`,
+        newLabel: `${rawPath} (proposed ${hunks.length} hunk edit)`,
       };
     }
   }
@@ -219,8 +219,8 @@ export async function calculateDiffPreview(
       filePath: rawPath,
       oldText,
       newText,
-      oldLabel: oldText.length > 0 ? `${rawPath} (lama)` : `${rawPath} (file baru)`,
-      newLabel: `${rawPath} (baru)`,
+      oldLabel: oldText.length > 0 ? `${rawPath} (previous)` : `${rawPath} (new file)`,
+      newLabel: `${rawPath} (new)`,
     };
   }
 
@@ -229,8 +229,8 @@ export async function calculateDiffPreview(
       filePath: rawPath,
       oldText,
       newText: "",
-      oldLabel: `${rawPath} (saat ini)`,
-      newLabel: `${rawPath} (dihapus)`,
+      oldLabel: `${rawPath} (current)`,
+      newLabel: `${rawPath} (deleted)`,
     };
   }
 
@@ -241,8 +241,8 @@ export async function calculateDiffPreview(
       filePath: rawPath,
       oldText,
       newText,
-      oldLabel: `${rawPath} (saat ini)`,
-      newLabel: `${rawPath} (setelah patch)`,
+      oldLabel: `${rawPath} (current)`,
+      newLabel: `${rawPath} (after patch)`,
     };
   }
 
@@ -317,7 +317,7 @@ export class GranularPermissionEngine extends EventEmitter {
       if (matchedRule.action === "deny") {
         return {
           allowed: false,
-          reason: `Ditolak oleh aturan konfigurasi: ${matchedRule.raw}`,
+          reason: `Denied by configuration rule: ${matchedRule.raw}`,
         };
       }
     }
@@ -326,7 +326,7 @@ export class GranularPermissionEngine extends EventEmitter {
       if (!tool.readOnly) {
         return {
           allowed: false,
-          reason: `Tool "${tool.name}" memodifikasi file/keadaan, dan mode PLAN hanya mengizinkan tool read-only.`,
+          reason: `Tool "${tool.name}" modifies files or state, and PLAN mode only allows read-only tools.`,
         };
       }
       return { allowed: true };
@@ -342,7 +342,7 @@ export class GranularPermissionEngine extends EventEmitter {
       if (shellRisk?.riskLevel === "critical") {
         return {
           allowed: false,
-          reason: `Perintah fatal "${shellRisk.command}" ditolak otomatis di mode ULTRAWORK: ${shellRisk.warning}`,
+          reason: `Fatal command "${shellRisk.command}" automatically denied in ULTRAWORK mode: ${shellRisk.warning}`,
         };
       }
       return { allowed: true };
@@ -363,7 +363,7 @@ export class GranularPermissionEngine extends EventEmitter {
       filePath: typeof args.filePath === "string" ? args.filePath : undefined,
       diffPreview,
       shellDetails: shellRisk,
-      reason: shellRisk?.warning ?? "Tool ini memerlukan persetujuan sebelum mengeksekusi perubahan.",
+      reason: shellRisk?.warning ?? "This tool requires approval before executing changes.",
     };
 
     const decision = await this.requestApproval(request);
@@ -374,7 +374,7 @@ export class GranularPermissionEngine extends EventEmitter {
 
     return {
       allowed: false,
-      reason: decision.reason ?? "Eksekusi tool dibatalkan oleh pengguna.",
+      reason: decision.reason ?? "Tool execution denied by user.",
       feedback: decision.feedback,
     };
   }
@@ -395,7 +395,7 @@ export class GranularPermissionEngine extends EventEmitter {
       decision = {
         approved: false,
         choice: "deny",
-        reason: "Tidak ada handler persetujuan interaktif yang terpasang.",
+        reason: "No interactive approval handler attached.",
       };
     }
 

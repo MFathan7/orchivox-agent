@@ -27,6 +27,8 @@ import { WorktreeManager } from "./vcs/worktree";
 import { installSynchronizedOutput, OrchivoxApp, type ChatEntryView, type InputAction } from "./tui/app";
 import type { HashlineLifecycle } from "./tools/hashline-edit";
 import type { ThemeName } from "./tui/theme";
+import { WorkspaceTrustManager } from "./security/workspace-trust";
+import { WorkspaceTrustPrompt } from "./tui/trust-modal";
 import type { ReasoningEffortLevel } from "./tui/command-palette";
 import { AgentModeSchema, type AgentMode, type Message } from "./types/schema";
 
@@ -37,6 +39,7 @@ export interface CliOptions {
   format: "text" | "json";
   mode: AgentMode;
   help: boolean;
+  trust?: boolean;
 }
 
 export interface RuntimeHandle {
@@ -55,12 +58,13 @@ const HELP_TEXT = [
   "",
   "usage:",
   "  orchivox                             interactive TUI",
+  "  orchivox --trust                     interactive TUI (skip trust prompt)",
   '  orchivox serve [--port 8080]         inbound OpenAPI and OpenClaude gateway',
   '  orchivox -p "task" [-f text|json] [--mode plan|build|ultrawork]',
   "                                       headless run for scripts and CI pipelines",
   "  orchivox mcp                         expose the agent tools as an MCP server on stdio",
   "",
-  "flags: -p/--prompt, -f/--format, --mode, --port, -h/--help",
+  "flags: -p/--prompt, -f/--format, --mode, --port, --trust, -h/--help",
 ].join("\n");
 
 export function parseCliArgs(argv: string[]): CliOptions {
@@ -68,6 +72,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "-h" || arg === "--help") options.help = true;
+    else if (arg === "--trust") options.trust = true;
     else if (arg === "serve") options.command = "serve";
     else if (arg === "mcp") options.command = "mcp";
     else if (arg === "-p" || arg === "--prompt") {
@@ -210,6 +215,29 @@ async function startLspClient(config: AppConfig, root: string): Promise<LSPClien
   }
 }
 
+export async function promptWorkspaceTrust(workspacePath: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let resolved = false;
+    const instance = render(
+      React.createElement(WorkspaceTrustPrompt, {
+        workspacePath,
+        onTrust: () => {
+          if (resolved) return;
+          resolved = true;
+          instance.unmount();
+          resolve(true);
+        },
+        onExit: () => {
+          if (resolved) return;
+          resolved = true;
+          instance.unmount();
+          resolve(false);
+        },
+      }),
+    );
+  });
+}
+
 export async function main(
   argv: string[],
   io: { print?: (text: string) => void } = {},
@@ -219,6 +247,18 @@ export async function main(
   if (options.help) {
     print(HELP_TEXT);
     return { close: async () => undefined };
+  }
+
+  if (options.command === "tui") {
+    const cwd = globalThis.process.cwd();
+    const trustManager = new WorkspaceTrustManager();
+    if (!options.trust && !trustManager.isTrusted(cwd)) {
+      const trusted = await promptWorkspaceTrust(cwd);
+      if (!trusted) {
+        return { close: async () => undefined };
+      }
+      trustManager.trust(cwd);
+    }
   }
 
   const runtime = await bootstrap();
@@ -269,6 +309,7 @@ async function runTuiSession(
   runtime: RuntimeHandle,
   print: (text: string) => void,
 ): Promise<{ close: () => Promise<void> }> {
+  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J");
   const initialSession = runtime.database.createSession({
     title: "Interactive Session",
     mode: "build",
@@ -336,7 +377,7 @@ async function runTuiSession(
     reasoningEffort: state.reasoningEffort,
     onReasoningEffortChange: (effort: ReasoningEffortLevel) => {
       state.reasoningEffort = effort;
-      pushEntry("system", `penalaran model diubah ke level: ${effort}`);
+      pushEntry("system", `model reasoning level set to: ${effort}`);
       rerender();
     },
     onResumeSession: (sessionId: string) => {
@@ -352,7 +393,7 @@ async function runTuiSession(
           .join(" "),
       }));
       const sess = runtime.database.getSession(sessionId);
-      pushEntry("system", `melanjutkan sesi: ${sess?.title ?? sessionId}`);
+      pushEntry("system", `resumed session: ${sess?.title ?? sessionId}`);
       rerender();
     },
     onForkSession: (forked: SessionRecord) => {
@@ -367,11 +408,11 @@ async function runTuiSession(
           .filter(Boolean)
           .join(" "),
       }));
-      pushEntry("system", `sesi dicabangkan ke: ${forked.title}`);
+      pushEntry("system", `session forked to: ${forked.title}`);
       rerender();
     },
     onRestoreSnapshot: (result: RestoreResult) => {
-      pushEntry("system", `memulihkan snapshot ${result.snapshotId}: ${result.restoredFiles.length} file dipulihkan`);
+      pushEntry("system", `restored snapshot ${result.snapshotId}: ${result.restoredFiles.length} file(s) restored`);
       rerender();
     },
     pendingApproval,
@@ -403,7 +444,7 @@ async function runTuiSession(
     onAbort: () => {
       if (activeAbortController) {
         activeAbortController.abort();
-        pushEntry("system", "proses dibatalkan oleh pengguna.");
+        pushEntry("system", "process cancelled by user.");
         rerender();
       }
     },
@@ -425,7 +466,6 @@ async function runTuiSession(
   const rerender = (): void => {
     instance.rerender(React.createElement(OrchivoxApp, view()));
   };
-  const refresh = setInterval(rerender, 500);
 
   const executeTurn = async (promptText: string, displayUserText?: string, targetAgent?: string): Promise<void> => {
     if (state.busy) {
@@ -498,25 +538,127 @@ async function runTuiSession(
 
   const handleCommand = async (command: string, args = "", raw = command): Promise<void> => {
     switch (command) {
+      case "/help": {
+        pushEntry("system", [
+          "Built-in Slash Commands:",
+          "  /mode [plan|build|ultrawork]       Inspect or switch active agent mode",
+          "  /theme [tokyonight|catppuccin|...] Switch visual color theme preset",
+          "  /reasoning [off|low|med|high|max]  Set reasoning / thinking intensity",
+          "  /palette, /model                   Open command palette and model selector",
+          "  /sessions, /fork, /timeline        Open session manager and VCS timeline",
+          "  /hub                               Open Subagent Hub management panel",
+          "  /undo, /redo                       Undo or redo snapshot file changes",
+          "  /commit                            Analyze and split git changes into atomic commits",
+          "  /compact                           Compact chat history context window",
+          "  /plugins                           List loaded plugins",
+          "  /collab                            Start live terminal sharing relay session",
+          "  /clear                             Clear chat entry viewport",
+          "  /exit, /quit                       Exit Orchivox",
+          "",
+          "Custom Commands (.agent/commands/):",
+          "  /review [args]                     Review git changes with Oracle agent",
+          "  /fix-tests [args]                  Run tests and fix failures with Sisyphus",
+          "  /refactor <file> [args]            Perform structured code refactoring",
+          "  /init-rules [args]                 Initialize agent rules in .agent/rules/",
+          "",
+          "Keyboard Shortcuts:",
+          "  Tab Cycle mode · Ctrl+P Palette · Ctrl+S Sessions · Alt+A Subagents",
+          "  Ctrl+B Toggle sidebar · Ctrl+O Toggle collapse · PgUp/PgDn Scroll",
+        ].join("\n"));
+        break;
+      }
+      case "/mode": {
+        const targetMode = args.trim().toLowerCase();
+        if (targetMode === "plan" || targetMode === "build" || targetMode === "ultrawork") {
+          state.mode = targetMode as AgentMode;
+          pushEntry("system", `agent mode switched to: ${targetMode}`);
+        } else if (!targetMode) {
+          pushEntry("system", `current mode: ${state.mode} (options: plan, build, ultrawork)`);
+        } else {
+          pushEntry("system", `invalid mode: "${targetMode}". Options: plan, build, ultrawork`);
+        }
+        break;
+      }
+      case "/theme": {
+        const targetTheme = args.trim().toLowerCase();
+        if (targetTheme === "tokyonight" || targetTheme === "catppuccin" || targetTheme === "gruvbox" || targetTheme === "monochrome") {
+          state.currentTheme = targetTheme as ThemeName;
+          pushEntry("system", `theme switched to: ${targetTheme}`);
+        } else if (!targetTheme) {
+          pushEntry("system", `current theme: ${state.currentTheme} (options: tokyonight, catppuccin, gruvbox, monochrome)`);
+        } else {
+          pushEntry("system", `unknown theme: "${targetTheme}". Options: tokyonight, catppuccin, gruvbox, monochrome`);
+        }
+        break;
+      }
+      case "/reasoning": {
+        const targetReasoning = args.trim().toLowerCase();
+        if (targetReasoning === "off" || targetReasoning === "low" || targetReasoning === "medium" || targetReasoning === "high" || targetReasoning === "max") {
+          state.reasoningEffort = targetReasoning as ReasoningEffortLevel;
+          pushEntry("system", `model reasoning level set to: ${targetReasoning}`);
+        } else if (!targetReasoning) {
+          pushEntry("system", `current reasoning level: ${state.reasoningEffort} (options: off, low, medium, high, max)`);
+        } else {
+          pushEntry("system", `invalid reasoning level: "${targetReasoning}". Options: off, low, medium, high, max`);
+        }
+        break;
+      }
+      case "/palette":
+      case "/model": {
+        pushEntry("system", "press Ctrl+P to open the command palette and model selector.");
+        break;
+      }
+      case "/sessions": {
+        pushEntry("system", "press Ctrl+S to open the session manager.");
+        break;
+      }
+      case "/fork": {
+        pushEntry("system", "press Ctrl+S and navigate to the Fork tab to branch the session.");
+        break;
+      }
+      case "/timeline": {
+        pushEntry("system", "press Ctrl+S and navigate to the Timeline tab for time-travel snapshots.");
+        break;
+      }
+      case "/hub": {
+        pushEntry("system", "press Alt+A to open the Subagent Hub.");
+        break;
+      }
       case "/undo": {
-        const restored = await runtime.snapshots.undo();
-        pushEntry("system", `undo: ${restored.snapshotId} restored ${restored.restoredFiles.length} file(s)`);
+        try {
+          const restored = await runtime.snapshots.undo();
+          pushEntry("system", `undo: ${restored.snapshotId} restored ${restored.restoredFiles.length} file(s)`);
+        } catch (error) {
+          pushEntry("system", `undo failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
         break;
       }
       case "/redo": {
-        const restored = await runtime.snapshots.redo();
-        pushEntry("system", `redo: ${restored.snapshotId} restored ${restored.restoredFiles.length} file(s)`);
+        try {
+          const restored = await runtime.snapshots.redo();
+          pushEntry("system", `redo: ${restored.snapshotId} restored ${restored.restoredFiles.length} file(s)`);
+        } catch (error) {
+          pushEntry("system", `redo failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
         break;
       }
       case "/commit": {
-        const results = await analyzeAndSplitCommits(runtime.router.get("main"));
-        pushEntry("system", results.length === 0 ? "nothing to commit" : `created ${results.length} commit(s): ${results.map((entry) => entry.message).join(" | ")}`);
+        try {
+          const results = await analyzeAndSplitCommits(runtime.router.get("main"));
+          pushEntry("system", results.length === 0 ? "nothing to commit" : `created ${results.length} commit(s): ${results.map((entry) => entry.message).join(" | ")}`);
+        } catch (error) {
+          pushEntry("system", `commit failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
         break;
       }
       case "/compact": {
-        const memory = new HindsightMemory(runtime.database);
-        state.messages = await memory.compactMessagesIfNeeded(state.messages, 200_000, runtime.router.get("main"));
-        pushEntry("system", `compacted: ${state.messages.length} message(s) in context`);
+        try {
+          const memory = new HindsightMemory(runtime.database);
+          state.messages = await memory.compactMessagesIfNeeded(state.messages, 200_000, runtime.router.get("main"));
+          pushEntry("system", `compacted: ${state.messages.length} message(s) in context`);
+        } catch (error) {
+          pushEntry("system", `compact failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
         break;
       }
       case "/plugins": {
@@ -527,47 +669,63 @@ async function runTuiSession(
       case "/collab": {
         if (relay?.getSession()) {
           pushEntry("system", `live session already running: ${relay.getSession()?.viewerUrl}`);
-          break;
+        } else {
+          try {
+            relay = new CollabRelay({
+              token: crypto.randomUUID().replace(/-/g, ""),
+              allowInput: true,
+              onInput: (text) => {
+                pushEntry("user", `[collab] ${text}`);
+                rerender();
+              },
+            });
+            const session = await relay.start();
+            pushEntry("system", `live session: ${session.viewerUrl}`);
+          } catch (error) {
+            pushEntry("system", `collab relay failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
-        relay = new CollabRelay({
-          token: crypto.randomUUID().replace(/-/g, ""),
-          allowInput: true,
-          onInput: (text) => {
-            pushEntry("user", `[collab] ${text}`);
-            rerender();
-          },
-        });
-        const session = await relay.start();
-        pushEntry("system", `live session: ${session.viewerUrl}`);
         break;
       }
       case "/clear": {
         state.entries = [];
         break;
       }
+      case "/exit":
+      case "/quit": {
+        pushEntry("system", "shutting down Orchivox...");
+        rerender();
+        cleanupSignals();
+        return;
+      }
       default: {
-        const customCmd = await runtime.orchestrator.customCommands.getCommand(command);
-        if (customCmd) {
-          const executed = await runtime.orchestrator.customCommands.executeCommand(command, args);
-          if (executed) {
-            if (executed.subtask) {
-              const worker = runtime.orchestrator.subagents.spawnOne({
-                agent: executed.agent,
-                task: executed.prompt,
-                writeIsolation: true,
-                onComplete: (w) => {
-                  pushEntry("system", `subtask ${w.id} (${w.status}): ${w.result?.output.slice(0, 100) ?? ""}`);
-                  rerender();
-                },
-              });
-              pushEntry("system", `menjalankan /${customCmd.name} sebagai subtask: ${worker.id}`);
-            } else {
-              await executeTurn(executed.prompt, raw, executed.agent);
+        try {
+          const customCmd = await runtime.orchestrator.customCommands.getCommand(command);
+          if (customCmd) {
+            const executed = await runtime.orchestrator.customCommands.executeCommand(command, args);
+            if (executed) {
+              if (executed.subtask) {
+                const worker = runtime.orchestrator.subagents.spawnOne({
+                  agent: executed.agent,
+                  task: executed.prompt,
+                  writeIsolation: true,
+                  onComplete: (w) => {
+                    pushEntry("system", `subtask ${w.id} (${w.status}): ${w.result?.output.slice(0, 100) ?? ""}`);
+                    rerender();
+                  },
+                });
+                pushEntry("system", `running /${customCmd.name} as subtask: ${worker.id}`);
+              } else {
+                await executeTurn(executed.prompt, raw, executed.agent);
+              }
+              break;
             }
-            break;
           }
+        } catch (error) {
+          pushEntry("system", `custom command execution failed: ${error instanceof Error ? error.message : String(error)}`);
+          break;
         }
-        pushEntry("system", `unknown command: ${command}`);
+        pushEntry("system", `unknown command: ${command}. Type /help for assistance.`);
       }
     }
     rerender();
@@ -594,7 +752,6 @@ async function runTuiSession(
   pushEntry("system", "orchivox ready. type a prompt, or / for commands.");
   rerender();
   await instance.waitUntilExit();
-  clearInterval(refresh);
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);

@@ -53,7 +53,7 @@ describe("Autocomplete Engine", () => {
   });
 
   it("detects @file trigger in sentence and supports line ranges", () => {
-    const text = "cek file @src/api/server.ts:10-45";
+    const text = "check file @src/api/server.ts:10-45";
     const ctx = detectTriggerContext(text, text.length);
     expect(ctx).not.toBeNull();
     expect(ctx!.trigger).toBe("file");
@@ -61,7 +61,7 @@ describe("Autocomplete Engine", () => {
   });
 
   it("detects #symbol trigger in sentence", () => {
-    const text = "jelaskan #AgentOrchestrator";
+    const text = "explain #AgentOrchestrator";
     const ctx = detectTriggerContext(text, text.length);
     expect(ctx).not.toBeNull();
     expect(ctx!.trigger).toBe("symbol");
@@ -85,7 +85,7 @@ describe("Autocomplete Engine", () => {
 
 describe("Composer Engine", () => {
   it("parses file references and line ranges", () => {
-    const text = "Coba periksa @src/index.ts dan @src/api/server.ts:12-40";
+    const text = "Please inspect @src/index.ts and @src/api/server.ts:12-40";
     const attachments = parseFileAttachments(text);
     expect(attachments.length).toBe(2);
 
@@ -98,7 +98,7 @@ describe("Composer Engine", () => {
   });
 
   it("resolves file attachments and estimates tokens", async () => {
-    const parsed = parseFileAttachments("Periksa @PLAN13.md:1-5");
+    const parsed = parseFileAttachments("Check @PLAN13.md:1-5");
     const resolved = await resolveFileAttachments(parsed);
 
     expect(resolved.length).toBe(1);
@@ -106,8 +106,8 @@ describe("Composer Engine", () => {
     expect(resolved[0].tokens).toBeGreaterThan(0);
   });
 
-  it("builds injected context with hashline format nomor_baris:hash| isi", async () => {
-    const parsed = parseFileAttachments("Lihat @PLAN13.md:1-3");
+  it("builds injected context with hashline format line_number:hash| content", async () => {
+    const parsed = parseFileAttachments("Inspect @PLAN13.md:1-3");
     const resolved = await resolveFileAttachments(parsed);
     const injected = await buildInjectedContext(resolved);
 

@@ -75,6 +75,7 @@ export class McpClientManager {
         command: config.command,
         args: config.args,
         env: { ...collectEnv(), ...config.env },
+        stderr: "pipe",
       });
     }
     if (!config.url) throw new Error(`mcp server "${name}" needs a url for ${config.transport} transport`);

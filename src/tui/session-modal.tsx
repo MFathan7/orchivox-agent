@@ -218,19 +218,21 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
         const s = sessions[sessionIndex];
         if (s) {
           database.deleteSession(s.id);
-          setStatusNotice(`Sesi "${s.title}" berhasil dihapus.`);
+          setStatusNotice(`Session "${s.title}" deleted successfully.`);
           refreshSessions();
           setSessionIndex((prev) => Math.max(0, prev - 1));
         }
         return;
       }
 
-      if (key.backspace) {
+      const isBackspace = Boolean(key.backspace || key.delete || input === "\x7f" || input === "\b");
+
+      if (isBackspace) {
         setSearchQuery((prev) => prev.slice(0, -1));
         return;
       }
 
-      if (!key.ctrl && !key.meta && input.length > 0 && input >= " ") {
+      if (!key.ctrl && !key.meta && !isBackspace && input.length > 0 && input >= " " && input !== "\x7f") {
         setSearchQuery((prev) => prev + input);
       }
       return;
@@ -254,7 +256,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             onForkSession?.(forked);
             onClose();
           } catch (error) {
-            setStatusNotice(`Fork gagal: ${error instanceof Error ? error.message : String(error)}`);
+            setStatusNotice(`Fork failed: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
       }
@@ -298,22 +300,22 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             bold={activeTab === "sessions"}
             color={activeTab === "sessions" ? theme.accent : theme.muted}
           >
-            [1. Sessions &amp; FTS Search]
+            1. Sessions &amp; FTS Search
           </Text>
           <Text
             bold={activeTab === "fork"}
             color={activeTab === "fork" ? theme.modes.build.primary : theme.muted}
           >
-            [2. Conversation Forking]
+            2. Conversation Forking
           </Text>
           <Text
             bold={activeTab === "timeline"}
             color={activeTab === "timeline" ? theme.modes.ultrawork.primary : theme.muted}
           >
-            [3. Git Snapshot Timeline]
+            3. Git Snapshot Timeline
           </Text>
         </Box>
-        <Text dimColor>Esc: Tutup | Tab: Ganti Tab</Text>
+        <Text dimColor>Esc Close  |  Tab Switch Tab</Text>
       </Box>
 
       {statusNotice ? (
@@ -331,7 +333,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             <Text>{searchQuery}</Text>
             <Text inverse color={theme.accent}> </Text>
             {searchQuery.length === 0 ? (
-              <Text dimColor>Ketik kata kunci untuk pencarian FTS instan di seluruh percakapan...</Text>
+              <Text dimColor>Type keyword for instant FTS search across sessions...</Text>
             ) : null}
           </Box>
 
@@ -339,8 +341,8 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             <Box flexDirection="column" width="50%" paddingRight={1}>
               <Text bold color={theme.modes.plan.primary}>
                 {searchHits.length > 0
-                  ? `Hasil Pencarian (${searchHits.length})`
-                  : `Riwayat Sesi (${sessions.length})`}
+                  ? `Search Results (${searchHits.length})`
+                  : `Session History (${sessions.length})`}
               </Text>
               {searchHits.length > 0 ? (
                 searchHits.slice(0, 8).map((hit, idx) => {
@@ -355,7 +357,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                   );
                 })
               ) : sessions.length === 0 ? (
-                <Text dimColor>Belum ada sesi percakapan tersimpan.</Text>
+                <Text dimColor>No conversation sessions found.</Text>
               ) : (
                 sessions.slice(0, 8).map((sess, idx) => {
                   const isSelected = idx === sessionIndex;
@@ -367,7 +369,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                           {isSelected ? "> " : "  "}
                           {sess.title.slice(0, 26)}
                         </Text>
-                        {isCurrent ? <Text color={theme.modes.build.primary}> (aktif)</Text> : null}
+                        {isCurrent ? <Text color={theme.modes.build.primary}> (active)</Text> : null}
                       </Box>
                       <Text dimColor>
                         {formatTimestamp(sess.updatedAt)} [{sess.mode}]
@@ -380,10 +382,10 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
 
             <Box flexDirection="column" width="50%" borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
               <Text bold color={theme.accent}>
-                Pratinjau Pesan Sesi
+                Session Message Preview
               </Text>
               {previewMessages.length === 0 ? (
-                <Text dimColor>(Tidak ada pesan dalam sesi ini)</Text>
+                <Text dimColor>(No messages in this session)</Text>
               ) : (
                 previewMessages.slice(-6).map((msg, idx) => (
                   <Box key={`prev-${msg.id}-${idx}`}>
@@ -399,7 +401,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
 
           <Box justifyContent="space-between">
             <Text dimColor>
-              Enter: Resume Sesi | d: Hapus Sesi | Up/Down: Pilih Sesi
+              Enter Resume Session  |  d Delete Session  |  Up/Down Select Session
             </Text>
           </Box>
         </Box>
@@ -409,13 +411,13 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
         <Box flexDirection="column" marginY={1}>
           <Box justifyContent="space-between" marginBottom={1}>
             <Text bold color={theme.modes.build.primary}>
-              Conversation Forking: Pilih Titik Percakapan untuk Membuat Sesi Baru
+              Conversation Forking: Choose a Turn to Create a New Branch
             </Text>
-            <Text dimColor>{activeMessages.length} giliran pesan</Text>
+            <Text dimColor>{activeMessages.length} turns</Text>
           </Box>
 
           {activeMessages.length === 0 ? (
-            <Text dimColor>Tidak ada giliran pesan dalam sesi aktif untuk di-fork.</Text>
+            <Text dimColor>No message turns available to fork in this session.</Text>
           ) : (
             activeMessages.slice(0, 10).map((msg, idx) => {
               const isSelected = idx === turnIndex;
@@ -425,7 +427,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                 <Box key={msg.id} marginY={0}>
                   <Text color={isSelected ? theme.modes.build.primary : undefined} bold={isSelected}>
                     {isSelected ? "> " : "  "}
-                    [Turn {idx + 1}] {msg.role.toUpperCase()}:{" "}
+                    Turn {idx + 1} {msg.role.toUpperCase()}:{" "}
                   </Text>
                   <Text dimColor={!isSelected}>
                     {textContent.length > 70 ? `${textContent.slice(0, 67)}...` : textContent}
@@ -437,7 +439,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
 
           <Box marginTop={1} justifyContent="space-between">
             <Text dimColor>
-              f / Enter: Buat Fork Sesi Baru dari Pesan Terpilih | Up/Down: Pilih Turn
+              f / Enter Fork New Session from Selected Turn  |  Up/Down Select Turn
             </Text>
           </Box>
         </Box>
@@ -450,14 +452,14 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
               Shadow Git Snapshot Timeline
             </Text>
             <Text dimColor>
-              {snapshotHistory.entries.length} snapshot tersimpan
+              {snapshotHistory.entries.length} snapshots stored
             </Text>
           </Box>
 
           <Box flexDirection="row">
             <Box flexDirection="column" width="55%" paddingRight={1}>
               {snapshotHistory.entries.length === 0 ? (
-                <Text dimColor>Belum ada snapshot git yang tercatat.</Text>
+                <Text dimColor>No git snapshots recorded yet.</Text>
               ) : (
                 snapshotHistory.entries.slice(0, 8).map((snap, idx) => {
                   const isSelected = idx === snapshotIndex;
@@ -473,7 +475,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                         {isCurrent ? (
                           <Text color={theme.modes.build.primary} bold>
                             {" "}
-                            [CURRENT]
+                            ACTIVE
                           </Text>
                         ) : null}
                       </Box>
@@ -486,10 +488,10 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
 
             <Box flexDirection="column" width="45%" borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
               <Text bold color={theme.accent}>
-                File yang Berubah
+                Changed Files
               </Text>
               {changedFiles.length === 0 ? (
-                <Text dimColor>(Tidak ada modifikasi file pada snapshot ini)</Text>
+                <Text dimColor>(No modified files in this snapshot)</Text>
               ) : (
                 changedFiles.map((file, idx) => (
                   <Text key={`file-${idx}`} color={theme.modes.build.primary}>
@@ -502,7 +504,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
 
           <Box marginTop={1} justifyContent="space-between">
             <Text dimColor>
-              Enter: Pulihkan (Checkout) Kondisi Kode ke Titik Snapshot | Up/Down: Pilih Snapshot
+              Enter Restore Workspace to Snapshot  |  Up/Down Select Snapshot
             </Text>
           </Box>
         </Box>

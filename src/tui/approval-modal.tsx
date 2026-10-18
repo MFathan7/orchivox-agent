@@ -40,7 +40,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
         onDecision({
           approved: false,
           choice: "deny_with_feedback",
-          feedback: trimmed.length > 0 ? trimmed : "Ditolak oleh pengguna tanpa catatan khusus.",
+          feedback: trimmed.length > 0 ? trimmed : "Denied by user without additional feedback.",
         });
         return;
       }
@@ -51,12 +51,12 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
         return;
       }
 
-      if (key.backspace || key.delete) {
+      if (key.backspace || key.delete || input === "\x7f" || input === "\b") {
         setFeedbackText((prev) => prev.slice(0, -1));
         return;
       }
 
-      if (!key.ctrl && !key.meta && input.length > 0 && input >= " ") {
+      if (!key.ctrl && !key.meta && input.length > 0 && input >= " " && input !== "\x7f") {
         setFeedbackText((prev) => prev + input);
       }
       return;
@@ -76,7 +76,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
       onDecision({
         approved: false,
         choice: "deny",
-        reason: "Eksekusi tool dibatalkan oleh pengguna.",
+        reason: "Tool execution cancelled by user.",
       });
       return;
     }
@@ -97,17 +97,17 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
     >
       <Box justifyContent="space-between">
         <Text bold color={borderColor}>
-          [PERMINTAAN PERSETUJUAN TOOL]
+          TOOL APPROVAL REQUIRED
         </Text>
         <Text dimColor>
-          Mode: {request.mode.toUpperCase()} | Tool: {request.toolName}
+          Mode: {request.mode.toUpperCase()}  |  Tool: {request.toolName}
         </Text>
       </Box>
 
       {request.diffPreview ? (
         <Box flexDirection="column" marginY={1}>
           <Text bold color={theme.accent}>
-            Pratinjau Perubahan: {request.diffPreview.filePath}
+            Diff Preview: {request.diffPreview.filePath}
           </Text>
           <DiffView
             oldText={request.diffPreview.oldText}
@@ -136,7 +136,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
                   : theme.modes.build.primary
               }
             >
-              [RISIKO: {riskLevel.toUpperCase()}]
+              RISK: {riskLevel.toUpperCase()}
             </Text>
           </Box>
           <Box
@@ -151,7 +151,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
           </Box>
           {request.shellDetails.warning ? (
             <Text color={theme.diff.removed}>
-              Peringatan: {request.shellDetails.warning}
+              Warning: {request.shellDetails.warning}
             </Text>
           ) : null}
         </Box>
@@ -159,7 +159,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
 
       {!request.diffPreview && !request.shellDetails ? (
         <Box flexDirection="column" marginY={1}>
-          <Text dimColor>Argumen:</Text>
+          <Text dimColor>Arguments:</Text>
           <Text>{JSON.stringify(request.args, null, 2)}</Text>
         </Box>
       ) : null}
@@ -174,7 +174,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
         {feedbackMode ? (
           <Box flexDirection="column">
             <Text color={theme.accent} bold>
-              Ketik instruksi revisi / alasan penolakan:
+              Type rejection feedback or instructions:
             </Text>
             <Box>
               <Text color={theme.accent}>&gt; </Text>
@@ -182,26 +182,26 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
               <Text inverse color={theme.accent}> </Text>
             </Box>
             <Text dimColor>
-              Enter: Kirim Feedback | Esc: Batal
+              Enter Send Feedback  |  Esc Cancel
             </Text>
           </Box>
         ) : (
           <Box justifyContent="space-between">
-            <Box gap={1}>
+            <Box gap={2}>
               <Text color={theme.modes.build.primary} bold>
-                [y] Approve Once
+                y Approve Once
               </Text>
               <Text color={theme.modes.plan.primary} bold>
-                [a] Always Allow
+                a Always Allow
               </Text>
               <Text color={theme.diff.removed} bold>
-                [n] Deny
+                n Deny
               </Text>
               <Text color={theme.modes.ultrawork.primary} bold>
-                [f] Deny with Feedback
+                f Deny with Feedback
               </Text>
             </Box>
-            <Text dimColor>Pilih tombol hotkey</Text>
+            <Text dimColor>Select an action hotkey</Text>
           </Box>
         )}
       </Box>

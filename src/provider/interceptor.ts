@@ -186,7 +186,7 @@ function withReminder(request: ChatRequest, violation: RuleViolation, injected: 
       content: [
         {
           type: "text",
-          text: `[SYSTEM STREAM INTERCEPTOR - RULE VIOLATION]: ${violation.entry.rule.reminderMessage}. Ulangi jawabanmu tanpa melanggar aturan ini.`,
+          text: `[SYSTEM STREAM INTERCEPTOR - RULE VIOLATION]: ${violation.entry.rule.reminderMessage}. Repeat your answer without violating this rule.`,
         },
       ],
     });
