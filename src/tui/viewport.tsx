@@ -55,6 +55,8 @@ export interface ScrollableChatViewportProps {
   theme?: Theme;
   initiallyCollapsed?: boolean;
   active?: boolean;
+  repoPath?: string;
+  branch?: string;
 }
 
 export interface SplitPaneViewportProps extends ScrollableChatViewportProps {
@@ -168,6 +170,8 @@ export function ScrollableChatViewport({
   theme = getTheme("tokyonight"),
   initiallyCollapsed = false,
   active = true,
+  repoPath,
+  branch,
 }: ScrollableChatViewportProps): React.ReactElement {
   const [offsetFromBottom, setOffsetFromBottom] = React.useState(0);
   const [collapsed, setCollapsed] = React.useState(initiallyCollapsed);
@@ -208,24 +212,32 @@ export function ScrollableChatViewport({
     setOffsetFromBottom(0);
   }, [entries.length]);
 
+  const hasChatMessages = entries.some((e) => e.role === "user" || e.role === "assistant");
+
   return (
     <Box flexDirection="column" height={height}>
       <Box flexDirection="column" flexGrow={1}>
-        {entries.length === 0 && !streamingText ? (
-          <WelcomeBanner theme={theme} />
+        {!hasChatMessages && !streamingText ? (
+          <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />
         ) : null}
         {visible.map((entry) => (
           <Box key={entry.id} flexDirection="column">
             {entry.role === "user" ? (
-              <Text color={theme.accent} bold>
-                &gt; {entry.text}
-              </Text>
+              <Box marginY={0}>
+                <Text color={theme.accent} bold>
+                  ❯ {entry.text}
+                </Text>
+              </Box>
             ) : entry.role === "system" ? (
-              <Text color={theme.muted} italic>
-                {entry.text}
-              </Text>
+              <Box marginY={0}>
+                <Text color={theme.muted} italic>
+                  ℹ {entry.text}
+                </Text>
+              </Box>
             ) : (
-              <MarkdownView content={entry.text} theme={theme} />
+              <Box marginY={0} flexDirection="column">
+                <MarkdownView content={entry.text} theme={theme} />
+              </Box>
             )}
             {entry.thinking ? (
               <ThinkingBlock

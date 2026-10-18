@@ -46,9 +46,9 @@ export interface AutocompletePopupProps {
 
 export const BUILTIN_SLASH_COMMANDS: Array<{ name: string; args?: string; description: string }> = [
   { name: "/help", description: "Display slash commands guide and keyboard shortcuts" },
-  { name: "/mode", args: "[plan|build|ultrawork]", description: "Switch or inspect agent execution mode" },
-  { name: "/theme", args: "[tokyonight|catppuccin|gruvbox|monochrome]", description: "Change or inspect terminal visual theme" },
-  { name: "/reasoning", args: "[off|low|medium|high|max]", description: "Adjust thinking model reasoning effort level" },
+  { name: "/mode", args: "<plan|build|ultrawork>", description: "Switch or inspect agent execution mode" },
+  { name: "/theme", args: "<name>", description: "Change or inspect terminal visual theme" },
+  { name: "/reasoning", args: "<off|low|med|high|max>", description: "Adjust thinking model reasoning effort level" },
   { name: "/palette", description: "Open command palette for models, themes, and reasoning" },
   { name: "/model", description: "Open provider and model routing settings" },
   { name: "/sessions", description: "Open session manager and past conversation search" },
@@ -258,7 +258,7 @@ export async function fetchSlashCommands(repoRoot?: string): Promise<Autocomplet
         trigger: "command",
         label: `/${cmd.name}`,
         insertText: `/${cmd.name} `,
-        detail: cmd.frontmatter.agent ? `[@${cmd.frontmatter.agent}]` : "(custom)",
+        detail: cmd.frontmatter.agent ? `@${cmd.frontmatter.agent}` : "custom",
         description: cmd.frontmatter.description ?? "Custom markdown slash command",
         kind: "custom-command",
       });
@@ -282,7 +282,7 @@ export async function fetchSpecialistAgents(repoRoot?: string): Promise<Autocomp
       label: agent.name,
       insertText: `@${agent.name} `,
       kind: "agent",
-      detail: `[${agent.roleModel ?? "main"}]`,
+      detail: agent.roleModel ? `(${agent.roleModel})` : undefined,
       description: agent.description,
     }));
   } catch {
@@ -321,7 +321,7 @@ function formatFileItems(paths: string[]): AutocompleteItem[] {
       label: path,
       insertText: `@${path}`,
       kind: isDir ? "dir" : "file",
-      description: isDir ? "Direktori proyek" : undefined,
+      description: isDir ? "Project directory" : undefined,
     };
   });
 }
@@ -451,16 +451,16 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
   }
   const visibleItems = items.slice(startIndex, startIndex + maxVisible);
 
-  let triggerLabel = "PENCARIAN CEPAT";
+  let triggerLabel = "QUICK SEARCH";
   let triggerColor = theme.accent;
   if (trigger === "command") {
-    triggerLabel = "SLASH COMMANDS (/)";
+    triggerLabel = "SLASH COMMANDS";
     triggerColor = theme.modes.plan.primary;
   } else if (trigger === "file") {
-    triggerLabel = "FILE & SPECIALIST AGENTS (@)";
+    triggerLabel = "FILES & SPECIALIST AGENTS";
     triggerColor = theme.modes.build.primary;
   } else if (trigger === "symbol") {
-    triggerLabel = "SIMBOL AST (#)";
+    triggerLabel = "AST SYMBOLS";
     triggerColor = theme.modes.ultrawork.primary;
   }
 
@@ -486,26 +486,75 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
           const actualIndex = startIndex + index;
           const isSelected = actualIndex === clampedSelected;
 
+          if (trigger === "command") {
+            return (
+              <Box key={item.id}>
+                <Box width={13}>
+                  <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                    {isSelected ? "❯ " : "  "}
+                    {item.label}
+                  </Text>
+                </Box>
+                <Box width={25}>
+                  {item.detail ? (
+                    <Text color={theme.muted}>{item.detail}</Text>
+                  ) : (
+                    <Text> </Text>
+                  )}
+                </Box>
+                {item.description ? (
+                  <Box flexGrow={1}>
+                    <Text dimColor>
+                      {item.description.length > 38
+                        ? `${item.description.slice(0, 35)}...`
+                        : item.description}
+                    </Text>
+                  </Box>
+                ) : null}
+              </Box>
+            );
+          }
+
+          if (trigger === "file") {
+            return (
+              <Box key={item.id} justifyContent="space-between">
+                <Box flexGrow={1}>
+                  <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                    {isSelected ? "❯ " : "  "}
+                    {item.label}
+                  </Text>
+                  {item.detail ? <Text color={theme.muted}> {item.detail}</Text> : null}
+                </Box>
+                {item.description ? (
+                  <Box marginLeft={2}>
+                    <Text dimColor>{item.description}</Text>
+                  </Box>
+                ) : null}
+              </Box>
+            );
+          }
+
           return (
-            <Box key={item.id} justifyContent="space-between">
-              <Box>
+            <Box key={item.id}>
+              <Box width={24}>
                 <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
                   {isSelected ? "❯ " : "  "}
                   {item.label}
                 </Text>
-                {item.kind ? (
-                  <Text color={theme.muted}> ({item.kind})</Text>
-                ) : null}
-                {item.detail ? (
-                  <Text dimColor> {item.detail}</Text>
-                ) : null}
               </Box>
+              {item.detail ? (
+                <Box width={26}>
+                  <Text color={theme.muted}>
+                    {item.detail.length > 25 ? `${item.detail.slice(0, 22)}...` : item.detail}
+                  </Text>
+                </Box>
+              ) : null}
               {item.description ? (
-                <Text dimColor>
-                  {item.description.length > 45
-                    ? `${item.description.slice(0, 42)}...`
-                    : item.description}
-                </Text>
+                <Box flexGrow={1}>
+                  <Text dimColor>
+                    {item.description.length > 26 ? `${item.description.slice(0, 23)}...` : item.description}
+                  </Text>
+                </Box>
               ) : null}
             </Box>
           );

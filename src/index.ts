@@ -748,8 +748,6 @@ async function runTuiSession(
   };
   process.on("SIGINT", cleanupSignals);
   process.on("SIGTERM", cleanupSignals);
-
-  pushEntry("system", "orchivox ready. type a prompt, or / for commands.");
   rerender();
   await instance.waitUntilExit();
   synced.uninstall();

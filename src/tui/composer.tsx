@@ -287,6 +287,31 @@ export function getCursorOffset(lines: string[], targetLine: number, targetCol: 
   return offset + clampedCol;
 }
 
+export function deletePreviousWord(text: string, cursorPos: number): { nextText: string; nextCursor: number } {
+  if (cursorPos <= 0) return { nextText: text, nextCursor: 0 };
+  let target = cursorPos;
+
+  // Skip trailing whitespace first
+  while (target > 0 && /\s/.test(text[target - 1])) {
+    target -= 1;
+  }
+
+  // If next is punctuation, delete sequence of punctuation
+  if (target > 0 && /[^a-zA-Z0-9_\s]/.test(text[target - 1])) {
+    while (target > 0 && /[^a-zA-Z0-9_\s]/.test(text[target - 1])) {
+      target -= 1;
+    }
+  } else {
+    // Otherwise delete sequence of alphanumeric/word characters
+    while (target > 0 && /[a-zA-Z0-9_]/.test(text[target - 1])) {
+      target -= 1;
+    }
+  }
+
+  const nextText = text.slice(0, target) + text.slice(cursorPos);
+  return { nextText, nextCursor: target };
+}
+
 export function PromptComposer(props: PromptComposerProps) {
   const {
     mode = "build",
@@ -445,7 +470,16 @@ export function PromptComposer(props: PromptComposerProps) {
     const isExplicitNewline =
       (key.return && key.shift) ||
       (key.return && key.meta) ||
-      input === "\u001b\r";
+      (key.return && key.ctrl) ||
+      input === "\u001b\r" ||
+      input === "\n" ||
+      input === "\r\n" ||
+      input === "\x1b[13;2u" ||
+      input === "\x1b[27;2;13~" ||
+      input === "\x1b[13;5u" ||
+      input === "\x1b[27;5;13~" ||
+      (("name" in key && (key as { name?: string }).name === "enter") && !key.return) ||
+      (input === "\r" && key.shift);
 
     const isBackslashNewline =
       key.return &&
@@ -516,16 +550,17 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
-    if (key.ctrl && input === "w") {
-      const before = text.slice(0, cursorPos);
-      const after = text.slice(cursorPos);
-      const lastWordMatch = /([a-zA-Z0-9_\-./\\]+|[^\s\w]+|\s+)\s*$/.exec(before);
-      if (lastWordMatch) {
-        const cutLength = lastWordMatch[0].length;
-        const nextBefore = before.slice(0, -cutLength);
-        setText(`${nextBefore}${after}`);
-        setCursorPos(nextBefore.length);
-      }
+    const isWordBackspace =
+      (key.ctrl && (input === "w" || key.backspace || key.delete || input === "\x7f" || input === "\b" || input === "\x08")) ||
+      (key.meta && (key.backspace || key.delete || input === "\x7f" || input === "\b" || input === "\x1b\x7f" || input === "\x1b\b")) ||
+      input === "\x17" ||
+      input === "\x1f" ||
+      input === "\x1b[127;5u";
+
+    if (isWordBackspace) {
+      const { nextText, nextCursor } = deletePreviousWord(text, cursorPos);
+      setText(nextText);
+      setCursorPos(nextCursor);
       return;
     }
 
@@ -612,14 +647,14 @@ export function PromptComposer(props: PromptComposerProps) {
         {lines.length === 1 && lines[0].length === 0 ? (
           <Box>
             <Text color={modeStyle.primary} bold>
-              &gt;{" "}
+              ❯{" "}
             </Text>
             <Text dimColor>{placeholder}</Text>
           </Box>
         ) : (
           lines.map((lineContent, lineIndex) => {
             const isCurrentLine = lineIndex === activeLine;
-            const prefix = lines.length > 1 ? `${lineIndex + 1} | ` : "> ";
+            const prefix = lines.length > 1 ? `${lineIndex + 1} | ` : "❯ ";
 
             if (!isCurrentLine) {
               return (
@@ -654,10 +689,10 @@ export function PromptComposer(props: PromptComposerProps) {
 
       <Box justifyContent="space-between" paddingX={1}>
         <Text dimColor>
-          Tab Mode  |  @ Attach File  |  / Command  |  Ctrl+P Palette  |  Alt+A Subagents  |  Ctrl+O Details
+          Tab Mode · @ File · / Command · Ctrl+P Palette · Ctrl+S Sessions · Alt+A Hub
         </Text>
         <Text dimColor>
-          Shift+Enter New Line  |  Enter Send
+          Shift+Enter Newline · Enter Send
         </Text>
       </Box>
     </Box>

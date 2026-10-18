@@ -4,18 +4,18 @@
   appliesToGlob: "*.ts"
   triggerRegex: '//\s*TODO:'
   action: abort_and_retry
-  reminderMessage: Tulis implementasi yang lengkap tanpa komentar TODO
+  reminderMessage: Write complete implementations without TODO comments
 
 - id: no-console-log
   name: No console.log in source files
   appliesToGlob: "*.ts"
   triggerRegex: 'console\.log\('
   action: abort_and_retry
-  reminderMessage: Gunakan kanal logging proyek, jangan console.log
+  reminderMessage: Use the project logging channel, do not use console.log
 
 - id: no-any-type
   name: No any type in TypeScript files
   appliesToGlob: "*.ts"
   triggerRegex: 'any\b'
   action: abort_and_retry
-  reminderMessage: Gunakan tipe yang spesifik, jangan any
+  reminderMessage: Use specific types, do not use any

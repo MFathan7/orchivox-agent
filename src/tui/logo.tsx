@@ -78,9 +78,11 @@ export function OrchivoxLogo({ variant = "emblem" }: OrchivoxLogoProps): React.R
 
 export interface WelcomeBannerProps {
   theme?: Theme;
+  repoPath?: string;
+  branch?: string;
 }
 
-export function WelcomeBanner({ theme }: WelcomeBannerProps): React.ReactElement {
+export function WelcomeBanner({ theme, repoPath, branch }: WelcomeBannerProps): React.ReactElement {
   const accentColor = theme?.accent ?? "#38bdf8";
   const mutedColor = theme?.muted ?? "gray";
 
@@ -91,13 +93,18 @@ export function WelcomeBanner({ theme }: WelcomeBannerProps): React.ReactElement
         <Text bold color={accentColor}>ORCHIVOX</Text>
         <Text> </Text>
         <Text bold color="#a855f7">AGENT</Text>
+        <Text color={mutedColor} dimColor> v0.1.0</Text>
       </Box>
-      <Text color={mutedColor} dimColor>
-        Personal AI coding agent runtime v0.1.0
-      </Text>
+      {repoPath ? (
+        <Box marginTop={0}>
+          <Text color={mutedColor} dimColor>
+            {repoPath} {branch && branch !== "unknown" ? `(${branch})` : ""}
+          </Text>
+        </Box>
+      ) : null}
       <Box marginTop={1} flexDirection="column" alignItems="center">
         <Text color={mutedColor}>
-          Type a message to start collaborating, or use shortcut keys:
+          Type a prompt to begin, or use shortcut keys:
         </Text>
         <Box gap={1} marginTop={0}>
           <Text color={accentColor}>Tab</Text>
@@ -114,6 +121,11 @@ export function WelcomeBanner({ theme }: WelcomeBannerProps): React.ReactElement
           <Text color={mutedColor}>·</Text>
           <Text color={accentColor}>/</Text>
           <Text color={mutedColor}>Commands</Text>
+        </Box>
+        <Box marginTop={1}>
+          <Text dimColor color="gray">
+            Shift+Enter Newline · Ctrl+Backspace Delete Word · Esc Cancel
+          </Text>
         </Box>
       </Box>
     </Box>

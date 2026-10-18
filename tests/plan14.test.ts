@@ -114,7 +114,7 @@ describe("Granular Permission Engine", () => {
       return {
         approved: false,
         choice: "deny_with_feedback",
-        feedback: "Jangan hapus file konfigurasi ini, gunakan flag --dry-run dulu.",
+        feedback: "Do not delete this configuration file, use the --dry-run flag first.",
       };
     });
 

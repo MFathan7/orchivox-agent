@@ -157,15 +157,19 @@ export function DiffView({ oldText, newText, oldLabel = "old", newLabel = "new",
 
 export function ToolCallBadge({ name, argumentsSummary, durationMs, status = "ok", lspStatus }: ToolCallBadgeProps) {
   const statusColor = status === "running" ? "yellow" : status === "error" ? "red" : "green";
-  const statusIcon = status === "running" ? "~" : status === "error" ? "x" : "+";
+  const statusIcon = status === "running" ? "●" : status === "error" ? "✖" : "✔";
   return (
-    <Box>
+    <Box gap={1} marginY={0}>
       <Text color={statusColor} bold>
         {statusIcon} {name}
       </Text>
-      <Text dimColor> {argumentsSummary.length > 60 ? `${argumentsSummary.slice(0, 57)}...` : argumentsSummary}</Text>
-      {durationMs !== undefined ? <Text color="gray"> {durationMs}ms</Text> : null}
-      {lspStatus ? <Text color="yellow"> lsp:{lspStatus}</Text> : null}
+      {argumentsSummary ? (
+        <Text dimColor>
+          {argumentsSummary.length > 60 ? `${argumentsSummary.slice(0, 57)}...` : argumentsSummary}
+        </Text>
+      ) : null}
+      {durationMs !== undefined ? <Text color="gray">{durationMs}ms</Text> : null}
+      {lspStatus ? <Text color="yellow">lsp:{lspStatus}</Text> : null}
     </Box>
   );
 }
@@ -180,9 +184,9 @@ export function ThinkingBlock({ text, defaultOpen = false, focused = false }: Th
   );
   const lines = text.split("\n");
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor="magenta" paddingX={1}>
+    <Box flexDirection="column" borderStyle="single" borderColor="magenta" paddingX={1} marginY={0}>
       <Text color="magenta" bold>
-        {open ? "[-]" : "[+]"} thinking ({lines.length} line(s)){focused ? " - Enter to toggle" : ""}
+        {open ? "▼" : "▶"} Thinking ({lines.length} lines){focused ? " · Enter to toggle" : ""}
       </Text>
       {open
         ? lines.map((line, index) => (

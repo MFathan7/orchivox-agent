@@ -359,6 +359,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 theme={theme}
                 initiallyCollapsed={collapsed}
                 active={!hasModalOpen}
+                repoPath={globalThis.process.cwd()}
+                branch={branch}
               />
             </Box>
             {sidebarVisible ? (
