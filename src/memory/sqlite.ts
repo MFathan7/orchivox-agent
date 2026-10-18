@@ -133,6 +133,32 @@ export class MemoryDatabase {
     return true;
   }
 
+  forkSession(sourceSessionId: string, upToMessageId?: string, newTitle?: string): SessionRecord {
+    const source = this.getSession(sourceSessionId);
+    if (!source) throw new Error(`source session "${sourceSessionId}" not found`);
+    const allMessages = this.loadMessages(sourceSessionId);
+    let slice = allMessages;
+    if (upToMessageId) {
+      const idx = allMessages.findIndex((m) => m.id === upToMessageId);
+      if (idx !== -1) {
+        slice = allMessages.slice(0, idx + 1);
+      }
+    }
+    const forked = this.createSession({
+      title: newTitle ?? `${source.title} (fork)`,
+      mode: source.mode,
+    });
+    for (const msg of slice) {
+      this.saveMessage(forked.id, {
+        id: `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        role: msg.role,
+        content: msg.content,
+        created_at: msg.created_at,
+      });
+    }
+    return forked;
+  }
+
   saveMessage(sessionId: string, message: Message): void {
     const session = this.getSession(sessionId);
     if (!session) throw new Error(`unknown session "${sessionId}"`);

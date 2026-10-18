@@ -9,22 +9,25 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
+import type { ApprovalDecision, ApprovalRequest } from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
 import { loadConfig, type AppConfig } from "./config/loader";
 import { LSPClient } from "./ide/lsp-client";
 import { HindsightMemory } from "./memory/hindsight";
 import { RulesLoader } from "./memory/rules-loader";
-import { MemoryDatabase } from "./memory/sqlite";
+import { MemoryDatabase, type SessionRecord } from "./memory/sqlite";
 import { McpClientManager } from "./mcp/client";
 import { McpToolServer } from "./mcp/server";
 import { InterceptedProvider, loadStreamRules, type StreamRule } from "./provider/interceptor";
 import { ProviderRouter, type LLMProvider } from "./provider/router";
 import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
-import { SnapshotManager } from "./vcs/snapshot";
+import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
 import { runGit } from "./vcs/git";
 import { WorktreeManager } from "./vcs/worktree";
 import { installSynchronizedOutput, OrchivoxApp, type ChatEntryView, type InputAction } from "./tui/app";
 import type { HashlineLifecycle } from "./tools/hashline-edit";
+import type { ThemeName } from "./tui/theme";
+import type { ReasoningEffortLevel } from "./tui/command-palette";
 import { AgentModeSchema, type AgentMode, type Message } from "./types/schema";
 
 export interface CliOptions {
@@ -186,6 +189,7 @@ export async function bootstrap(options: { repoRoot?: string } = {}): Promise<Ru
     plugins,
     mcpServers: mcpReport.connected.map((entry) => entry.server),
     close: async () => {
+      await orchestrator.bgProcesses.stopAll();
       await mcpClient.close();
       await lsp?.dispose();
       database.close();
@@ -265,10 +269,18 @@ async function runTuiSession(
   runtime: RuntimeHandle,
   print: (text: string) => void,
 ): Promise<{ close: () => Promise<void> }> {
+  const initialSession = runtime.database.createSession({
+    title: "Interactive Session",
+    mode: "build",
+  });
+
   const state = {
+    sessionId: initialSession.id,
     entries: [] as ChatEntryView[],
     messages: [] as Message[],
     mode: "build" as AgentMode,
+    currentTheme: "tokyonight" as ThemeName,
+    reasoningEffort: "medium" as ReasoningEffortLevel,
     streamingText: "",
     totalTokens: 0,
     totalCostUsd: 0,
@@ -277,6 +289,18 @@ async function runTuiSession(
   };
   let relay: CollabRelay | undefined;
   let branch = "unknown";
+  let pendingApproval: ApprovalRequest | undefined;
+  let approvalResolver: ((decision: ApprovalDecision) => void) | undefined;
+  let activeAbortController: AbortController | undefined;
+
+  runtime.orchestrator.permissions.setApprovalHandler((request) => {
+    return new Promise<ApprovalDecision>((resolve) => {
+      pendingApproval = request;
+      approvalResolver = resolve;
+      rerender();
+    });
+  });
+
   try {
     branch = (await runGit(globalThis.process.cwd(), ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
   } catch {
@@ -299,6 +323,65 @@ async function runTuiSession(
     streamingText: state.streamingText,
     mode: state.mode,
     workers: runtime.orchestrator.subagents.listWorkers(),
+    router: runtime.router,
+    database: runtime.database,
+    snapshots: runtime.snapshots,
+    activeSessionId: state.sessionId,
+    activeSessionMessages: state.messages,
+    currentTheme: state.currentTheme,
+    onThemeChange: (nextTheme: ThemeName) => {
+      state.currentTheme = nextTheme;
+      rerender();
+    },
+    reasoningEffort: state.reasoningEffort,
+    onReasoningEffortChange: (effort: ReasoningEffortLevel) => {
+      state.reasoningEffort = effort;
+      pushEntry("system", `penalaran model diubah ke level: ${effort}`);
+      rerender();
+    },
+    onResumeSession: (sessionId: string) => {
+      state.sessionId = sessionId;
+      const msgs = runtime.database.loadMessages(sessionId);
+      state.messages = msgs;
+      state.entries = msgs.map((m, idx) => ({
+        id: `entry-${idx + 1}`,
+        role: m.role === "system" ? "system" : m.role === "assistant" ? "assistant" : "user",
+        text: m.content
+          .map((b) => (b.type === "text" ? b.text : ""))
+          .filter(Boolean)
+          .join(" "),
+      }));
+      const sess = runtime.database.getSession(sessionId);
+      pushEntry("system", `melanjutkan sesi: ${sess?.title ?? sessionId}`);
+      rerender();
+    },
+    onForkSession: (forked: SessionRecord) => {
+      state.sessionId = forked.id;
+      const msgs = runtime.database.loadMessages(forked.id);
+      state.messages = msgs;
+      state.entries = msgs.map((m, idx) => ({
+        id: `entry-${idx + 1}`,
+        role: m.role === "system" ? "system" : m.role === "assistant" ? "assistant" : "user",
+        text: m.content
+          .map((b) => (b.type === "text" ? b.text : ""))
+          .filter(Boolean)
+          .join(" "),
+      }));
+      pushEntry("system", `sesi dicabangkan ke: ${forked.title}`);
+      rerender();
+    },
+    onRestoreSnapshot: (result: RestoreResult) => {
+      pushEntry("system", `memulihkan snapshot ${result.snapshotId}: ${result.restoredFiles.length} file dipulihkan`);
+      rerender();
+    },
+    pendingApproval,
+    onApprovalDecision: (decision: ApprovalDecision) => {
+      const resolver = approvalResolver;
+      pendingApproval = undefined;
+      approvalResolver = undefined;
+      resolver?.(decision);
+      rerender();
+    },
     onModeChange: (next: AgentMode) => {
       state.mode = next;
       rerender();
@@ -317,6 +400,21 @@ async function runTuiSession(
       pushEntry("system", `kill sent to ${workerId}`);
       rerender();
     },
+    onAbort: () => {
+      if (activeAbortController) {
+        activeAbortController.abort();
+        pushEntry("system", "proses dibatalkan oleh pengguna.");
+        rerender();
+      }
+    },
+    todos: runtime.orchestrator.todos.list().map((t) => ({
+      id: t.id,
+      task: t.task,
+      status: t.status,
+      priority: t.priority,
+    })),
+    lspStatus: runtime.config.lsp.servers ? "active" : "disabled",
+    mcpServers: runtime.mcpServers,
     onSubmit: (text: string, action: InputAction) => {
       void handleInput(text, action);
     },
@@ -329,7 +427,76 @@ async function runTuiSession(
   };
   const refresh = setInterval(rerender, 500);
 
-  const handleCommand = async (command: string): Promise<void> => {
+  const executeTurn = async (promptText: string, displayUserText?: string, targetAgent?: string): Promise<void> => {
+    if (state.busy) {
+      pushEntry("system", "a turn is already running");
+      rerender();
+      return;
+    }
+    pushEntry("user", displayUserText ?? promptText);
+    const userMsg: Message = {
+      id: `user-${Date.now().toString(36)}`,
+      role: "user",
+      content: [{ type: "text", text: promptText }],
+      created_at: Date.now(),
+    };
+    state.messages = [...state.messages, userMsg];
+    try {
+      runtime.database.saveMessage(state.sessionId, userMsg);
+    } catch {
+      // Ignore database save error if session not found.
+    }
+    state.busy = true;
+    state.streamingText = "";
+    activeAbortController = new AbortController();
+    rerender();
+    try {
+      const request = AgentRunRequestSchema.parse({
+        profile: modeToProfile(state.mode),
+        messages: state.messages,
+        metadata: targetAgent ? { agent: targetAgent } : undefined,
+        max_tokens: 4096,
+      });
+      let answer = "";
+      for await (const event of runtime.orchestrator.runStream(request, activeAbortController.signal)) {
+        if (event.type === "token") {
+          answer += event.text;
+          state.streamingText = answer;
+        } else if (event.type === "thinking_token") {
+          state.streamingText = `${answer}${answer ? "\n" : ""}${event.text}`;
+        } else if (event.type === "advisor_note") {
+          pushEntry("system", `[advisor note] ${event.note}`);
+        } else if (event.type === "bg_process_update") {
+          pushEntry("system", `[bg_process ${event.processId}] ${event.status}`);
+        } else if (event.type === "usage") {
+          state.totalTokens += event.prompt_tokens + event.completion_tokens;
+          if (event.cost_usd !== undefined) state.totalCostUsd += event.cost_usd;
+        }
+      }
+      pushEntry("assistant", answer || "(no output)");
+      const assistantMsg: Message = {
+        id: `assistant-${Date.now().toString(36)}`,
+        role: "assistant",
+        content: [{ type: "text", text: answer }],
+        created_at: Date.now(),
+      };
+      state.messages = [...state.messages, assistantMsg];
+      try {
+        runtime.database.saveMessage(state.sessionId, assistantMsg);
+      } catch {
+        // Ignore database save error if session not found.
+      }
+    } catch (error) {
+      pushEntry("system", `turn failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      activeAbortController = undefined;
+      state.streamingText = "";
+      state.busy = false;
+      rerender();
+    }
+  };
+
+  const handleCommand = async (command: string, args = "", raw = command): Promise<void> => {
     switch (command) {
       case "/undo": {
         const restored = await runtime.snapshots.undo();
@@ -378,68 +545,60 @@ async function runTuiSession(
         state.entries = [];
         break;
       }
-      default:
+      default: {
+        const customCmd = await runtime.orchestrator.customCommands.getCommand(command);
+        if (customCmd) {
+          const executed = await runtime.orchestrator.customCommands.executeCommand(command, args);
+          if (executed) {
+            if (executed.subtask) {
+              const worker = runtime.orchestrator.subagents.spawnOne({
+                agent: executed.agent,
+                task: executed.prompt,
+                writeIsolation: true,
+                onComplete: (w) => {
+                  pushEntry("system", `subtask ${w.id} (${w.status}): ${w.result?.output.slice(0, 100) ?? ""}`);
+                  rerender();
+                },
+              });
+              pushEntry("system", `menjalankan /${customCmd.name} sebagai subtask: ${worker.id}`);
+            } else {
+              await executeTurn(executed.prompt, raw, executed.agent);
+            }
+            break;
+          }
+        }
         pushEntry("system", `unknown command: ${command}`);
+      }
     }
     rerender();
   };
 
   const handleInput = async (text: string, action: InputAction): Promise<void> => {
     if (action.kind === "command") {
-      await handleCommand(action.command);
-      return;
-    }
-    if (state.busy) {
-      pushEntry("system", "a turn is already running");
-      rerender();
+      await handleCommand(action.command, action.args ?? "", action.raw ?? text);
       return;
     }
     if (action.ultrawork) state.mode = "ultrawork";
-    pushEntry("user", text);
-    state.messages = [
-      ...state.messages,
-      { id: `user-${Date.now().toString(36)}`, role: "user", content: [{ type: "text", text }] },
-    ];
-    state.busy = true;
-    state.streamingText = "";
-    rerender();
-    try {
-      const request = AgentRunRequestSchema.parse({
-        profile: modeToProfile(state.mode),
-        messages: state.messages,
-        max_tokens: 4096,
-      });
-      let answer = "";
-      for await (const event of runtime.orchestrator.runStream(request)) {
-        if (event.type === "token") {
-          answer += event.text;
-          state.streamingText = answer;
-        } else if (event.type === "thinking_token") {
-          state.streamingText = `${answer}${answer ? "\n" : ""}${event.text}`;
-        } else if (event.type === "usage") {
-          state.totalTokens += event.prompt_tokens + event.completion_tokens;
-          if (event.cost_usd !== undefined) state.totalCostUsd += event.cost_usd;
-        }
-      }
-      pushEntry("assistant", answer || "(no output)");
-      state.messages = [
-        ...state.messages,
-        { id: `assistant-${Date.now().toString(36)}`, role: "assistant", content: [{ type: "text", text: answer }] },
-      ];
-    } catch (error) {
-      pushEntry("system", `turn failed: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      state.streamingText = "";
-      state.busy = false;
-      rerender();
-    }
+    await executeTurn(text);
   };
+
+  const cleanupSignals = () => {
+    process.stdout.write("\x1b[?1049l");
+    void runtime.close().then(() => {
+      process.exit(0);
+    });
+  };
+  process.on("SIGINT", cleanupSignals);
+  process.on("SIGTERM", cleanupSignals);
 
   pushEntry("system", "orchivox ready. type a prompt, or / for commands.");
   rerender();
   await instance.waitUntilExit();
   clearInterval(refresh);
   synced.uninstall();
+  process.removeListener("SIGINT", cleanupSignals);
+  process.removeListener("SIGTERM", cleanupSignals);
+  process.stdout.write("\x1b[?1049l");
   await relay?.close();
   await runtime.close();
   print("session closed");

@@ -211,6 +211,115 @@ export const DoneEventSchema = z.object({
 export type DoneEvent = z.infer<typeof DoneEventSchema>;
 export type FinishReason = DoneEvent["finish_reason"];
 
+export const ReasoningEffortSchema = z.enum(["off", "low", "medium", "high", "max"]);
+export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
+
+export const ApprovalChoiceSchema = z.enum([
+  "approve_once",
+  "approve_session",
+  "deny",
+  "deny_with_feedback",
+]);
+export type ApprovalChoice = z.infer<typeof ApprovalChoiceSchema>;
+
+export const DiffPreviewDetailsSchema = z.object({
+  filePath: z.string().min(1),
+  oldText: z.string(),
+  newText: z.string(),
+  oldLabel: z.string().optional(),
+  newLabel: z.string().optional(),
+});
+export type DiffPreviewDetails = z.infer<typeof DiffPreviewDetailsSchema>;
+
+export const ShellRiskDetailsSchema = z.object({
+  command: z.string(),
+  cwd: z.string(),
+  riskLevel: z.enum(["low", "medium", "high", "critical"]),
+  warning: z.string().optional(),
+});
+export type ShellRiskDetails = z.infer<typeof ShellRiskDetailsSchema>;
+
+export const ApprovalRequestSchema = z.object({
+  id: z.string().min(1),
+  toolCallId: z.string().min(1),
+  toolName: z.string().min(1),
+  args: z.record(z.string(), z.unknown()),
+  mode: z.enum(["plan", "build", "ultrawork"]),
+  readOnly: z.boolean(),
+  filePath: z.string().optional(),
+  diffPreview: DiffPreviewDetailsSchema.optional(),
+  shellDetails: ShellRiskDetailsSchema.optional(),
+  reason: z.string().optional(),
+});
+export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>;
+
+export const ApprovalDecisionSchema = z.object({
+  approved: z.boolean(),
+  choice: ApprovalChoiceSchema,
+  feedback: z.string().optional(),
+  reason: z.string().optional(),
+});
+export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
+
+export const EditHunkSchema = z.object({
+  startAnchor: z.string().min(1),
+  endAnchor: z.string().min(1),
+  newContent: z.string(),
+});
+export type EditHunk = z.infer<typeof EditHunkSchema>;
+
+export const MultiHunkEditSchema = z.object({
+  filePath: z.string().min(1),
+  edits: z.array(EditHunkSchema).optional(),
+  startAnchor: z.string().optional(),
+  endAnchor: z.string().optional(),
+  newContent: z.string().optional(),
+});
+export type MultiHunkEdit = z.infer<typeof MultiHunkEditSchema>;
+
+export const SpecialistAgentProfileSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().min(1),
+  systemPrompt: z.string().min(1),
+  modelRole: ModelRoleSchema.default("main_model"),
+  thinkingBudget: z.number().int().nonnegative().default(0),
+  allowedTools: z.array(z.string().min(1)).optional(),
+  readOnlyOnly: z.boolean().default(false),
+  color: z.string().optional(),
+});
+export type SpecialistAgentProfile = z.infer<typeof SpecialistAgentProfileSchema>;
+
+export const CustomCommandSchema = z.object({
+  name: z.string().min(1),
+  description: z.string(),
+  template: z.string(),
+  sourceFile: z.string().optional(),
+  argumentCount: z.number().int().nonnegative().default(0),
+});
+export type CustomCommand = z.infer<typeof CustomCommandSchema>;
+
+export const ApprovalRequiredEventSchema = z.object({
+  type: z.literal("approval_required"),
+  request: ApprovalRequestSchema,
+});
+export type ApprovalRequiredEvent = z.infer<typeof ApprovalRequiredEventSchema>;
+
+export const AdvisorNoteEventSchema = z.object({
+  type: z.literal("advisor_note"),
+  note: z.string(),
+  severity: z.enum(["info", "warning", "critical"]).default("info"),
+});
+export type AdvisorNoteEvent = z.infer<typeof AdvisorNoteEventSchema>;
+
+export const BgProcessUpdateEventSchema = z.object({
+  type: z.literal("bg_process_update"),
+  processId: z.string().min(1),
+  status: z.enum(["running", "ready", "stopped", "failed"]),
+  listeningUrls: z.array(z.string()).default([]),
+  recentLogLine: z.string().optional(),
+});
+export type BgProcessUpdateEvent = z.infer<typeof BgProcessUpdateEventSchema>;
+
 export const StreamEventSchema = z.discriminatedUnion("type", [
   TokenEventSchema,
   ThinkingTokenEventSchema,
@@ -220,6 +329,9 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   RuleViolationEventSchema,
   ErrorEventSchema,
   DoneEventSchema,
+  ApprovalRequiredEventSchema,
+  AdvisorNoteEventSchema,
+  BgProcessUpdateEventSchema,
 ]);
 export type StreamEvent = z.infer<typeof StreamEventSchema>;
 

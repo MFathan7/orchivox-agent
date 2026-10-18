@@ -21,10 +21,23 @@ export interface AgentTool<TSchema extends z.ZodTypeAny = z.ZodTypeAny> {
 export interface PermissionDecision {
   allowed: boolean;
   reason?: string;
+  feedback?: string;
 }
 
-export class ToolPermissionManager {
-  check(tool: { name: string; readOnly: boolean }, mode: AgentMode): PermissionDecision {
+export interface IToolPermissionChecker {
+  check(
+    tool: { name: string; readOnly: boolean },
+    mode: AgentMode,
+    args?: Record<string, unknown>,
+  ): Promise<PermissionDecision> | PermissionDecision;
+}
+
+export class ToolPermissionManager implements IToolPermissionChecker {
+  check(
+    tool: { name: string; readOnly: boolean },
+    mode: AgentMode,
+    _args?: Record<string, unknown>,
+  ): PermissionDecision {
     if (mode === "plan" && !tool.readOnly) {
       return {
         allowed: false,
@@ -37,9 +50,9 @@ export class ToolPermissionManager {
 
 export class ToolRegistry {
   private readonly tools = new Map<string, AgentTool>();
-  private readonly permissions: ToolPermissionManager;
+  private readonly permissions: IToolPermissionChecker;
 
-  constructor(options: { permissions?: ToolPermissionManager } = {}) {
+  constructor(options: { permissions?: IToolPermissionChecker } = {}) {
     this.permissions = options.permissions ?? new ToolPermissionManager();
   }
 
@@ -50,6 +63,10 @@ export class ToolRegistry {
 
   get(name: string): AgentTool | undefined {
     return this.tools.get(name);
+  }
+
+  has(name: string): boolean {
+    return this.tools.has(name);
   }
 
   list(): AgentTool[] {
@@ -72,11 +89,16 @@ export class ToolRegistry {
       return { tool_call_id: call.id, content: `unknown tool "${call.name}"`, is_error: true };
     }
 
-    const decision = this.permissions.check(tool, mode);
+    const decision = await this.permissions.check(
+      tool,
+      mode,
+      (call.arguments ?? {}) as Record<string, unknown>,
+    );
     if (!decision.allowed) {
+      const feedbackPart = decision.feedback ? ` Feedback pengguna: ${decision.feedback}` : "";
       return {
         tool_call_id: call.id,
-        content: decision.reason ?? `tool "${tool.name}" is not allowed in ${mode} mode`,
+        content: (decision.reason ?? `tool "${tool.name}" is not allowed in ${mode} mode`) + feedbackPart,
         is_error: true,
       };
     }

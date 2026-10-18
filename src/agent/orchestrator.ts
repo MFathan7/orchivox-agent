@@ -8,6 +8,7 @@ import type {
 } from "../api/server";
 import type { AppConfig } from "../config/loader";
 import { registerAstTools } from "../ide/ast-compress";
+import { registerCodeIntelTools } from "../ide/code-intel";
 import type { LSPClient } from "../ide/lsp-client";
 import { HindsightMemory } from "../memory/hindsight";
 import type { MemoryDatabase } from "../memory/sqlite";
@@ -20,12 +21,24 @@ import {
   createJsonQueryTool,
 } from "../tools/builtins";
 import {
+  createApplyUnifiedPatchTool,
+  createCreateFileTool,
+  createDeleteFileTool,
   createHashEditTool,
+  createMoveFileTool,
   createReadFileTool,
   type HashlineLifecycle,
 } from "../tools/hashline-edit";
+import {
+  buildSelfHealingPrompt,
+  createDiagnosticsCheckTool,
+  runTscDiagnostics,
+  type LSPDiagnostic,
+} from "../ide/lsp-fixer";
 import { ToolRegistry } from "../tools/registry";
 import { PersistentShellTool } from "../tools/shell";
+import { BackgroundProcessManager } from "../tools/bg-process";
+import { createInspectImageTool } from "../tools/vision";
 import {
   ChatRequestSchema,
   type AgentMode,
@@ -40,7 +53,10 @@ import {
 import type { SnapshotManager } from "../vcs/snapshot";
 import type { WorktreeManager } from "../vcs/worktree";
 import { AdvisorReviewer } from "./advisor";
+import { CustomCommandEngine } from "./custom-commands";
 import { HookRunner, type PluginLoadReport } from "./hooks";
+import { GranularPermissionEngine } from "./permissions";
+import { SpecialistAgentRegistry, type SpecialistAgentProfile } from "./specialist-agents";
 import { SubagentManager, type SubagentTaskInput, type SubagentTaskResult, type SubagentWorkerState } from "./subagent";
 import { TodoEngine } from "./todo";
 
@@ -56,6 +72,7 @@ export interface AgentOrchestratorOptions {
   repoRoot?: string;
   maxTurns?: number;
   contextTokenBudget?: number;
+  permissions?: GranularPermissionEngine;
 }
 
 const PROFILE_MODES: Record<AgentProfile, AgentMode> = {
@@ -88,7 +105,11 @@ export class AgentOrchestrator implements IAgentRunner {
   readonly hooks: HookRunner;
   readonly advisor: AdvisorReviewer;
   readonly subagents: SubagentManager;
-  readonly registry = new ToolRegistry();
+  readonly permissions: GranularPermissionEngine;
+  readonly registry: ToolRegistry;
+  readonly customCommands: CustomCommandEngine;
+  readonly specialistAgents: SpecialistAgentRegistry;
+  readonly bgProcesses: BackgroundProcessManager;
 
   private readonly router: ProviderRouter;
   private readonly snapshots: SnapshotManager;
@@ -111,9 +132,14 @@ export class AgentOrchestrator implements IAgentRunner {
     this.root = options.repoRoot ?? globalThis.process.cwd();
     this.maxTurns = options.maxTurns ?? 40;
     this.contextTokenBudget = options.contextTokenBudget ?? 200_000;
+    this.permissions = options.permissions ?? new GranularPermissionEngine({ repoRoot: this.root });
+    this.registry = new ToolRegistry({ permissions: this.permissions });
     this.hindsight = new HindsightMemory(options.database);
     this.hooks = new HookRunner({ hooks: options.config?.hooks, cwd: this.root });
     this.advisor = new AdvisorReviewer({ router: options.router, repoRoot: this.root });
+    this.customCommands = new CustomCommandEngine({ repoRoot: this.root });
+    this.specialistAgents = new SpecialistAgentRegistry({ repoRoot: this.root });
+    this.bgProcesses = new BackgroundProcessManager({ defaultCwd: this.root });
     this.subagents = new SubagentManager({
       worktrees: options.worktrees,
       executor: (input) => this.executeSubagent(input),
@@ -122,6 +148,8 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 
   async initialize(): Promise<PluginLoadReport> {
+    await this.customCommands.ensureDefaults();
+    await this.specialistAgents.ensureDefaults();
     return this.hooks.loadUserPlugins(this.registry);
   }
 
@@ -187,22 +215,26 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 
   private registerDefaultTools(): void {
+    const lifecycle: HashlineLifecycle = {
+      onBeforeModify: async (filePath) => {
+        await this.hashEditLifecycle?.onBeforeModify?.(filePath);
+      },
+      onAfterModify: async (filePath, newContent) => {
+        if (this.hashEditLifecycle?.onAfterModify) {
+          await this.hashEditLifecycle.onAfterModify(filePath, newContent);
+          return;
+        }
+        const diagnostics = await this.collectDiagnostics(filePath, newContent);
+        if (diagnostics) this.pendingDiagnostics.set(filePath, diagnostics);
+      },
+    };
+
     this.registry.register(createReadFileTool());
-    this.registry.register(
-      createHashEditTool({
-        onBeforeModify: async (filePath) => {
-          await this.hashEditLifecycle?.onBeforeModify?.(filePath);
-        },
-        onAfterModify: async (filePath, newContent) => {
-          if (this.hashEditLifecycle?.onAfterModify) {
-            await this.hashEditLifecycle.onAfterModify(filePath, newContent);
-            return;
-          }
-          const diagnostics = await this.collectDiagnostics(filePath, newContent);
-          if (diagnostics) this.pendingDiagnostics.set(filePath, diagnostics);
-        },
-      }),
-    );
+    this.registry.register(createHashEditTool(lifecycle));
+    this.registry.register(createCreateFileTool(lifecycle));
+    this.registry.register(createDeleteFileTool(lifecycle));
+    this.registry.register(createMoveFileTool(lifecycle));
+    this.registry.register(createApplyUnifiedPatchTool(lifecycle));
     this.registry.register(createGlobFilesTool());
     this.registry.register(createGrepSearchTool());
     this.registry.register(createDiffViewTool());
@@ -212,6 +244,10 @@ export class AgentOrchestrator implements IAgentRunner {
     this.todos.registerTools(this.registry);
     this.subagents.registerTools(this.registry);
     this.hindsight.registerTools(this.registry);
+    this.registry.register(createDiagnosticsCheckTool({ lsp: this.lsp, repoRoot: this.root }));
+    this.bgProcesses.registerTools(this.registry);
+    this.registry.register(createInspectImageTool({ router: this.router, repoRoot: this.root }));
+    registerCodeIntelTools(this.registry, { lsp: this.lsp, repoRoot: this.root });
     if (this.lsp) this.lsp.registerTools(this.registry);
   }
 
@@ -221,25 +257,82 @@ export class AgentOrchestrator implements IAgentRunner {
     sink: (event: StreamEvent) => void,
   ): Promise<AgentRunResult> {
     const mode = PROFILE_MODES[request.profile];
-    const provider = this.router.get("main");
-    const system = [request.system, MODE_PROMPTS[mode]].filter(Boolean).join("\n\n");
+
+    let activeSpecialist: SpecialistAgentProfile | undefined;
+    if (typeof request.metadata?.agent === "string") {
+      activeSpecialist = await this.specialistAgents.getAgent(request.metadata.agent as string);
+    }
+
     let messages: Message[] = [...request.messages];
-    const tools = this.combineTools(request.tools);
+
+    const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+    if (lastUserIdx !== -1) {
+      const userMsg = messages[lastUserIdx];
+      const textBlock = userMsg.content.find((b) => b.type === "text");
+      if (textBlock && textBlock.type === "text") {
+        const trimmed = textBlock.text.trim();
+        if (trimmed.startsWith("/")) {
+          const spaceIdx = trimmed.indexOf(" ");
+          const cmdName = (spaceIdx === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIdx)).trim();
+          const rawArgs = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+          const expanded = await this.customCommands.executeCommand(cmdName, rawArgs);
+          if (expanded) {
+            textBlock.text = expanded.prompt;
+            if (expanded.agent && !request.metadata?.agent) {
+              activeSpecialist = await this.specialistAgents.getAgent(expanded.agent);
+            }
+          }
+        }
+      }
+    }
+
+    if (!activeSpecialist && messages.length > 0) {
+      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+      const lastText = lastUserMsg?.content
+        .map((b) => (b.type === "text" ? b.text : ""))
+        .join(" ");
+      if (lastText) {
+        const mention = await this.specialistAgents.parseMention(lastText);
+        if (mention?.profile) {
+          activeSpecialist = mention.profile;
+        }
+      }
+    }
+
+    const requestedRole = activeSpecialist?.roleModel ?? "main";
+    const provider = this.router.get(
+      requestedRole === "advisor" || requestedRole === "fast" || requestedRole === "main"
+        ? requestedRole
+        : "main",
+    );
+    const system = [activeSpecialist?.systemPrompt, request.system, MODE_PROMPTS[mode]].filter(Boolean).join("\n\n");
+    let tools = this.combineTools(request.tools);
+    if (activeSpecialist) {
+      tools = this.specialistAgents.filterTools(activeSpecialist, tools);
+    }
     const totals = zeroUsage();
     let finishReason: FinishReason = "stop";
+
+    const budget = activeSpecialist?.thinkingBudget ?? 0;
+    const maxTokens = budget > 0
+      ? Math.max(request.max_tokens ?? 4096, budget + 2048)
+      : (request.max_tokens ?? 4096);
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
       messages = await this.hindsight.compactMessagesIfNeeded(messages, this.contextTokenBudget, provider);
 
       const advisorNote = this.advisor.consumeNote();
-      if (advisorNote) messages.push(makeMessage(`turn-${turn}-advisor`, "system", advisorNote));
+      if (advisorNote) {
+        sink({ type: "advisor_note", note: advisorNote, severity: "info" });
+        messages.push(makeMessage(`turn-${turn}-advisor`, "system", advisorNote));
+      }
 
       const chatRequest = ChatRequestSchema.parse({
         system,
         messages,
         tools,
         tool_choice: request.tool_choice.mode,
-        max_tokens: request.max_tokens ?? 4096,
+        max_tokens: maxTokens,
         temperature: request.temperature,
         top_p: request.top_p,
         stop_sequences: request.stop_sequences,
@@ -374,13 +467,34 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 
   private async executeSubagent(input: SubagentTaskInput): Promise<SubagentTaskResult> {
-    const provider = this.router.get("main");
+    let specialist: SpecialistAgentProfile | undefined;
+    if (input.agent) {
+      specialist = await this.specialistAgents.getAgent(input.agent);
+    }
+    if (!specialist) {
+      const mention = await this.specialistAgents.parseMention(input.task);
+      if (mention?.profile) {
+        specialist = mention.profile;
+      }
+    }
+
+    const requestedRole = specialist?.roleModel ?? "main";
+    const provider = this.router.get(
+      requestedRole === "advisor" || requestedRole === "fast" || requestedRole === "main"
+        ? requestedRole
+        : "main",
+    );
     const messages: Message[] = [];
     const scope = input.worktreePath
       ? `Work only inside this directory: ${input.worktreePath}\n\n`
       : "";
     messages.push(makeMessage("subagent-task", "user", `${scope}${input.task}`));
     const totals = zeroUsage();
+
+    let tools = this.registry.listDefinitions();
+    if (specialist) {
+      tools = this.specialistAgents.filterTools(specialist, tools);
+    }
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
       for (const instruction of input.drainSteerings()) {
@@ -390,9 +504,10 @@ export class AgentOrchestrator implements IAgentRunner {
 
       const accumulator = new TurnAccumulator();
       const chatRequest = ChatRequestSchema.parse({
+        system: specialist?.systemPrompt,
         messages,
-        tools: this.registry.listDefinitions(),
-        max_tokens: 4096,
+        tools,
+        max_tokens: specialist?.thinkingBudget ? Math.max(4096, specialist.thinkingBudget) : 4096,
       });
       for await (const event of provider.streamChat(chatRequest, input.signal)) {
         if (event.type === "token") {
@@ -421,7 +536,8 @@ export class AgentOrchestrator implements IAgentRunner {
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         input.onTranscript(`[tool] ${call.name}`);
-        const result = await this.registry.run(call, "build");
+        const effectiveMode = specialist?.readOnly ? "plan" : "build";
+        const result = await this.registry.run(call, effectiveMode);
         messages.push(
           toolResultMessage(call, typeof result.content === "string" ? result.content : JSON.stringify(result.content), result.is_error),
         );
@@ -441,10 +557,17 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 
   private async collectDiagnostics(filePath: string, newContent: string): Promise<string | undefined> {
-    if (!this.lsp) return undefined;
     try {
-      const diagnostics = await this.lsp.notifyFileChanged(filePath, newContent);
+      let diagnostics: LSPDiagnostic[] = [];
+      if (this.lsp && this.lsp.isReady()) {
+        diagnostics = await this.lsp.notifyFileChanged(filePath, newContent);
+      }
+      if (diagnostics.length === 0 && (filePath.endsWith(".ts") || filePath.endsWith(".tsx"))) {
+        diagnostics = await runTscDiagnostics(this.root, filePath);
+      }
       if (diagnostics.length === 0) return "lsp diagnostics: none";
+      const selfHealingPrompt = await buildSelfHealingPrompt(filePath, diagnostics, this.root);
+      if (selfHealingPrompt) return selfHealingPrompt;
       return [
         `lsp diagnostics (${diagnostics.length}):`,
         ...diagnostics.map((item) => `- ${item.file}:${item.line}:${item.column} ${item.severity}: ${item.message}`),

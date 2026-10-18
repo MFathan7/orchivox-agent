@@ -30,6 +30,27 @@ export class ProviderRouter {
     return this.provider(ref.provider, ref.model);
   }
 
+  getRole(role: ProviderRole): { provider: string; model: string } | undefined {
+    return this.config.roles[ROLE_MODEL_KEYS[role]];
+  }
+
+  setRole(role: ProviderRole, provider: string, model: string): void {
+    const profile = this.config.providers[provider];
+    if (!profile) throw new Error(`unknown provider profile "${provider}"`);
+    this.config.roles[ROLE_MODEL_KEYS[role]] = { provider, model };
+  }
+
+  listAllConfiguredModels(): Array<{ provider: string; model: string; kind: string }> {
+    const list: Array<{ provider: string; model: string; kind: string }> = [];
+    for (const [providerName, profile] of Object.entries(this.config.providers)) {
+      if (!profile.enabled) continue;
+      for (const model of profile.models) {
+        list.push({ provider: providerName, model, kind: profile.kind });
+      }
+    }
+    return list;
+  }
+
   provider(profileName: string, model?: string): LLMProvider {
     const profile = this.config.providers[profileName];
     if (!profile) throw new Error(`unknown provider profile "${profileName}"`);

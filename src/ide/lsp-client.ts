@@ -19,6 +19,15 @@ export interface LSPTextEdit {
   newText: string;
 }
 
+export interface LSPWorkspaceSymbol {
+  name: string;
+  kind: string;
+  containerName?: string;
+  file: string;
+  line: number;
+  column: number;
+}
+
 export interface LSPClientOptions {
   command: string;
   args?: string[];
@@ -159,6 +168,33 @@ export class LSPClient {
       changed.push(file);
     }
     return changed;
+  }
+
+  isReady(): boolean {
+    return Boolean(this.transport);
+  }
+
+  async hover(filePath: string, line: number, column: number): Promise<string | null> {
+    if (!this.transport) return null;
+    try {
+      const result = await this.request("textDocument/hover", {
+        textDocument: { uri: pathToFileURL(filePath).toString() },
+        position: { line: line - 1, character: column - 1 },
+      });
+      return formatHover(result);
+    } catch {
+      return null;
+    }
+  }
+
+  async workspaceSymbols(query: string): Promise<LSPWorkspaceSymbol[]> {
+    if (!this.transport) return [];
+    try {
+      const result = await this.request("workspace/symbol", { query });
+      return formatWorkspaceSymbols(result);
+    } catch {
+      return [];
+    }
   }
 
   registerTools(registry: ToolRegistry): void {
@@ -400,4 +436,95 @@ function languageIdFor(filePath: string): string {
     default:
       return "plaintext";
   }
+}
+
+function formatHover(raw: unknown): string | null {
+  if (!raw || typeof raw !== "object") return null;
+  const hover = raw as { contents?: unknown };
+  if (!hover.contents) return null;
+
+  if (typeof hover.contents === "string") {
+    return hover.contents;
+  }
+  if (Array.isArray(hover.contents)) {
+    return hover.contents
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && "value" in part) {
+          const typed = part as { language?: string; value: string };
+          return typed.language ? `\`\`\`${typed.language}\n${typed.value}\n\`\`\`` : typed.value;
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n\n");
+  }
+  if (typeof hover.contents === "object") {
+    const obj = hover.contents as { kind?: string; value?: string; language?: string };
+    if (obj.value) {
+      return obj.language ? `\`\`\`${obj.language}\n${obj.value}\n\`\`\`` : obj.value;
+    }
+  }
+  return null;
+}
+
+const LSP_SYMBOL_KINDS: Record<number, string> = {
+  1: "file",
+  2: "module",
+  3: "namespace",
+  4: "package",
+  5: "class",
+  6: "method",
+  7: "property",
+  8: "field",
+  9: "constructor",
+  10: "enum",
+  11: "interface",
+  12: "function",
+  13: "variable",
+  14: "constant",
+  15: "string",
+  16: "number",
+  17: "boolean",
+  18: "array",
+  19: "object",
+  20: "key",
+  21: "null",
+  22: "enum-member",
+  23: "struct",
+  24: "event",
+  25: "operator",
+  26: "type-parameter",
+};
+
+function formatWorkspaceSymbols(raw: unknown): LSPWorkspaceSymbol[] {
+  if (!Array.isArray(raw)) return [];
+  const results: LSPWorkspaceSymbol[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as {
+      name?: string;
+      kind?: number;
+      containerName?: string;
+      location?: {
+        uri?: string;
+        range?: RawRange;
+      };
+    };
+    if (!entry.name || !entry.location?.uri) continue;
+    const uri = entry.location.uri;
+    const file = uri.startsWith("file:") ? fileURLToPath(uri) : uri;
+    const line = (entry.location.range?.start.line ?? 0) + 1;
+    const column = (entry.location.range?.start.character ?? 0) + 1;
+    const kind = (entry.kind && LSP_SYMBOL_KINDS[entry.kind]) || "symbol";
+    results.push({
+      name: entry.name,
+      kind,
+      containerName: entry.containerName,
+      file,
+      line,
+      column,
+    });
+  }
+  return results;
 }

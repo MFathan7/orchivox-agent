@@ -55,6 +55,35 @@ export class SnapshotManager {
     return this.step(1);
   }
 
+  async getHistory(): Promise<SnapshotHistory> {
+    return this.readHistory();
+  }
+
+  async restoreTo(snapshotId: string): Promise<RestoreResult> {
+    const history = await this.readHistory();
+    const index = history.entries.findIndex((entry) => entry.id === snapshotId);
+    if (index === -1) throw new Error(`unknown snapshot "${snapshotId}"`);
+    const target = history.entries[index];
+    const restoredFiles = await this.restore(target.tree);
+    history.cursor = index;
+    await this.writeHistory(history);
+    return { snapshotId: target.id, restoredFiles };
+  }
+
+  async getChangedFiles(snapshotId: string): Promise<string[]> {
+    const history = await this.readHistory();
+    const index = history.entries.findIndex((entry) => entry.id === snapshotId);
+    if (index === -1) return [];
+    const current = history.entries[index];
+    const previous = index > 0 ? history.entries[index - 1] : undefined;
+    if (!previous) {
+      const { stdout } = await runGit(this.root, ["diff-tree", "--no-commit-id", "--name-only", "-r", current.tree]).catch(() => ({ stdout: "" }));
+      return stdout.split("\n").filter(Boolean);
+    }
+    const { stdout } = await runGit(this.root, ["diff-tree", "--no-commit-id", "--name-only", "-r", previous.tree, current.tree]).catch(() => ({ stdout: "" }));
+    return stdout.split("\n").filter(Boolean);
+  }
+
   private async step(direction: -1 | 1): Promise<RestoreResult> {
     const history = await this.readHistory();
     const nextCursor = history.cursor + direction;

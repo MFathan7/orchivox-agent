@@ -7,6 +7,7 @@ import type { WorktreeManager } from "../vcs/worktree";
 
 export interface SubagentTaskInput {
   workerId: string;
+  agent?: string;
   task: string;
   outputJsonSchema?: JsonSchemaObject;
   writeIsolation: boolean;
@@ -26,6 +27,7 @@ export type SubagentExecutor = (input: SubagentTaskInput) => Promise<SubagentTas
 
 export interface SubagentWorkerState {
   id: string;
+  agent?: string;
   task: string;
   status: SubagentState;
   transcript: string[];
@@ -70,6 +72,7 @@ export class SubagentManager {
 
   spawnOne(input: {
     id?: string;
+    agent?: string;
     task: string;
     outputJsonSchema?: JsonSchemaObject;
     writeIsolation?: boolean;
@@ -82,9 +85,18 @@ export class SubagentManager {
     }
     if (this.workers.has(id)) throw new Error(`worker "${id}" already exists`);
 
+    let resolvedAgent = input.agent;
+    if (!resolvedAgent) {
+      const match = /^@([a-zA-Z0-9_-]+)\s+([\s\S]*)$/.exec(input.task.trim());
+      if (match) {
+        resolvedAgent = match[1];
+      }
+    }
+
     const controller = new AbortController();
     const worker: SubagentWorkerState = {
       id,
+      agent: resolvedAgent,
       task: input.task,
       status: "queued",
       transcript: [],
@@ -107,7 +119,7 @@ export class SubagentManager {
   }
 
   async spawn(
-    tasks: Array<{ id?: string; task: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean }>,
+    tasks: Array<{ id?: string; agent?: string; task: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean }>,
   ): Promise<SubagentResult[]> {
     const workers = tasks.map((task) => this.spawnOne(task));
     await Promise.all(tasks.map((_, index) => this.completions.get(workers[index].id)));
@@ -163,6 +175,7 @@ export class SubagentManager {
     try {
       const result = await this.executor({
         workerId: worker.id,
+        agent: worker.agent,
         task: buildTaskText(worker.task, input.outputJsonSchema),
         outputJsonSchema: input.outputJsonSchema,
         writeIsolation,
@@ -247,6 +260,7 @@ export class SubagentManager {
           .array(
             z.object({
               id: z.string().min(1).optional(),
+              agent: z.string().min(1).optional(),
               task: z.string().min(1),
               outputJsonSchema: z.record(z.string(), z.unknown()).optional(),
               writeIsolation: z.boolean().default(true),
@@ -257,7 +271,7 @@ export class SubagentManager {
       readOnly: false,
       execute: async (args) => {
         const request = args as {
-          tasks: Array<{ id?: string; task: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean }>;
+          tasks: Array<{ id?: string; agent?: string; task: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean }>;
         };
         const results = await this.spawn(request.tasks);
         return results
