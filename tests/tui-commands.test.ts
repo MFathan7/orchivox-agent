@@ -48,7 +48,7 @@ describe("Orchivox TUI & Commands Polish", () => {
       { input: "/theme catppuccin", command: "/theme", args: "catppuccin" },
       { input: "/reasoning high", command: "/reasoning", args: "high" },
       { input: "/palette", command: "/palette", args: "" },
-      { input: "/model", command: "/model", args: "" },
+      { input: "/models", command: "/models", args: "" },
       { input: "/sessions", command: "/sessions", args: "" },
       { input: "/fork", command: "/fork", args: "" },
       { input: "/timeline", command: "/timeline", args: "" },
@@ -82,7 +82,8 @@ describe("Orchivox TUI & Commands Polish", () => {
     expect(names).toContain("/theme");
     expect(names).toContain("/reasoning");
     expect(names).toContain("/palette");
-    expect(names).toContain("/model");
+    expect(names).toContain("/models");
+    expect(names).not.toContain("/model");
     expect(names).toContain("/sessions");
     expect(names).toContain("/fork");
     expect(names).toContain("/timeline");
@@ -138,5 +139,31 @@ describe("Orchivox TUI & Commands Polish", () => {
     state = simulateKeyInput(state.text, "\x7f", state.cursor);
     expect(state.text).toBe("hel");
     expect(state.text).not.toContain("\x7f");
+  });
+
+  it("simulates forward delete key at cursor position 0 and middle cleanly", () => {
+    function simulateForwardDelete(currentText: string, cursorPos: number): { text: string; cursor: number } {
+      if (cursorPos < currentText.length) {
+        const before = currentText.slice(0, cursorPos);
+        const after = currentText.slice(cursorPos + 1);
+        return { text: `${before}${after}`, cursor: cursorPos };
+      }
+      return { text: currentText, cursor: cursorPos };
+    }
+
+    // At position 0, deletes first char 'h'
+    const res1 = simulateForwardDelete("hello", 0);
+    expect(res1.text).toBe("ello");
+    expect(res1.cursor).toBe(0);
+
+    // In middle of text at position 2, deletes 'l'
+    const res2 = simulateForwardDelete("hello", 2);
+    expect(res2.text).toBe("helo");
+    expect(res2.cursor).toBe(2);
+
+    // At end of text, does not crash or modify
+    const res3 = simulateForwardDelete("hello", 5);
+    expect(res3.text).toBe("hello");
+    expect(res3.cursor).toBe(5);
   });
 });

@@ -10,6 +10,7 @@ export type ReasoningEffortLevel = "off" | "low" | "medium" | "high" | "max";
 export interface PaletteItem {
   id: string;
   category: "model" | "reasoning" | "theme" | "action";
+  section: string;
   title: string;
   subtitle?: string;
   badge?: string;
@@ -21,9 +22,9 @@ export interface CommandPaletteModalProps {
   router: ProviderRouter;
   currentTheme?: ThemeName;
   reasoningEffort?: ReasoningEffortLevel;
-  onSelectModel?: (role: ProviderRole, provider: string, model: string) => void;
   onSelectReasoning?: (effort: ReasoningEffortLevel) => void;
   onSelectTheme?: (theme: ThemeName) => void;
+  onOpenModels?: () => void;
   onAction?: (actionKey: string) => void;
   onClose: () => void;
   theme?: Theme;
@@ -42,9 +43,9 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     router,
     currentTheme = "tokyonight",
     reasoningEffort = "medium",
-    onSelectModel,
     onSelectReasoning,
     onSelectTheme,
+    onOpenModels,
     onAction,
     onClose,
     theme = getTheme(currentTheme),
@@ -55,143 +56,104 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
 
   const items = React.useMemo(() => {
     const list: PaletteItem[] = [];
-
-    const configuredModels = router.listAllConfiguredModels();
     const roles: ProviderRole[] = ["main", "fast", "advisor"];
 
     for (const role of roles) {
       const active = router.getRole(role);
-      for (const entry of configuredModels) {
-        const isCurrent = active?.provider === entry.provider && active?.model === entry.model;
-        list.push({
-          id: `model-${role}-${entry.provider}-${entry.model}`,
-          category: "model",
-          title: `Set ${role.toUpperCase()} -> ${entry.provider}: ${entry.model}`,
-          subtitle: `${entry.kind} provider`,
-          badge: isCurrent ? "ACTIVE" : undefined,
-          isCurrent,
-          onExecute: () => {
-            router.setRole(role, entry.provider, entry.model);
-            onSelectModel?.(role, entry.provider, entry.model);
-            onClose();
-          },
-        });
-      }
+      list.push({
+        id: `role-${role}`,
+        category: "model",
+        section: "Model roles",
+        title: active ? `${role}: ${active.provider} / ${active.model}` : `${role}: not configured`,
+        subtitle: active ? "Change in the model manager" : "Connect a provider first",
+        badge: active ? undefined : "EMPTY",
+        onExecute: () => {
+          onOpenModels?.();
+          onClose();
+        },
+      });
     }
 
-    for (const lvl of REASONING_LEVELS) {
-      const isCurrent = reasoningEffort === lvl.id;
+    for (const level of REASONING_LEVELS) {
+      const isCurrent = reasoningEffort === level.id;
       list.push({
-        id: `reasoning-${lvl.id}`,
+        id: `reasoning-${level.id}`,
         category: "reasoning",
-        title: `Thinking Effort: ${lvl.label}`,
-        subtitle: lvl.description,
+        section: "Thinking effort",
+        title: level.label,
+        subtitle: level.description,
         badge: isCurrent ? "ACTIVE" : undefined,
         isCurrent,
         onExecute: () => {
-          onSelectReasoning?.(lvl.id);
+          onSelectReasoning?.(level.id);
           onClose();
         },
       });
     }
 
-    for (const th of THEME_ORDER) {
-      const isCurrent = currentTheme === th;
+    for (const name of THEME_ORDER) {
+      const isCurrent = currentTheme === name;
       list.push({
-        id: `theme-${th}`,
+        id: `theme-${name}`,
         category: "theme",
-        title: `Change Theme: ${th}`,
-        subtitle: `Terminal color theme preset for ${th}`,
+        section: "Theme",
+        title: name,
+        subtitle: isCurrent ? "Current preset" : "Switch preset",
         badge: isCurrent ? "ACTIVE" : undefined,
         isCurrent,
         onExecute: () => {
-          onSelectTheme?.(th);
+          onSelectTheme?.(name);
           onClose();
         },
       });
     }
 
-    list.push(
-      {
-        id: "action-commit",
+    const actions: Array<{ key: string; title: string; subtitle: string }> = [
+      { key: "open_models", title: "Model manager", subtitle: "Roles, providers, and connections (/models)" },
+      { key: "open_skills", title: "Skills", subtitle: "Inspect installed skills (/skills)" },
+      { key: "open_tasks", title: "Task board", subtitle: "Multi-agent tasks and results (/tasks)" },
+      { key: "open_sessions", title: "Sessions", subtitle: "Browse, search, fork, and restore (Ctrl+S)" },
+      { key: "open_timeline", title: "Snapshot timeline", subtitle: "Inspect and restore file changes" },
+      { key: "open_fork", title: "Fork session", subtitle: "Branch the active conversation" },
+      { key: "open_hub", title: "Subagent hub", subtitle: "Inspect and steer workers (Alt+A)" },
+      { key: "toggle_sidebar", title: "Toggle sidebar", subtitle: "Show or hide workspace status (Ctrl+B)" },
+      { key: "run_commit", title: "Atomic commit", subtitle: "Split changes into commits (/commit)" },
+      { key: "run_compact", title: "Compact context", subtitle: "Summarize history to save tokens (/compact)" },
+      { key: "run_plugins", title: "List plugins", subtitle: "Show active plugins (/plugins)" },
+    ];
+
+    for (const action of actions) {
+      list.push({
+        id: `action-${action.key}`,
         category: "action",
-        title: "Atomic Git Commit (/commit)",
-        subtitle: "Split working tree changes into atomic commits",
+        section: "Actions",
+        title: action.title,
+        subtitle: action.subtitle,
         onExecute: () => {
-          onAction?.("/commit");
+          onAction?.(action.key);
           onClose();
         },
-      },
-      {
-        id: "action-compact",
-        category: "action",
-        title: "Compact Context Window (/compact)",
-        subtitle: "Summarize conversation history to save context tokens",
-        onExecute: () => {
-          onAction?.("/compact");
-          onClose();
-        },
-      },
-      {
-        id: "action-plugins",
-        category: "action",
-        title: "List Active Plugins (/plugins)",
-        subtitle: "Inspect status of loaded agent plugins",
-        onExecute: () => {
-          onAction?.("/plugins");
-          onClose();
-        },
-      },
-      {
-        id: "action-sidebar",
-        category: "action",
-        title: "Toggle Workspace Sidebar (Ctrl+B)",
-        subtitle: "Show or hide the right workspace status sidebar",
-        onExecute: () => {
-          onAction?.("toggle_sidebar");
-          onClose();
-        },
-      },
-      {
-        id: "action-hub",
-        category: "action",
-        title: "Open Subagent Hub (Alt+A)",
-        subtitle: "Manage background subagent workers and steering",
-        onExecute: () => {
-          onAction?.("open_hub");
-          onClose();
-        },
-      },
-      {
-        id: "action-sessions",
-        category: "action",
-        title: "Session Time-Travel Manager (Ctrl+S)",
-        subtitle: "Browse past conversations, fork sessions, or restore snapshots",
-        onExecute: () => {
-          onAction?.("open_sessions");
-          onClose();
-        },
-      },
-    );
+      });
+    }
 
     return list;
-  }, [router, currentTheme, reasoningEffort, onSelectModel, onSelectReasoning, onSelectTheme, onAction, onClose]);
+  }, [router, currentTheme, reasoningEffort, onSelectReasoning, onSelectTheme, onOpenModels, onAction, onClose]);
 
-  const filteredItems = React.useMemo(() => {
+  const source = React.useMemo(() => {
     const trimmed = query.trim();
-    if (!trimmed) return items;
-    const ranked = filterFuzzy(trimmed, items, (item) => `${item.category} ${item.title} ${item.subtitle ?? ""}`, 50);
-    return ranked.map((r) => r.item);
+    if (!trimmed) return items.filter((item) => item.category === "action");
+    const ranked = filterFuzzy(trimmed, items, (item) => `${item.section} ${item.title} ${item.subtitle ?? ""}`, 50);
+    return ranked.map((entry) => entry.item);
   }, [items, query]);
 
   const maxVisible = 10;
-  const clampedIndex = Math.max(0, Math.min(filteredItems.length - 1, selectedIndex));
+  const clampedIndex = Math.max(0, Math.min(source.length - 1, selectedIndex));
   const halfWindow = Math.floor(maxVisible / 2);
   let startIndex = Math.max(0, clampedIndex - halfWindow);
-  if (startIndex + maxVisible > filteredItems.length) {
-    startIndex = Math.max(0, filteredItems.length - maxVisible);
+  if (startIndex + maxVisible > source.length) {
+    startIndex = Math.max(0, source.length - maxVisible);
   }
-  const visibleItems = filteredItems.slice(startIndex, startIndex + maxVisible);
+  const visibleItems = source.slice(startIndex, startIndex + maxVisible);
 
   useInput((input, key) => {
     if (key.escape) {
@@ -200,96 +162,78 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     }
 
     if (key.upArrow) {
-      setSelectedIndex((prev) => (prev > 0 ? prev - 1 : filteredItems.length - 1));
+      setSelectedIndex((prev) => (prev > 0 ? prev - 1 : Math.max(0, source.length - 1)));
       return;
     }
 
     if (key.downArrow) {
-      setSelectedIndex((prev) => (prev < filteredItems.length - 1 ? prev + 1 : 0));
+      setSelectedIndex((prev) => (prev < source.length - 1 ? prev + 1 : 0));
       return;
     }
 
     if (key.return) {
-      const selected = filteredItems[clampedIndex];
-      if (selected) {
-        selected.onExecute();
-      }
+      const selected = source[clampedIndex];
+      selected?.onExecute();
       return;
     }
 
-    const isBackspace = Boolean(key.backspace || key.delete || input === "\x7f" || input === "\b" || input === "\x1b[3~");
-
+    const isBackspace = Boolean(key.backspace || input === "\x7f" || input === "\b" || input === "\x1b[3~");
     if (isBackspace) {
       setQuery((prev) => prev.slice(0, -1));
       setSelectedIndex(0);
       return;
     }
 
-    if (!key.ctrl && !key.meta && !isBackspace && input.length > 0 && input >= " " && input !== "\x7f") {
+    if (!key.ctrl && !key.meta && input.length > 0 && input >= " " && input !== "\x7f" && !input.startsWith("\x1b")) {
       setQuery((prev) => prev + input);
       setSelectedIndex(0);
     }
   });
 
-  return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={theme.border.active}
-      paddingX={1}
-      marginY={1}
-    >
-      <Box justifyContent="space-between" marginBottom={0}>
-        <Text bold color={theme.accent}>
-          COMMAND PALETTE &amp; SETTINGS
-        </Text>
-        <Text dimColor>
-          {filteredItems.length} options available  |  Esc Close
-        </Text>
-      </Box>
+  let lastSection = "";
 
-      <Box borderStyle="single" borderColor={theme.border.passive} paddingX={1} marginY={0}>
-        <Text color={theme.accent} bold>
-          &gt;{" "}
-        </Text>
-        <Text>{query}</Text>
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <Box justifyContent="space-between">
+        <Text bold color={theme.text}>Palette</Text>
+        <Text color={theme.muted}>{source.length} matches · Esc close</Text>
+      </Box>
+      <Box borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
+        <Text color={theme.accent} bold>❯ </Text>
+        <Text color={theme.text}>{query}</Text>
         <Text inverse color={theme.accent}> </Text>
         {query.length === 0 ? (
-          <Text dimColor>Type to search models, reasoning, themes, or actions...</Text>
+          <Text color={theme.muted}>  Type to search models, thinking effort, themes, and actions</Text>
         ) : null}
       </Box>
 
-      <Box flexDirection="column" marginY={1}>
+      <Box flexDirection="column" marginTop={0}>
         {visibleItems.length === 0 ? (
-          <Text dimColor>No actions match your search.</Text>
+          <Text color={theme.muted}>No matches. Try a shorter query.</Text>
         ) : (
-          visibleItems.map((item, idx) => {
-            const actualIndex = startIndex + idx;
+          visibleItems.map((item, index) => {
+            const actualIndex = startIndex + index;
             const isSelected = actualIndex === clampedIndex;
-
-            let catColor = theme.muted;
-            if (item.category === "model") catColor = theme.modes.plan.primary;
-            if (item.category === "reasoning") catColor = theme.modes.ultrawork.primary;
-            if (item.category === "theme") catColor = theme.modes.build.primary;
-            if (item.category === "action") catColor = theme.accent;
+            const showSection = item.section !== lastSection;
+            lastSection = item.section;
 
             return (
-              <Box key={item.id} justifyContent="space-between">
-                <Box>
-                  <Text color={isSelected ? theme.accent : undefined} bold={isSelected}>
-                    {isSelected ? "❯ " : "  "}
-                  </Text>
-                  <Text color={catColor}>{item.category.toUpperCase()} </Text>
-                  <Text color={isSelected ? theme.accent : undefined} bold={isSelected}>
-                    {item.title}
-                  </Text>
-                  {item.subtitle ? <Text dimColor> · {item.subtitle}</Text> : null}
-                </Box>
-                {item.badge ? (
-                  <Text color={theme.modes.build.primary} bold>
-                    {item.badge}
-                  </Text>
+              <Box key={item.id} flexDirection="column">
+                {showSection ? (
+                  <Text bold color={theme.modes.plan.primary}>{item.section}</Text>
                 ) : null}
+                <Box justifyContent="space-between">
+                  <Box>
+                    <Text color={isSelected ? theme.accent : theme.muted}>{isSelected ? "❯ " : "  "}</Text>
+                    <Text color={isSelected ? theme.text : theme.text} bold={isSelected}>{item.title}</Text>
+                    {item.subtitle ? <Text color={theme.muted}> · {item.subtitle}</Text> : null}
+                  </Box>
+                  {item.badge ? (
+                    <Text color={item.badge === "EMPTY" ? theme.badge.error : theme.modes.build.primary} bold>
+                      {item.badge}
+                    </Text>
+                  ) : null}
+                </Box>
               </Box>
             );
           })
@@ -297,11 +241,9 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       </Box>
 
       <Box justifyContent="space-between">
-        <Text dimColor>
-          Navigate: Up/Down · Select: Enter · Close: Esc
-        </Text>
-        <Text dimColor>
-          {clampedIndex + 1} of {filteredItems.length}
+        <Text color={theme.muted}>Up/Down move · Enter select · Esc close</Text>
+        <Text color={theme.muted}>
+          {source.length === 0 ? "0 of 0" : `${clampedIndex + 1} of ${source.length}`}
         </Text>
       </Box>
     </Box>

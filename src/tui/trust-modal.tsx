@@ -2,11 +2,13 @@ import React from "react";
 import { Box, Text, useInput } from "ink";
 
 import { OrchivoxLogo } from "./logo";
+import { getTheme, type Theme } from "./theme";
 
 export interface WorkspaceTrustPromptProps {
   workspacePath: string;
   onTrust: () => void;
   onExit: () => void;
+  theme?: Theme;
 }
 
 const OPTIONS = [
@@ -18,6 +20,7 @@ export function WorkspaceTrustPrompt({
   workspacePath,
   onTrust,
   onExit,
+  theme = getTheme("tokyonight"),
 }: WorkspaceTrustPromptProps): React.ReactElement {
   const [selectedIndex, setSelectedIndex] = React.useState(0);
 
@@ -45,29 +48,29 @@ export function WorkspaceTrustPrompt({
   });
 
   return (
-    <Box flexDirection="column" paddingX={2} paddingY={1} borderStyle="round" borderColor="#38bdf8">
+    <Box flexDirection="column" paddingX={2} paddingY={1} borderStyle="round" borderColor={theme.border.active}>
       <Box marginBottom={1} gap={1} alignItems="center">
-        <OrchivoxLogo variant="compact" />
-        <Text bold color="#38bdf8">
-          Workspace Trust Verification
+        <OrchivoxLogo variant="compact" theme={theme} />
+        <Text bold color={theme.text}>
+          Workspace trust
         </Text>
       </Box>
 
       <Box marginBottom={1} flexDirection="column">
-        <Text bold color="white">
+        <Text bold color={theme.text}>
           Do you trust the authors of the files in this workspace folder?
         </Text>
-        <Box marginTop={1} paddingX={1} borderStyle="single" borderColor="gray">
-          <Text color="#38bdf8">{workspacePath}</Text>
+        <Box marginTop={1} paddingX={1} borderStyle="single" borderColor={theme.border.passive}>
+          <Text color={theme.accent}>{workspacePath}</Text>
         </Box>
       </Box>
 
       <Box marginBottom={1} flexDirection="column">
-        <Text color="gray">
+        <Text color={theme.muted}>
           Trusting allows Orchivox to execute tools, run commands, and read files in this directory.
         </Text>
-        <Text color="gray">
-          If you do not trust this workspace, Orchivox will safely exit.
+        <Text color={theme.muted}>
+          If you do not trust this workspace, Orchivox will exit.
         </Text>
       </Box>
 
@@ -76,13 +79,10 @@ export function WorkspaceTrustPrompt({
           const isSelected = index === selectedIndex;
           return (
             <Box key={option.id} gap={1}>
-              <Text bold color={isSelected ? "#38bdf8" : "gray"}>
+              <Text bold color={isSelected ? theme.accent : theme.muted}>
                 {isSelected ? "❯" : " "}
               </Text>
-              <Text
-                bold={isSelected}
-                color={isSelected ? "cyan" : "gray"}
-              >
+              <Text bold={isSelected} color={isSelected ? theme.text : theme.muted}>
                 {option.label}
               </Text>
             </Box>
@@ -91,8 +91,8 @@ export function WorkspaceTrustPrompt({
       </Box>
 
       <Box marginTop={1}>
-        <Text dimColor color="gray">
-          Use ↑ / ↓ to navigate · Enter to select · Esc to exit
+        <Text color={theme.muted}>
+          Up/Down navigate · Enter select · Esc exit
         </Text>
       </Box>
     </Box>

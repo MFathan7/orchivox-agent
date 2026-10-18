@@ -49,7 +49,7 @@ export const THEMES: Record<ThemeName, Theme> = {
     name: "tokyonight",
     background: "#1a1b26",
     text: "#c0caf5",
-    muted: "#565f89",
+    muted: "#7a86b8",
     accent: "#7aa2f7",
     modes: {
       plan: { primary: "#7dcfff", secondary: "#bb9af7" },
@@ -59,13 +59,13 @@ export const THEMES: Record<ThemeName, Theme> = {
     diff: { added: "#9ece6a", removed: "#f7768e", hunkHeader: "#7aa2f7" },
     border: { active: "#7aa2f7", passive: "#3b4261" },
     badge: { running: "#e0af68", ok: "#9ece6a", error: "#f7768e", idle: "#565f89" },
-    syntax: { keyword: "#bb9af7", string: "#9ece6a", comment: "#565f89", number: "#e0af68", type: "#7dcfff" },
+    syntax: { keyword: "#bb9af7", string: "#9ece6a", comment: "#7a86b8", number: "#e0af68", type: "#7dcfff" },
   },
   catppuccin: {
     name: "catppuccin",
     background: "#1e1e2e",
     text: "#cdd6f4",
-    muted: "#6c7086",
+    muted: "#9399b2",
     accent: "#89b4fa",
     modes: {
       plan: { primary: "#89dceb", secondary: "#cba6f7" },
@@ -75,13 +75,13 @@ export const THEMES: Record<ThemeName, Theme> = {
     diff: { added: "#a6e3a1", removed: "#f38ba8", hunkHeader: "#89b4fa" },
     border: { active: "#89b4fa", passive: "#45475a" },
     badge: { running: "#f9e2af", ok: "#a6e3a1", error: "#f38ba8", idle: "#6c7086" },
-    syntax: { keyword: "#cba6f7", string: "#a6e3a1", comment: "#6c7086", number: "#fab387", type: "#89dceb" },
+    syntax: { keyword: "#cba6f7", string: "#a6e3a1", comment: "#9399b2", number: "#fab387", type: "#89dceb" },
   },
   gruvbox: {
     name: "gruvbox",
     background: "#282828",
     text: "#ebdbb2",
-    muted: "#928374",
+    muted: "#a89984",
     accent: "#83a598",
     modes: {
       plan: { primary: "#8ec07c", secondary: "#d3869b" },
@@ -91,7 +91,7 @@ export const THEMES: Record<ThemeName, Theme> = {
     diff: { added: "#b8bb26", removed: "#fb4934", hunkHeader: "#83a598" },
     border: { active: "#83a598", passive: "#504945" },
     badge: { running: "#fabd2f", ok: "#b8bb26", error: "#fb4934", idle: "#928374" },
-    syntax: { keyword: "#d3869b", string: "#b8bb26", comment: "#928374", number: "#fabd2f", type: "#8ec07c" },
+    syntax: { keyword: "#d3869b", string: "#b8bb26", comment: "#a89984", number: "#fabd2f", type: "#8ec07c" },
   },
   monochrome: {
     name: "monochrome",

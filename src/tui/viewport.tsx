@@ -50,6 +50,7 @@ export interface WorkspaceSidebarProps {
 export interface ScrollableChatViewportProps {
   entries: ChatEntryView[];
   streamingText?: string;
+  liveEntry?: ChatEntryView;
   width: number;
   height: number;
   theme?: Theme;
@@ -57,6 +58,7 @@ export interface ScrollableChatViewportProps {
   active?: boolean;
   repoPath?: string;
   branch?: string;
+  resetKey?: string;
 }
 
 export interface SplitPaneViewportProps extends ScrollableChatViewportProps {
@@ -126,13 +128,23 @@ export function useTerminalSize(): ScreenSize {
   return size;
 }
 
+export function countWrappedLines(text: string, width: number): number {
+  const safeWidth = Math.max(1, width);
+  if (text.length === 0) return 1;
+  return text
+    .split("\n")
+    .reduce((total, line) => total + Math.max(1, Math.ceil(line.length / safeWidth)), 0);
+}
+
 export function estimateEntryLines(entry: ChatEntryView, width: number, collapsed: boolean): number {
   const safeWidth = Math.max(width, 20);
-  let lines = Math.max(1, Math.ceil(entry.text.length / safeWidth));
+  let lines = countWrappedLines(entry.text, safeWidth);
   if (entry.thinking) {
-    lines += collapsed ? 1 : 1 + entry.thinking.split("\n").length;
+    lines += collapsed ? 1 : 1 + countWrappedLines(entry.thinking, safeWidth - 2);
   }
   lines += entry.toolCalls?.length ?? 0;
+  lines += (entry.files?.length ?? 0) * (collapsed ? 1 : 10);
+  if (entry.live) lines += 1;
   if (entry.diff) lines += collapsed ? 1 : 10;
   return lines;
 }
@@ -156,15 +168,31 @@ export function selectWindow(
   return selected;
 }
 
-export function formatProgressBar(done: number, total: number, width = 12): string {
+export function formatProgressBar(done: number, total: number, width = 8): string {
   const ratio = total === 0 ? 0 : Math.min(1, done / total);
   const filled = Math.round(ratio * width);
-  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}] ${Math.round(ratio * 100)}% (${done}/${total})`;
+  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}] ${done}/${total}`;
+}
+
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function useSpinner(active: boolean): string {
+  const [frame, setFrame] = React.useState(0);
+  React.useEffect(() => {
+    if (!active) {
+      setFrame(0);
+      return;
+    }
+    const timer = setInterval(() => setFrame((value) => (value + 1) % SPINNER_FRAMES.length), 110);
+    return () => clearInterval(timer);
+  }, [active]);
+  return SPINNER_FRAMES[frame % SPINNER_FRAMES.length];
 }
 
 export function ScrollableChatViewport({
   entries,
   streamingText,
+  liveEntry,
   width,
   height,
   theme = getTheme("tokyonight"),
@@ -172,10 +200,10 @@ export function ScrollableChatViewport({
   active = true,
   repoPath,
   branch,
+  resetKey,
 }: ScrollableChatViewportProps): React.ReactElement {
   const [offsetFromBottom, setOffsetFromBottom] = React.useState(0);
   const [collapsed, setCollapsed] = React.useState(initiallyCollapsed);
-  const halfPage = Math.max(1, Math.floor(height / 2));
 
   useInput(
     (input, key) => {
@@ -187,15 +215,7 @@ export function ScrollableChatViewport({
         setOffsetFromBottom((value) => Math.max(0, value - height));
         return;
       }
-      if (key.ctrl && input === "u") {
-        setOffsetFromBottom((value) => value + halfPage);
-        return;
-      }
-      if (key.ctrl && input === "d") {
-        setOffsetFromBottom((value) => Math.max(0, value - halfPage));
-        return;
-      }
-      if (input === "G" || input === "\u001b[F" || input === "\u001bOF") {
+      if (input === "\u001b[F" || input === "\u001bOF") {
         setOffsetFromBottom(0);
         return;
       }
@@ -206,74 +226,131 @@ export function ScrollableChatViewport({
     { isActive: active },
   );
 
-  const visible = selectWindow(entries, width, height, offsetFromBottom, collapsed);
+  const spinner = useSpinner(Boolean(liveEntry));
+  const allEntries = liveEntry ? [...entries, liveEntry] : entries;
+  const visible = selectWindow(allEntries, width, height, offsetFromBottom, collapsed);
 
   React.useEffect(() => {
     setOffsetFromBottom(0);
-  }, [entries.length]);
+  }, [entries.length, resetKey]);
 
-  const hasChatMessages = entries.some((e) => e.role === "user" || e.role === "assistant");
+  const hasChatMessages = allEntries.some((e) => e.role === "user" || e.role === "assistant");
+  const showWelcome = !hasChatMessages && !streamingText && !liveEntry;
 
   return (
-    <Box flexDirection="column" height={height}>
-      <Box flexDirection="column" flexGrow={1}>
-        {!hasChatMessages && !streamingText ? (
-          <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />
+    <Box flexDirection="column" height={height} overflow="hidden">
+      <Box flexDirection="column" flexGrow={1} overflow="hidden">
+        {showWelcome ? (
+          height >= 12 ? (
+            <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />
+          ) : (
+            <Box justifyContent="center">
+              <Text bold color={theme.accent}>ORCHIVOX</Text>
+              <Text color={theme.muted}> · type a prompt to begin</Text>
+            </Box>
+          )
         ) : null}
-        {visible.map((entry) => (
-          <Box key={entry.id} flexDirection="column">
-            {entry.role === "user" ? (
-              <Box marginY={0}>
-                <Text color={theme.accent} bold>
-                  ❯ {entry.text}
-                </Text>
-              </Box>
-            ) : entry.role === "system" ? (
-              <Box marginY={0}>
-                <Text color={theme.muted} italic>
-                  ℹ {entry.text}
-                </Text>
-              </Box>
-            ) : (
-              <Box marginY={0} flexDirection="column">
-                <MarkdownView content={entry.text} theme={theme} />
-              </Box>
-            )}
-            {entry.thinking ? (
-              <ThinkingBlock
-                key={`${entry.id}-thinking-${collapsed ? "closed" : "open"}`}
-                text={entry.thinking}
-                defaultOpen={!collapsed}
-              />
-            ) : null}
-            {(entry.toolCalls ?? []).map((call, index) => (
-              <ToolCallBadge
-                key={`${entry.id}-tool-${index}`}
-                name={call.name}
-                argumentsSummary={collapsed ? "" : call.argumentsSummary}
-                durationMs={call.durationMs}
-                status={call.status}
-                lspStatus={call.lspStatus}
-              />
-            ))}
-            {entry.diff ? (
-              collapsed ? (
-                <Text color={theme.muted}>
-                  diff hidden: {entry.diff.oldLabel ?? "old"} -&gt; {entry.diff.newLabel ?? "new"} (Ctrl+O to expand)
-                </Text>
-              ) : (
-                <DiffView
-                  oldText={entry.diff.oldText}
-                  newText={entry.diff.newText}
-                  oldLabel={entry.diff.oldLabel}
-                  newLabel={entry.diff.newLabel}
-                  unified={entry.diff.unified ?? false}
+        {visible.map((entry) => {
+          const running = entry.toolCalls?.find((call) => call.status === "running");
+          const elapsed = entry.startedAt ? Math.max(0, Math.floor((Date.now() - entry.startedAt) / 1000)) : 0;
+          const files = entry.live ? (entry.files ?? []).slice(-2) : (entry.files ?? []);
+          const toolCalls = entry.live ? (entry.toolCalls ?? []).slice(-6) : (entry.toolCalls ?? []);
+          const liveText = entry.live
+            ? entry.text.split("\n").slice(-Math.max(4, height - 4)).join("\n")
+            : entry.text;
+          return (
+            <Box key={entry.id} flexDirection="column">
+              {entry.live ? (
+                <Box gap={1} marginY={0}>
+                  <Text color={theme.badge.running} bold>{spinner}</Text>
+                  <Text color={theme.text} bold>
+                    {running ? running.name : entry.text ? "writing" : entry.thinking ? "thinking" : "working"}
+                  </Text>
+                  {elapsed > 0 ? <Text color={theme.muted}>{elapsed}s</Text> : null}
+                  <Text color={theme.muted}>Esc twice to stop</Text>
+                </Box>
+              ) : null}
+              {entry.role === "user" ? (
+                <Box marginY={0}>
+                  <Text color={theme.accent} bold>
+                    ❯ {entry.text}
+                  </Text>
+                </Box>
+              ) : entry.role === "system" ? (
+                <Box marginY={0} flexDirection="column">
+                  {entry.text.split("\n").map((line, lineIndex) => (
+                    <Text key={`${entry.id}-line-${lineIndex}`}>
+                      <Text color={theme.modes.plan.primary}>{lineIndex === 0 ? "ℹ " : "  "}</Text>
+                      <Text color={theme.text}>{line}</Text>
+                    </Text>
+                  ))}
+                </Box>
+              ) : entry.text ? (
+                <Box marginY={0} flexDirection="column">
+                  <MarkdownView content={liveText} theme={theme} />
+                </Box>
+              ) : null}
+              {entry.thinking ? (
+                <ThinkingBlock
+                  key={`${entry.id}-thinking-${collapsed ? "closed" : "open"}`}
+                  text={entry.thinking}
+                  defaultOpen={entry.live ? false : !collapsed}
+                  theme={theme}
                 />
-              )
-            ) : null}
-          </Box>
-        ))}
-        {streamingText ? (
+              ) : null}
+              {toolCalls.map((call, index) => (
+                <ToolCallBadge
+                  key={`${entry.id}-tool-${index}`}
+                  name={call.name}
+                  argumentsSummary={collapsed ? "" : call.argumentsSummary}
+                  durationMs={call.durationMs}
+                  status={call.status}
+                  lspStatus={call.lspStatus}
+                  theme={theme}
+                />
+              ))}
+              {files.map((file, index) => (
+                <Box key={`${entry.id}-file-${index}`} flexDirection="column">
+                  <Text color={theme.muted}>
+                    {file.path}
+                    {file.additions !== undefined || file.deletions !== undefined
+                      ? ` (+${file.additions ?? 0} -${file.deletions ?? 0})`
+                      : ""}
+                  </Text>
+                  {collapsed ? (
+                    <Text color={theme.muted}>diff hidden (Ctrl+O to expand)</Text>
+                  ) : (
+                    <DiffView
+                      oldText={file.oldText}
+                      newText={file.newText}
+                      oldLabel={`a/${file.path}`}
+                      newLabel={`b/${file.path}`}
+                      unified
+                      theme={theme}
+                    />
+                  )}
+                </Box>
+              ))}
+              {entry.diff ? (
+                collapsed ? (
+                  <Text color={theme.muted}>
+                    diff hidden: {entry.diff.oldLabel ?? "old"} → {entry.diff.newLabel ?? "new"} (Ctrl+O to expand)
+                  </Text>
+                ) : (
+                  <DiffView
+                    oldText={entry.diff.oldText}
+                    newText={entry.diff.newText}
+                    oldLabel={entry.diff.oldLabel}
+                    newLabel={entry.diff.newLabel}
+                    unified={entry.diff.unified ?? false}
+                    theme={theme}
+                  />
+                )
+              ) : null}
+            </Box>
+          );
+        })}
+        {!liveEntry && streamingText ? (
           <Box flexDirection="column">
             <Text color={theme.badge.running} dimColor>
               ... streaming
@@ -301,7 +378,15 @@ export function WorkspaceSidebar({
 }: WorkspaceSidebarProps): React.ReactElement {
   const done = todos.filter((todo) => todo.status === "completed").length;
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={theme.border.active} paddingX={1}>
+    <Box
+      flexDirection="column"
+      borderStyle="single"
+      borderColor={theme.border.passive}
+      borderTop={false}
+      borderBottom={false}
+      borderRight={false}
+      paddingLeft={1}
+    >
       <Text bold color={theme.accent}>
         Workspace
       </Text>

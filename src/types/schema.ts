@@ -12,6 +12,18 @@ export const TextBlockSchema = z.object({
 });
 export type TextBlock = z.infer<typeof TextBlockSchema>;
 
+export const ImageBlockSchema = z.object({
+  type: z.literal("image"),
+  source: z.object({
+    type: z.literal("base64"),
+    media_type: z.string().min(1),
+    data: z.string().min(1),
+  }),
+  path: z.string().min(1).optional(),
+  detail: z.enum(["auto", "low", "high"]).optional(),
+});
+export type ImageBlock = z.infer<typeof ImageBlockSchema>;
+
 export const ToolUseBlockSchema = z.object({
   type: z.literal("tool_use"),
   id: z.string().min(1),
@@ -37,6 +49,7 @@ export type ThinkingBlock = z.infer<typeof ThinkingBlockSchema>;
 
 export const ContentBlockSchema = z.discriminatedUnion("type", [
   TextBlockSchema,
+  ImageBlockSchema,
   ToolUseBlockSchema,
   ToolResultBlockSchema,
   ThinkingBlockSchema,
@@ -99,6 +112,7 @@ export const ChatRequestSchema = z.object({
   top_p: z.number().min(0).max(1).optional(),
   max_tokens: z.number().int().positive(),
   stop_sequences: z.array(z.string().min(1)).default([]),
+  reasoning_effort: z.enum(["low", "medium", "high"]).optional(),
 });
 export type ChatRequest = z.infer<typeof ChatRequestSchema>;
 
@@ -155,6 +169,7 @@ export type TokenEvent = z.infer<typeof TokenEventSchema>;
 export const ThinkingTokenEventSchema = z.object({
   type: z.literal("thinking_token"),
   text: z.string(),
+  signature: z.string().optional(),
 });
 export type ThinkingTokenEvent = z.infer<typeof ThinkingTokenEventSchema>;
 
@@ -320,6 +335,42 @@ export const BgProcessUpdateEventSchema = z.object({
 });
 export type BgProcessUpdateEvent = z.infer<typeof BgProcessUpdateEventSchema>;
 
+export const ToolStartEventSchema = z.object({
+  type: z.literal("tool_start"),
+  id: z.string().min(1),
+  name: z.string().min(1),
+  arguments_summary: z.string().default(""),
+  file_path: z.string().optional(),
+});
+export type ToolStartEvent = z.infer<typeof ToolStartEventSchema>;
+
+export const ToolEndEventSchema = z.object({
+  type: z.literal("tool_end"),
+  id: z.string().min(1),
+  name: z.string().min(1),
+  status: z.enum(["ok", "error"]),
+  duration_ms: z.number().nonnegative().default(0),
+  file_path: z.string().optional(),
+});
+export type ToolEndEvent = z.infer<typeof ToolEndEventSchema>;
+
+export const FileChangeEventSchema = z.object({
+  type: z.literal("file_change"),
+  path: z.string().min(1),
+  old_text: z.string(),
+  new_text: z.string(),
+  additions: z.number().int().nonnegative().default(0),
+  deletions: z.number().int().nonnegative().default(0),
+});
+export type FileChangeEvent = z.infer<typeof FileChangeEventSchema>;
+
+export const SkillActivatedEventSchema = z.object({
+  type: z.literal("skill_activated"),
+  name: z.string().min(1),
+  allowed_tools: z.array(z.string()).default([]),
+});
+export type SkillActivatedEvent = z.infer<typeof SkillActivatedEventSchema>;
+
 export const StreamEventSchema = z.discriminatedUnion("type", [
   TokenEventSchema,
   ThinkingTokenEventSchema,
@@ -332,6 +383,10 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   ApprovalRequiredEventSchema,
   AdvisorNoteEventSchema,
   BgProcessUpdateEventSchema,
+  ToolStartEventSchema,
+  ToolEndEventSchema,
+  FileChangeEventSchema,
+  SkillActivatedEventSchema,
 ]);
 export type StreamEvent = z.infer<typeof StreamEventSchema>;
 

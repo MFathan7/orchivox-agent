@@ -16,6 +16,7 @@ export interface SessionTimeTravelModalProps {
   initialTab?: SessionModalTab;
   onResumeSession?: (sessionId: string) => void;
   onForkSession?: (forkedSession: SessionRecord) => void;
+  onNewSession?: () => void;
   onRestoreSnapshot?: (result: RestoreResult) => void;
   onClose: () => void;
   theme?: Theme;
@@ -51,6 +52,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
     initialTab = "sessions",
     onResumeSession,
     onForkSession,
+    onNewSession,
     onRestoreSnapshot,
     onClose,
     theme = getTheme("tokyonight"),
@@ -163,6 +165,12 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
 
   useInput((input, key) => {
     if (key.escape) {
+      onClose();
+      return;
+    }
+
+    if (key.ctrl && input === "n") {
+      onNewSession?.();
       onClose();
       return;
     }
@@ -300,7 +308,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             bold={activeTab === "sessions"}
             color={activeTab === "sessions" ? theme.accent : theme.muted}
           >
-            1. Sessions &amp; FTS Search
+            1. Sessions & FTS Search
           </Text>
           <Text
             bold={activeTab === "fork"}
@@ -315,7 +323,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             3. Git Snapshot Timeline
           </Text>
         </Box>
-        <Text dimColor>Esc Close  |  Tab Switch Tab</Text>
+        <Text dimColor>Esc Close  |  Tab Switch Tab  |  Ctrl+N New Session</Text>
       </Box>
 
       {statusNotice ? (
@@ -350,8 +358,8 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                   return (
                     <Box key={`hit-${hit.messageId}-${idx}`}>
                       <Text color={isSelected ? theme.accent : undefined} bold={isSelected}>
-                        {isSelected ? "> " : "  "}
-                        [{hit.role}] {hit.snippet}
+                        {isSelected ? "❯ " : "  "}
+                        ● {hit.role.toUpperCase()}: {hit.snippet}
                       </Text>
                     </Box>
                   );
@@ -366,13 +374,13 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                     <Box key={sess.id} justifyContent="space-between">
                       <Box>
                         <Text color={isSelected ? theme.accent : undefined} bold={isSelected}>
-                          {isSelected ? "> " : "  "}
+                          {isSelected ? "❯ " : "  "}
                           {sess.title.slice(0, 26)}
                         </Text>
                         {isCurrent ? <Text color={theme.modes.build.primary}> (active)</Text> : null}
                       </Box>
                       <Text dimColor>
-                        {formatTimestamp(sess.updatedAt)} [{sess.mode}]
+                        {formatTimestamp(sess.updatedAt)} · {sess.mode}
                       </Text>
                     </Box>
                   );
@@ -426,7 +434,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
               return (
                 <Box key={msg.id} marginY={0}>
                   <Text color={isSelected ? theme.modes.build.primary : undefined} bold={isSelected}>
-                    {isSelected ? "> " : "  "}
+                    {isSelected ? "❯ " : "  "}
                     Turn {idx + 1} {msg.role.toUpperCase()}:{" "}
                   </Text>
                   <Text dimColor={!isSelected}>
@@ -469,7 +477,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                     <Box key={snap.id} justifyContent="space-between">
                       <Box>
                         <Text color={isSelected ? theme.modes.ultrawork.primary : undefined} bold={isSelected}>
-                          {isSelected ? "> " : "  "}
+                          {isSelected ? "❯ " : "  "}
                           {snap.label.slice(0, 30)}
                         </Text>
                         {isCurrent ? (

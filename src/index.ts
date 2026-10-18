@@ -9,6 +9,7 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
+import type { SkillDocument } from "./agent/skills";
 import type { ApprovalDecision, ApprovalRequest } from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
 import { loadConfig, type AppConfig } from "./config/loader";
@@ -24,12 +25,15 @@ import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
 import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
 import { runGit } from "./vcs/git";
 import { WorktreeManager } from "./vcs/worktree";
+import { formatCost, formatTokenCount } from "./tui/format";
 import { installSynchronizedOutput, OrchivoxApp, type ChatEntryView, type InputAction } from "./tui/app";
-import type { HashlineLifecycle } from "./tools/hashline-edit";
+import type { FileAttachmentRef } from "./tui/composer";import type { HashlineLifecycle } from "./tools/hashline-edit";
 import type { ThemeName } from "./tui/theme";
+import { basename, relative } from "node:path";
 import { WorkspaceTrustManager } from "./security/workspace-trust";
 import { WorkspaceTrustPrompt } from "./tui/trust-modal";
 import type { ReasoningEffortLevel } from "./tui/command-palette";
+import type { SessionModalTab } from "./tui/session-modal";
 import { AgentModeSchema, type AgentMode, type Message } from "./types/schema";
 
 export interface CliOptions {
@@ -102,6 +106,14 @@ export function modeToProfile(mode: AgentMode): AgentProfile {
   return "orchivox-main";
 }
 
+export function reasoningEffortToRequest(
+  level: ReasoningEffortLevel,
+): "low" | "medium" | "high" | undefined {
+  if (level === "off") return undefined;
+  if (level === "max") return "high";
+  return level;
+}
+
 export function buildHashEditLifecycle(deps: { snapshots: SnapshotManager; lsp?: LSPClient }): HashlineLifecycle {
   return {
     onBeforeModify: async (filePath) => {
@@ -160,7 +172,9 @@ class InterceptingRouter extends ProviderRouter {
 
 export async function bootstrap(options: { repoRoot?: string } = {}): Promise<RuntimeHandle> {
   const root = options.repoRoot ?? globalThis.process.cwd();
-  const config = await loadConfig(`${root}/.agent/config.yaml`);
+  const config = await loadConfig(`${root}/.agent/config.yaml`, globalThis.process.env, {
+    secretsPath: `${root}/.agent/secrets.yaml`,
+  });
   const database = new MemoryDatabase(`${root}/.agent/memory.db`);
   const rules = new RulesLoader({ rootPath: root });
   const streamRules = await loadStreamRules(`${root}/.agent/rules/stream_rules.yaml`);
@@ -310,23 +324,36 @@ async function runTuiSession(
   print: (text: string) => void,
 ): Promise<{ close: () => Promise<void> }> {
   process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J");
-  const initialSession = runtime.database.createSession({
-    title: "Interactive Session",
-    mode: "build",
-  });
+
+  const projectName = basename(globalThis.process.cwd());
+  const root = globalThis.process.cwd();
 
   const state = {
-    sessionId: initialSession.id,
+    sessionId: undefined as string | undefined,
+    sessionEpoch: 0,
     entries: [] as ChatEntryView[],
     messages: [] as Message[],
     mode: "build" as AgentMode,
     currentTheme: "tokyonight" as ThemeName,
     reasoningEffort: "medium" as ReasoningEffortLevel,
     streamingText: "",
+    liveEntry: undefined as ChatEntryView | undefined,
+    modifiedFiles: new Map<string, { path: string; additions: number; deletions: number }>(),
     totalTokens: 0,
+    totalPromptTokens: 0,
+    totalCompletionTokens: 0,
     totalCostUsd: 0,
     busy: false,
     counter: 0,
+    helpOpen: false,
+    modelsOpen: false,
+    skillsOpen: false,
+    skills: runtime.orchestrator.skills.listDocuments() as SkillDocument[],
+    hubTab: "workers" as "workers" | "tasks",
+    paletteOpen: false,
+    sessionTab: null as SessionModalTab | null,
+    hubOpen: false,
+    notice: undefined as string | undefined,
   };
   let relay: CollabRelay | undefined;
   let branch = "unknown";
@@ -348,13 +375,52 @@ async function runTuiSession(
     branch = "unknown";
   }
 
-  const pushEntry = (role: ChatEntryView["role"], text: string): void => {
+  const pushEntry = (role: ChatEntryView["role"], text: string, extra?: Partial<ChatEntryView>): void => {
     state.counter += 1;
-    state.entries = [...state.entries, { id: `entry-${state.counter}`, role, text }];
+    state.entries = [...state.entries, { id: `entry-${state.counter}`, role, text, ...extra }];
+  };
+
+  const sessionTitle = (text: string): string => {
+    const clean = text.replace(/\s+/g, " ").trim();
+    if (clean.length === 0) return "Interactive Session";
+    return clean.length > 48 ? `${clean.slice(0, 45).trimEnd()}...` : clean;
+  };
+
+  const ensureSession = (promptText: string): string => {
+    if (state.sessionId) {
+      try {
+        runtime.database.updateSession(state.sessionId, { mode: state.mode });
+      } catch {
+        // Session metadata updates are best effort.
+      }
+      return state.sessionId;
+    }
+    const session = runtime.database.createSession({ title: sessionTitle(promptText), mode: state.mode });
+    state.sessionId = session.id;
+    state.sessionEpoch += 1;
+    return session.id;
+  };
+
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  const setNotice = (text: string, ttlMs = 6000): void => {
+    state.notice = text;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => {
+      if (state.notice === text) {
+        state.notice = undefined;
+        rerender();
+      }
+    }, ttlMs);
+    rerender();
+  };
+
+  const reloadSkills = async (): Promise<void> => {
+    state.skills = await runtime.orchestrator.skills.load(true);
+    rerender();
   };
 
   const view = () => ({
-    projectName: "orchivox-agent",
+    projectName,
     branch,
     mcpCount: runtime.mcpServers.length,
     pluginCount: runtime.plugins.loaded.length,
@@ -362,14 +428,77 @@ async function runTuiSession(
     totalCostUsd: state.totalCostUsd,
     entries: state.entries,
     streamingText: state.streamingText,
+    liveEntry: state.liveEntry,
+    busy: state.busy,
     mode: state.mode,
     workers: runtime.orchestrator.subagents.listWorkers(),
     router: runtime.router,
     database: runtime.database,
     snapshots: runtime.snapshots,
-    activeSessionId: state.sessionId,
+    activeSessionId: state.sessionId ?? `draft-${state.sessionEpoch}`,
     activeSessionMessages: state.messages,
     currentTheme: state.currentTheme,
+    statusMessage: state.notice,
+    onStatusMessage: setNotice,
+    helpOpen: state.helpOpen,
+    onHelpOpenChange: (open: boolean) => {
+      state.helpOpen = open;
+      rerender();
+    },
+    modelsOpen: state.modelsOpen,
+    onModelsOpenChange: (open: boolean) => {
+      state.modelsOpen = open;
+      rerender();
+    },
+    skillsOpen: state.skillsOpen,
+    skills: state.skills,
+    onSkillsOpenChange: (open: boolean) => {
+      state.skillsOpen = open;
+      rerender();
+    },
+    onReloadSkills: () => {
+      void reloadSkills();
+    },
+    tasks: runtime.orchestrator.tasks.list(),
+    hubTab: state.hubTab,
+    onHubTabChange: (tab: "workers" | "tasks") => {
+      state.hubTab = tab;
+      rerender();
+    },
+    onCancelTask: (id: string) => {
+      runtime.orchestrator.tasks.cancel(id);
+      rerender();
+    },
+    onDispatchTasks: () => {
+      runtime.orchestrator.tasks.dispatch();
+      rerender();
+    },
+    onMergeTask: (id: string) => {
+      setNotice(`merging ${id}...`, 10000);
+      void runtime.orchestrator.tasks.merge(id).then((message) => {
+        setNotice(message, 12000);
+      });
+    },
+    configPath: `${root}/.agent/config.yaml`,
+    secretsPath: `${root}/.agent/secrets.yaml`,
+    onRoleChange: (role: "main" | "fast" | "advisor", provider: string, model: string) => {
+      setNotice(`${role} now uses ${provider} / ${model}`);
+    },
+    paletteOpen: state.paletteOpen,
+    onPaletteOpenChange: (open: boolean) => {
+      state.paletteOpen = open;
+      rerender();
+    },
+    sessionTab: state.sessionTab,
+    onSessionTabChange: (tab: SessionModalTab | null) => {
+      state.sessionTab = tab;
+      rerender();
+    },
+    hubOpen: state.hubOpen,
+    onHubOpenChange: (open: boolean) => {
+      state.hubOpen = open;
+      rerender();
+    },
     onThemeChange: (nextTheme: ThemeName) => {
       state.currentTheme = nextTheme;
       rerender();
@@ -381,7 +510,14 @@ async function runTuiSession(
       rerender();
     },
     onResumeSession: (sessionId: string) => {
+      if (state.busy) {
+        setNotice("Cancel the running turn before switching sessions.", 8000);
+        return;
+      }
       state.sessionId = sessionId;
+      state.sessionEpoch += 1;
+      state.liveEntry = undefined;
+      state.modifiedFiles.clear();
       const msgs = runtime.database.loadMessages(sessionId);
       state.messages = msgs;
       state.entries = msgs.map((m, idx) => ({
@@ -392,12 +528,33 @@ async function runTuiSession(
           .filter(Boolean)
           .join(" "),
       }));
+      state.counter = msgs.length;
       const sess = runtime.database.getSession(sessionId);
+      if (sess) state.mode = sess.mode;
+      state.totalTokens = sess?.totalTokens ?? 0;
+      state.totalCostUsd = sess?.totalCostUsd ?? 0;
+      state.totalPromptTokens = 0;
+      state.totalCompletionTokens = 0;
       pushEntry("system", `resumed session: ${sess?.title ?? sessionId}`);
       rerender();
     },
+    onNewSession: () => {
+      void handleCommand("/new");
+    },
     onForkSession: (forked: SessionRecord) => {
+      if (state.busy) {
+        setNotice("Cancel the running turn before forking the session.", 8000);
+        return;
+      }
       state.sessionId = forked.id;
+      state.sessionEpoch += 1;
+      state.mode = forked.mode;
+      state.liveEntry = undefined;
+      state.modifiedFiles.clear();
+      state.totalTokens = forked.totalTokens ?? 0;
+      state.totalCostUsd = forked.totalCostUsd ?? 0;
+      state.totalPromptTokens = 0;
+      state.totalCompletionTokens = 0;
       const msgs = runtime.database.loadMessages(forked.id);
       state.messages = msgs;
       state.entries = msgs.map((m, idx) => ({
@@ -408,6 +565,7 @@ async function runTuiSession(
           .filter(Boolean)
           .join(" "),
       }));
+      state.counter = msgs.length;
       pushEntry("system", `session forked to: ${forked.title}`);
       rerender();
     },
@@ -454,10 +612,11 @@ async function runTuiSession(
       status: t.status,
       priority: t.priority,
     })),
+    modifiedFiles: [...state.modifiedFiles.values()],
     lspStatus: runtime.config.lsp.servers ? "active" : "disabled",
     mcpServers: runtime.mcpServers,
-    onSubmit: (text: string, action: InputAction) => {
-      void handleInput(text, action);
+    onSubmit: (text: string, action: InputAction, attachments?: FileAttachmentRef[]) => {
+      void handleInput(text, action, attachments);
     },
   });
 
@@ -467,53 +626,184 @@ async function runTuiSession(
     instance.rerender(React.createElement(OrchivoxApp, view()));
   };
 
-  const executeTurn = async (promptText: string, displayUserText?: string, targetAgent?: string): Promise<void> => {
+  const activityTimer = setInterval(() => {
+    const workers = runtime.orchestrator.subagents.listWorkers();
+    const tasks = runtime.orchestrator.tasks.list();
+    const activeWorker = workers.some(
+      (worker) =>
+        worker.status === "queued" ||
+        worker.status === "preparing" ||
+        worker.status === "running" ||
+        worker.status === "finalizing",
+    );
+    const activeTask = tasks.some((task) => task.state === "pending" || task.state === "running");
+    if (activeWorker || activeTask) rerender();
+  }, 750);
+
+  const executeTurn = async (
+    promptText: string,
+    displayUserText?: string,
+    targetAgent?: string,
+    attachments?: FileAttachmentRef[],
+  ): Promise<void> => {
     if (state.busy) {
       pushEntry("system", "a turn is already running");
       rerender();
       return;
     }
     pushEntry("user", displayUserText ?? promptText);
+    for (const attachment of attachments ?? []) {
+      if (attachment.kind === "image" && attachment.error) {
+        pushEntry("system", `image skipped: ${attachment.filePath} (${attachment.error})`);
+      }
+    }
+    const sessionId = ensureSession(displayUserText ?? promptText);
+    const imageBlocks = (attachments ?? [])
+      .filter((attachment) => attachment.kind === "image" && attachment.base64 && attachment.mimeType)
+      .map((attachment) => ({
+        type: "image" as const,
+        source: {
+          type: "base64" as const,
+          media_type: attachment.mimeType as string,
+          data: attachment.base64 as string,
+        },
+        path: attachment.filePath,
+      }));
     const userMsg: Message = {
       id: `user-${Date.now().toString(36)}`,
       role: "user",
-      content: [{ type: "text", text: promptText }],
+      content: [...imageBlocks, { type: "text", text: promptText }],
       created_at: Date.now(),
     };
     state.messages = [...state.messages, userMsg];
     try {
-      runtime.database.saveMessage(state.sessionId, userMsg);
+      runtime.database.saveMessage(sessionId, userMsg);
     } catch {
       // Ignore database save error if session not found.
     }
     state.busy = true;
     state.streamingText = "";
+    const liveEntry: ChatEntryView = {
+      id: "live",
+      role: "assistant",
+      text: "",
+      thinking: "",
+      toolCalls: [],
+      files: [],
+      live: true,
+      startedAt: Date.now(),
+    };
+    state.liveEntry = liveEntry;
     activeAbortController = new AbortController();
+    let lastLiveRender = 0;
+    const renderLive = (force = false): void => {
+      const now = Date.now();
+      if (!force && now - lastLiveRender < 40) return;
+      lastLiveRender = now;
+      rerender();
+    };
     rerender();
     try {
       const request = AgentRunRequestSchema.parse({
         profile: modeToProfile(state.mode),
         messages: state.messages,
-        metadata: targetAgent ? { agent: targetAgent } : undefined,
+        metadata: {
+          ...(targetAgent ? { agent: targetAgent } : {}),
+          session_id: sessionId,
+        },
         max_tokens: 4096,
+        reasoning_effort: reasoningEffortToRequest(state.reasoningEffort),
       });
       let answer = "";
+      let finishReason: string | undefined;
       for await (const event of runtime.orchestrator.runStream(request, activeAbortController.signal)) {
         if (event.type === "token") {
           answer += event.text;
+          liveEntry.text = answer;
           state.streamingText = answer;
+          renderLive();
         } else if (event.type === "thinking_token") {
-          state.streamingText = `${answer}${answer ? "\n" : ""}${event.text}`;
+          if (!event.text.startsWith("[tool]") && !event.text.startsWith("[snapshot]")) {
+            liveEntry.thinking = `${liveEntry.thinking ?? ""}${event.text}`;
+          }
+          renderLive();
+        } else if (event.type === "tool_start") {
+          liveEntry.toolCalls = [
+            ...(liveEntry.toolCalls ?? []),
+            {
+              id: event.id,
+              name: event.name,
+              argumentsSummary: event.arguments_summary,
+              status: "running",
+            },
+          ];
+          renderLive(true);
+        } else if (event.type === "tool_end") {
+          liveEntry.toolCalls = (liveEntry.toolCalls ?? []).map((call) =>
+            call.id === event.id
+              ? { ...call, status: event.status, durationMs: event.duration_ms }
+              : call,
+          );
+          renderLive(true);
+        } else if (event.type === "file_change") {
+          const displayPath = relative(root, event.path) || event.path;
+          liveEntry.files = [
+            ...(liveEntry.files ?? []),
+            {
+              path: displayPath,
+              oldText: event.old_text,
+              newText: event.new_text,
+              additions: event.additions,
+              deletions: event.deletions,
+            },
+          ];
+          const existing = state.modifiedFiles.get(event.path);
+          state.modifiedFiles.set(event.path, {
+            path: displayPath,
+            additions: (existing?.additions ?? 0) + event.additions,
+            deletions: (existing?.deletions ?? 0) + event.deletions,
+          });
+          renderLive(true);
+        } else if (event.type === "skill_activated") {
+          const scope =
+            event.allowed_tools.length > 0
+              ? `tools limited to ${event.allowed_tools.join(", ")}`
+              : "core read-only tools only";
+          pushEntry("system", `skill ${event.name} active · ${scope}`);
+          renderLive(true);
         } else if (event.type === "advisor_note") {
           pushEntry("system", `[advisor note] ${event.note}`);
+          renderLive(true);
         } else if (event.type === "bg_process_update") {
           pushEntry("system", `[bg_process ${event.processId}] ${event.status}`);
+          renderLive(true);
+        } else if (event.type === "error") {
+          pushEntry("system", `provider error: ${event.message}`);
+          renderLive(true);
+        } else if (event.type === "done") {
+          finishReason = event.finish_reason;
         } else if (event.type === "usage") {
-          state.totalTokens += event.prompt_tokens + event.completion_tokens;
+          const usedTokens = event.prompt_tokens + event.completion_tokens;
+          state.totalTokens += usedTokens;
+          state.totalPromptTokens += event.prompt_tokens;
+          state.totalCompletionTokens += event.completion_tokens;
           if (event.cost_usd !== undefined) state.totalCostUsd += event.cost_usd;
+          try {
+            runtime.database.addSessionUsage(sessionId, usedTokens, event.cost_usd ?? 0);
+          } catch {
+            // Usage tracking is best effort.
+          }
+          renderLive();
         }
       }
-      pushEntry("assistant", answer || "(no output)");
+      pushEntry("assistant", answer || "(no output)", {
+        thinking: liveEntry.thinking,
+        toolCalls: liveEntry.toolCalls,
+        files: liveEntry.files,
+      });
+      if (finishReason === "length") {
+        pushEntry("system", "turn stopped at the turn limit; send another message to continue");
+      }
       const assistantMsg: Message = {
         id: `assistant-${Date.now().toString(36)}`,
         role: "assistant",
@@ -522,7 +812,7 @@ async function runTuiSession(
       };
       state.messages = [...state.messages, assistantMsg];
       try {
-        runtime.database.saveMessage(state.sessionId, assistantMsg);
+        runtime.database.saveMessage(sessionId, assistantMsg);
       } catch {
         // Ignore database save error if session not found.
       }
@@ -530,6 +820,7 @@ async function runTuiSession(
       pushEntry("system", `turn failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       activeAbortController = undefined;
+      state.liveEntry = undefined;
       state.streamingText = "";
       state.busy = false;
       rerender();
@@ -539,43 +830,34 @@ async function runTuiSession(
   const handleCommand = async (command: string, args = "", raw = command): Promise<void> => {
     switch (command) {
       case "/help": {
-        pushEntry("system", [
-          "Built-in Slash Commands:",
-          "  /mode [plan|build|ultrawork]       Inspect or switch active agent mode",
-          "  /theme [tokyonight|catppuccin|...] Switch visual color theme preset",
-          "  /reasoning [off|low|med|high|max]  Set reasoning / thinking intensity",
-          "  /palette, /model                   Open command palette and model selector",
-          "  /sessions, /fork, /timeline        Open session manager and VCS timeline",
-          "  /hub                               Open Subagent Hub management panel",
-          "  /undo, /redo                       Undo or redo snapshot file changes",
-          "  /commit                            Analyze and split git changes into atomic commits",
-          "  /compact                           Compact chat history context window",
-          "  /plugins                           List loaded plugins",
-          "  /collab                            Start live terminal sharing relay session",
-          "  /clear                             Clear chat entry viewport",
-          "  /exit, /quit                       Exit Orchivox",
-          "",
-          "Custom Commands (.agent/commands/):",
-          "  /review [args]                     Review git changes with Oracle agent",
-          "  /fix-tests [args]                  Run tests and fix failures with Sisyphus",
-          "  /refactor <file> [args]            Perform structured code refactoring",
-          "  /init-rules [args]                 Initialize agent rules in .agent/rules/",
-          "",
-          "Keyboard Shortcuts:",
-          "  Tab Cycle mode · Ctrl+P Palette · Ctrl+S Sessions · Alt+A Subagents",
-          "  Ctrl+B Toggle sidebar · Ctrl+O Toggle collapse · PgUp/PgDn Scroll",
-        ].join("\n"));
+        state.helpOpen = true;
+        rerender();
+        break;
+      }
+      case "/plan": {
+        state.mode = "plan";
+        setNotice("Mode: plan (read-only)");
+        break;
+      }
+      case "/build": {
+        state.mode = "build";
+        setNotice("Mode: build (approval on write)");
+        break;
+      }
+      case "/ultrawork": {
+        state.mode = "ultrawork";
+        setNotice("Mode: ultrawork (autonomous)");
         break;
       }
       case "/mode": {
         const targetMode = args.trim().toLowerCase();
         if (targetMode === "plan" || targetMode === "build" || targetMode === "ultrawork") {
           state.mode = targetMode as AgentMode;
-          pushEntry("system", `agent mode switched to: ${targetMode}`);
+          setNotice(`Mode: ${targetMode}`);
         } else if (!targetMode) {
-          pushEntry("system", `current mode: ${state.mode} (options: plan, build, ultrawork)`);
+          setNotice(`Current mode: ${state.mode}. Options: plan, build, ultrawork`);
         } else {
-          pushEntry("system", `invalid mode: "${targetMode}". Options: plan, build, ultrawork`);
+          setNotice(`Unknown mode "${targetMode}". Options: plan, build, ultrawork`, 8000);
         }
         break;
       }
@@ -583,45 +865,96 @@ async function runTuiSession(
         const targetTheme = args.trim().toLowerCase();
         if (targetTheme === "tokyonight" || targetTheme === "catppuccin" || targetTheme === "gruvbox" || targetTheme === "monochrome") {
           state.currentTheme = targetTheme as ThemeName;
-          pushEntry("system", `theme switched to: ${targetTheme}`);
+          setNotice(`Theme: ${targetTheme}`);
         } else if (!targetTheme) {
-          pushEntry("system", `current theme: ${state.currentTheme} (options: tokyonight, catppuccin, gruvbox, monochrome)`);
+          setNotice(`Current theme: ${state.currentTheme}. Options: tokyonight, catppuccin, gruvbox, monochrome`);
         } else {
-          pushEntry("system", `unknown theme: "${targetTheme}". Options: tokyonight, catppuccin, gruvbox, monochrome`);
+          setNotice(`Unknown theme "${targetTheme}". Options: tokyonight, catppuccin, gruvbox, monochrome`, 8000);
         }
         break;
       }
       case "/reasoning": {
-        const targetReasoning = args.trim().toLowerCase();
+        let targetReasoning = args.trim().toLowerCase();
+        if (targetReasoning === "med") targetReasoning = "medium";
         if (targetReasoning === "off" || targetReasoning === "low" || targetReasoning === "medium" || targetReasoning === "high" || targetReasoning === "max") {
           state.reasoningEffort = targetReasoning as ReasoningEffortLevel;
-          pushEntry("system", `model reasoning level set to: ${targetReasoning}`);
+          setNotice(`Thinking effort: ${targetReasoning}`);
         } else if (!targetReasoning) {
-          pushEntry("system", `current reasoning level: ${state.reasoningEffort} (options: off, low, medium, high, max)`);
+          setNotice(`Current thinking effort: ${state.reasoningEffort}. Options: off, low, medium, high, max`);
         } else {
-          pushEntry("system", `invalid reasoning level: "${targetReasoning}". Options: off, low, medium, high, max`);
+          setNotice(`Unknown thinking effort "${targetReasoning}". Options: off, low, medium, high, max`, 8000);
         }
         break;
       }
-      case "/palette":
-      case "/model": {
-        pushEntry("system", "press Ctrl+P to open the command palette and model selector.");
+      case "/palette": {
+        state.paletteOpen = true;
+        rerender();
+        break;
+      }
+      case "/models": {
+        state.modelsOpen = true;
+        rerender();
         break;
       }
       case "/sessions": {
-        pushEntry("system", "press Ctrl+S to open the session manager.");
+        state.sessionTab = "sessions";
+        rerender();
         break;
       }
       case "/fork": {
-        pushEntry("system", "press Ctrl+S and navigate to the Fork tab to branch the session.");
+        state.sessionTab = "fork";
+        rerender();
         break;
       }
       case "/timeline": {
-        pushEntry("system", "press Ctrl+S and navigate to the Timeline tab for time-travel snapshots.");
+        state.sessionTab = "timeline";
+        rerender();
         break;
       }
       case "/hub": {
-        pushEntry("system", "press Alt+A to open the Subagent Hub.");
+        state.hubTab = "workers";
+        state.hubOpen = true;
+        rerender();
+        break;
+      }
+      case "/tasks": {
+        state.hubTab = "tasks";
+        state.hubOpen = true;
+        rerender();
+        break;
+      }
+      case "/skills": {
+        await reloadSkills();
+        state.skillsOpen = true;
+        rerender();
+        break;
+      }
+      case "/stats": {
+        const sessionCount = runtime.database.listSessions().length;
+        const snapshotHistory = await runtime.snapshots.getHistory();
+        const snapshotCount = snapshotHistory.entries.length;
+        const taskSummary = runtime.orchestrator.tasks.summary();
+        const skillCount = runtime.orchestrator.skills.listDocuments().length;
+        pushEntry("system", [
+          "Session Statistics:",
+          `  Active Session ID : ${state.sessionId ?? "(draft)"}`,
+          `  Messages in Memory: ${state.messages.length} messages`,
+          `  Total Token Usage : ${formatTokenCount(state.totalTokens, false)} tokens`,
+          `    Input tokens    : ${formatTokenCount(state.totalPromptTokens, false)}`,
+          `    Output tokens   : ${formatTokenCount(state.totalCompletionTokens, false)}`,
+          `  Estimated Cost    : ${formatCost(state.totalCostUsd)}`,
+          `  Active Agent Mode : ${state.mode}`,
+          `  Reasoning Level   : ${state.reasoningEffort}`,
+          `  Visual Theme      : ${state.currentTheme}`,
+          `  Connected MCP     : ${runtime.mcpServers.length > 0 ? runtime.mcpServers.join(", ") : "none"}`,
+          `  Loaded Plugins    : ${runtime.plugins.loaded.length > 0 ? runtime.plugins.loaded.join(", ") : "none"}`,
+          `  Skills Installed  : ${skillCount}`,
+          `  Task Board        : ${taskSummary.completed}/${taskSummary.total} completed, ${taskSummary.running} running, ${taskSummary.blocked} blocked`,
+          `  Git Branch        : ${branch}`,
+          `  VCS Snapshots     : ${snapshotCount} snapshots recorded`,
+          `  Saved Sessions    : ${sessionCount} total sessions in database`,
+        ].join("\n"));
+        rerender();
         break;
       }
       case "/undo": {
@@ -687,8 +1020,30 @@ async function runTuiSession(
         }
         break;
       }
+      case "/new": {
+        if (state.busy) {
+          setNotice("Cancel the running turn before starting a new session.", 8000);
+          break;
+        }
+        state.sessionId = undefined;
+        state.sessionEpoch += 1;
+        state.messages = [];
+        state.entries = [];
+        state.counter = 0;
+        state.streamingText = "";
+        state.liveEntry = undefined;
+        state.modifiedFiles.clear();
+        state.totalTokens = 0;
+        state.totalPromptTokens = 0;
+        state.totalCompletionTokens = 0;
+        state.totalCostUsd = 0;
+        setNotice("Started a new draft session");
+        rerender();
+        break;
+      }
       case "/clear": {
         state.entries = [];
+        state.notice = undefined;
         break;
       }
       case "/exit":
@@ -731,16 +1086,22 @@ async function runTuiSession(
     rerender();
   };
 
-  const handleInput = async (text: string, action: InputAction): Promise<void> => {
+  const handleInput = async (
+    text: string,
+    action: InputAction,
+    attachments?: FileAttachmentRef[],
+  ): Promise<void> => {
     if (action.kind === "command") {
       await handleCommand(action.command, action.args ?? "", action.raw ?? text);
       return;
     }
     if (action.ultrawork) state.mode = "ultrawork";
-    await executeTurn(text);
+    await executeTurn(text, undefined, undefined, attachments);
   };
 
   const cleanupSignals = () => {
+    if (noticeTimer) clearTimeout(noticeTimer);
+    clearInterval(activityTimer);
     process.stdout.write("\x1b[?1049l");
     void runtime.close().then(() => {
       process.exit(0);
@@ -750,6 +1111,8 @@ async function runTuiSession(
   process.on("SIGTERM", cleanupSignals);
   rerender();
   await instance.waitUntilExit();
+  if (noticeTimer) clearTimeout(noticeTimer);
+  clearInterval(activityTimer);
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);

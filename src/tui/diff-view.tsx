@@ -4,6 +4,7 @@ import { Box, Text } from "ink";
 import { useInput } from "ink";
 
 import { computeLineHash } from "../tools/hashline-edit";
+import { getTheme, type Theme } from "./theme";
 
 export interface DiffViewProps {
   oldText: string;
@@ -12,6 +13,7 @@ export interface DiffViewProps {
   newLabel?: string;
   unified?: boolean;
   context?: number;
+  theme?: Theme;
 }
 
 export interface ToolCallBadgeProps {
@@ -20,12 +22,14 @@ export interface ToolCallBadgeProps {
   durationMs?: number;
   status?: "running" | "ok" | "error";
   lspStatus?: string;
+  theme?: Theme;
 }
 
 export interface ThinkingBlockProps {
   text: string;
   defaultOpen?: boolean;
   focused?: boolean;
+  theme?: Theme;
 }
 
 interface DisplayLine {
@@ -95,32 +99,43 @@ function lineHash(line: DisplayLine): string {
   return computeLineHash(line.text);
 }
 
-function unifiedLine(line: DisplayLine): { marker: string; color: string; gutter: string } {
+function unifiedLine(line: DisplayLine): { marker: string; kind: DisplayLine["kind"]; gutter: string } {
   const number = line.kind === "add" ? line.newNumber : line.oldNumber;
   const gutter = `${String(number ?? "").padStart(4)} ${lineHash(line)}`;
-  if (line.kind === "add") return { marker: "+", color: "green", gutter };
-  if (line.kind === "remove") return { marker: "-", color: "red", gutter };
-  return { marker: " ", color: "gray", gutter };
+  if (line.kind === "add") return { marker: "+", kind: "add", gutter };
+  if (line.kind === "remove") return { marker: "-", kind: "remove", gutter };
+  return { marker: " ", kind: "context", gutter };
 }
 
-export function DiffView({ oldText, newText, oldLabel = "old", newLabel = "new", unified = false, context = 3 }: DiffViewProps) {
+export function DiffView({
+  oldText,
+  newText,
+  oldLabel = "old",
+  newLabel = "new",
+  unified = false,
+  context = 3,
+  theme = getTheme("tokyonight"),
+}: DiffViewProps) {
   const hunks = React.useMemo(() => collectDiffHunks(oldText, newText, context), [oldText, newText, context]);
 
+  const lineColor = (kind: DisplayLine["kind"]): string =>
+    kind === "add" ? theme.diff.added : kind === "remove" ? theme.diff.removed : theme.muted;
+
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1}>
-      <Text bold>
-        {oldLabel} -&gt; {newLabel} {unified ? "(unified)" : "(side by side)"}
+    <Box flexDirection="column" borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
+      <Text bold color={theme.text}>
+        {oldLabel} → {newLabel} {unified ? "(unified)" : "(side by side)"}
       </Text>
       {hunks.map((hunk, hunkIndex) => (
         <Box key={hunkIndex} flexDirection="column">
-          <Text dimColor>
+          <Text color={theme.muted}>
             @@ -{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@
           </Text>
           {unified
             ? hunk.lines.map((line, lineIndex) => {
                 const view = unifiedLine(line);
                 return (
-                  <Text key={lineIndex} color={view.color}>
+                  <Text key={lineIndex} color={lineColor(view.kind)}>
                     {view.gutter} {view.marker} {line.text}
                   </Text>
                 );
@@ -129,22 +144,22 @@ export function DiffView({ oldText, newText, oldLabel = "old", newLabel = "new",
                 <Box key={lineIndex}>
                   <Box width="50%">
                     {pair.left ? (
-                      <Text color={pair.left.kind === "remove" ? "red" : "gray"}>
+                      <Text color={lineColor(pair.left.kind)}>
                         {String(pair.left.kind === "add" ? "" : (pair.left.oldNumber ?? "")).padStart(4)} {lineHash(pair.left)}{" "}
                         {pair.left.kind === "remove" ? "-" : " "} {pair.left.text}
                       </Text>
                     ) : (
-                      <Text color="gray">{"     (empty)"}</Text>
+                      <Text color={theme.muted}>{"     (empty)"}</Text>
                     )}
                   </Box>
                   <Box width="50%">
                     {pair.right ? (
-                      <Text color={pair.right.kind === "add" ? "green" : "gray"}>
+                      <Text color={lineColor(pair.right.kind)}>
                         {String(pair.right.kind === "remove" ? "" : (pair.right.newNumber ?? "")).padStart(4)} {lineHash(pair.right)}{" "}
                         {pair.right.kind === "add" ? "+" : " "} {pair.right.text}
                       </Text>
                     ) : (
-                      <Text color="gray">{"     (empty)"}</Text>
+                      <Text color={theme.muted}>{"     (empty)"}</Text>
                     )}
                   </Box>
                 </Box>
@@ -155,8 +170,15 @@ export function DiffView({ oldText, newText, oldLabel = "old", newLabel = "new",
   );
 }
 
-export function ToolCallBadge({ name, argumentsSummary, durationMs, status = "ok", lspStatus }: ToolCallBadgeProps) {
-  const statusColor = status === "running" ? "yellow" : status === "error" ? "red" : "green";
+export function ToolCallBadge({
+  name,
+  argumentsSummary,
+  durationMs,
+  status = "ok",
+  lspStatus,
+  theme = getTheme("tokyonight"),
+}: ToolCallBadgeProps) {
+  const statusColor = status === "running" ? theme.badge.running : status === "error" ? theme.badge.error : theme.badge.ok;
   const statusIcon = status === "running" ? "●" : status === "error" ? "✖" : "✔";
   return (
     <Box gap={1} marginY={0}>
@@ -164,17 +186,22 @@ export function ToolCallBadge({ name, argumentsSummary, durationMs, status = "ok
         {statusIcon} {name}
       </Text>
       {argumentsSummary ? (
-        <Text dimColor>
+        <Text color={theme.muted}>
           {argumentsSummary.length > 60 ? `${argumentsSummary.slice(0, 57)}...` : argumentsSummary}
         </Text>
       ) : null}
-      {durationMs !== undefined ? <Text color="gray">{durationMs}ms</Text> : null}
-      {lspStatus ? <Text color="yellow">lsp:{lspStatus}</Text> : null}
+      {durationMs !== undefined ? <Text color={theme.muted}>{durationMs}ms</Text> : null}
+      {lspStatus ? <Text color={theme.badge.running}>lsp:{lspStatus}</Text> : null}
     </Box>
   );
 }
 
-export function ThinkingBlock({ text, defaultOpen = false, focused = false }: ThinkingBlockProps) {
+export function ThinkingBlock({
+  text,
+  defaultOpen = false,
+  focused = false,
+  theme = getTheme("tokyonight"),
+}: ThinkingBlockProps) {
   const [open, setOpen] = React.useState(defaultOpen);
   useInput(
     (input, key) => {
@@ -184,13 +211,13 @@ export function ThinkingBlock({ text, defaultOpen = false, focused = false }: Th
   );
   const lines = text.split("\n");
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor="magenta" paddingX={1} marginY={0}>
-      <Text color="magenta" bold>
+    <Box flexDirection="column" borderStyle="single" borderColor={theme.border.passive} paddingX={1} marginY={0}>
+      <Text color={theme.modes.plan.secondary} bold>
         {open ? "▼" : "▶"} Thinking ({lines.length} lines){focused ? " · Enter to toggle" : ""}
       </Text>
       {open
         ? lines.map((line, index) => (
-            <Text key={index} dimColor>
+            <Text key={index} color={theme.muted}>
               {line}
             </Text>
           ))

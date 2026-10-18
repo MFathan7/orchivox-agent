@@ -42,8 +42,18 @@ const AnthropicToolResultBlockSchema = z.object({
   cache_control: AnthropicCacheControlSchema.optional(),
 });
 
+const AnthropicImageBlockSchema = z.object({
+  type: z.literal("image"),
+  source: z.object({
+    type: z.literal("base64"),
+    media_type: z.string().min(1),
+    data: z.string().min(1),
+  }),
+});
+
 const AnthropicContentBlockSchema = z.discriminatedUnion("type", [
   AnthropicTextBlockSchema,
+  AnthropicImageBlockSchema,
   AnthropicThinkingBlockSchema,
   AnthropicToolUseBlockSchema,
   AnthropicToolResultBlockSchema,
@@ -246,6 +256,8 @@ function toAgentBlock(
   switch (block.type) {
     case "text":
       return { ok: true, block: { type: "text", text: block.text } };
+    case "image":
+      return { ok: true, block: { type: "image", source: block.source } };
     case "thinking":
       return {
         ok: true,

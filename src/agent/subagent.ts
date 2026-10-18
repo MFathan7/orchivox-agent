@@ -3,12 +3,18 @@ import { z } from "zod";
 import type { AgentTool, ToolRegistry } from "../tools/registry";
 import type { JsonSchemaObject, SubagentResult, SubagentState, Usage } from "../types/schema";
 import { SubagentResultSchema } from "../types/schema";
+import type { AgentMode } from "../types/schema";
 import type { WorktreeManager } from "../vcs/worktree";
+import { currentTurnContext } from "./turn-context";
 
 export interface SubagentTaskInput {
   workerId: string;
   agent?: string;
   task: string;
+  mode?: AgentMode;
+  roleModel?: "main" | "fast" | "advisor";
+  provider?: string;
+  model?: string;
   outputJsonSchema?: JsonSchemaObject;
   writeIsolation: boolean;
   worktreePath?: string;
@@ -29,6 +35,9 @@ export interface SubagentWorkerState {
   id: string;
   agent?: string;
   task: string;
+  roleModel?: "main" | "fast" | "advisor";
+  provider?: string;
+  model?: string;
   status: SubagentState;
   transcript: string[];
   usage?: Usage;
@@ -74,6 +83,10 @@ export class SubagentManager {
     id?: string;
     agent?: string;
     task: string;
+    mode?: AgentMode;
+    roleModel?: "main" | "fast" | "advisor";
+    provider?: string;
+    model?: string;
     outputJsonSchema?: JsonSchemaObject;
     writeIsolation?: boolean;
     onComplete?: (worker: SubagentWorkerState) => void;
@@ -98,6 +111,9 @@ export class SubagentManager {
       id,
       agent: resolvedAgent,
       task: input.task,
+      roleModel: input.roleModel,
+      provider: input.provider,
+      model: input.model,
       status: "queued",
       transcript: [],
       outputJsonSchema: input.outputJsonSchema,
@@ -107,7 +123,11 @@ export class SubagentManager {
     this.workers.set(id, worker);
     this.controllers.set(id, controller);
     this.steerings.set(id, []);
-    const completion = this.runWorker(worker, input, controller)
+    const completion = this.runWorker(
+      worker,
+      { ...input, mode: input.mode ?? currentTurnContext()?.mode ?? "build" },
+      controller,
+    )
       .catch(() => {
         // runWorker records failures on the worker state
       })
@@ -119,7 +139,7 @@ export class SubagentManager {
   }
 
   async spawn(
-    tasks: Array<{ id?: string; agent?: string; task: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean }>,
+    tasks: Array<{ id?: string; agent?: string; task: string; mode?: AgentMode; roleModel?: "main" | "fast" | "advisor"; provider?: string; model?: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean }>,
   ): Promise<SubagentResult[]> {
     const workers = tasks.map((task) => this.spawnOne(task));
     await Promise.all(tasks.map((_, index) => this.completions.get(workers[index].id)));
@@ -153,10 +173,9 @@ export class SubagentManager {
 
   private async runWorker(
     worker: SubagentWorkerState,
-    input: { task: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean; onComplete?: (worker: SubagentWorkerState) => void },
+    input: { task: string; mode?: AgentMode; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean; onComplete?: (worker: SubagentWorkerState) => void },
     controller: AbortController,
-  ): Promise<void> {
-    const startedAt = Date.now();
+  ): Promise<void> {    const startedAt = Date.now();
     const writeIsolation = input.writeIsolation ?? true;
     if (writeIsolation) {
       worker.status = "preparing";
@@ -177,6 +196,10 @@ export class SubagentManager {
         workerId: worker.id,
         agent: worker.agent,
         task: buildTaskText(worker.task, input.outputJsonSchema),
+        mode: input.mode,
+        roleModel: worker.roleModel,
+        provider: worker.provider,
+        model: worker.model,
         outputJsonSchema: input.outputJsonSchema,
         writeIsolation,
         worktreePath: worker.worktreePath,
@@ -254,7 +277,7 @@ export class SubagentManager {
     return {
       name: "spawn_subagents",
       description:
-        "Run independent tasks in parallel, optionally with file-write isolation (a git worktree per worker) and a JSON output schema. Returns each worker result when all finish.",
+        "Run independent tasks in parallel, optionally with file-write isolation (a git worktree per worker), a model role or provider/model route, and a JSON output schema. Each worker has its own context, so include every file path and decision it needs. Returns each worker result when all finish.",
       parameters: z.object({
         tasks: z
           .array(
@@ -262,6 +285,9 @@ export class SubagentManager {
               id: z.string().min(1).optional(),
               agent: z.string().min(1).optional(),
               task: z.string().min(1),
+              role_model: z.enum(["main", "fast", "advisor"]).optional(),
+              provider: z.string().min(1).optional(),
+              model: z.string().min(1).optional(),
               outputJsonSchema: z.record(z.string(), z.unknown()).optional(),
               writeIsolation: z.boolean().default(true),
             }),
@@ -271,9 +297,29 @@ export class SubagentManager {
       readOnly: false,
       execute: async (args) => {
         const request = args as {
-          tasks: Array<{ id?: string; agent?: string; task: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean }>;
+          tasks: Array<{
+            id?: string;
+            agent?: string;
+            task: string;
+            role_model?: "main" | "fast" | "advisor";
+            provider?: string;
+            model?: string;
+            outputJsonSchema?: JsonSchemaObject;
+            writeIsolation?: boolean;
+          }>;
         };
-        const results = await this.spawn(request.tasks);
+        const results = await this.spawn(
+          request.tasks.map((entry) => ({
+            id: entry.id,
+            agent: entry.agent,
+            task: entry.task,
+            roleModel: entry.role_model,
+            provider: entry.provider,
+            model: entry.model,
+            outputJsonSchema: entry.outputJsonSchema,
+            writeIsolation: entry.writeIsolation,
+          })),
+        );
         return results
           .map((result) => {
             const header = `# subagent ${result.id} (${result.state})`;

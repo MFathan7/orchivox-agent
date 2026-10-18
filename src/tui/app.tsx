@@ -3,16 +3,23 @@ import { Box, Text, render, useInput } from "ink";
 
 import type { AgentMode, Message } from "../types/schema";
 import type { SubagentWorkerState } from "../agent/subagent";
+import type { SkillDocument } from "../agent/skills";
+import type { TaskItem } from "../agent/task-board";
 import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import type { ProviderRouter } from "../provider/router";
 import type { MemoryDatabase, SessionRecord } from "../memory/sqlite";
 import type { RestoreResult, SnapshotManager } from "../vcs/snapshot";
-import { AgentHub } from "./agent-hub";
+import type { ConfigRole } from "../config/writer";
+import { AgentHub, type AgentHubTab } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
 import { CommandPaletteModal, type ReasoningEffortLevel } from "./command-palette";
-import { PromptComposer } from "./composer";
+import { PromptComposer, type FileAttachmentRef } from "./composer";
+import { HelpOverlay } from "./help-overlay";
 import { OrchivoxLogo } from "./logo";
+import { ModelConfigModal } from "./model-modal";
 import { SessionTimeTravelModal, type SessionModalTab } from "./session-modal";
+import { SkillsModal } from "./skills-modal";
+import { formatCost, formatTokenCount } from "./format";
 import { ThemeProvider, getTheme, type ThemeName } from "./theme";
 import {
   ScrollableChatViewport,
@@ -40,11 +47,20 @@ export type InputAction =
   | { kind: "submit"; text: string; ultrawork: boolean };
 
 export interface ChatToolCallView {
+  id?: string;
   name: string;
   argumentsSummary: string;
   durationMs?: number;
   status?: "running" | "ok" | "error";
   lspStatus?: string;
+}
+
+export interface ChatFileChangeView {
+  path: string;
+  oldText: string;
+  newText: string;
+  additions?: number;
+  deletions?: number;
 }
 
 export interface ChatEntryView {
@@ -53,6 +69,9 @@ export interface ChatEntryView {
   text: string;
   thinking?: string;
   toolCalls?: ChatToolCallView[];
+  files?: ChatFileChangeView[];
+  live?: boolean;
+  startedAt?: number;
   diff?: { oldText: string; newText: string; oldLabel?: string; newLabel?: string; unified?: boolean };
 }
 
@@ -65,9 +84,11 @@ export interface OrchivoxAppProps {
   totalCostUsd?: number;
   entries: ChatEntryView[];
   streamingText?: string;
+  liveEntry?: ChatEntryView;
+  busy?: boolean;
   mode?: AgentMode;
   onModeChange?: (mode: AgentMode) => void;
-  onSubmit?: (text: string, action: InputAction) => void;
+  onSubmit?: (text: string, action: InputAction, attachments?: FileAttachmentRef[]) => void;
   onAbort?: () => void;
   workers?: SubagentWorkerState[];
   onSteer?: (workerId: string, instruction: string) => void;
@@ -85,18 +106,45 @@ export interface OrchivoxAppProps {
   onReasoningEffortChange?: (effort: ReasoningEffortLevel) => void;
   onForkSession?: (forkedSession: SessionRecord) => void;
   onResumeSession?: (sessionId: string) => void;
+  onNewSession?: () => void;
   onRestoreSnapshot?: (result: RestoreResult) => void;
   todos?: SidebarTodo[];
   modifiedFiles?: SidebarFile[];
   lspStatus?: string;
   mcpServers?: string[];
+  statusMessage?: string;
+  onStatusMessage?: (message: string) => void;
+  helpOpen?: boolean;
+  onHelpOpenChange?: (open: boolean) => void;
+  modelsOpen?: boolean;
+  onModelsOpenChange?: (open: boolean) => void;
+  hubOpen?: boolean;
+  onHubOpenChange?: (open: boolean) => void;
+  hubTab?: AgentHubTab;
+  onHubTabChange?: (tab: AgentHubTab) => void;
+  tasks?: TaskItem[];
+  onCancelTask?: (id: string) => void;
+  onDispatchTasks?: () => void;
+  onMergeTask?: (id: string) => void;
+  skills?: SkillDocument[];
+  skillsOpen?: boolean;
+  onSkillsOpenChange?: (open: boolean) => void;
+  onReloadSkills?: () => void;
+  paletteOpen?: boolean;
+  onPaletteOpenChange?: (open: boolean) => void;
+  sessionTab?: SessionModalTab | null;
+  onSessionTabChange?: (tab: SessionModalTab | null) => void;
+  onRoleChange?: (role: ConfigRole, provider: string, model: string) => void;
+  configPath?: string;
+  secretsPath?: string;
 }
 
 const MODE_ORDER: AgentMode[] = ["plan", "build", "ultrawork"];
-const MODE_STYLES: Record<AgentMode, { label: string; color: string; accent: string }> = {
-  plan: { label: "PLAN / PROMETHEUS MODE", color: "blue", accent: "magenta" },
-  build: { label: "BUILD MODE", color: "green", accent: "green" },
-  ultrawork: { label: "ULTRAWORK MODE", color: "yellow", accent: "red" },
+
+const MODE_HINTS: Record<AgentMode, string> = {
+  plan: "read-only",
+  build: "approval on write",
+  ultrawork: "autonomous",
 };
 
 export function interpretInput(text: string): InputAction {
@@ -112,8 +160,10 @@ export function interpretInput(text: string): InputAction {
   return { kind: "submit", text: trimmed, ultrawork };
 }
 
-export function formatCost(costUsd: number): string {
-  return `$${costUsd.toFixed(4)}`;
+export { formatCost } from "./format";
+
+export function computeViewportHeight(rows: number, chromeRows: number, composerRows: number): number {
+  return Math.max(3, rows - chromeRows - composerRows - 1);
 }
 
 export function installSynchronizedOutput(
@@ -169,12 +219,12 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const {
     projectName = "orchivox-agent",
     branch = "main",
-    mcpCount = 0,
-    pluginCount = 0,
     totalTokens = 0,
     totalCostUsd = 0,
     entries,
     streamingText,
+    liveEntry,
+    busy = false,
     workers = [],
     onSteer = () => undefined,
     onKill = () => undefined,
@@ -185,138 +235,198 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     modifiedFiles = [],
     lspStatus = "ready",
     mcpServers = [],
+    statusMessage,
+    onStatusMessage,
+    onRoleChange,
+    configPath = `${globalThis.process.cwd()}/.agent/config.yaml`,
+    secretsPath = `${globalThis.process.cwd()}/.agent/secrets.yaml`,
   } = props;
 
   const [internalMode, setInternalMode] = React.useState<AgentMode>("build");
   const mode = props.mode ?? internalMode;
-  const [hubOpen, setHubOpen] = React.useState(false);
-  const [paletteOpen, setPaletteOpen] = React.useState(false);
-  const [sessionTab, setSessionTab] = React.useState<SessionModalTab | null>(null);
-  const [sidebarVisible, setSidebarVisible] = React.useState(true);
-  const [collapsed, setCollapsed] = React.useState(false);
+
+  const [internalHelpOpen, setInternalHelpOpen] = React.useState(false);
+  const [internalModelsOpen, setInternalModelsOpen] = React.useState(false);
+  const [internalSkillsOpen, setInternalSkillsOpen] = React.useState(false);
+  const [internalHubOpen, setInternalHubOpen] = React.useState(false);
+  const [internalHubTab, setInternalHubTab] = React.useState<AgentHubTab>("workers");
+  const [internalPaletteOpen, setInternalPaletteOpen] = React.useState(false);
+  const [internalSessionTab, setInternalSessionTab] = React.useState<SessionModalTab | null>(null);
+
+  const helpOpen = props.helpOpen ?? internalHelpOpen;
+  const setHelpOpen = (open: boolean) => {
+    if (props.helpOpen === undefined) setInternalHelpOpen(open);
+    props.onHelpOpenChange?.(open);
+  };
+
+  const modelsOpen = props.modelsOpen ?? internalModelsOpen;
+  const setModelsOpen = (open: boolean) => {
+    if (props.modelsOpen === undefined) setInternalModelsOpen(open);
+    props.onModelsOpenChange?.(open);
+  };
+
+  const hubOpen = props.hubOpen ?? internalHubOpen;
+  const setHubOpen = (open: boolean) => {
+    if (props.hubOpen === undefined) setInternalHubOpen(open);
+    props.onHubOpenChange?.(open);
+  };
+
+  const hubTab = props.hubTab ?? internalHubTab;
+  const setHubTab = (tab: AgentHubTab) => {
+    if (props.hubTab === undefined) setInternalHubTab(tab);
+    props.onHubTabChange?.(tab);
+  };
+
+  const skillsOpen = props.skillsOpen ?? internalSkillsOpen;
+  const setSkillsOpen = (open: boolean) => {
+    if (props.skillsOpen === undefined) setInternalSkillsOpen(open);
+    props.onSkillsOpenChange?.(open);
+  };
+
+  const paletteOpen = props.paletteOpen ?? internalPaletteOpen;
+  const setPaletteOpen = (open: boolean) => {
+    if (props.paletteOpen === undefined) setInternalPaletteOpen(open);
+    props.onPaletteOpenChange?.(open);
+  };
+
+  const sessionTab = props.sessionTab ?? internalSessionTab;
+  const setSessionTab = (tab: SessionModalTab | null) => {
+    if (props.sessionTab === undefined) setInternalSessionTab(tab);
+    props.onSessionTabChange?.(tab);
+  };
 
   const terminalSize = useTerminalSize();
   const theme = getTheme(props.currentTheme ?? "tokyonight");
+  const modePalette = theme.modes[mode] ?? theme.modes.build;
+  const [sidebarVisible, setSidebarVisible] = React.useState(terminalSize.columns >= 100);
+  const [composerRows, setComposerRows] = React.useState(4);
+  const handleComposerRows = React.useCallback((rows: number) => setComposerRows(rows), []);
+  const [escArmed, setEscArmed] = React.useState(false);
+  const escTimerRef = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const streaming = busy || Boolean(streamingText);
+
+  React.useEffect(() => {
+    if (!streaming) {
+      setEscArmed(false);
+      if (escTimerRef.current) clearTimeout(escTimerRef.current);
+      escTimerRef.current = undefined;
+    }
+  }, [streaming]);
+
+  React.useEffect(() => {
+    return () => {
+      if (escTimerRef.current) clearTimeout(escTimerRef.current);
+    };
+  }, []);
 
   const setMode = (next: AgentMode): void => {
     if (props.mode === undefined) setInternalMode(next);
     onModeChange(next);
   };
 
-  const hasModalOpen = hubOpen || paletteOpen || Boolean(sessionTab) || Boolean(props.pendingApproval);
+  const hasModalOpen =
+    Boolean(props.pendingApproval) || helpOpen || modelsOpen || skillsOpen || paletteOpen || Boolean(sessionTab) || hubOpen;
 
   useInput((input, key) => {
-    // Esc: cancel active streaming or dismiss open modal
     if (key.escape) {
-      if (streamingText && onAbort) {
+      if (hasModalOpen) return;
+      if (!streaming || !onAbort) return;
+      if (escArmed) {
+        if (escTimerRef.current) clearTimeout(escTimerRef.current);
+        escTimerRef.current = undefined;
+        setEscArmed(false);
         onAbort();
         return;
       }
-      if (hubOpen) {
-        setHubOpen(false);
-        return;
-      }
-      if (paletteOpen) {
-        setPaletteOpen(false);
-        return;
-      }
-      if (sessionTab) {
-        setSessionTab(null);
-        return;
-      }
-      if (props.pendingApproval && props.onApprovalDecision) {
-        props.onApprovalDecision({
-          approved: false,
-          choice: "deny",
-          reason: "Cancelled by user via Esc",
-        });
-        return;
-      }
+      setEscArmed(true);
+      if (escTimerRef.current) clearTimeout(escTimerRef.current);
+      escTimerRef.current = setTimeout(() => {
+        escTimerRef.current = undefined;
+        setEscArmed(false);
+      }, 2500);
       return;
     }
 
     if (hasModalOpen) return;
 
-    // Tab: cycle through modes
-    if (key.tab) {
-      const index = MODE_ORDER.indexOf(mode);
-      setMode(MODE_ORDER[(index + 1) % MODE_ORDER.length]);
-      return;
+    if (escArmed) {
+      if (escTimerRef.current) clearTimeout(escTimerRef.current);
+      escTimerRef.current = undefined;
+      setEscArmed(false);
     }
 
-    // Ctrl+P: open command palette
-    if (key.ctrl && input === "p") {
-      setPaletteOpen(true);
-      return;
-    }
-
-    // Ctrl+S: open session time-travel modal
-    if (key.ctrl && input === "s") {
-      setSessionTab("sessions");
-      return;
-    }
-
-    // Alt+A: toggle agent hub
-    if ((key.meta && input === "a") || input === "\u001ba") {
-      setHubOpen(true);
-      return;
-    }
-
-    // Ctrl+O: toggle collapse for tool calls & thinking blocks
-    if (key.ctrl && input === "o") {
-      setCollapsed((prev) => !prev);
-      return;
-    }
-
-    // Ctrl+B: toggle workspace sidebar
     if (key.ctrl && input === "b") {
       setSidebarVisible((prev) => !prev);
-      return;
     }
   });
 
-  const style = MODE_STYLES[mode];
-
-  const sidebarSubagents: SidebarSubagent[] = workers.map((w) => ({
-    id: w.id,
-    status: w.status,
-    task: w.task,
+  const sidebarSubagents: SidebarSubagent[] = workers.map((worker) => ({
+    id: worker.id,
+    status: worker.status,
+    task: worker.task,
   }));
 
-  const innerWidth = Math.max(40, terminalSize.columns - 4);
-  const viewportHeight = Math.max(6, terminalSize.rows - 10);
-  const chatWidth = sidebarVisible ? Math.max(20, Math.floor(innerWidth * 0.72)) : innerWidth;
-  const sidebarWidth = sidebarVisible ? Math.max(20, innerWidth - chatWidth) : 0;
+  const innerWidth = Math.max(20, terminalSize.columns - 2);
+  const chromeRows = 3 + (statusMessage || escArmed ? 1 : 0);
+  const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
+  const showSidebar = sidebarVisible && innerWidth >= 60;
+  const chatWidth = showSidebar ? Math.max(20, Math.floor(innerWidth * 0.72)) : innerWidth;
+  const sidebarWidth = showSidebar ? Math.max(20, innerWidth - chatWidth) : 0;
+  const divider = "─".repeat(innerWidth);
+
+  const runCommand = (command: string): void => {
+    onSubmit(command, { kind: "command", command, raw: command });
+  };
 
   return (
     <ThemeProvider theme={props.currentTheme ?? "tokyonight"}>
-      <Box flexDirection="column" borderStyle="round" borderColor={style.color} paddingX={1}>
+      <Box flexDirection="column" paddingX={1}>
         <Box justifyContent="space-between">
           <Box gap={1}>
-            <OrchivoxLogo variant="compact" />
-            <Text bold color={theme.text}>
-              {projectName} | branch: {branch} | MCP: {mcpCount} | plugins: {pluginCount}
-            </Text>
+            <OrchivoxLogo variant="compact" theme={theme} />
+            <Text bold color={theme.text}>{projectName}</Text>
+            <Text color={theme.muted}>· {branch}</Text>
           </Box>
-          <Text color={theme.text}>
-            {totalTokens} tok | <Text color={theme.syntax.number}>{formatCost(totalCostUsd)}</Text>
+          <Text color={theme.muted}>
+            {formatTokenCount(totalTokens)} tok · <Text color={theme.text}>{formatCost(totalCostUsd)}</Text>
           </Text>
         </Box>
-        <Text bold color={style.color}>
-          {style.label}
-        </Text>
+        <Text color={theme.border.passive}>{divider}</Text>
+        <Box gap={1}>
+          <Text color={modePalette.primary}>●</Text>
+          <Text bold color={modePalette.primary}>{mode.toUpperCase()}</Text>
+          <Text color={theme.muted}>{MODE_HINTS[mode]}</Text>
+        </Box>
 
-        {hubOpen ? (
-          <AgentHub
-            workers={workers}
-            onSteer={(workerId, instruction) => onSteer(workerId, instruction)}
-            onKill={onKill}
-            onExit={() => setHubOpen(false)}
-          />
-        ) : props.pendingApproval && props.onApprovalDecision ? (
+        {props.pendingApproval && props.onApprovalDecision ? (
           <ToolApprovalModal
             request={props.pendingApproval}
             onDecision={props.onApprovalDecision}
+          />
+        ) : helpOpen ? (
+          <HelpOverlay
+            theme={theme}
+            width={innerWidth}
+            height={Math.max(10, terminalSize.rows - 8)}
+            onClose={() => setHelpOpen(false)}
+          />
+        ) : skillsOpen ? (
+          <SkillsModal
+            skills={props.skills ?? []}
+            width={innerWidth}
+            theme={theme}
+            onReload={props.onReloadSkills}
+            onClose={() => setSkillsOpen(false)}
+          />
+        ) : modelsOpen && props.router ? (
+          <ModelConfigModal
+            router={props.router}
+            configPath={configPath}
+            secretsPath={secretsPath}
+            theme={theme}
+            onClose={() => setModelsOpen(false)}
+            onSaved={(message) => onStatusMessage?.(message)}
+            onRoleChange={onRoleChange}
           />
         ) : paletteOpen && props.router ? (
           <CommandPaletteModal
@@ -325,13 +435,32 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             reasoningEffort={props.reasoningEffort}
             onSelectTheme={props.onThemeChange}
             onSelectReasoning={props.onReasoningEffortChange}
+            onOpenModels={() => setModelsOpen(true)}
             onAction={(action) => {
-              if (action === "/commit" || action === "/compact" || action === "/plugins") {
-                onSubmit(action, { kind: "command", command: action });
+              if (action === "open_models") {
+                setModelsOpen(true);
+              } else if (action === "open_skills") {
+                props.onReloadSkills?.();
+                setSkillsOpen(true);
+              } else if (action === "open_tasks") {
+                setHubTab("tasks");
+                setHubOpen(true);
               } else if (action === "open_hub") {
                 setHubOpen(true);
               } else if (action === "open_sessions") {
                 setSessionTab("sessions");
+              } else if (action === "open_timeline") {
+                setSessionTab("timeline");
+              } else if (action === "open_fork") {
+                setSessionTab("fork");
+              } else if (action === "toggle_sidebar") {
+                setSidebarVisible((prev) => !prev);
+              } else if (action === "run_commit") {
+                runCommand("/commit");
+              } else if (action === "run_compact") {
+                runCommand("/compact");
+              } else if (action === "run_plugins") {
+                runCommand("/plugins");
               }
             }}
             onClose={() => setPaletteOpen(false)}
@@ -345,8 +474,24 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             initialTab={sessionTab}
             onResumeSession={props.onResumeSession}
             onForkSession={props.onForkSession}
+            onNewSession={props.onNewSession}
             onRestoreSnapshot={props.onRestoreSnapshot}
             onClose={() => setSessionTab(null)}
+          />
+        ) : hubOpen ? (
+          <AgentHub
+            workers={workers}
+            tasks={props.tasks ?? []}
+            initialTab={hubTab}
+            onTabChange={setHubTab}
+            onSteer={(workerId, instruction) => onSteer(workerId, instruction)}
+            onKill={onKill}
+            onCancelTask={props.onCancelTask}
+            onDispatchTasks={props.onDispatchTasks}
+            onMergeTask={props.onMergeTask}
+            onExit={() => setHubOpen(false)}
+            width={innerWidth}
+            theme={theme}
           />
         ) : (
           <Box width={innerWidth}>
@@ -354,16 +499,18 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               <ScrollableChatViewport
                 entries={entries}
                 streamingText={streamingText}
+                liveEntry={liveEntry}
                 width={chatWidth}
                 height={viewportHeight}
                 theme={theme}
-                initiallyCollapsed={collapsed}
+                initiallyCollapsed={false}
                 active={!hasModalOpen}
                 repoPath={globalThis.process.cwd()}
                 branch={branch}
+                resetKey={props.activeSessionId}
               />
             </Box>
-            {sidebarVisible ? (
+            {showSidebar ? (
               <Box width={sidebarWidth} flexDirection="column">
                 <WorkspaceSidebar
                   todos={todos}
@@ -378,21 +525,39 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           </Box>
         )}
 
+        {escArmed ? (
+          <Text color={theme.badge.running}>Press Esc again to stop the current turn</Text>
+        ) : statusMessage ? (
+          <Text color={theme.modes.build.primary}>{statusMessage}</Text>
+        ) : null}
+
         {!hasModalOpen ? (
           <PromptComposer
             mode={mode}
             theme={theme}
+            width={innerWidth}
+            streaming={streaming}
+            onLayoutRows={handleComposerRows}
             onModeToggle={() => {
               const index = MODE_ORDER.indexOf(mode);
               setMode(MODE_ORDER[(index + 1) % MODE_ORDER.length]);
             }}
+            onOpenHelp={() => setHelpOpen(true)}
             onOpenHub={() => setHubOpen(true)}
             onOpenPalette={() => setPaletteOpen(true)}
             onOpenSessions={() => setSessionTab("sessions")}
             onSubmit={(payload) => {
               const action = interpretInput(payload.rawText);
               if (action.kind === "command") {
-                if (action.command === "/palette" || action.command === "/model") {
+                if (action.command === "/help") {
+                  setHelpOpen(true);
+                  return;
+                }
+                if (action.command === "/models") {
+                  setModelsOpen(true);
+                  return;
+                }
+                if (action.command === "/palette") {
                   setPaletteOpen(true);
                   return;
                 }
@@ -409,6 +574,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                   return;
                 }
                 if (action.command === "/hub") {
+                  setHubTab("workers");
                   setHubOpen(true);
                   return;
                 }
@@ -417,7 +583,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 setMode("ultrawork");
               }
               if (payload.fullText.trim().length > 0) {
-                onSubmit(payload.fullText.trim(), action);
+                onSubmit(payload.fullText.trim(), action, payload.attachments);
               }
             }}
           />

@@ -7,9 +7,10 @@ import { extractDeclarations, detectLanguage, type SourceLanguage } from "../ide
 import { readText } from "../tools/hashline-edit";
 import { CustomCommandEngine } from "../agent/custom-commands";
 import { SpecialistAgentRegistry } from "../agent/specialist-agents";
+import { SkillRegistry } from "../agent/skills";
 import { getTheme, type Theme } from "./theme";
 
-export type AutocompleteTrigger = "command" | "file" | "symbol";
+export type AutocompleteTrigger = "command" | "file" | "symbol" | "skill";
 
 export interface AutocompleteItem {
   id: string;
@@ -42,23 +43,38 @@ export interface AutocompletePopupProps {
   theme?: Theme;
   maxVisible?: number;
   title?: string;
+  width?: number;
+}
+
+function truncateText(text: string, max: number): string {
+  if (max <= 0) return "";
+  if (text.length <= max) return text;
+  if (max <= 3) return text.slice(0, max);
+  return `${text.slice(0, max - 3)}...`;
 }
 
 export const BUILTIN_SLASH_COMMANDS: Array<{ name: string; args?: string; description: string }> = [
-  { name: "/help", description: "Display slash commands guide and keyboard shortcuts" },
+  { name: "/help", description: "Open the command reference panel" },
+  { name: "/models", description: "Inspect roles, connect providers, and assign models" },
   { name: "/mode", args: "<plan|build|ultrawork>", description: "Switch or inspect agent execution mode" },
-  { name: "/theme", args: "<name>", description: "Change or inspect terminal visual theme" },
-  { name: "/reasoning", args: "<off|low|med|high|max>", description: "Adjust thinking model reasoning effort level" },
-  { name: "/palette", description: "Open command palette for models, themes, and reasoning" },
-  { name: "/model", description: "Open provider and model routing settings" },
+  { name: "/plan", description: "Switch to plan mode (read-only)" },
+  { name: "/build", description: "Switch to build mode (approval on write)" },
+  { name: "/ultrawork", description: "Switch to autonomous ultrawork mode" },
+  { name: "/theme", args: "<name>", description: "Change or inspect the terminal theme" },
+  { name: "/reasoning", args: "<off|low|med|high|max>", description: "Set thinking effort" },
+  { name: "/palette", description: "Search actions and settings" },
   { name: "/sessions", description: "Open session manager and past conversation search" },
   { name: "/fork", description: "Fork active conversation from a specific turn" },
   { name: "/timeline", description: "Open VCS snapshot history timeline" },
   { name: "/hub", description: "Open subagent manager to inspect or stop workers" },
+  { name: "/tasks", description: "Open the multi-agent task board" },
+  { name: "/skills", description: "Inspect installed skills" },
+  { name: "/new", description: "Start a fresh session and reset the view" },
   { name: "/undo", description: "Undo file modifications to the previous snapshot" },
   { name: "/redo", description: "Re-apply reverted snapshot" },
   { name: "/commit", description: "Analyze git diff and create atomic commits" },
   { name: "/compact", description: "Compact conversation history to save context tokens" },
+  { name: "/stats", description: "Show session and workspace statistics" },
   { name: "/plugins", description: "List loaded and active agent plugins" },
   { name: "/collab", description: "Start live terminal sharing relay session" },
   { name: "/clear", description: "Clear chat screen" },
@@ -84,10 +100,19 @@ interface CacheEntry<T> {
 let cachedFiles: CacheEntry<string[]> | undefined;
 let cachedSymbols: CacheEntry<AutocompleteItem[]> | undefined;
 let cachedCommands: CacheEntry<AutocompleteItem[]> | undefined;
+let cachedSkills: CacheEntry<AutocompleteItem[]> | undefined;
 
 const CACHE_TTL_FILES_MS = 10_000;
 const CACHE_TTL_SYMBOLS_MS = 30_000;
 const CACHE_TTL_COMMANDS_MS = 15_000;
+const CACHE_TTL_SKILLS_MS = 10_000;
+
+export function resetAutocompleteCaches(): void {
+  cachedFiles = undefined;
+  cachedSymbols = undefined;
+  cachedCommands = undefined;
+  cachedSkills = undefined;
+}
 
 export function scoreFuzzyMatch(query: string, candidate: string): FuzzyMatchResult | null {
   if (query.length === 0) {
@@ -229,6 +254,18 @@ export function detectTriggerContext(text: string, cursorPos: number): TriggerCo
     };
   }
 
+  const skillMatch = /(?:^|\s)\$([a-zA-Z0-9_-]*)$/.exec(linePrefix);
+  if (skillMatch) {
+    const query = skillMatch[1];
+    return {
+      trigger: "skill",
+      query,
+      replaceStart: safeCursor - (query.length + 1),
+      replaceEnd: safeCursor,
+      linePrefix,
+    };
+  }
+
   return null;
 }
 
@@ -285,6 +322,32 @@ export async function fetchSpecialistAgents(repoRoot?: string): Promise<Autocomp
       detail: agent.roleModel ? `(${agent.roleModel})` : undefined,
       description: agent.description,
     }));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchSkills(repoRoot?: string): Promise<AutocompleteItem[]> {
+  const now = Date.now();
+  if (cachedSkills && now - cachedSkills.timestamp < CACHE_TTL_SKILLS_MS) {
+    return cachedSkills.data;
+  }
+
+  const root = repoRoot ?? globalThis.process.cwd();
+  const registry = new SkillRegistry({ repoRoot: root });
+  try {
+    const documents = await registry.load(true);
+    const items: AutocompleteItem[] = documents.map((document) => ({
+      id: `skill:${document.name}`,
+      trigger: "skill",
+      label: document.name,
+      insertText: `$${document.name} `,
+      kind: "skill",
+      detail: document.modelRole ? `(${document.modelRole})` : undefined,
+      description: document.description,
+    }));
+    cachedSkills = { data: items, timestamp: now };
+    return items;
   } catch {
     return [];
   }
@@ -423,6 +486,8 @@ export async function queryAutocomplete(
     return { context, items };
   } else if (context.trigger === "symbol") {
     sourceItems = await fetchAstSymbols(repoRoot);
+  } else if (context.trigger === "skill") {
+    sourceItems = await fetchSkills(repoRoot);
   }
 
   const ranked = filterFuzzy(context.query, sourceItems, (item) => item.label, 20);
@@ -437,11 +502,16 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
     trigger,
     theme = getTheme("tokyonight"),
     maxVisible = 6,
+    width = 80,
   } = props;
 
   if (items.length === 0) {
     return null;
   }
+
+  const popupWidth = Math.max(30, width);
+  const descWidth = Math.max(12, Math.min(48, popupWidth - 34));
+  const commandDescWidth = Math.max(12, popupWidth - 42);
 
   const clampedSelected = Math.max(0, Math.min(items.length - 1, selectedIndex));
   const halfWindow = Math.floor(maxVisible / 2);
@@ -462,6 +532,9 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
   } else if (trigger === "symbol") {
     triggerLabel = "AST SYMBOLS";
     triggerColor = theme.modes.ultrawork.primary;
+  } else if (trigger === "skill") {
+    triggerLabel = "SKILLS";
+    triggerColor = theme.modes.plan.secondary;
   }
 
   return (
@@ -504,11 +577,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
                 </Box>
                 {item.description ? (
                   <Box flexGrow={1}>
-                    <Text dimColor>
-                      {item.description.length > 38
-                        ? `${item.description.slice(0, 35)}...`
-                        : item.description}
-                    </Text>
+                    <Text dimColor>{truncateText(item.description, commandDescWidth)}</Text>
                   </Box>
                 ) : null}
               </Box>
@@ -516,18 +585,20 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
           }
 
           if (trigger === "file") {
+            const labelWidth = Math.max(16, popupWidth - descWidth - 6);
+            const detailBudget = item.detail ? item.detail.length + 1 : 0;
             return (
               <Box key={item.id} justifyContent="space-between">
-                <Box flexGrow={1}>
+                <Box width={labelWidth} flexShrink={1}>
                   <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
                     {isSelected ? "❯ " : "  "}
-                    {item.label}
+                    {truncateText(item.label, Math.max(4, labelWidth - 2 - detailBudget))}
                   </Text>
                   {item.detail ? <Text color={theme.muted}> {item.detail}</Text> : null}
                 </Box>
                 {item.description ? (
-                  <Box marginLeft={2}>
-                    <Text dimColor>{item.description}</Text>
+                  <Box width={descWidth} marginLeft={2} flexShrink={0}>
+                    <Text dimColor>{truncateText(item.description, descWidth)}</Text>
                   </Box>
                 ) : null}
               </Box>
@@ -544,16 +615,12 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
               </Box>
               {item.detail ? (
                 <Box width={26}>
-                  <Text color={theme.muted}>
-                    {item.detail.length > 25 ? `${item.detail.slice(0, 22)}...` : item.detail}
-                  </Text>
+                  <Text color={theme.muted}>{truncateText(item.detail, 25)}</Text>
                 </Box>
               ) : null}
               {item.description ? (
                 <Box flexGrow={1}>
-                  <Text dimColor>
-                    {item.description.length > 26 ? `${item.description.slice(0, 23)}...` : item.description}
-                  </Text>
+                  <Text dimColor>{truncateText(item.description, Math.max(10, popupWidth - 54))}</Text>
                 </Box>
               ) : null}
             </Box>

@@ -141,6 +141,7 @@ export class HindsightMemory {
 
 export function estimateMessageTokens(message: Message): number {
   let chars = 0;
+  let imageTokens = 0;
   for (const block of message.content) {
     if (block.type === "text") chars += block.text.length;
     else if (block.type === "thinking") chars += block.thinking.length;
@@ -150,9 +151,11 @@ export function estimateMessageTokens(message: Message): number {
         typeof block.content === "string"
           ? block.content.length
           : block.content.reduce((sum, item) => sum + item.text.length, 0);
+    } else if (block.type === "image") {
+      imageTokens += Math.max(1000, Math.ceil((block.source.data.length * 3) / 4096));
     }
   }
-  return Math.ceil(chars / 4) + 4;
+  return Math.ceil(chars / 4) + imageTokens + 4;
 }
 
 function formatMessageForSummary(message: Message): string {
@@ -164,6 +167,8 @@ function formatMessageForSummary(message: Message): string {
     else if (block.type === "tool_result") {
       const text = typeof block.content === "string" ? block.content : block.content.map((item) => item.text).join("\n");
       parts.push(`tool result: ${text}`);
+    } else if (block.type === "image") {
+      parts.push(`[image: ${block.path ?? block.source.media_type}]`);
     }
   }
   return parts.join("\n");

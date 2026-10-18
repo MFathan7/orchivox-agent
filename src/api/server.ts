@@ -39,6 +39,7 @@ export const AgentRunRequestSchema = z.object({
   top_p: z.number().min(0).max(1).optional(),
   stop_sequences: z.array(z.string().min(1)).default([]),
   metadata: z.record(z.string(), z.unknown()).optional(),
+  reasoning_effort: z.enum(["low", "medium", "high"]).optional(),
 });
 export type AgentRunRequest = z.infer<typeof AgentRunRequestSchema>;
 
@@ -72,7 +73,7 @@ export type AgentTask = z.infer<typeof AgentTaskSchema>;
 export interface IAgentRunner {
   /** Runs one complete turn and returns the final assistant message. */
   runOnce(request: AgentRunRequest): Promise<AgentRunResult>;
-  /** Streams one turn; rewind events are resolved by the runner and tool activity arrives as thinking_token. */
+  /** Streams one turn; rewind events are resolved by the runner. Tool activity arrives as tool_start/tool_end/file_change. */
   runStream(request: AgentRunRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown>;
   /** Starts a background task; the runner posts the finished task record to request.webhook_url. */
   startTask(request: AgentTaskRequest): Promise<AgentTask>;

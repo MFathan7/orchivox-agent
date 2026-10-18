@@ -18,6 +18,7 @@ export interface OpenAICompatProviderOptions {
   headers?: Record<string, string>;
   model?: string;
   pricing?: TokenPricing;
+  enableReasoningEffort?: boolean;
 }
 
 const OpenAiToolCallFragmentSchema = z.object({
@@ -73,9 +74,12 @@ type OpenAiToolCall = {
   type: "function";
   function: { name: string; arguments: string };
 };
+type OpenAiContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string; detail?: "auto" | "low" | "high" } };
 type OpenAiMessage = {
   role: string;
-  content?: string | null;
+  content?: string | OpenAiContentPart[] | null;
   tool_calls?: OpenAiToolCall[];
   tool_call_id?: string;
 };
@@ -94,6 +98,7 @@ export class OpenAICompatProvider implements LLMProvider {
   private readonly extraHeaders: Record<string, string>;
   private readonly model: string | undefined;
   private readonly pricing: TokenPricing | undefined;
+  private readonly enableReasoningEffort: boolean;
 
   constructor(options: OpenAICompatProviderOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -101,6 +106,7 @@ export class OpenAICompatProvider implements LLMProvider {
     this.extraHeaders = options.headers ?? {};
     this.model = options.model;
     this.pricing = options.pricing;
+    this.enableReasoningEffort = options.enableReasoningEffort ?? false;
   }
 
   async *streamChat(req: ChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown> {
@@ -112,7 +118,7 @@ export class OpenAICompatProvider implements LLMProvider {
       response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: "POST",
         headers: this.requestHeaders(),
-        body: JSON.stringify(buildChatPayload(req, model)),
+        body: JSON.stringify(buildChatPayload(req, model, this.enableReasoningEffort)),
         signal,
       });
     } catch (error) {
@@ -246,7 +252,7 @@ export class OpenAICompatProvider implements LLMProvider {
   }
 }
 
-function buildChatPayload(req: ChatRequest, model: string): Record<string, unknown> {
+function buildChatPayload(req: ChatRequest, model: string, enableReasoningEffort: boolean): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     model,
     messages: toOpenAiMessages(req),
@@ -257,6 +263,7 @@ function buildChatPayload(req: ChatRequest, model: string): Record<string, unkno
   if (req.temperature !== undefined) payload.temperature = req.temperature;
   if (req.top_p !== undefined) payload.top_p = req.top_p;
   if (req.stop_sequences.length > 0) payload.stop = req.stop_sequences;
+  if (req.reasoning_effort && enableReasoningEffort) payload.reasoning_effort = req.reasoning_effort;
   if (req.tools.length > 0) {
     payload.tools = req.tools.map((tool) => ({
       type: "function",
@@ -272,7 +279,7 @@ function buildChatPayload(req: ChatRequest, model: string): Record<string, unkno
   return payload;
 }
 
-function toOpenAiMessages(req: ChatRequest): OpenAiMessage[] {
+export function toOpenAiMessages(req: ChatRequest): OpenAiMessage[] {
   const messages: OpenAiMessage[] = [];
   if (req.system) messages.push({ role: "system", content: req.system });
 
@@ -284,7 +291,8 @@ function toOpenAiMessages(req: ChatRequest): OpenAiMessage[] {
           lastToolMessage = { role: "tool", tool_call_id: block.tool_use_id, content: toolResultText(block.content) };
           messages.push(lastToolMessage);
         } else if (block.type === "text" && lastToolMessage) {
-          lastToolMessage.content = [lastToolMessage.content ?? "", block.text].filter(Boolean).join("\n");
+          const existing = typeof lastToolMessage.content === "string" ? lastToolMessage.content : "";
+          lastToolMessage.content = [existing, block.text].filter(Boolean).join("\n");
         }
       }
       if (!lastToolMessage) throw new Error('messages with role "tool" must contain tool_result blocks');
@@ -296,23 +304,39 @@ function toOpenAiMessages(req: ChatRequest): OpenAiMessage[] {
       }
     }
 
-    let text: string[] = [];
+    let parts: OpenAiContentPart[] = [];
     let toolCalls: OpenAiToolCall[] = [];
     const flush = (): void => {
-      if (text.length === 0 && toolCalls.length === 0) return;
+      if (parts.length === 0 && toolCalls.length === 0) return;
+      const first = parts[0];
+      const content =
+        parts.length === 0
+          ? null
+          : parts.length === 1 && first?.type === "text"
+            ? first.text
+            : parts;
       messages.push({
         role: message.role,
-        content: text.length > 0 ? text.join("\n") : null,
+        content,
         ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
       });
-      text = [];
+      parts = [];
       toolCalls = [];
     };
 
     for (const block of message.content) {
       switch (block.type) {
         case "text":
-          text.push(block.text);
+          parts.push({ type: "text", text: block.text });
+          break;
+        case "image":
+          parts.push({
+            type: "image_url",
+            image_url: {
+              url: `data:${block.source.media_type};base64,${block.source.data}`,
+              ...(block.detail ? { detail: block.detail } : {}),
+            },
+          });
           break;
         case "tool_use":
           if (message.role !== "assistant") throw new Error("tool_use blocks require the assistant role");

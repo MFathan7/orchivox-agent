@@ -26,6 +26,10 @@ const ANTHROPIC_BETA = "prompt-caching-2024-07-31";
 type CacheControl = { type: "ephemeral" };
 
 type AnthropicTextBlock = { type: "text"; text: string; cache_control?: CacheControl };
+type AnthropicImageBlock = {
+  type: "image";
+  source: { type: "base64"; media_type: string; data: string };
+};
 type AnthropicThinkingBlock = { type: "thinking"; thinking: string; signature?: string };
 type AnthropicToolUseBlock = {
   type: "tool_use";
@@ -41,7 +45,12 @@ type AnthropicToolResultBlock = {
   is_error: boolean;
   cache_control?: CacheControl;
 };
-type AnthropicBlock = AnthropicTextBlock | AnthropicThinkingBlock | AnthropicToolUseBlock | AnthropicToolResultBlock;
+type AnthropicBlock =
+  | AnthropicTextBlock
+  | AnthropicImageBlock
+  | AnthropicThinkingBlock
+  | AnthropicToolUseBlock
+  | AnthropicToolResultBlock;
 type AnthropicMessage = { role: "user" | "assistant"; content: AnthropicBlock[] };
 
 const AnthropicUsageSchema = z.object({
@@ -230,6 +239,8 @@ export class AnthropicCompatProvider implements LLMProvider {
               yield { type: "token", text: delta.text };
             } else if (delta.type === "thinking_delta" && delta.thinking) {
               yield { type: "thinking_token", text: delta.thinking };
+            } else if (delta.type === "signature_delta" && delta.signature) {
+              yield { type: "thinking_token", text: "", signature: delta.signature };
             } else if (delta.type === "input_json_delta") {
               const fragment = delta.partial_json ?? "";
               if (state) state.argumentsText += fragment;
@@ -369,10 +380,17 @@ function buildMessagesPayload(req: ChatRequest, model: string): Record<string, u
       type: req.tool_choice === "required" ? "any" : req.tool_choice === "none" ? "none" : "auto",
     };
   }
+  if (req.reasoning_effort) {
+    const mapped = req.reasoning_effort === "high" ? 8192 : req.reasoning_effort === "medium" ? 4096 : 1024;
+    const budget = Math.min(mapped, Math.max(1024, req.max_tokens - 1024));
+    payload.thinking = { type: "enabled", budget_tokens: budget };
+    payload.max_tokens = Math.max(req.max_tokens, budget + 1024);
+    payload.temperature = 1;
+  }
   return payload;
 }
 
-function toAnthropicMessages(req: ChatRequest): { system: AnthropicTextBlock[]; messages: AnthropicMessage[] } {
+export function toAnthropicMessages(req: ChatRequest): { system: AnthropicTextBlock[]; messages: AnthropicMessage[] } {
   const systemTexts: string[] = [];
   if (req.system) systemTexts.push(req.system);
   const messages: AnthropicMessage[] = [];
@@ -391,6 +409,9 @@ function toAnthropicMessages(req: ChatRequest): { system: AnthropicTextBlock[]; 
       switch (block.type) {
         case "text":
           blocks.push({ type: "text", text: block.text });
+          break;
+        case "image":
+          blocks.push({ type: "image", source: block.source });
           break;
         case "thinking":
           blocks.push({

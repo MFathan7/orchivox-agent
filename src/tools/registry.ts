@@ -95,7 +95,7 @@ export class ToolRegistry {
       (call.arguments ?? {}) as Record<string, unknown>,
     );
     if (!decision.allowed) {
-      const feedbackPart = decision.feedback ? ` Feedback pengguna: ${decision.feedback}` : "";
+      const feedbackPart = decision.feedback ? ` User feedback: ${decision.feedback}` : "";
       return {
         tool_call_id: call.id,
         content: (decision.reason ?? `tool "${tool.name}" is not allowed in ${mode} mode`) + feedbackPart,

@@ -234,6 +234,15 @@ describe("Master Integration Phase 2 - Agent Orchestrator Tool Registry", () => 
       "todo_read",
       "todo_write",
       "spawn_subagents",
+      "task_create",
+      "task_list",
+      "task_dispatch",
+      "task_cancel",
+      "task_merge",
+      "task_wait",
+      // Skills
+      "skill",
+      "skill_list",
       // Hindsight memory
       "remember_insight",
       "recall_insights",

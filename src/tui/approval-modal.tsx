@@ -177,7 +177,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
               Type rejection feedback or instructions:
             </Text>
             <Box>
-              <Text color={theme.accent}>&gt; </Text>
+              <Text color={theme.accent}>❯ </Text>
               <Text>{feedbackText}</Text>
               <Text inverse color={theme.accent}> </Text>
             </Box>

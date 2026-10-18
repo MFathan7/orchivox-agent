@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 
 import type { AgentMode, Message, Role, Usage } from "../types/schema";
+import type { TaskItem, TaskStore } from "../agent/task-board";
 
 export interface SessionRecord {
   id: string;
@@ -56,6 +57,29 @@ interface NoteRow {
   updated_at: number;
 }
 
+interface TaskRow {
+  id: string;
+  title: string;
+  task: string;
+  agent: string | null;
+  role_model: string | null;
+  provider: string | null;
+  model: string | null;
+  mode: string | null;
+  depends_on: string;
+  write_isolation: number;
+  state: string;
+  worker_id: string | null;
+  result: string | null;
+  error: string | null;
+  diff: string | null;
+  files_changed: string;
+  merged: number | null;
+  merge_summary: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
@@ -82,9 +106,32 @@ CREATE TABLE IF NOT EXISTS hindsight_notes (
   file_patterns TEXT NOT NULL DEFAULT '[]',
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  task TEXT NOT NULL,
+  agent TEXT,
+  role_model TEXT,
+  provider TEXT,
+  model TEXT,
+  mode TEXT,
+  depends_on TEXT NOT NULL DEFAULT '[]',
+  write_isolation INTEGER NOT NULL DEFAULT 1,
+  state TEXT NOT NULL,
+  worker_id TEXT,
+  result TEXT,
+  error TEXT,
+  diff TEXT,
+  files_changed TEXT NOT NULL DEFAULT '[]',
+  merged INTEGER,
+  merge_summary TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
 `;
 
-export class MemoryDatabase {
+export class MemoryDatabase implements TaskStore {
   private readonly db: Database;
 
   constructor(path: string) {
@@ -93,6 +140,10 @@ export class MemoryDatabase {
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
+    const taskColumns = this.db.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    if (!taskColumns.some((column) => column.name === "mode")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN mode TEXT;");
+    }
   }
 
   createSession(input: { id?: string; title: string; mode: AgentMode }): SessionRecord {
@@ -123,6 +174,14 @@ export class MemoryDatabase {
       .query("UPDATE sessions SET title = ?, mode = ?, updated_at = ? WHERE id = ?")
       .run(patch.title ?? current.title, patch.mode ?? current.mode, Date.now(), id);
     return this.getSession(id) as SessionRecord;
+  }
+
+  addSessionUsage(id: string, tokens: number, costUsd: number): void {
+    this.db
+      .query(
+        "UPDATE sessions SET total_tokens = total_tokens + ?, total_cost_usd = total_cost_usd + ?, updated_at = ? WHERE id = ?",
+      )
+      .run(tokens, costUsd, Date.now(), id);
   }
 
   deleteSession(id: string): boolean {
@@ -163,12 +222,13 @@ export class MemoryDatabase {
     const session = this.getSession(sessionId);
     if (!session) throw new Error(`unknown session "${sessionId}"`);
     const createdAt = message.created_at ?? Date.now();
+    const content = stripInlineImages(message.content);
     this.db
       .query("INSERT INTO messages (id, session_id, role, content_json, created_at) VALUES (?, ?, ?, ?, ?)")
-      .run(message.id, sessionId, message.role, JSON.stringify(message.content), createdAt);
+      .run(message.id, sessionId, message.role, JSON.stringify(content), createdAt);
     this.db
       .query("INSERT INTO messages_fts (message_id, session_id, role, content) VALUES (?, ?, ?, ?)")
-      .run(message.id, sessionId, message.role, plainText(message.content));
+      .run(message.id, sessionId, message.role, plainText(content));
     this.db.query("UPDATE sessions SET updated_at = ? WHERE id = ?").run(createdAt, sessionId);
   }
 
@@ -255,6 +315,66 @@ export class MemoryDatabase {
     return rows.map(toNote);
   }
 
+  loadTasks(): TaskItem[] {
+    const rows = this.db
+      .query("SELECT * FROM tasks ORDER BY created_at ASC, rowid ASC")
+      .all() as unknown as TaskRow[];
+    return rows.map(toTaskItem);
+  }
+
+  saveTask(task: TaskItem): void {
+    this.db
+      .query(
+        `INSERT INTO tasks (id, title, task, agent, role_model, provider, model, mode, depends_on, write_isolation, state, worker_id, result, error, diff, files_changed, merged, merge_summary, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           title = excluded.title,
+           task = excluded.task,
+           agent = excluded.agent,
+           role_model = excluded.role_model,
+           provider = excluded.provider,
+           model = excluded.model,
+           mode = excluded.mode,
+           depends_on = excluded.depends_on,
+           write_isolation = excluded.write_isolation,
+           state = excluded.state,
+           worker_id = excluded.worker_id,
+           result = excluded.result,
+           error = excluded.error,
+           diff = excluded.diff,
+           files_changed = excluded.files_changed,
+           merged = excluded.merged,
+           merge_summary = excluded.merge_summary,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        task.id,
+        task.title,
+        task.task,
+        task.agent ?? null,
+        task.roleModel ?? null,
+        task.provider ?? null,
+        task.model ?? null,
+        task.mode ?? null,
+        JSON.stringify(task.dependsOn),
+        task.writeIsolation ? 1 : 0,
+        task.state,
+        task.workerId ?? null,
+        task.result ?? null,
+        task.error ?? null,
+        task.diff ?? null,
+        JSON.stringify(task.filesChanged),
+        task.merged === undefined ? null : task.merged ? 1 : 0,
+        task.mergeSummary ?? null,
+        task.createdAt,
+        task.updatedAt,
+      );
+  }
+
+  deleteTask(id: string): void {
+    this.db.query("DELETE FROM tasks WHERE id = ?").run(id);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -287,6 +407,49 @@ function toNote(row: NoteRow): HindsightNoteRecord {
     filePatterns,
     updatedAt: row.updated_at,
   };
+}
+
+function parseStringArray(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function toTaskItem(row: TaskRow): TaskItem {
+  return {
+    id: row.id,
+    title: row.title,
+    task: row.task,
+    agent: row.agent ?? undefined,
+    roleModel: (row.role_model ?? undefined) as TaskItem["roleModel"],
+    provider: row.provider ?? undefined,
+    model: row.model ?? undefined,
+    mode: (row.mode ?? undefined) as TaskItem["mode"],
+    dependsOn: parseStringArray(row.depends_on),
+    writeIsolation: row.write_isolation === 1,
+    state: row.state as TaskItem["state"],
+    workerId: row.worker_id ?? undefined,
+    result: row.result ?? undefined,
+    error: row.error ?? undefined,
+    diff: row.diff ?? undefined,
+    filesChanged: parseStringArray(row.files_changed),
+    merged: row.merged === null ? undefined : row.merged === 1,
+    mergeSummary: row.merge_summary ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function stripInlineImages(content: Message["content"]): Message["content"] {
+  if (!content.some((block) => block.type === "image")) return content;
+  return content.map((block) =>
+    block.type === "image"
+      ? { type: "text" as const, text: `[image: ${block.path ?? block.source.media_type}]` }
+      : block,
+  );
 }
 
 function plainText(content: Message["content"]): string {

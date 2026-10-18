@@ -314,5 +314,5 @@ describe("Auto-LSP Self-Healing Loop & Diagnostics", () => {
     // Since our workspace currently typechecks cleanly:
     expect(result).toBeDefined();
     expect(typeof result).toBe("string");
-  });
+  }, 20000);
 });

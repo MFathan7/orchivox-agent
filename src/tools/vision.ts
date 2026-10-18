@@ -2,6 +2,7 @@ import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 
 import type { ProviderRouter } from "../provider/router";
+import { ChatRequestSchema } from "../types/schema";
 import type { AgentTool } from "./registry";
 
 export interface ImageMetadata {
@@ -238,128 +239,59 @@ export async function callVisionProvider(options: {
   detail?: "auto" | "low" | "high";
   signal?: AbortSignal;
 }): Promise<string> {
-  const { router, base64Data, mimeType, prompt, detail = "auto", signal } = options;
+  const { router, base64Data, mimeType, prompt, detail, signal } = options;
 
   if (!router) {
-    return [
-      "Image received and verified.",
-      "Inspection details: Provider router was not attached; binary dimensions and header were verified successfully.",
-    ].join("\n");
+    return "Image received and verified. No provider router is attached, so visual analysis is unavailable.";
   }
 
-  const role = router.getRole("advisor") ? "advisor" : "main";
-  const ref = router.getRole(role);
-  if (!ref) {
-    throw new Error(`no configured model found for role "${role}"`);
-  }
-
-  const configuredModels = router.listAllConfiguredModels();
-  const providerConfig = configuredModels.find((m) => m.provider === ref.provider);
-  const kind = providerConfig?.kind ?? "openai";
-
-  const isAnthropic = kind === "anthropic" || kind === "openclaude";
-
-  if (isAnthropic) {
-    return callAnthropicVision({
-      router,
-      ref,
-      base64Data,
-      mimeType,
-      prompt,
-      signal,
+  const candidates: Array<{
+    role: "advisor" | "main";
+    ref: { provider: string; model: string };
+    vision: boolean;
+  }> = [];
+  for (const role of ["advisor", "main"] as const) {
+    const candidateRef = router.getRole(role);
+    if (!candidateRef) continue;
+    candidates.push({
+      role,
+      ref: candidateRef,
+      vision: router.capabilitiesFor(candidateRef.provider, candidateRef.model).vision,
     });
   }
+  if (candidates.length === 0) throw new Error("no configured model found for vision analysis");
 
-  return callOpenAiVision({
-    router,
-    ref,
-    base64Data,
-    mimeType,
-    prompt,
-    detail,
-    signal,
+  const selected = candidates.find((candidate) => candidate.vision) ?? candidates[0];
+  const ref = selected.ref;
+  if (!selected.vision) {
+    return `The ${selected.role} model ${ref.provider}/${ref.model} does not support vision. Set model_capabilities.vision: true for a vision model or assign one to the advisor role.`;
+  }
+
+  const request = ChatRequestSchema.parse({
+    messages: [
+      {
+        id: `vision-${Date.now().toString(36)}`,
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type: mimeType, data: base64Data },
+            ...(detail ? { detail } : {}),
+          },
+          { type: "text", text: prompt },
+        ],
+      },
+    ],
+    max_tokens: 4096,
   });
-}
 
-async function callAnthropicVision(options: {
-  router: ProviderRouter;
-  ref: { provider: string; model: string };
-  base64Data: string;
-  mimeType: string;
-  prompt: string;
-  signal?: AbortSignal;
-}): Promise<string> {
-  const { base64Data, mimeType, prompt } = options;
-
-  try {
-    const payload = {
-      model: options.ref.model,
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: mimeType,
-                data: base64Data,
-              },
-            },
-            {
-              type: "text",
-              text: prompt,
-            },
-          ],
-        },
-      ],
-    };
-
-    const dummyProvider = options.router.provider(options.ref.provider, options.ref.model);
-    return `[Anthropic Vision Analysis for ${options.ref.model}]: Processed ${mimeType} image with prompt "${prompt.slice(0, 60)}...". Model ready.`;
-  } catch (error) {
-    return `Vision model call failed: ${error instanceof Error ? error.message : String(error)}`;
+  const provider = router.provider(ref.provider, ref.model);
+  let text = "";
+  for await (const event of provider.streamChat(request, signal)) {
+    if (event.type === "token") text += event.text;
+    else if (event.type === "error") throw new Error(event.message);
   }
-}
-
-async function callOpenAiVision(options: {
-  router: ProviderRouter;
-  ref: { provider: string; model: string };
-  base64Data: string;
-  mimeType: string;
-  prompt: string;
-  detail: "auto" | "low" | "high";
-  signal?: AbortSignal;
-}): Promise<string> {
-  const { base64Data, mimeType, prompt, detail } = options;
-
-  try {
-    const payload = {
-      model: options.ref.model,
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:${mimeType};base64,${base64Data}`,
-                detail,
-              },
-            },
-          ],
-        },
-      ],
-    };
-
-    const dummyProvider = options.router.provider(options.ref.provider, options.ref.model);
-    return `[OpenAI Vision Analysis for ${options.ref.model}]: Processed ${mimeType} image with prompt "${prompt.slice(0, 60)}...". Model ready.`;
-  } catch (error) {
-    return `Vision model call failed: ${error instanceof Error ? error.message : String(error)}`;
-  }
+  return text.trim().length > 0 ? text.trim() : "The vision model returned no text.";
 }
 
 export const InspectImageArgsSchema = z
@@ -432,6 +364,9 @@ export function createInspectImageTool(options?: {
       }
 
       const metadata = parseImageMetadata(imageBytes);
+      if (imageBytes.length > 5 * 1024 * 1024) {
+        throw new Error("Image is larger than 5 MB; resize it before inspection.");
+      }
       const mimeType = metadata?.mimeType ?? "image/png";
       const base64Data = Buffer.from(imageBytes).toString("base64");
 

@@ -242,17 +242,43 @@ export class SpecialistAgentRegistry {
     };
   }
 
-  filterTools(agent: SpecialistAgentProfile, tools: ToolDefinition[]): ToolDefinition[] {
+  filterTools(
+    agent: SpecialistAgentProfile,
+    tools: ToolDefinition[],
+    readOnlyToolNames?: ReadonlySet<string>,
+  ): ToolDefinition[] {
     let filtered = tools;
+    const alwaysAllowed = new Set(["skill", "skill_list"]);
 
     if (agent.allowedTools && agent.allowedTools.length > 0) {
-      const allowedSet = new Set(agent.allowedTools);
+      const allowedSet = new Set([...agent.allowedTools, ...alwaysAllowed]);
       filtered = filtered.filter((tool) => allowedSet.has(tool.name));
     }
 
     if (agent.readOnly) {
-      const mutatingToolNames = new Set(["hash_edit", "shell_execute"]);
-      filtered = filtered.filter((tool) => !mutatingToolNames.has(tool.name));
+      if (readOnlyToolNames) {
+        filtered = filtered.filter((tool) => readOnlyToolNames.has(tool.name));
+      } else {
+        const mutatingToolNames = new Set([
+          "hash_edit",
+          "create_file",
+          "delete_file",
+          "move_file",
+          "apply_unified_patch",
+          "shell_execute",
+          "bash",
+          "bg_start",
+          "bg_stop",
+          "todo_write",
+          "spawn_subagents",
+          "task_create",
+          "task_dispatch",
+          "task_cancel",
+          "task_merge",
+          "task_wait",
+        ]);
+        filtered = filtered.filter((tool) => !mutatingToolNames.has(tool.name));
+      }
     }
 
     return filtered;

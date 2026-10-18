@@ -1,5 +1,6 @@
 import React from "react";
-import { Box, Text, useInput } from "ink";
+import { existsSync, readFileSync } from "node:fs";
+import { Box, Text, useInput, useStdin } from "ink";
 import { resolve } from "node:path";
 
 import type { AgentMode } from "../types/schema";
@@ -11,6 +12,7 @@ import {
   type TriggerContext,
 } from "./autocomplete";
 import { getTheme, type Theme } from "./theme";
+import { formatTokenCount } from "./format";
 
 export interface FileAttachmentRef {
   raw: string;
@@ -19,6 +21,27 @@ export interface FileAttachmentRef {
   endLine?: number;
   exists: boolean;
   tokens: number;
+  kind: "text" | "image";
+  mimeType?: string;
+  base64?: string;
+  error?: string;
+}
+
+const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+  gif: "image/gif",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+};
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGES_PER_MESSAGE = 4;
+
+export function imageMimeType(filePath: string): string | undefined {
+  const dot = filePath.lastIndexOf(".");
+  if (dot === -1) return undefined;
+  return IMAGE_MIME_BY_EXTENSION[filePath.slice(dot + 1).toLowerCase()];
 }
 
 export interface PromptSubmitPayload {
@@ -33,14 +56,18 @@ export interface PromptComposerProps {
   mode?: AgentMode;
   theme?: Theme;
   repoRoot?: string;
+  width?: number;
   placeholder?: string;
   historyFilePath?: string;
   disabled?: boolean;
+  streaming?: boolean;
   onSubmit?: (payload: PromptSubmitPayload) => void;
   onModeToggle?: () => void;
   onOpenHub?: () => void;
   onOpenPalette?: () => void;
   onOpenSessions?: () => void;
+  onOpenHelp?: () => void;
+  onLayoutRows?: (rows: number) => void;
 }
 
 export class PersistentCommandHistory {
@@ -57,20 +84,11 @@ export class PersistentCommandHistory {
 
   loadSync(): void {
     try {
-      const file = Bun.file(this.filePath);
-      if (file.size > 0) {
-        const text = file.text();
-        // Since loadSync is non-async in constructor, read via standard fs or async promise handler
-        void text.then((raw) => {
-          try {
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) {
-              this.history = parsed.filter((item): item is string => typeof item === "string");
-            }
-          } catch {
-            this.history = [];
-          }
-        });
+      if (!existsSync(this.filePath)) return;
+      const raw = readFileSync(this.filePath, "utf8");
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        this.history = parsed.filter((item): item is string => typeof item === "string");
       }
     } catch {
       this.history = [];
@@ -78,18 +96,7 @@ export class PersistentCommandHistory {
   }
 
   async load(): Promise<string[]> {
-    try {
-      const file = Bun.file(this.filePath);
-      if (await file.exists()) {
-        const raw = await file.text();
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          this.history = parsed.filter((item): item is string => typeof item === "string");
-        }
-      }
-    } catch {
-      this.history = [];
-    }
+    this.loadSync();
     return this.history;
   }
 
@@ -111,7 +118,7 @@ export class PersistentCommandHistory {
     try {
       await Bun.write(this.filePath, JSON.stringify(this.history, null, 2));
     } catch {
-      // Ignore write failures if directory is not writable.
+      // History is best effort and never blocks sending a prompt.
     }
   }
 
@@ -182,13 +189,15 @@ export async function resolveFileAttachments(
 
   for (const item of attachments) {
     const fullPath = resolve(root, item.filePath);
+    const mimeType = imageMimeType(item.filePath);
+    const kind = mimeType ? "image" : "text";
     let exists = false;
     let tokens = 0;
 
     try {
       const file = Bun.file(fullPath);
       exists = await file.exists();
-      if (exists) {
+      if (exists && kind === "text") {
         if (item.startLine !== undefined) {
           const content = await file.text();
           const lines = splitLines(content);
@@ -212,6 +221,8 @@ export async function resolveFileAttachments(
       endLine: item.endLine,
       exists,
       tokens,
+      kind,
+      mimeType,
     });
   }
 
@@ -226,6 +237,7 @@ export async function buildInjectedContext(
   const blocks: string[] = [];
 
   for (const item of attachments) {
+    if (item.kind === "image") continue;
     if (!item.exists) continue;
     const fullPath = resolve(root, item.filePath);
 
@@ -252,11 +264,53 @@ export async function buildInjectedContext(
         ].join("\n"),
       );
     } catch {
-      // Omit files that fail reading.
+      // Skip files that cannot be read.
     }
   }
 
   return blocks.join("\n\n");
+}
+
+export async function loadImageAttachments(
+  attachments: FileAttachmentRef[],
+  repoRoot?: string,
+): Promise<FileAttachmentRef[]> {
+  const root = repoRoot ?? globalThis.process.cwd();
+  const results: FileAttachmentRef[] = [];
+  let imageCount = 0;
+
+  for (const item of attachments) {
+    if (item.kind !== "image") {
+      results.push(item);
+      continue;
+    }
+    if (!item.exists) {
+      results.push({ ...item, error: "file not found" });
+      continue;
+    }
+    if (imageCount >= MAX_IMAGES_PER_MESSAGE) {
+      results.push({ ...item, error: `only ${MAX_IMAGES_PER_MESSAGE} images per message` });
+      continue;
+    }
+
+    try {
+      const file = Bun.file(resolve(root, item.filePath));
+      if (file.size > MAX_IMAGE_BYTES) {
+        results.push({
+          ...item,
+          error: `image is larger than ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)} MB`,
+        });
+        continue;
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      results.push({ ...item, base64: Buffer.from(bytes).toString("base64") });
+      imageCount += 1;
+    } catch (error) {
+      results.push({ ...item, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  return results;
 }
 
 export function getLineAndColumn(text: string, cursor: number): { line: number; col: number; lines: string[] } {
@@ -287,23 +341,72 @@ export function getCursorOffset(lines: string[], targetLine: number, targetCol: 
   return offset + clampedCol;
 }
 
-export function deletePreviousWord(text: string, cursorPos: number): { nextText: string; nextCursor: number } {
-  if (cursorPos <= 0) return { nextText: text, nextCursor: 0 };
-  let target = cursorPos;
+function isWordCharacter(char: string): boolean {
+  return /[a-zA-Z0-9_]/.test(char);
+}
 
-  // Skip trailing whitespace first
-  while (target > 0 && /\s/.test(text[target - 1])) {
+function isSpace(char: string): boolean {
+  return /\s/.test(char);
+}
+
+export function findPreviousWordStart(text: string, cursorPos: number): number {
+  let target = Math.max(0, Math.min(text.length, cursorPos));
+
+  while (target > 0 && isSpace(text[target - 1])) {
     target -= 1;
   }
 
-  // If next is punctuation, delete sequence of punctuation
-  if (target > 0 && /[^a-zA-Z0-9_\s]/.test(text[target - 1])) {
-    while (target > 0 && /[^a-zA-Z0-9_\s]/.test(text[target - 1])) {
+  if (target > 0 && isWordCharacter(text[target - 1])) {
+    while (target > 0 && isWordCharacter(text[target - 1])) {
+      target -= 1;
+    }
+    return target;
+  }
+
+  while (target > 0 && !isSpace(text[target - 1]) && !isWordCharacter(text[target - 1])) {
+    target -= 1;
+  }
+  while (target > 0 && isWordCharacter(text[target - 1])) {
+    target -= 1;
+  }
+
+  return target;
+}
+
+export function findNextWordEnd(text: string, cursorPos: number): number {
+  let target = Math.max(0, Math.min(text.length, cursorPos));
+
+  while (target < text.length && isSpace(text[target])) {
+    target += 1;
+  }
+
+  if (target < text.length && !isWordCharacter(text[target])) {
+    while (target < text.length && !isSpace(text[target]) && !isWordCharacter(text[target])) {
+      target += 1;
+    }
+  } else {
+    while (target < text.length && isWordCharacter(text[target])) {
+      target += 1;
+    }
+  }
+
+  return target;
+}
+
+export function deletePreviousWord(text: string, cursorPos: number): { nextText: string; nextCursor: number } {
+  if (cursorPos <= 0) return { nextText: text, nextCursor: 0 };
+  let target = Math.max(0, Math.min(text.length, cursorPos));
+
+  while (target > 0 && isSpace(text[target - 1])) {
+    target -= 1;
+  }
+
+  if (target > 0 && !isWordCharacter(text[target - 1])) {
+    while (target > 0 && !isSpace(text[target - 1]) && !isWordCharacter(text[target - 1])) {
       target -= 1;
     }
   } else {
-    // Otherwise delete sequence of alphanumeric/word characters
-    while (target > 0 && /[a-zA-Z0-9_]/.test(text[target - 1])) {
+    while (target > 0 && isWordCharacter(text[target - 1])) {
       target -= 1;
     }
   }
@@ -312,19 +415,81 @@ export function deletePreviousWord(text: string, cursorPos: number): { nextText:
   return { nextText, nextCursor: target };
 }
 
+export function deleteNextWord(text: string, cursorPos: number): { nextText: string; nextCursor: number } {
+  if (cursorPos >= text.length) return { nextText: text, nextCursor: cursorPos };
+  const target = findNextWordEnd(text, cursorPos);
+  const nextText = text.slice(0, cursorPos) + text.slice(target);
+  return { nextText, nextCursor: cursorPos };
+}
+
+export function charDisplayWidth(char: string): number {
+  const code = char.codePointAt(0) ?? 0;
+  if (code === 0) return 0;
+  if (code < 32 || (code >= 0x7f && code < 0xa0)) return 0;
+  if (code === 0x200d) return 0;
+  if (code >= 0x0300 && code <= 0x036f) return 0;
+
+  const wide =
+    (code >= 0x1100 && code <= 0x115f) ||
+    code === 0x2329 ||
+    code === 0x232a ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe19) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1f300 && code <= 0x1faff) ||
+    (code >= 0x20000 && code <= 0x3fffd);
+
+  return wide ? 2 : 1;
+}
+
+export function displayWidth(text: string): number {
+  let width = 0;
+  for (const char of text) width += charDisplayWidth(char);
+  return width;
+}
+
+export function splitLineAtCursor(line: string, col: number): { before: string; cursorChar: string; after: string } {
+  const chars = Array.from(line);
+  let consumed = 0;
+  let pointIndex = 0;
+
+  for (const char of chars) {
+    if (consumed >= col) break;
+    consumed += char.length;
+    pointIndex += 1;
+  }
+
+  const cursorChar = chars[pointIndex];
+  const before = chars.slice(0, pointIndex).join("");
+  const after = chars.slice(pointIndex + (cursorChar ? 1 : 0)).join("");
+  return { before, cursorChar: cursorChar ?? " ", after };
+}
+
+function normalizeInsertedText(input: string): string {
+  return input.replace(/\r\n?/g, "\n").replace(/\t/g, "  ");
+}
+
 export function PromptComposer(props: PromptComposerProps) {
   const {
     mode = "build",
     theme = getTheme("tokyonight"),
     repoRoot,
-    placeholder = "Type a prompt, / for commands, @ for files, # for symbols...",
+    width,
+    placeholder = "Ask Orchivox, / for commands, @ for files, $ for skills",
     historyFilePath,
     disabled = false,
+    streaming = false,
     onSubmit,
     onModeToggle,
     onOpenHub,
     onOpenPalette,
     onOpenSessions,
+    onOpenHelp,
+    onLayoutRows,
   } = props;
 
   const [text, setText] = React.useState("");
@@ -335,6 +500,24 @@ export function PromptComposer(props: PromptComposerProps) {
   const [autocompleteContext, setAutocompleteContext] = React.useState<TriggerContext | null>(null);
   const [autocompleteItems, setAutocompleteItems] = React.useState<AutocompleteItem[]>([]);
   const [autocompleteSelected, setAutocompleteSelected] = React.useState(0);
+
+  const { internal_eventEmitter } = useStdin();
+  const lastRawInputRef = React.useRef<string>("");
+  const undoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
+  const redoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
+
+  React.useEffect(() => {
+    const emitter = internal_eventEmitter as
+      | { prependListener?: (event: string, listener: (data: Buffer | string) => void) => void; removeListener?: (event: string, listener: (data: Buffer | string) => void) => void }
+      | undefined;
+    const onRaw = (data: Buffer | string) => {
+      lastRawInputRef.current = typeof data === "string" ? data : data.toString("utf8");
+    };
+    emitter?.prependListener?.("input", onRaw);
+    return () => {
+      emitter?.removeListener?.("input", onRaw);
+    };
+  }, [internal_eventEmitter]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -376,6 +559,31 @@ export function PromptComposer(props: PromptComposerProps) {
     };
   }, [text, cursorPos, repoRoot]);
 
+  const commitEdit = (nextText: string, nextCursor: number): void => {
+    if (nextText === text && nextCursor === cursorPos) return;
+    undoStack.current.push({ text, cursor: cursorPos });
+    if (undoStack.current.length > 200) undoStack.current.shift();
+    redoStack.current = [];
+    setText(nextText);
+    setCursorPos(nextCursor);
+  };
+
+  const undo = (): void => {
+    const previous = undoStack.current.pop();
+    if (!previous) return;
+    redoStack.current.push({ text, cursor: cursorPos });
+    setText(previous.text);
+    setCursorPos(Math.min(previous.cursor, previous.text.length));
+  };
+
+  const redo = (): void => {
+    const next = redoStack.current.pop();
+    if (!next) return;
+    undoStack.current.push({ text, cursor: cursorPos });
+    setText(next.text);
+    setCursorPos(Math.min(next.cursor, next.text.length));
+  };
+
   const handleInsertAutocomplete = (item: AutocompleteItem): void => {
     if (!autocompleteContext) return;
     const before = text.slice(0, autocompleteContext.replaceStart);
@@ -384,8 +592,7 @@ export function PromptComposer(props: PromptComposerProps) {
     const nextText = `${before}${inserted}${after}`;
     const nextCursor = before.length + inserted.length;
 
-    setText(nextText);
-    setCursorPos(nextCursor);
+    commitEdit(nextText, nextCursor);
     setAutocompleteContext(null);
     setAutocompleteItems([]);
   };
@@ -397,7 +604,8 @@ export function PromptComposer(props: PromptComposerProps) {
     const lower = trimmed.toLowerCase();
     const ultrawork = /^(ulw|ultrawork)\b/.test(lower);
     const resolvedAttachments = await resolveFileAttachments(parseFileAttachments(trimmed), repoRoot);
-    const injectedContext = await buildInjectedContext(resolvedAttachments, repoRoot);
+    const loadedAttachments = await loadImageAttachments(resolvedAttachments, repoRoot);
+    const injectedContext = await buildInjectedContext(loadedAttachments, repoRoot);
     const fullText = injectedContext.length > 0 ? `${trimmed}\n\n${injectedContext}` : trimmed;
 
     await historyManager.append(trimmed);
@@ -407,6 +615,8 @@ export function PromptComposer(props: PromptComposerProps) {
     setAttachedFiles([]);
     setAutocompleteContext(null);
     setAutocompleteItems([]);
+    undoStack.current = [];
+    redoStack.current = [];
 
     if (onSubmit) {
       onSubmit({
@@ -414,13 +624,16 @@ export function PromptComposer(props: PromptComposerProps) {
         injectedContext: injectedContext.length > 0 ? injectedContext : undefined,
         fullText,
         ultrawork,
-        attachments: resolvedAttachments,
+        attachments: loadedAttachments,
       });
     }
   };
 
   useInput((input, key) => {
     if (disabled) return;
+
+    const raw = lastRawInputRef.current;
+    const sequence = raw.startsWith("\x1b") ? raw : input.length > 0 ? input : raw;
 
     if (autocompleteItems.length > 0 && autocompleteContext) {
       if (key.upArrow) {
@@ -450,18 +663,23 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
-    if ((key.meta && input === "a") || input === "\u001ba") {
+    if ((key.meta && input === "a") || sequence === "\u001ba") {
       onOpenHub?.();
       return;
     }
 
-    if (key.ctrl && (input === "p" || input === "\x10")) {
+    if ((key.ctrl && (input === "p" || sequence === "\x10")) || sequence === "\x10") {
       onOpenPalette?.();
       return;
     }
 
-    if (key.ctrl && (input === "s" || input === "\x13")) {
+    if ((key.ctrl && (input === "s" || sequence === "\x13")) || sequence === "\x13") {
       onOpenSessions?.();
+      return;
+    }
+
+    if ((key.ctrl && (input === "g" || sequence === "\x07")) || sequence === "\x07") {
+      onOpenHelp?.();
       return;
     }
 
@@ -471,15 +689,11 @@ export function PromptComposer(props: PromptComposerProps) {
       (key.return && key.shift) ||
       (key.return && key.meta) ||
       (key.return && key.ctrl) ||
-      input === "\u001b\r" ||
-      input === "\n" ||
-      input === "\r\n" ||
-      input === "\x1b[13;2u" ||
-      input === "\x1b[27;2;13~" ||
-      input === "\x1b[13;5u" ||
-      input === "\x1b[27;5;13~" ||
-      (("name" in key && (key as { name?: string }).name === "enter") && !key.return) ||
-      (input === "\r" && key.shift);
+      sequence === "\u001b\r" ||
+      sequence === "\x1b[13;2u" ||
+      sequence === "\x1b[27;2;13~" ||
+      sequence === "\x1b[13;5u" ||
+      sequence === "\x1b[27;5;13~";
 
     const isBackslashNewline =
       key.return &&
@@ -492,13 +706,47 @@ export function PromptComposer(props: PromptComposerProps) {
         before = before.slice(0, -1);
       }
       const after = text.slice(cursorPos);
-      setText(`${before}\n${after}`);
-      setCursorPos(before.length + 1);
+      commitEdit(`${before}\n${after}`, before.length + 1);
       return;
     }
 
     if (key.return) {
       void handleFinalSubmit();
+      return;
+    }
+
+    const isUndo = (key.ctrl && (input === "z" || sequence === "\x1a")) || sequence === "\x1a";
+    if (isUndo) {
+      if (key.shift) redo();
+      else undo();
+      return;
+    }
+
+    const isRedo = (key.ctrl && (input === "y" || sequence === "\x19")) || sequence === "\x19";
+    if (isRedo) {
+      redo();
+      return;
+    }
+
+    const isWordMoveLeft =
+      (key.ctrl && key.leftArrow) ||
+      (key.meta && input === "b") ||
+      sequence === "\x1b[1;5D" ||
+      sequence === "\x1b[5D" ||
+      sequence === "\x1bb";
+    if (isWordMoveLeft) {
+      setCursorPos(findPreviousWordStart(text, cursorPos));
+      return;
+    }
+
+    const isWordMoveRight =
+      (key.ctrl && key.rightArrow) ||
+      (key.meta && input === "f") ||
+      sequence === "\x1b[1;5C" ||
+      sequence === "\x1b[5C" ||
+      sequence === "\x1bf";
+    if (isWordMoveRight) {
+      setCursorPos(findNextWordEnd(text, cursorPos));
       return;
     }
 
@@ -540,72 +788,113 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
-    if ((key.ctrl && input === "a") || (key as { home?: boolean }).home) {
+    if ((key.ctrl && (input === "a" || sequence === "\x01")) || (key as { home?: boolean }).home || sequence === "\x1b[H" || sequence === "\x1b[1~") {
       setCursorPos(getCursorOffset(lines, line, 0));
       return;
     }
 
-    if ((key.ctrl && input === "e") || (key as { end?: boolean }).end) {
+    if ((key.ctrl && (input === "e" || sequence === "\x05")) || (key as { end?: boolean }).end || sequence === "\x1b[F" || sequence === "\x1b[4~") {
       setCursorPos(getCursorOffset(lines, line, lines[line].length));
       return;
     }
 
-    const isWordBackspace =
-      (key.ctrl && (input === "w" || key.backspace || key.delete || input === "\x7f" || input === "\b" || input === "\x08")) ||
-      (key.meta && (key.backspace || key.delete || input === "\x7f" || input === "\b" || input === "\x1b\x7f" || input === "\x1b\b")) ||
-      input === "\x17" ||
-      input === "\x1f" ||
-      input === "\x1b[127;5u";
-
-    if (isWordBackspace) {
-      const { nextText, nextCursor } = deletePreviousWord(text, cursorPos);
-      setText(nextText);
-      setCursorPos(nextCursor);
+    if ((key.ctrl && (input === "u" || sequence === "\x15")) || sequence === "\x15") {
+      const lineStart = getCursorOffset(lines, line, 0);
+      commitEdit(`${text.slice(0, lineStart)}${text.slice(cursorPos)}`, lineStart);
       return;
     }
 
-    const isForwardDelete = input === "\x1b[3~";
-    const isBackspace = Boolean(key.backspace || key.delete || input === "\x7f" || input === "\b");
+    if ((key.ctrl && (input === "k" || sequence === "\x0b")) || sequence === "\x0b") {
+      const lineEnd = getCursorOffset(lines, line, lines[line].length);
+      commitEdit(`${text.slice(0, cursorPos)}${text.slice(lineEnd)}`, cursorPos);
+      return;
+    }
 
+    const isForwardWordDelete =
+      (key.ctrl && key.delete) ||
+      sequence === "\x1b[3;5~" ||
+      sequence === "\x1b[3;3~" ||
+      (key.meta && (input === "d" || sequence === "\x1bd"));
+    if (isForwardWordDelete) {
+      const { nextText, nextCursor } = deleteNextWord(text, cursorPos);
+      commitEdit(nextText, nextCursor);
+      return;
+    }
+
+    const isWordBackspace =
+      (key.ctrl && (key.backspace || input === "w" || input === "h")) ||
+      (key.meta && key.backspace) ||
+      sequence === "\x17" ||
+      sequence === "\x08" ||
+      sequence === "\b" ||
+      sequence === "\x1f" ||
+      sequence === "\x1b[127;5u" ||
+      sequence === "\x1b[27;5;127~" ||
+      sequence === "\x1b[27;5;8~" ||
+      sequence === "\x1b[8;5~" ||
+      sequence === "\x1b\x7f";
+    if (isWordBackspace) {
+      const { nextText, nextCursor } = deletePreviousWord(text, cursorPos);
+      commitEdit(nextText, nextCursor);
+      return;
+    }
+
+    const isForwardDelete =
+      sequence === "\x1b[3~" ||
+      sequence === "\x04" ||
+      (key.ctrl && input === "d");
     if (isForwardDelete) {
       if (cursorPos < text.length) {
-        const before = text.slice(0, cursorPos);
-        const after = text.slice(cursorPos + 1);
-        setText(`${before}${after}`);
+        commitEdit(`${text.slice(0, cursorPos)}${text.slice(cursorPos + 1)}`, cursorPos);
       }
       return;
     }
 
+    const isBackspace =
+      key.backspace ||
+      sequence === "\x7f";
     if (isBackspace) {
       if (cursorPos > 0) {
-        const before = text.slice(0, cursorPos - 1);
-        const after = text.slice(cursorPos);
-        setText(`${before}${after}`);
-        setCursorPos(cursorPos - 1);
+        commitEdit(`${text.slice(0, cursorPos - 1)}${text.slice(cursorPos)}`, cursorPos - 1);
       }
       return;
     }
 
     if (key.escape) {
-      if (text.length > 0) {
-        setText("");
-        setCursorPos(0);
+      if (!streaming && text.length > 0) {
+        commitEdit("", 0);
         historyManager.resetPointer();
       }
       return;
     }
 
-    if (!key.ctrl && !key.meta && !isBackspace && !isForwardDelete && input.length > 0 && input >= " " && input !== "\x7f") {
-      const before = text.slice(0, cursorPos);
-      const after = text.slice(cursorPos);
-      setText(`${before}${input}${after}`);
-      setCursorPos(cursorPos + input.length);
+    const isPrintable =
+      !key.ctrl &&
+      !key.meta &&
+      input.length > 0 &&
+      input >= " " &&
+      input !== "\x7f" &&
+      !input.startsWith("\x1b");
+
+    if (isPrintable) {
+      const inserted = normalizeInsertedText(input);
+      commitEdit(`${text.slice(0, cursorPos)}${inserted}${text.slice(cursorPos)}`, cursorPos + inserted.length);
     }
   });
 
   const modeStyle = theme.modes[mode] ?? theme.modes.build;
   const { line: activeLine, col: activeCol, lines } = getLineAndColumn(text, cursorPos);
   const totalTokens = attachedFiles.reduce((sum, item) => sum + item.tokens, 0);
+  const imageCount = attachedFiles.filter((item) => item.kind === "image").length;
+
+  const popupVisible = autocompleteItems.length > 0 && autocompleteContext !== null;
+  const popupRows = popupVisible ? Math.min(6, autocompleteItems.length) + 4 : 0;
+  const attachmentRows = attachedFiles.length > 0 ? 1 : 0;
+  const layoutRows = popupRows + attachmentRows + lines.length + 2 + 1;
+
+  React.useLayoutEffect(() => {
+    onLayoutRows?.(layoutRows);
+  }, [layoutRows, onLayoutRows]);
 
   return (
     <Box flexDirection="column" marginTop={0}>
@@ -616,24 +905,30 @@ export function PromptComposer(props: PromptComposerProps) {
           trigger={autocompleteContext.trigger}
           theme={theme}
           maxVisible={6}
+          width={width}
         />
       ) : null}
 
       {attachedFiles.length > 0 ? (
         <Box flexDirection="row" gap={1} marginBottom={0} paddingX={1}>
           <Text bold color={theme.accent}>
-            Attached files:
+            Attached:
           </Text>
-          {attachedFiles.map((file) => (
+          {attachedFiles.slice(0, 3).map((file) => (
             <Text
               key={file.raw}
-              color={file.exists ? theme.modes.build.primary : theme.modes.ultrawork.secondary}
+              color={file.exists ? theme.modes.build.primary : theme.badge.error}
             >
-              {file.raw} (~{file.tokens} tok)
+              {file.raw.length > 28 ? `${file.raw.slice(0, 25)}...` : file.raw}{" "}
+              {file.kind === "image" ? "(image)" : `(~${file.tokens} tok)`}
             </Text>
           ))}
-          <Text dimColor>
-            (~{totalTokens} tokens injected on Enter)
+          {attachedFiles.length > 3 ? (
+            <Text color={theme.muted}>+{attachedFiles.length - 3} more</Text>
+          ) : null}
+          <Text color={theme.muted}>
+            (~{formatTokenCount(totalTokens)} tokens
+            {imageCount > 0 ? ` + ${imageCount} image${imageCount === 1 ? "" : "s"}` : ""} on Enter)
           </Text>
         </Box>
       ) : null}
@@ -649,50 +944,45 @@ export function PromptComposer(props: PromptComposerProps) {
             <Text color={modeStyle.primary} bold>
               ❯{" "}
             </Text>
-            <Text dimColor>{placeholder}</Text>
+            <Text color={theme.muted}>{placeholder}</Text>
           </Box>
         ) : (
           lines.map((lineContent, lineIndex) => {
             const isCurrentLine = lineIndex === activeLine;
-            const prefix = lines.length > 1 ? `${lineIndex + 1} | ` : "❯ ";
+            const prefix = lines.length > 1 ? `${lineIndex + 1} │ ` : "❯ ";
 
             if (!isCurrentLine) {
               return (
                 <Box key={`line-${lineIndex}`}>
-                  <Text color={modeStyle.secondary} dimColor>
+                  <Text color={theme.border.passive}>
                     {prefix}
                   </Text>
-                  <Text>{lineContent}</Text>
+                  <Text color={theme.text}>{lineContent}</Text>
                 </Box>
               );
             }
 
-            const beforeCursor = lineContent.slice(0, activeCol);
-            const cursorChar = lineContent[activeCol] ?? " ";
-            const afterCursor = lineContent.slice(activeCol + 1);
+            const { before, cursorChar, after } = splitLineAtCursor(lineContent, activeCol);
 
             return (
               <Box key={`line-${lineIndex}`}>
                 <Text color={modeStyle.primary} bold>
                   {prefix}
                 </Text>
-                <Text>{beforeCursor}</Text>
+                <Text color={theme.text}>{before}</Text>
                 <Text inverse bold color={modeStyle.primary}>
                   {cursorChar}
                 </Text>
-                <Text>{afterCursor}</Text>
+                <Text color={theme.text}>{after}</Text>
               </Box>
             );
           })
         )}
       </Box>
 
-      <Box justifyContent="space-between" paddingX={1}>
-        <Text dimColor>
-          Tab Mode · @ File · / Command · Ctrl+P Palette · Ctrl+S Sessions · Alt+A Hub
-        </Text>
-        <Text dimColor>
-          Shift+Enter Newline · Enter Send
+      <Box paddingX={1}>
+        <Text color={theme.muted}>
+          Tab mode · / commands · @ files · $ skills · Ctrl+P palette · Enter send · Shift+Enter newline
         </Text>
       </Box>
     </Box>

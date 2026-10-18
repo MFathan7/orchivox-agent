@@ -7,6 +7,7 @@ import type {
   IAgentRunner,
 } from "../api/server";
 import type { AppConfig } from "../config/loader";
+import { structuredPatch } from "diff";
 import { registerAstTools } from "../ide/ast-compress";
 import { registerCodeIntelTools } from "../ide/code-intel";
 import type { LSPClient } from "../ide/lsp-client";
@@ -57,8 +58,13 @@ import { CustomCommandEngine } from "./custom-commands";
 import { HookRunner, type PluginLoadReport } from "./hooks";
 import { GranularPermissionEngine } from "./permissions";
 import { SpecialistAgentRegistry, type SpecialistAgentProfile } from "./specialist-agents";
+import { SkillRegistry } from "./skills";
 import { SubagentManager, type SubagentTaskInput, type SubagentTaskResult, type SubagentWorkerState } from "./subagent";
+import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
+import { runWithTurnContext } from "./turn-context";
+import { SKILL_ALWAYS_ALLOWED_TOOLS, SkillToolPolicy } from "./skill-policy";
 import { TodoEngine } from "./todo";
+import { runGit } from "../vcs/git";
 
 export interface AgentOrchestratorOptions {
   router: ProviderRouter;
@@ -81,6 +87,15 @@ const PROFILE_MODES: Record<AgentProfile, AgentMode> = {
   "orchivox-ultrawork": "ultrawork",
 };
 
+const SUBAGENT_BLOCKED_TOOLS = new Set([
+  "spawn_subagents",
+  "task_create",
+  "task_dispatch",
+  "task_cancel",
+  "task_merge",
+  "task_wait",
+]);
+
 const MODE_PROMPTS: Record<AgentMode, string> = {
   plan: [
     "You are in PLAN mode (Prometheus), acting as the lead architect.",
@@ -97,6 +112,8 @@ const MODE_PROMPTS: Record<AgentMode, string> = {
     "You are in ULTRAWORK mode.",
     "Track the work with todo_write and keep making progress with tools",
     "until every todo item is completed.",
+    "For independent work, create tasks with task_create (ready tasks start automatically)",
+    "and inspect progress with task_list.",
   ].join(" "),
 };
 
@@ -110,6 +127,8 @@ export class AgentOrchestrator implements IAgentRunner {
   readonly customCommands: CustomCommandEngine;
   readonly specialistAgents: SpecialistAgentRegistry;
   readonly bgProcesses: BackgroundProcessManager;
+  readonly skills: SkillRegistry;
+  readonly tasks: TaskBoard;
 
   private readonly router: ProviderRouter;
   private readonly snapshots: SnapshotManager;
@@ -139,10 +158,18 @@ export class AgentOrchestrator implements IAgentRunner {
     this.advisor = new AdvisorReviewer({ router: options.router, repoRoot: this.root });
     this.customCommands = new CustomCommandEngine({ repoRoot: this.root });
     this.specialistAgents = new SpecialistAgentRegistry({ repoRoot: this.root });
+    this.skills = new SkillRegistry({ repoRoot: this.root });
     this.bgProcesses = new BackgroundProcessManager({ defaultCwd: this.root });
     this.subagents = new SubagentManager({
       worktrees: options.worktrees,
       executor: (input) => this.executeSubagent(input),
+    });
+    this.tasks = new TaskBoard({
+      spawner: (input) => this.spawnTaskWorker(input),
+      canceller: (workerId) => this.subagents.kill(workerId),
+      merger: (workerId) => options.worktrees.mergeAndCleanup(workerId),
+      maxConcurrent: 3,
+      store: options.database,
     });
     this.registerDefaultTools();
   }
@@ -150,6 +177,7 @@ export class AgentOrchestrator implements IAgentRunner {
   async initialize(): Promise<PluginLoadReport> {
     await this.customCommands.ensureDefaults();
     await this.specialistAgents.ensureDefaults();
+    await this.skills.load(true);
     return this.hooks.loadUserPlugins(this.registry);
   }
 
@@ -243,6 +271,8 @@ export class AgentOrchestrator implements IAgentRunner {
     registerAstTools(this.registry);
     this.todos.registerTools(this.registry);
     this.subagents.registerTools(this.registry);
+    this.skills.registerTools(this.registry);
+    this.tasks.registerTools(this.registry);
     this.hindsight.registerTools(this.registry);
     this.registry.register(createDiagnosticsCheckTool({ lsp: this.lsp, repoRoot: this.root }));
     this.bgProcesses.registerTools(this.registry);
@@ -257,7 +287,16 @@ export class AgentOrchestrator implements IAgentRunner {
     sink: (event: StreamEvent) => void,
   ): Promise<AgentRunResult> {
     const mode = PROFILE_MODES[request.profile];
+    const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
+    return runWithTurnContext({ mode, sessionId }, () => this.executeInner(request, signal, sink, mode));
+  }
 
+  private async executeInner(
+    request: AgentRunRequest,
+    signal: AbortSignal | undefined,
+    sink: (event: StreamEvent) => void,
+    mode: AgentMode,
+  ): Promise<AgentRunResult> {
     let activeSpecialist: SpecialistAgentProfile | undefined;
     if (typeof request.metadata?.agent === "string") {
       activeSpecialist = await this.specialistAgents.getAgent(request.metadata.agent as string);
@@ -300,26 +339,40 @@ export class AgentOrchestrator implements IAgentRunner {
     }
 
     const requestedRole = activeSpecialist?.roleModel ?? "main";
-    const provider = this.router.get(
+    const roleName: "main" | "fast" | "advisor" =
       requestedRole === "advisor" || requestedRole === "fast" || requestedRole === "main"
         ? requestedRole
-        : "main",
-    );
-    const system = [activeSpecialist?.systemPrompt, request.system, MODE_PROMPTS[mode]].filter(Boolean).join("\n\n");
+        : "main";
+    const provider = this.router.get(roleName);
+    const capabilities = this.router.capabilitiesForRole(roleName);
+    if (!capabilities.vision) messages = stripImageBlocks(messages);
+    const system = [activeSpecialist?.systemPrompt, request.system, MODE_PROMPTS[mode], this.skills.buildIndexPrompt()]
+      .filter(Boolean)
+      .join("\n\n");
     let tools = this.combineTools(request.tools);
+    if (!capabilities.tool_calling) tools = [];
     if (activeSpecialist) {
-      tools = this.specialistAgents.filterTools(activeSpecialist, tools);
+      tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
     }
+    const skillPolicy = new SkillToolPolicy(SKILL_ALWAYS_ALLOWED_TOOLS);
+    const activatedSkills = new Set<string>();
     const totals = zeroUsage();
     let finishReason: FinishReason = "stop";
+    let ultraworkNudges = 0;
 
     const budget = activeSpecialist?.thinkingBudget ?? 0;
-    const maxTokens = budget > 0
+    const requestedMaxTokens = budget > 0
       ? Math.max(request.max_tokens ?? 4096, budget + 2048)
       : (request.max_tokens ?? 4096);
+    const maxTokens = capabilities.max_output
+      ? Math.min(requestedMaxTokens, capabilities.max_output)
+      : requestedMaxTokens;
+    const contextBudget = capabilities.context_window
+      ? Math.floor(capabilities.context_window * 0.75)
+      : this.contextTokenBudget;
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
-      messages = await this.hindsight.compactMessagesIfNeeded(messages, this.contextTokenBudget, provider);
+      messages = await this.hindsight.compactMessagesIfNeeded(messages, contextBudget, provider);
 
       const advisorNote = this.advisor.consumeNote();
       if (advisorNote) {
@@ -327,15 +380,17 @@ export class AgentOrchestrator implements IAgentRunner {
         messages.push(makeMessage(`turn-${turn}-advisor`, "system", advisorNote));
       }
 
+      const turnTools = skillPolicy.filter(tools);
       const chatRequest = ChatRequestSchema.parse({
         system,
         messages,
-        tools,
-        tool_choice: request.tool_choice.mode,
+        tools: turnTools,
+        tool_choice: turnTools.length > 0 ? request.tool_choice.mode : "none",
         max_tokens: maxTokens,
         temperature: request.temperature,
         top_p: request.top_p,
         stop_sequences: request.stop_sequences,
+        reasoning_effort: capabilities.reasoning ? request.reasoning_effort : undefined,
       });
 
       const accumulator = new TurnAccumulator();
@@ -347,7 +402,7 @@ export class AgentOrchestrator implements IAgentRunner {
             sink(event);
             break;
           case "thinking_token":
-            accumulator.addThinking(event.text);
+            accumulator.addThinking(event.text, event.signature);
             sink(event);
             break;
           case "tool_call_delta":
@@ -385,7 +440,16 @@ export class AgentOrchestrator implements IAgentRunner {
           const enforcement = this.todos.checkPendingTodos();
           if (enforcement.hasPending) {
             messages.push(makeMessage(`turn-${turn}-todo`, "user", enforcement.continuationPrompt));
-            sink({ type: "thinking_token", text: enforcement.continuationPrompt });
+            continue;
+          }
+          if (finishReason === "stop" && ultraworkNudges < 2) {
+            ultraworkNudges += 1;
+            const nudge = [
+              "Continue in ULTRAWORK mode.",
+              "Verify the result with tools, finish any remaining work, and update the todo list.",
+              "If everything is complete, reply with a short final summary.",
+            ].join(" ");
+            messages.push(makeMessage(`turn-${turn}-ultrawork`, "user", nudge));
             continue;
           }
         }
@@ -399,16 +463,59 @@ export class AgentOrchestrator implements IAgentRunner {
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         const filePath = extractFilePath(call.arguments);
-        sink({ type: "thinking_token", text: `[tool] ${call.name} ${summarizeArguments(call.arguments)}` });
+        const toolStartedAt = Date.now();
+        sink({
+          type: "tool_start",
+          id: call.id,
+          name: call.name,
+          arguments_summary: summarizeArguments(call.arguments),
+          file_path: filePath,
+        });
+
+        if (!skillPolicy.allows(call.name)) {
+          messages.push(toolResultMessage(call, `blocked: the active skill does not allow the ${call.name} tool`, true));
+          sink({
+            type: "tool_end",
+            id: call.id,
+            name: call.name,
+            status: "error",
+            duration_ms: Date.now() - toolStartedAt,
+            file_path: filePath,
+          });
+          continue;
+        }
 
         const pre = await this.hooks.runPreToolUse({ toolName: call.name, args: call.arguments, filePath });
         if (pre.allowed === false) {
           messages.push(toolResultMessage(call, `blocked: ${pre.reason ?? "pre tool use hook"}`, true));
-          sink({ type: "thinking_token", text: `[tool] ${call.name} blocked` });
+          sink({
+            type: "tool_end",
+            id: call.id,
+            name: call.name,
+            status: "error",
+            duration_ms: Date.now() - toolStartedAt,
+            file_path: filePath,
+          });
           continue;
         }
 
+        if (call.name === "skill") {
+          const skillName = typeof call.arguments.name === "string" ? call.arguments.name : undefined;
+          const document = skillName ? this.skills.get(skillName) : undefined;
+          if (document?.allowedTools !== undefined && !activatedSkills.has(document.name)) {
+            activatedSkills.add(document.name);
+            skillPolicy.activate(document.allowedTools);
+            sink({
+              type: "skill_activated",
+              name: document.name,
+              allowed_tools: [...document.allowedTools],
+            });
+          }
+        }
+
         const mutates = this.registry.get(call.name)?.readOnly === false;
+        const captureChange = Boolean(filePath && mutates && mode !== "plan");
+        const beforeText = captureChange && filePath ? (await readTextFile(filePath)) ?? "" : undefined;
         const hashEditOwnsSnapshot =
           call.name === "hash_edit" && this.hashEditLifecycle?.onBeforeModify !== undefined;
         if (filePath && mutates && mode !== "plan" && !hashEditOwnsSnapshot) {
@@ -426,6 +533,45 @@ export class AgentOrchestrator implements IAgentRunner {
 
         const result = await this.registry.run(call, mode);
         let content = typeof result.content === "string" ? result.content : JSON.stringify(result.content);
+        sink({
+          type: "tool_end",
+          id: call.id,
+          name: call.name,
+          status: result.is_error ? "error" : "ok",
+          duration_ms: Date.now() - toolStartedAt,
+          file_path: filePath,
+        });
+
+        if (captureChange && filePath && beforeText !== undefined) {
+          const afterText = (await readTextFile(filePath)) ?? "";
+          if (afterText !== beforeText) {
+            const stats = countLineChanges(beforeText, afterText);
+            sink({
+              type: "file_change",
+              path: filePath,
+              old_text: beforeText.slice(0, MAX_DIFF_CHARS),
+              new_text: afterText.slice(0, MAX_DIFF_CHARS),
+              additions: stats.additions,
+              deletions: stats.deletions,
+            });
+          }
+        }
+
+        if (call.name === "move_file" && mode !== "plan" && typeof call.arguments.destinationPath === "string") {
+          const destination = call.arguments.destinationPath;
+          const destinationText = (await readTextFile(destination)) ?? "";
+          if (destinationText.length > 0) {
+            const stats = countLineChanges("", destinationText);
+            sink({
+              type: "file_change",
+              path: destination,
+              old_text: "",
+              new_text: destinationText.slice(0, MAX_DIFF_CHARS),
+              additions: stats.additions,
+              deletions: 0,
+            });
+          }
+        }
 
         const post = await this.hooks.runPostToolUse({
           toolName: call.name,
@@ -433,8 +579,7 @@ export class AgentOrchestrator implements IAgentRunner {
           filePath,
           resultContent: content,
           isError: result.is_error,
-        });
-        if (post.notes?.length) content = `${content}\n${post.notes.join("\n")}`;
+        });        if (post.notes?.length) content = `${content}\n${post.notes.join("\n")}`;
 
         if (filePath) {
           const diagnostics = this.pendingDiagnostics.get(filePath);
@@ -445,10 +590,6 @@ export class AgentOrchestrator implements IAgentRunner {
         }
 
         messages.push(toolResultMessage(call, content, result.is_error));
-        sink({
-          type: "thinking_token",
-          text: `[tool] ${call.name} ${result.is_error ? "failed" : "ok"}: ${firstLine(content)}`,
-        });
         if (filePath && mutates && mode !== "plan") this.advisor.scheduleReview();
       }
     }
@@ -466,6 +607,64 @@ export class AgentOrchestrator implements IAgentRunner {
     };
   }
 
+  private readOnlyToolNames(): ReadonlySet<string> {
+    return new Set(
+      this.registry
+        .list()
+        .filter((tool) => tool.readOnly)
+        .map((tool) => tool.name),
+    );
+  }
+
+  private spawnTaskWorker(input: TaskSpawnInput): { workerId: string; done: Promise<TaskWorkerOutcome> } {
+    let resolveDone!: (outcome: TaskWorkerOutcome) => void;
+    const done = new Promise<TaskWorkerOutcome>((resolve) => {
+      resolveDone = resolve;
+    });
+
+    const worker = this.subagents.spawnOne({
+      task: input.task,
+      agent: input.agent,
+      mode: input.mode,
+      roleModel: input.roleModel,
+      provider: input.provider,
+      model: input.model,
+      writeIsolation: input.writeIsolation,
+      onComplete: (finished) => {
+        void this.captureWorkerOutcome(finished).then(resolveDone);
+      },
+    });
+
+    return { workerId: worker.id, done };
+  }
+
+  private async captureWorkerOutcome(worker: SubagentWorkerState): Promise<TaskWorkerOutcome> {
+    const output = worker.result?.output;
+    const error = worker.result?.error?.message ?? worker.error?.message;
+    let diff: string | undefined;
+    let filesChanged: string[] = [];
+
+    if (worker.worktreePath) {
+      try {
+        const status = await runGit(worker.worktreePath, ["status", "--porcelain"], { allowFailure: true });
+        filesChanged = status.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 3)
+          .map((line) => line.slice(3).trim());
+
+        const staged = await runGit(worker.worktreePath, ["diff", "--cached", "--", "."], { allowFailure: true });
+        const unstaged = await runGit(worker.worktreePath, ["diff", "--", "."], { allowFailure: true });
+        const combined = `${staged.stdout}${unstaged.stdout}`.trim();
+        if (combined.length > 0) diff = combined.slice(0, 20_000);
+      } catch {
+        // Worker diff capture is best effort and never fails the task.
+      }
+    }
+
+    return { output, error, diff, filesChanged };
+  }
+
   private async executeSubagent(input: SubagentTaskInput): Promise<SubagentTaskResult> {
     let specialist: SpecialistAgentProfile | undefined;
     if (input.agent) {
@@ -478,12 +677,16 @@ export class AgentOrchestrator implements IAgentRunner {
       }
     }
 
-    const requestedRole = specialist?.roleModel ?? "main";
-    const provider = this.router.get(
-      requestedRole === "advisor" || requestedRole === "fast" || requestedRole === "main"
-        ? requestedRole
-        : "main",
-    );
+    const requestedRole = input.roleModel ?? specialist?.roleModel ?? "main";
+    const role = requestedRole === "advisor" || requestedRole === "fast" ? requestedRole : "main";
+    const provider =
+      input.provider && input.model
+        ? this.router.provider(input.provider, input.model)
+        : this.router.get(role);
+    const capabilities =
+      input.provider && input.model
+        ? this.router.capabilitiesFor(input.provider, input.model)
+        : this.router.capabilitiesForRole(role);
     const messages: Message[] = [];
     const scope = input.worktreePath
       ? `Work only inside this directory: ${input.worktreePath}\n\n`
@@ -491,10 +694,15 @@ export class AgentOrchestrator implements IAgentRunner {
     messages.push(makeMessage("subagent-task", "user", `${scope}${input.task}`));
     const totals = zeroUsage();
 
-    let tools = this.registry.listDefinitions();
+    let tools = this.registry.listDefinitions().filter((tool) => !SUBAGENT_BLOCKED_TOOLS.has(tool.name));
+    if (!capabilities.tool_calling) tools = [];
     if (specialist) {
-      tools = this.specialistAgents.filterTools(specialist, tools);
+      tools = this.specialistAgents.filterTools(specialist, tools, this.readOnlyToolNames());
     }
+    const requestedMaxTokens = specialist?.thinkingBudget ? Math.max(4096, specialist.thinkingBudget) : 4096;
+    const subagentMaxTokens = capabilities.max_output
+      ? Math.min(requestedMaxTokens, capabilities.max_output)
+      : requestedMaxTokens;
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
       for (const instruction of input.drainSteerings()) {
@@ -504,17 +712,19 @@ export class AgentOrchestrator implements IAgentRunner {
 
       const accumulator = new TurnAccumulator();
       const chatRequest = ChatRequestSchema.parse({
-        system: specialist?.systemPrompt,
+        system: [specialist?.systemPrompt, this.skills.buildIndexPrompt()].filter(Boolean).join("\n\n"),
         messages,
         tools,
-        max_tokens: specialist?.thinkingBudget ? Math.max(4096, specialist.thinkingBudget) : 4096,
+        tool_choice: tools.length > 0 ? "auto" : "none",
+        max_tokens: subagentMaxTokens,
+        reasoning_effort: capabilities.reasoning ? "medium" : undefined,
       });
       for await (const event of provider.streamChat(chatRequest, input.signal)) {
         if (event.type === "token") {
           accumulator.addText(event.text);
           input.onTranscript(event.text);
         } else if (event.type === "thinking_token") {
-          accumulator.addThinking(event.text);
+          accumulator.addThinking(event.text, event.signature);
         } else if (event.type === "tool_call_delta") {
           accumulator.addDelta(event);
         } else if (event.type === "tool_call_ready") {
@@ -536,7 +746,7 @@ export class AgentOrchestrator implements IAgentRunner {
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         input.onTranscript(`[tool] ${call.name}`);
-        const effectiveMode = specialist?.readOnly ? "plan" : "build";
+        const effectiveMode = input.mode ?? (specialist?.readOnly ? "plan" : "build");
         const result = await this.registry.run(call, effectiveMode);
         messages.push(
           toolResultMessage(call, typeof result.content === "string" ? result.content : JSON.stringify(result.content), result.is_error),
@@ -606,6 +816,7 @@ export class AgentOrchestrator implements IAgentRunner {
 class TurnAccumulator {
   private text = "";
   private thinking = "";
+  private thinkingSignature: string | undefined;
   private readonly drafts = new Map<string, { id: string; name: string; argumentsText: string }>();
   private readonly ready = new Map<string, ToolCallReadyEvent>();
 
@@ -613,8 +824,9 @@ class TurnAccumulator {
     this.text += text;
   }
 
-  addThinking(text: string): void {
+  addThinking(text: string, signature?: string): void {
     this.thinking += text;
+    if (signature) this.thinkingSignature = signature;
   }
 
   addDelta(event: ToolCallDeltaEvent): void {
@@ -635,7 +847,13 @@ class TurnAccumulator {
 
   toMessage(id: string): Message {
     const content: Message["content"] = [];
-    if (this.thinking.length > 0) content.push({ type: "thinking", thinking: this.thinking });
+    if (this.thinking.length > 0) {
+      content.push({
+        type: "thinking",
+        thinking: this.thinking,
+        ...(this.thinkingSignature ? { signature: this.thinkingSignature } : {}),
+      });
+    }
     if (this.text.length > 0) content.push({ type: "text", text: this.text });
     for (const draft of this.drafts.values()) {
       const ready = this.ready.get(draft.id);
@@ -677,8 +895,48 @@ function parseArguments(text: string): Record<string, unknown> {
 }
 
 function extractFilePath(args: Record<string, unknown>): string | undefined {
-  const candidate = args.filePath ?? args.path;
+  const candidate = args.filePath ?? args.path ?? args.sourcePath;
   return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+export function stripImageBlocks(messages: Message[]): Message[] {
+  if (!messages.some((message) => message.content.some((block) => block.type === "image"))) {
+    return messages;
+  }
+  return messages.map((message) => ({
+    ...message,
+    content: message.content.map((block) =>
+      block.type === "image"
+        ? {
+            type: "text" as const,
+            text: `[image attachment: ${block.path ?? "unknown"}; the active model has no vision support. Use inspect_image with imagePath to analyze it.]`,
+          }
+        : block,
+    ),
+  }));
+}
+
+const MAX_DIFF_CHARS = 24_000;
+
+async function readTextFile(path: string): Promise<string | undefined> {
+  try {
+    return await Bun.file(path).text();
+  } catch {
+    return undefined;
+  }
+}
+
+function countLineChanges(before: string, after: string): { additions: number; deletions: number } {
+  const patch = structuredPatch("before", "after", before, after, undefined, undefined, { context: 0 });
+  let additions = 0;
+  let deletions = 0;
+  for (const hunk of patch.hunks) {
+    for (const line of hunk.lines) {
+      if (line.startsWith("+")) additions += 1;
+      else if (line.startsWith("-")) deletions += 1;
+    }
+  }
+  return { additions, deletions };
 }
 
 function summarizeArguments(args: Record<string, unknown>): string {

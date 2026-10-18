@@ -3,7 +3,7 @@ import React from "react";
 import { render } from "ink";
 import { PassThrough } from "node:stream";
 
-import { deletePreviousWord, PromptComposer } from "../src/tui/composer";
+import { deleteNextWord, deletePreviousWord, PromptComposer } from "../src/tui/composer";
 import { AutocompletePopup, BUILTIN_SLASH_COMMANDS } from "../src/tui/autocomplete";
 import { ScrollableChatViewport } from "../src/tui/viewport";
 import { WelcomeBanner, OrchivoxLogo } from "../src/tui/logo";
@@ -35,6 +35,28 @@ describe("Composer Shortcuts & Word Deletion", () => {
     const res5 = deletePreviousWord("hello", 0);
     expect(res5.nextText).toBe("hello");
     expect(res5.nextCursor).toBe(0);
+  });
+
+  it("deletes next word accurately with deleteNextWord (forward word delete)", () => {
+    // Forward delete from start
+    const res1 = deleteNextWord("hello world", 0);
+    expect(res1.nextText).toBe(" world");
+    expect(res1.nextCursor).toBe(0);
+
+    // Forward delete with leading spaces
+    const res2 = deleteNextWord("hello   world", 5);
+    expect(res2.nextText).toBe("hello");
+    expect(res2.nextCursor).toBe(5);
+
+    // Forward delete punctuation
+    const res3 = deleteNextWord("foo();", 3);
+    expect(res3.nextText).toBe("foo");
+    expect(res3.nextCursor).toBe(3);
+
+    // Cursor at end of text
+    const res4 = deleteNextWord("orchivox", 8);
+    expect(res4.nextText).toBe("orchivox");
+    expect(res4.nextCursor).toBe(8);
   });
 
   it("BUILTIN_SLASH_COMMANDS has concise argument hints without square brackets", () => {
@@ -164,5 +186,27 @@ describe("Composer Shortcuts & Word Deletion", () => {
     // Welcome Banner title is hidden during active conversation
     expect(output).not.toContain("Type a prompt to begin");
     instance3.unmount();
+  });
+
+  it("renders official Orchivox ASCII emblem from Orchivox logos ASCII.md cleanly", () => {
+    const stream = new PassThrough();
+    let output = "";
+    stream.on("data", (chunk: Buffer | string) => {
+      output += chunk.toString();
+    });
+
+    const instance = render(React.createElement(OrchivoxLogo, { variant: "emblem" }), {
+      stdout: stream as unknown as NodeJS.WriteStream,
+      patchConsole: false,
+    });
+
+    // Check key distinct emblem patterns from Orchivox logos ASCII.md
+    expect(output).toContain("▄▄███▄▄  ╱●");
+    expect(output).toContain("▄██▀   ▀█╱´█▄");
+    expect(output).toContain("███  ● ╱´ ███");
+    expect(output).toContain("▀██▄ ╱´▄███▀");
+    expect(output).toContain("●╱▀▀███▀▀");
+
+    instance.unmount();
   });
 });
