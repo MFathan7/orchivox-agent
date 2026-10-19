@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 /docs/
+/tests/
 AGENTS.md
 
 # Build output
