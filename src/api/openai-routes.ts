@@ -345,6 +345,7 @@ function toOpenAiAssistantMessage(
 function toOpenAiFinishReason(reason: AgentRunResult["finish_reason"]): string {
   switch (reason) {
     case "length":
+    case "turn_limit":
       return "length";
     case "tool_calls":
       return "tool_calls";

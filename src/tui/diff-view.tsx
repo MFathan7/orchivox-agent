@@ -5,6 +5,8 @@ import { useInput } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
 import { computeLineHash } from "../tools/hashline-edit";
+import { wrapPreservingWhitespace, wrapText } from "./text-wrap";
+import type { ThinkingSegmentView } from "./app";
 import { getTheme, type Theme } from "./theme";
 
 export interface DiffViewProps {
@@ -14,6 +16,7 @@ export interface DiffViewProps {
   newLabel?: string;
   unified?: boolean;
   context?: number;
+  width?: number;
   theme?: Theme;
 }
 
@@ -32,7 +35,28 @@ export interface ThinkingBlockProps {
   text: string;
   defaultOpen?: boolean;
   focused?: boolean;
+  live?: boolean;
+  durationMs?: number;
+  width?: number;
   theme?: Theme;
+}
+
+function formatThinkingDuration(durationMs: number): string {
+  if (durationMs < 1000) return `${durationMs}ms`;
+  const seconds = durationMs / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.round(seconds % 60)}s`;
+}
+
+function thinkingSummary(text: string, width: number): string {
+  const first = text
+    .split("\n")
+    .map((line) => line.replace(/^[#>*\-\s]+/, "").replace(/[*_`]/g, "").trim())
+    .find((line) => line.length > 0);
+  if (!first) return "";
+  const limit = Math.max(20, Math.min(72, width - 18));
+  return first.length > limit ? `${first.slice(0, limit - 3).trimEnd()}...` : first;
 }
 
 interface DisplayLine {
@@ -102,9 +126,14 @@ function lineHash(line: DisplayLine): string {
   return computeLineHash(line.text);
 }
 
-function unifiedLine(line: DisplayLine): { marker: string; kind: DisplayLine["kind"]; gutter: string } {
+function unifiedLine(
+  line: DisplayLine,
+  showHash = true,
+): { marker: string; kind: DisplayLine["kind"]; gutter: string } {
   const number = line.kind === "add" ? line.newNumber : line.oldNumber;
-  const gutter = `${String(number ?? "").padStart(4)} ${lineHash(line)}`;
+  const gutter = showHash
+    ? `${String(number ?? "").padStart(4)} ${lineHash(line)}`
+    : String(number ?? "").padStart(4);
   if (line.kind === "add") return { marker: "+", kind: "add", gutter };
   if (line.kind === "remove") return { marker: "-", kind: "remove", gutter };
   return { marker: " ", kind: "context", gutter };
@@ -117,31 +146,35 @@ export function DiffView({
   newLabel = "new",
   unified = false,
   context = 3,
+  width = 80,
   theme = getTheme("tokyonight"),
 }: DiffViewProps) {
   const hunks = React.useMemo(() => collectDiffHunks(oldText, newText, context), [oldText, newText, context]);
+  const sideBySide = !unified && width >= 100;
+  const textWidth = Math.max(8, width - 10);
 
   const lineColor = (kind: DisplayLine["kind"]): string =>
     kind === "add" ? theme.diff.added : kind === "remove" ? theme.diff.removed : theme.muted;
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
+    <Box flexDirection="column">
       <Text bold color={theme.text}>
-        {oldLabel} → {newLabel} {unified ? "(unified)" : "(side by side)"}
+        {oldLabel} {"→"} {newLabel}
       </Text>
       {hunks.map((hunk, hunkIndex) => (
         <Box key={hunkIndex} flexDirection="column">
           <Text color={theme.muted}>
             @@ -{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@
           </Text>
-          {unified
-            ? hunk.lines.map((line, lineIndex) => {
-                const view = unifiedLine(line);
-                return (
-                  <Text key={lineIndex} color={lineColor(view.kind)}>
-                    {view.gutter} {view.marker} {line.text}
+          {!sideBySide
+            ? hunk.lines.flatMap((line, lineIndex) => {
+                const view = unifiedLine(line, width >= 60);
+                return wrapPreservingWhitespace(line.text, textWidth).map((chunk, chunkIndex) => (
+                  <Text key={`${lineIndex}-${chunkIndex}`} color={lineColor(view.kind)}>
+                    <Text color={theme.border.passive}>▎ </Text>
+                    {chunkIndex === 0 ? `${view.marker} ${view.gutter}` : "  "} {chunk}
                   </Text>
-                );
+                ));
               })
             : pairDiffLines(hunk.lines).map((pair, lineIndex) => (
                 <Box key={lineIndex}>
@@ -196,10 +229,71 @@ export function ToolCallBadge({
   );
 }
 
+export interface ThinkingTimelineProps {
+  segments: ThinkingSegmentView[];
+  expanded?: boolean;
+  live?: boolean;
+  width?: number;
+  theme?: Theme;
+}
+
+export function ThinkingTimeline({
+  segments,
+  expanded = false,
+  live = false,
+  width = 80,
+  theme = getTheme("tokyonight"),
+}: ThinkingTimelineProps) {
+  const visible = live ? segments.filter((segment) => segment.completedAt !== undefined) : segments;
+  if (visible.length === 0) return null;
+  const contentWidth = Math.max(8, width - 2);
+
+  return (
+    <Box flexDirection="column">
+      {visible.map((segment) => {
+        const duration =
+          segment.completedAt !== undefined
+            ? formatThinkingDuration(segment.completedAt - segment.startedAt)
+            : undefined;
+        const summary = thinkingSummary(segment.text, width);
+        const lines = segment.text.split("\n").flatMap((line) => wrapText(line, contentWidth));
+        if (!expanded) {
+          return (
+            <Text key={segment.id} color={theme.muted}>
+              <Text color={theme.border.passive}>▎ </Text>
+              <Text color={theme.badge.running} bold>Thought</Text>
+              {summary ? <Text color={theme.text}>: {summary}</Text> : null}
+              {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
+            </Text>
+          );
+        }
+        return (
+          <Box key={segment.id} flexDirection="column">
+            <Text color={theme.muted}>
+              <Text color={theme.border.passive}>▎ </Text>
+              <Text color={theme.badge.running} bold>Thought</Text>
+              {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
+            </Text>
+            {lines.map((line, index) => (
+              <Text key={`${segment.id}-${index}`} color={theme.muted}>
+                <Text color={theme.border.passive}>▎ </Text>
+                {line || " "}
+              </Text>
+            ))}
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
 export function ThinkingBlock({
   text,
   defaultOpen = false,
   focused = false,
+  live = false,
+  durationMs,
+  width = 80,
   theme = getTheme("tokyonight"),
 }: ThinkingBlockProps) {
   const [open, setOpen] = React.useState(defaultOpen);
@@ -209,19 +303,46 @@ export function ThinkingBlock({
     },
     { isActive: focused },
   );
-  const lines = text.split("\n");
-  return (
-    <Box flexDirection="column" borderStyle="single" borderColor={theme.border.passive} paddingX={1} marginY={0}>
-      <Text color={theme.modes.plan.secondary} bold>
-        {open ? "▼" : "▶"} Thinking ({lines.length} lines){focused ? " · Enter to toggle" : ""}
+  const contentWidth = Math.max(8, width - 2);
+  const lines = text.split("\n").flatMap((line) => wrapText(line, contentWidth));
+  const summary = thinkingSummary(text, width);
+  const duration = durationMs !== undefined ? formatThinkingDuration(durationMs) : undefined;
+
+  if (live) {
+    return (
+      <Text color={theme.muted}>
+        <Text color={theme.border.passive}>▎ </Text>
+        <Text color={theme.badge.running} bold>Thinking</Text>
+        {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
       </Text>
-      {open
-        ? lines.map((line, index) => (
-            <Text key={index} color={theme.muted}>
-              {line}
-            </Text>
-          ))
-        : null}
+    );
+  }
+
+  if (!open) {
+    return (
+      <Text color={theme.muted}>
+        <Text color={theme.border.passive}>▎ </Text>
+        <Text color={theme.badge.running} bold>Thought</Text>
+        {summary ? <Text color={theme.text}>: {summary}</Text> : null}
+        {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
+      </Text>
+    );
+  }
+
+  return (
+    <Box flexDirection="column">
+      <Text color={theme.muted}>
+        <Text color={theme.border.passive}>▎ </Text>
+        <Text color={theme.badge.running} bold>Thought</Text>
+        {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
+        {focused ? <Text color={theme.muted}> · Enter to collapse</Text> : null}
+      </Text>
+      {lines.map((line, index) => (
+        <Text key={index} color={theme.muted}>
+          <Text color={theme.border.passive}>▎ </Text>
+          {line || " "}
+        </Text>
+      ))}
     </Box>
   );
 }

@@ -174,6 +174,12 @@ export const ThinkingTokenEventSchema = z.object({
 });
 export type ThinkingTokenEvent = z.infer<typeof ThinkingTokenEventSchema>;
 
+export const FinalTextEventSchema = z.object({
+  type: z.literal("final_text"),
+  text: z.string(),
+});
+export type FinalTextEvent = z.infer<typeof FinalTextEventSchema>;
+
 export const ToolCallDeltaEventSchema = z.object({
   type: z.literal("tool_call_delta"),
   id: z.string().min(1),
@@ -221,7 +227,7 @@ export type ErrorEvent = z.infer<typeof ErrorEventSchema>;
 
 export const DoneEventSchema = z.object({
   type: z.literal("done"),
-  finish_reason: z.enum(["stop", "length", "tool_calls", "content_filter", "refusal", "aborted", "error"]),
+  finish_reason: z.enum(["stop", "length", "turn_limit", "tool_calls", "content_filter", "refusal", "aborted", "error"]),
   usage: UsageSchema.optional(),
 });
 export type DoneEvent = z.infer<typeof DoneEventSchema>;
@@ -401,6 +407,7 @@ export type CompactionEvent = z.infer<typeof CompactionEventSchema>;
 export const StreamEventSchema = z.discriminatedUnion("type", [
   TokenEventSchema,
   ThinkingTokenEventSchema,
+  FinalTextEventSchema,
   ToolCallDeltaEventSchema,
   ToolCallReadyEventSchema,
   UsageEventSchema,

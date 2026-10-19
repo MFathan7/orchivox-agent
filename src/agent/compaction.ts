@@ -4,9 +4,8 @@ import { ChatRequestSchema, type Message, type ToolDefinition } from "../types/s
 
 export { COMPACT_LABEL };
 
-const DEFAULT_CONTEXT_WINDOW = 128_000;
+const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_KEEP_TOKENS = 15_000;
-const DEFAULT_BUFFER_RATIO = 0.1;
 
 const SUMMARY_SYSTEM = [
   "You compress conversation history for a coding agent.",
@@ -20,14 +19,28 @@ const SUMMARY_SYSTEM = [
 export interface CompactionOptions {
   provider: LLMProvider;
   contextWindow?: number;
+  inputLimit?: number;
+  outputLimit?: number;
   keepTokens?: number;
   bufferTokens?: number;
   bufferRatio?: number;
+  reserveTokens?: number;
   force?: boolean;
   previousSummary?: string;
   overheadTokens?: number;
   maxSummaryTokens?: number;
   signal?: AbortSignal;
+}
+
+const RESERVE_MIN = 16_000;
+
+export function compactionReserve(window: number, options: { bufferTokens?: number; bufferRatio?: number; reserveTokens?: number; outputLimit?: number } = {}): number {
+  if (options.reserveTokens !== undefined) return options.reserveTokens;
+  if (options.bufferTokens !== undefined) return options.bufferTokens;
+  if (options.bufferRatio !== undefined) return Math.floor(window * options.bufferRatio);
+  const baseline = Math.max(Math.floor(window * 0.1), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0);
+  const outputFloor = Math.min(options.outputLimit ?? 0, Math.floor(window * 0.5));
+  return Math.max(baseline, outputFloor);
 }
 
 export interface CompactionResult {
@@ -108,8 +121,8 @@ function lastUserIndex(conversation: Message[], maxIndex: number): number {
 }
 
 export async function compactMessages(messages: Message[], options: CompactionOptions): Promise<CompactionResult> {
-  const contextWindow = options.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-  const buffer = options.bufferTokens ?? Math.floor(contextWindow * (options.bufferRatio ?? DEFAULT_BUFFER_RATIO));
+  const contextWindow = options.inputLimit ?? options.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+  const buffer = compactionReserve(contextWindow, options);
   const overhead = options.overheadTokens ?? 0;
   const beforeTokens = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overhead;
   const trigger = Math.max(1024, contextWindow - buffer);

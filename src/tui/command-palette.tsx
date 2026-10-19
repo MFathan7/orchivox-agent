@@ -3,9 +3,10 @@ import { Box, Text, useInput } from "ink";
 
 import type { ProviderRole, ProviderRouter } from "../provider/router";
 import { filterFuzzy } from "./autocomplete";
+import { isMouseSequence } from "./mouse";
 import { getTheme, type Theme, type ThemeName, THEME_ORDER } from "./theme";
 
-export type ReasoningEffortLevel = "off" | "low" | "medium" | "high" | "max" | (string & {});
+export type ReasoningEffortLevel = "default" | "off" | "low" | "medium" | "high" | "max" | (string & {});
 
 export interface PaletteItem {
   id: string;
@@ -32,7 +33,8 @@ export interface CommandPaletteModalProps {
 }
 
 export const REASONING_LEVELS: Array<{ id: ReasoningEffortLevel; label: string; description: string; tokens: number }> = [
-  { id: "off", label: "Off", description: "No thinking tokens (0 tokens)", tokens: 0 },
+  { id: "default", label: "Default", description: "Use the provider default, no override", tokens: 0 },
+  { id: "off", label: "Off", description: "Disable reasoning when the provider supports it", tokens: 0 },
   { id: "low", label: "Low", description: "Concise and fast reasoning (2,048 tokens)", tokens: 2048 },
   { id: "medium", label: "Medium", description: "Standard structured reasoning (8,192 tokens)", tokens: 8192 },
   { id: "high", label: "High", description: "Deep reasoning for complex architecture (16,384 tokens)", tokens: 16384 },
@@ -60,7 +62,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
   const {
     router,
     currentTheme = "tokyonight",
-    reasoningEffort = "medium",
+    reasoningEffort = "default",
     reasoningLevels,
     onSelectReasoning,
     onSelectTheme,
@@ -98,6 +100,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       });
     }
 
+    const reasoningUnavailable = levels.length === 1 && levels[0]?.id === "default";
     for (const level of levels) {
       const isCurrent = reasoningEffort === level.id;
       list.push({
@@ -105,7 +108,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
         category: "reasoning",
         section: "Thinking effort",
         title: level.label,
-        subtitle: level.description,
+        subtitle: reasoningUnavailable ? "This model does not expose reasoning controls" : level.description,
         badge: isCurrent ? "ACTIVE" : undefined,
         isCurrent,
         onExecute: () => {
@@ -185,6 +188,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
   const visibleItems = source.slice(startIndex, startIndex + maxVisible);
 
   useInput((input, key) => {
+    if (isMouseSequence(input)) return;
     if (key.escape) {
       onClose();
       return;

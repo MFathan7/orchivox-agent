@@ -70,11 +70,26 @@ import {
   looksLikeNonAnswer,
   type ProjectContext,
 } from "./project-context";
+import {
+  collectProjectEvidence,
+  isProjectFileFollowUp,
+  looksLikeMissingFileAnswer,
+  unknownProjectFiles,
+  type ProjectEvidence,
+} from "./project-evidence";
 import { createQuestionTool, type QuestionHandler } from "../tools/question";
+import {
+  isDesignQuestion,
+  looksLikeInternalDump,
+  sanitizeAssistantText,
+} from "./output-sanitizer";
 import { toolDisplay } from "./tool-display";
 import {
   formatActiveSkills,
+  formatSkillContent,
+  isSkillRelevant,
   matchSkillNames,
+  MAX_SKILL_INJECTION_CHARS,
   parseSkillMentions,
   SkillRegistry,
   type SkillDocument,
@@ -113,6 +128,10 @@ export interface PromptSnapshot {
   capturedAt: number;
 }
 
+const MAX_OUTPUT_LIMIT_CONTINUES = 2;
+const CONTINUE_AFTER_OUTPUT_LIMIT =
+  "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces and continue.";
+
 const PROFILE_MODES: Record<AgentProfile, AgentMode> = {
   "orchivox-main": "build",
   "orchivox-plan": "plan",
@@ -148,6 +167,7 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly database: MemoryDatabase;
   private readonly ephemeralSkills = new Set<string>();
   private readonly lastPrompts = new Map<string, PromptSnapshot>();
+  private readonly lastSkillReload = new Map<string, number>();
   private readonly hindsight: HindsightMemory;
   private readonly lsp: LSPClient | undefined;
   private readonly hashEditLifecycle: HashlineLifecycle | undefined;
@@ -433,25 +453,86 @@ export class AgentOrchestrator implements IAgentRunner {
       }
     }
     const namedSkills = compact && lastText ? matchSkillNames(lastText, this.skills) : [];
-    for (const document of namedSkills) {
+    const turnSkills = [
+      ...new Map(
+        [...mentionedSkills, ...namedSkills].map((document) => [document.name, document]),
+      ).values(),
+    ];
+    const injectedTurnSkills = turnSkills.filter(
+      (document) =>
+        document.body.length <= MAX_SKILL_INJECTION_CHARS ||
+        isSkillRelevant(document, lastText),
+    );
+    const pointerTurnSkills = turnSkills.filter(
+      (document) => !injectedTurnSkills.includes(document),
+    );
+    const historicalMentions = messages
+      .filter((message) => message.role === "user")
+      .flatMap((message) =>
+        parseSkillMentions(
+          message.content
+            .map((block) => (block.type === "text" ? block.text : ""))
+            .join("\n"),
+          this.skills,
+        ),
+      );
+    const pointerHistorySkills = [...new Map(
+      historicalMentions.map((document) => [document.name, document]),
+    ).values()].filter(
+      (document) =>
+        !turnSkills.some((turnSkill) => turnSkill.name === document.name) &&
+        document.body.length > MAX_SKILL_INJECTION_CHARS &&
+        !isSkillRelevant(document, lastText),
+    );
+    const pointerStripSkills = [...new Map(
+      [...pointerTurnSkills, ...pointerHistorySkills].map((document) => [
+        document.name,
+        document,
+      ]),
+    ).values()];
+    for (const document of injectedTurnSkills) {
       const newlyActivated = this.activateSkill(sessionId, document.name);
       if (newlyActivated) {
         sink({
           type: "skill_activated",
           name: document.name,
           allowed_tools: document.allowedTools ?? [],
-          trigger: "auto",
+          trigger: mentionedSkills.includes(document) ? "mention" : "auto",
         });
+      }
+    }
+    const turnSkillBlock =
+      injectedTurnSkills.length > 0
+        ? await formatActiveSkills(injectedTurnSkills, MAX_SKILL_INJECTION_CHARS)
+        : "";
+    if (pointerStripSkills.length > 0) {
+      for (let index = 0; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (message.role !== "user") continue;
+        const content = message.content.map((block) => {
+          if (block.type !== "text") return block;
+          let text = block.text;
+          for (const document of pointerStripSkills) {
+            const escaped = document.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            text = text.replace(
+              new RegExp(`[@$]${escaped}(?![a-zA-Z0-9_-])`, "gi"),
+              " ",
+            );
+          }
+          const cleaned = text.replace(/\s{2,}/g, " ").trim();
+          return { ...block, text: cleaned.length > 0 ? cleaned : block.text };
+        });
+        messages[index] = { ...message, content };
       }
     }
     const explicitWebIntent = /\b(web|internet|online|search|cari di web|cari online)\b/i.test(
       lastText,
     );
     const skillPriorityHint =
-      namedSkills.length > 0 && !explicitWebIntent
+      injectedTurnSkills.length > 0 && !explicitWebIntent
         ? [
             "# Skill priority",
-            `The request mentions ${namedSkills
+            `The request mentions ${injectedTurnSkills
               .map((document) => `"${document.name}"`)
               .join(", ")}. Follow the loaded skill instead of using web search.`,
           ].join("\n")
@@ -461,6 +542,13 @@ export class AgentOrchestrator implements IAgentRunner {
         ? isProjectQuestion(lastText, this.projectContext)
         : false;
     const projectStudy = lastText.length > 0 ? isProjectStudyRequest(lastText) : false;
+    const projectFileFollowUp = lastText.length > 0 ? isProjectFileFollowUp(lastText) : false;
+    const projectReview =
+      projectFileFollowUp &&
+      /\b(bug|error|salah|masalah|adjust|perlu|review|cek|periksa|risiko|issue)\b/i.test(lastText);
+    const projectEvidence = projectStudy || projectFileFollowUp
+      ? await collectProjectEvidence(this.root)
+      : undefined;
     const projectIdentity =
       lastText.length > 0 && this.projectContext
         ? isProjectIdentityQuestion(lastText, this.projectContext)
@@ -469,7 +557,8 @@ export class AgentOrchestrator implements IAgentRunner {
     const specificHint = projectStudy
       ? [
           "# Project study",
-          "The user asked you to study the current project. Inspect the codebase with read, search, and command tools. Read package.json, README.md, source files, and tests. If a file is missing, continue with the others. Do not stop at AGENTS.md and do not summarize the agent instructions.",
+          "The user asked you to study the current project. Use the # Project evidence section as the source of truth. Inspect more files with read, search, and command tools only when the evidence is not enough.",
+          "Do not write or replace code. Do not continue an earlier implementation. This is a read-only report.",
           "When done, write a concise report: what the project is, main modules and responsibilities, how the pieces fit together, and how to run and test it.",
           'Start with what the project is. Do not write a plan or a status update. Do not greet. Do not ask "How can I help you today?". Do not list every file you read. Reply in the user\'s language.',
         ].join("\n")
@@ -489,14 +578,30 @@ export class AgentOrchestrator implements IAgentRunner {
                 "The user is asking about this project. Answer from the # Project section first. Only read local files if the summary does not contain the answer. Do not list tools or skills, and do not use web search.",
               ].join("\n")
             : "";
-    const extraHints = [skillPriorityHint, specificHint].filter(Boolean).join("\n\n");
+    const fileFollowUpHint = projectFileFollowUp
+      ? [
+          "# File follow-up",
+          "The user is referring to a file discussed earlier in this session. Use the # Project evidence section and read the relevant file before answering.",
+          "Do not ask the user to paste a file that is already present in the repository.",
+          projectReview ? "Report findings. Do not rewrite the file unless the user asks for a fix." : "",
+        ].join("\n")
+      : "";
+    const extraHints = [
+      skillPriorityHint,
+      specificHint,
+      fileFollowUpHint,
+      projectEvidence?.text,
+      turnSkillBlock,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
 
-    const contextWindow = capabilities.context_window ?? this.contextTokenBudget;
-    const maxActiveChars = Math.max(8_000, Math.floor(contextWindow * 4 * 0.2));
-    const activeSkillDocs = this.activeSkillDocuments(sessionId);
-    const activeSkillsBlock = await formatActiveSkills(activeSkillDocs, maxActiveChars);
+    const contextWindow = capabilities.max_input ?? capabilities.context_window ?? this.contextTokenBudget;
+    const loadedSkillDocs = this.activeSkillDocuments(sessionId);
+    await this.reloadSkillsAfterCompaction(sessionId, messages, loadedSkillDocs);
     const promptBase = {
       mode,
+      task: projectStudy ? ("study" as const) : projectReview ? ("review" as const) : undefined,
       repoRoot: this.root,
       branch: this.branch,
       agentInstructions: this.globalRules,
@@ -506,7 +611,7 @@ export class AgentOrchestrator implements IAgentRunner {
       extra: [request.system, extraHints].filter(Boolean).join("\n\n") || undefined,
       compact,
     };
-    let system = buildSystemPrompt({ ...promptBase, activeSkills: activeSkillsBlock });
+    let system = buildSystemPrompt(promptBase);
     let tools = this.combineTools(request.tools, mode);
     if (!capabilities.tool_calling) tools = [];
     if (activeSpecialist) {
@@ -514,10 +619,8 @@ export class AgentOrchestrator implements IAgentRunner {
     }
     let overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
     const availableSkillCount = this.skills.listAvailableDocuments().length;
-    const mentionedSkillNames = [
-      ...new Set([...mentionedSkills, ...namedSkills].map((document) => document.name)),
-    ];
-    const initialActiveSkillNames = activeSkillDocs.map((document) => document.name);
+    const mentionedSkillNames = injectedTurnSkills.map((document) => document.name);
+    const initialActiveSkillNames = mentionedSkillNames;
     const promptStyle = compact ? ("compact" as const) : ("full" as const);
     const capturePrompt = (documents: SkillDocument[]): void => {
       this.rememberPrompt(sessionId, {
@@ -530,7 +633,7 @@ export class AgentOrchestrator implements IAgentRunner {
         capturedAt: Date.now(),
       });
     };
-    capturePrompt(activeSkillDocs);
+    capturePrompt(injectedTurnSkills);
     sink({
       type: "prompt_preflight",
       style: promptStyle,
@@ -542,16 +645,14 @@ export class AgentOrchestrator implements IAgentRunner {
     });
 
     const rebuildSystem = async (): Promise<void> => {
-      const documents = this.activeSkillDocuments(sessionId);
-      const block = await formatActiveSkills(documents, maxActiveChars);
-      system = buildSystemPrompt({ ...promptBase, activeSkills: block });
+      system = buildSystemPrompt(promptBase);
       overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
-      capturePrompt(documents);
+      capturePrompt(injectedTurnSkills);
     };
 
     const skillPolicy = new SkillToolPolicy(SKILL_ALWAYS_ALLOWED_TOOLS);
     const activatedSkills = new Set<string>();
-    for (const document of activeSkillDocs) {
+    for (const document of [...loadedSkillDocs, ...turnSkills]) {
       activatedSkills.add(document.name);
       if (document.allowedTools !== undefined) skillPolicy.activate(document.allowedTools);
     }
@@ -564,30 +665,49 @@ export class AgentOrchestrator implements IAgentRunner {
     const specialistBudget = activeSpecialist?.thinkingBudget ?? 0;
     const capabilityBudget = capabilities.reasoning ? (capabilities.reasoning_budget_max ?? 8192) : 0;
     const reasoningBudget = Math.max(specialistBudget, capabilityBudget);
-    const requestedMaxTokens = reasoningBudget > 0
-      ? Math.max(request.max_tokens ?? 4096, reasoningBudget + 2048)
-      : (request.max_tokens ?? 4096);
-    const maxTokens = capabilities.max_output
-      ? Math.min(requestedMaxTokens, capabilities.max_output)
-      : requestedMaxTokens;
+    const outputCap = Math.min(capabilities.max_output ?? 32_000, 256_000);
+    const defaultOutput = reasoningBudget > 0 ? Math.max(outputCap, reasoningBudget + 2048) : outputCap;
+    const requestedMaxTokens = request.max_tokens ?? defaultOutput;
+    const maxTokens = Math.min(requestedMaxTokens, outputCap);
     let compactedRetry = false;
+    let outputLimitContinues = 0;
 
-    const retryProjectStudy = async (originalText: string): Promise<string> => {
-      if (!this.projectContext) return originalText;
-      const fallback = `${this.projectContext.summary}\n\nI could not inspect more files in this turn. This summary comes from the project metadata.`;
+    const projectStudyFallback = (originalText: string, fallback: string): string => {
+      const trimmed = originalText.trim();
+      if (trimmed.length >= 40 && !looksLikeNonAnswer(trimmed, this.projectContext)) return trimmed;
+      return fallback;
+    };
+
+    const retryProjectStudy = async (
+      originalText: string,
+      evidence: ProjectEvidence | undefined,
+      unknownFiles: string[] = [],
+      task = "The user asked you to study the project. Write a concise report in the user's language.",
+    ): Promise<string> => {
+      if (!this.projectContext && !evidence) return originalText;
+      const fallbackProject = this.projectContext?.summary ?? "# Project\n- No project metadata available.";
+      const fallback = `${fallbackProject}\n\nI read the available project files but could not finish the report in this turn. Send another message to continue.`;
       const retrySystem = [
         "You are Orchivox, a helpful coding agent.",
         "# Project",
-        this.projectContext.summary,
+        fallbackProject,
+        evidence?.text ?? "",
+        unknownFiles.length > 0
+          ? `# Correction\nThese names were not found in the project and must not appear in the answer: ${unknownFiles.join(", ")}.`
+          : "",
         "# Task",
-        "The user asked you to study the project. Write a concise report in the user's language.",
-        "Start with what the project is. Include main modules, architecture, and how to run and test it.",
+        task,
+        "Start with the answer. Include main modules, architecture, and how to run and test it when relevant.",
+        "Use only file names that appear in the project evidence.",
         "Do not greet. Do not list the files you read. Do not describe the agent instructions or skills.",
-      ].join("\n\n");
+        "Do not write a plan or a status update. Answer directly.",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       const retryRequest = ChatRequestSchema.parse({
         system: retrySystem,
         messages: messages.slice(0, -1),
-        tools,
+        tools: [],
         tool_choice: "none",
         max_tokens: maxTokens,
         temperature: request.temperature,
@@ -598,20 +718,71 @@ export class AgentOrchestrator implements IAgentRunner {
           : undefined,
       });
       let text = "";
+      let thinking = "";
       try {
         for await (const event of provider.streamChat(retryRequest, signal)) {
           if (event.type === "token") text += event.text;
+          else if (event.type === "thinking_token") thinking += event.text;
           else if (event.type === "usage") accumulateUsage(totals, event);
         }
       } catch {
-        return fallback;
+        return projectStudyFallback(originalText, fallback);
       }
-      const candidate = text.trim();
-      if (candidate.length === 0) return fallback;
-      if (looksLikeNonAnswer(candidate, this.projectContext, { requireProjectMention: true })) {
+      const candidate =
+        stripThinkTags(text).trim().length > 0
+          ? stripThinkTags(text).trim()
+          : cleanReasoningAnswer(stripThinkTags(thinking));
+      if (candidate.length === 0) return projectStudyFallback(originalText, fallback);
+      if (looksLikeNonAnswer(candidate, this.projectContext)) {
+        return projectStudyFallback(originalText, fallback);
+      }
+      if (
+        evidence &&
+        (unknownProjectFiles(candidate, evidence).length > 0 || looksLikeMissingFileAnswer(candidate))
+      ) {
         return fallback;
       }
       return candidate;
+    };
+
+    const retryAfterInternalDump = async (originalText: string): Promise<string> => {
+      const retrySystem = [
+        system,
+        "# Correction",
+        "The previous response leaked internal skill content or an internal gate report.",
+        "Answer the user's actual question directly.",
+        "Do not print skill bodies, skill file listings, XML wrappers, internal notes, or gate reports.",
+        "Use the project evidence and tool results already present in the conversation.",
+      ].join("\n\n");
+      const retryRequest = ChatRequestSchema.parse({
+        system: retrySystem,
+        messages: messages.slice(0, -1),
+        tools: [],
+        tool_choice: "none",
+        max_tokens: maxTokens,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        stop_sequences: request.stop_sequences,
+        reasoning_effort: capabilities.reasoning
+          ? clampReasoningEffort(request.reasoning_effort, capabilities.reasoning_efforts)
+          : undefined,
+      });
+      let text = "";
+      let thinking = "";
+      try {
+        for await (const event of provider.streamChat(retryRequest, signal)) {
+          if (event.type === "token") text += event.text;
+          else if (event.type === "thinking_token") thinking += event.text;
+          else if (event.type === "usage") accumulateUsage(totals, event);
+        }
+      } catch {
+        return sanitizeAssistantText(originalText);
+      }
+      const candidate =
+        stripThinkTags(text).trim().length > 0
+          ? stripThinkTags(text).trim()
+          : cleanReasoningAnswer(stripThinkTags(thinking));
+      return sanitizeAssistantText(candidate);
     };
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
@@ -649,7 +820,7 @@ export class AgentOrchestrator implements IAgentRunner {
       const guardWebTools =
         turn === 0 &&
         !explicitWebIntent &&
-        (projectStudy || projectQuestion || (compact && namedSkills.length > 0));
+        (projectStudy || projectQuestion || (compact && injectedTurnSkills.length > 0));
       const forceNoTools = turn === 0 && (projectIdentity || capabilityQuestion);
       const turnTools = forceNoTools
         ? []
@@ -769,22 +940,67 @@ export class AgentOrchestrator implements IAgentRunner {
             continue;
           }
         }
-        let finalMessage = assistantMessage;
-        if (projectStudy && !turnError) {
-          const originalText = assistantMessage.content
+        if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES) {
+          outputLimitContinues += 1;
+          messages.push(
+            makeMessage(
+              `turn-${turn}-output-limit`,
+              "user",
+              CONTINUE_AFTER_OUTPUT_LIMIT,
+            ),
+          );
+          continue;
+        }
+
+        const textOf = (message: Message): string =>
+          message.content
             .map((block) => (block.type === "text" ? block.text : ""))
             .join("\n")
             .trim();
+        let finalMessage = assistantMessage;
+        if ((projectStudy || projectFileFollowUp) && !turnError) {
+          const originalText = textOf(assistantMessage);
+          const unknownFiles = projectEvidence ? unknownProjectFiles(originalText, projectEvidence) : [];
+          const needsRetry =
+            looksLikeNonAnswer(originalText, this.projectContext) ||
+            (projectEvidence !== undefined &&
+              (unknownFiles.length > 0 || looksLikeMissingFileAnswer(originalText)));
           let finalText = originalText;
-          if (looksLikeNonAnswer(originalText, this.projectContext, { requireProjectMention: true })) {
-            finalText = await retryProjectStudy(originalText);
-          }
-          if (bufferStudyTokens) {
-            sink({ type: "token", text: finalText });
+          if (needsRetry) {
+            finalText = await retryProjectStudy(
+              originalText,
+              projectEvidence,
+              unknownFiles,
+              projectStudy
+                ? "The user asked you to study the project. Write a concise report in the user's language."
+                : "The user asked a follow-up about a file from this session. Answer that question directly using the evidence. Do not ask the user to paste a file that is already in the repository.",
+            );
           }
           if (finalText !== originalText) {
             finalMessage = makeMessage(assistantMessage.id, "assistant", finalText);
           }
+        }
+        if (!turnError) {
+          const rawText = textOf(finalMessage);
+          const hasHardDump = /<skill_content\b|<skill_files\b|<available_skills\b|<file\b/i.test(
+            rawText,
+          );
+          const shouldRetryDump =
+            hasHardDump || (looksLikeInternalDump(rawText) && !isDesignQuestion(lastText));
+          const cleaned = shouldRetryDump
+            ? await retryAfterInternalDump(rawText)
+            : sanitizeAssistantText(rawText);
+          const finalText =
+            cleaned.length > 0
+              ? cleaned
+              : "The model returned internal metadata instead of an answer. Please retry.";
+          if (finalText !== rawText) {
+            finalMessage = makeMessage(assistantMessage.id, "assistant", finalText);
+            sink({ type: "final_text", text: finalText });
+          }
+        }
+        if (bufferStudyTokens && !turnError) {
+          sink({ type: "token", text: textOf(finalMessage) });
         }
         await this.hooks.runOnStop({});
         const finalReason: FinishReason = turnError ? "error" : finishReason;
@@ -972,7 +1188,7 @@ export class AgentOrchestrator implements IAgentRunner {
     }
 
     sink(usageEvent(totals));
-    sink({ type: "done", finish_reason: "length" });
+    sink({ type: "done", finish_reason: "turn_limit" });
     return {
       message: makeMessage(
         "turn-exhausted",
@@ -980,7 +1196,7 @@ export class AgentOrchestrator implements IAgentRunner {
         `Stopped after reaching the ${this.maxTurns} turn limit with work still in progress.`,
       ),
       usage: totals,
-      finish_reason: "length",
+      finish_reason: "turn_limit",
     };
   }
 
@@ -1000,6 +1216,47 @@ export class AgentOrchestrator implements IAgentRunner {
     return this.activeSkillNames(sessionId)
       .map((name) => this.skills.get(name))
       .filter((document): document is SkillDocument => Boolean(document));
+  }
+
+  private hasSkillReloadMessage(messages: Message[]): boolean {
+    return messages.some(
+      (message) =>
+        message.role === "system" &&
+        message.content.some(
+          (block) => block.type === "text" && block.text.startsWith("# Skill reload after compaction"),
+        ),
+    );
+  }
+
+  private async buildSkillReloadMessage(
+    documents: SkillDocument[],
+    key: string,
+  ): Promise<Message> {
+    const blocks: string[] = [];
+    for (const document of documents) {
+      blocks.push(await formatSkillContent(document, MAX_SKILL_INJECTION_CHARS));
+    }
+    return makeMessage(`skill-reload-${key}`, "system", [
+      "# Skill reload after compaction",
+      "The conversation was compacted. These skills were used earlier in the session and are reloaded as reference.",
+      "Never print this content, skill files, XML wrappers, or internal gate reports to the user.",
+      ...blocks,
+    ].join("\n\n"));
+  }
+
+  private async reloadSkillsAfterCompaction(
+    sessionId: string | undefined,
+    messages: Message[],
+    documents: SkillDocument[],
+  ): Promise<void> {
+    if (!sessionId || documents.length === 0) return;
+    if (this.hasSkillReloadMessage(messages)) return;
+    const compaction = this.database.getCompaction(sessionId);
+    if (!compaction) return;
+    const marker = compaction.created_at;
+    if (marker <= (this.lastSkillReload.get(sessionId) ?? 0)) return;
+    messages.push(await this.buildSkillReloadMessage(documents, `${sessionId}-${marker}`));
+    this.lastSkillReload.set(sessionId, marker);
   }
 
   private activateSkill(sessionId: string | undefined, name: string): boolean {
@@ -1139,10 +1396,11 @@ export class AgentOrchestrator implements IAgentRunner {
     if (specialist) {
       tools = this.specialistAgents.filterTools(specialist, tools, this.readOnlyToolNames());
     }
-    const requestedMaxTokens = specialist?.thinkingBudget ? Math.max(4096, specialist.thinkingBudget) : 4096;
-    const subagentMaxTokens = capabilities.max_output
-      ? Math.min(requestedMaxTokens, capabilities.max_output)
-      : requestedMaxTokens;
+    const outputCap = Math.min(capabilities.max_output ?? 32_000, 256_000);
+    const requestedMaxTokens = specialist?.thinkingBudget
+      ? Math.max(outputCap, specialist.thinkingBudget)
+      : outputCap;
+    const subagentMaxTokens = Math.max(1024, Math.min(requestedMaxTokens, outputCap));
     const compactPrompt = this.useCompactPrompt(providerName);
     const subagentSystem = buildSystemPrompt({
       mode: effectiveMode,

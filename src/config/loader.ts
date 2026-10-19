@@ -2,7 +2,6 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
 import type { CatalogModel } from "../provider/model-catalog";
-import type { OllamaCapabilities } from "../provider/ollama-introspect";
 import { TokenPricingSchema } from "../types/schema";
 
 export const CONFIG_PATH = ".agent/config.yaml";
@@ -24,11 +23,15 @@ export class ConfigError extends Error {
 export const ProviderKindSchema = z.enum(["openai", "anthropic", "openclaude", "ollama", "openrouter"]);
 export type ProviderKind = z.infer<typeof ProviderKindSchema>;
 
+export const DEFAULT_CONTEXT_WINDOW = 200_000;
+export const DEFAULT_MAX_OUTPUT = 32_000;
+
 export const ModelCapabilitiesSchema = z.object({
   tool_calling: z.boolean().default(true),
   reasoning: z.boolean().default(false),
   vision: z.boolean().default(false),
   context_window: z.number().int().positive().optional(),
+  max_input: z.number().int().positive().optional(),
   max_output: z.number().int().positive().optional(),
   structured_output: z.boolean().default(false),
   temperature: z.boolean().default(true),
@@ -38,14 +41,34 @@ export const ModelCapabilitiesSchema = z.object({
   reasoning_budget_min: z.number().int().positive().optional(),
   reasoning_budget_max: z.number().int().positive().optional(),
 });
-export type CapabilitySource = "inferred" | "catalog" | "ollama" | "override";
-export type ModelCapabilities = z.infer<typeof ModelCapabilitiesSchema> & { source?: CapabilitySource };
+export type CapabilitySource = "default" | "catalog" | "runtime" | "learned" | "override";
+export interface LimitSources {
+  context?: CapabilitySource;
+  input?: CapabilitySource;
+  output?: CapabilitySource;
+}
+export type ModelCapabilities = z.infer<typeof ModelCapabilitiesSchema> & {
+  source?: CapabilitySource;
+  limit_sources?: LimitSources;
+};
+
+/** Metadata reported by a provider runtime such as Ollama, vLLM, LM Studio, or LiteLLM. */
+export interface RuntimeModelMetadata {
+  contextWindow?: number;
+  maxInput?: number;
+  maxOutput?: number;
+  toolCalling?: boolean;
+  reasoning?: boolean;
+  vision?: boolean;
+  family?: string;
+}
 
 export const ModelCapabilitiesPatchSchema = z.object({
   tool_calling: z.boolean().optional(),
   reasoning: z.boolean().optional(),
   vision: z.boolean().optional(),
   context_window: z.number().int().positive().optional(),
+  max_input: z.number().int().positive().optional(),
   max_output: z.number().int().positive().optional(),
   structured_output: z.boolean().optional(),
   temperature: z.boolean().optional(),
@@ -71,17 +94,14 @@ export const ProviderProfileSchema = z.object({
 });
 export type ProviderProfile = z.infer<typeof ProviderProfileSchema>;
 
-export function inferModelCapabilities(kind: ProviderKind, model: string): ModelCapabilities {
+export function inferModelCapabilities(_kind: ProviderKind, model: string): ModelCapabilities {
   const lower = model.toLowerCase();
   const reasoning = /(^|[^a-z])(o[1-9]|r1|reason|thinking|qwq|magistral|gpt-5|gemini-2\.5|claude)([^a-z]|$)/.test(lower);
   const vision = /(vision|llava|pixtral|minicpm-v|qwen[0-9.]*-vl|gemma3|llama[0-9.]*-vision|claude|gemini|gpt-4o|gpt-4\.1|gpt-5|o[1-9])/.test(lower);
-  const largeContext = /(128k|200k|gpt-4o|gpt-4\.1|gpt-5|claude|gemini|o[1-9]|deepseek|qwen3|kimi|glm|minimax)/.test(lower);
   return {
     tool_calling: true,
     reasoning,
     vision,
-    context_window: largeContext ? 128_000 : 32_768,
-    max_output: kind === "anthropic" ? 8_192 : 4_096,
     structured_output: false,
     temperature: !/^(o[1-9]|gpt-5)/.test(lower),
     pdf: false,
@@ -89,9 +109,20 @@ export function inferModelCapabilities(kind: ProviderKind, model: string): Model
   };
 }
 
+export interface LearnedModelLimits {
+  contextWindow?: number;
+  maxInput?: number;
+  maxOutput?: number;
+}
+
 export interface CapabilityResolutionContext {
   catalogModel?: CatalogModel;
-  ollama?: OllamaCapabilities;
+  runtime?: RuntimeModelMetadata;
+  learned?: LearnedModelLimits;
+}
+
+function positiveLimit(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
 }
 
 export function resolveModelCapabilities(
@@ -103,59 +134,101 @@ export function resolveModelCapabilities(
   const inferred = inferModelCapabilities(profile.kind, key);
   const explicit = key ? profile.model_capabilities[key] : undefined;
 
-  let base: ModelCapabilities = { ...inferred, source: "inferred" };
+  const capabilities: ModelCapabilities = {
+    ...inferred,
+    context_window: DEFAULT_CONTEXT_WINDOW,
+    max_output: DEFAULT_MAX_OUTPUT,
+    source: "default",
+    limit_sources: { context: "default", output: "default" },
+  };
 
-  if (context.ollama) {
-    const ollama = context.ollama;
-    base = {
-      ...base,
-      tool_calling: ollama.toolCalling,
-      reasoning: ollama.reasoning,
-      vision: ollama.vision,
-      context_window: ollama.contextWindow ?? base.context_window,
-      source: "ollama",
-    };
-  } else if (context.catalogModel) {
+  const applyLimits = (
+    limits: LearnedModelLimits,
+    source: CapabilitySource,
+  ): void => {
+    const contextWindow = positiveLimit(limits.contextWindow);
+    const maxInput = positiveLimit(limits.maxInput);
+    const maxOutput = positiveLimit(limits.maxOutput);
+    if (contextWindow !== undefined) {
+      capabilities.context_window = contextWindow;
+      capabilities.limit_sources = { ...capabilities.limit_sources, context: source };
+    }
+    if (maxInput !== undefined) {
+      capabilities.max_input = maxInput;
+      capabilities.limit_sources = { ...capabilities.limit_sources, input: source };
+    }
+    if (maxOutput !== undefined) {
+      capabilities.max_output = maxOutput;
+      capabilities.limit_sources = { ...capabilities.limit_sources, output: source };
+    }
+  };
+
+  if (context.catalogModel) {
     const catalog = context.catalogModel;
     const effort = catalog.reasoningOptions.find((option) => option.type === "effort");
     const budget = catalog.reasoningOptions.find(
       (option) => option.type === "budget_tokens" || option.type === "budget",
     );
-    base = {
-      tool_calling: catalog.toolCall,
-      reasoning: catalog.reasoning,
-      vision: catalog.attachment && catalog.modalities.input.includes("image"),
-      context_window: catalog.limit.context ?? inferred.context_window,
-      max_output: catalog.limit.output ?? inferred.max_output,
-      structured_output: catalog.structuredOutput,
-      temperature: catalog.temperature,
-      pdf: catalog.modalities.input.includes("pdf"),
-      parallel_tool_calls: inferred.parallel_tool_calls,
-      reasoning_efforts: effort?.values,
-      reasoning_budget_min: budget?.min,
-      reasoning_budget_max: budget?.max,
-      source: "catalog",
-    };
+    capabilities.tool_calling = catalog.toolCall;
+    capabilities.reasoning = catalog.reasoning;
+    capabilities.vision = catalog.attachment && catalog.modalities.input.includes("image");
+    capabilities.structured_output = catalog.structuredOutput;
+    capabilities.temperature = catalog.temperature;
+    capabilities.pdf = catalog.modalities.input.includes("pdf");
+    capabilities.parallel_tool_calls = inferred.parallel_tool_calls;
+    capabilities.reasoning_efforts = effort?.values;
+    capabilities.reasoning_budget_min = budget?.min;
+    capabilities.reasoning_budget_max = budget?.max;
+    applyLimits(
+      {
+        contextWindow: catalog.limit.context,
+        maxInput: catalog.limit.input,
+        maxOutput: catalog.limit.output,
+      },
+      "catalog",
+    );
   }
 
-  if (!explicit) return base;
+  if (context.learned) applyLimits(context.learned, "learned");
 
-  return {
-    ...base,
-    tool_calling: explicit.tool_calling ?? base.tool_calling,
-    reasoning: explicit.reasoning ?? base.reasoning,
-    vision: explicit.vision ?? base.vision,
-    context_window: explicit.context_window ?? base.context_window,
-    max_output: explicit.max_output ?? base.max_output,
-    structured_output: explicit.structured_output ?? base.structured_output,
-    temperature: explicit.temperature ?? base.temperature,
-    pdf: explicit.pdf ?? base.pdf,
-    parallel_tool_calls: explicit.parallel_tool_calls ?? base.parallel_tool_calls,
-    reasoning_efforts: explicit.reasoning_efforts ?? base.reasoning_efforts,
-    reasoning_budget_min: explicit.reasoning_budget_min ?? base.reasoning_budget_min,
-    reasoning_budget_max: explicit.reasoning_budget_max ?? base.reasoning_budget_max,
-    source: "override",
-  };
+  if (context.runtime) {
+    const runtime = context.runtime;
+    if (runtime.toolCalling !== undefined) capabilities.tool_calling = runtime.toolCalling;
+    if (runtime.reasoning !== undefined) capabilities.reasoning = runtime.reasoning;
+    if (runtime.vision !== undefined) capabilities.vision = runtime.vision;
+    applyLimits(
+      {
+        contextWindow: runtime.contextWindow,
+        maxInput: runtime.maxInput,
+        maxOutput: runtime.maxOutput,
+      },
+      "runtime",
+    );
+  }
+
+  if (explicit) {
+    capabilities.tool_calling = explicit.tool_calling ?? capabilities.tool_calling;
+    capabilities.reasoning = explicit.reasoning ?? capabilities.reasoning;
+    capabilities.vision = explicit.vision ?? capabilities.vision;
+    capabilities.structured_output = explicit.structured_output ?? capabilities.structured_output;
+    capabilities.temperature = explicit.temperature ?? capabilities.temperature;
+    capabilities.pdf = explicit.pdf ?? capabilities.pdf;
+    capabilities.parallel_tool_calls = explicit.parallel_tool_calls ?? capabilities.parallel_tool_calls;
+    capabilities.reasoning_efforts = explicit.reasoning_efforts ?? capabilities.reasoning_efforts;
+    capabilities.reasoning_budget_min = explicit.reasoning_budget_min ?? capabilities.reasoning_budget_min;
+    capabilities.reasoning_budget_max = explicit.reasoning_budget_max ?? capabilities.reasoning_budget_max;
+    applyLimits(
+      {
+        contextWindow: explicit.context_window,
+        maxInput: explicit.max_input,
+        maxOutput: explicit.max_output,
+      },
+      "override",
+    );
+  }
+
+  capabilities.source = capabilities.limit_sources?.context ?? "default";
+  return capabilities;
 }
 
 export const ModelRefSchema = z.object({
@@ -252,7 +325,7 @@ export type SandboxConfig = z.infer<typeof SandboxConfigSchema>;
 export const CompactionConfigSchema = z.object({
   auto: z.boolean().default(true),
   keep_tokens: z.number().int().positive().default(15_000),
-  buffer_ratio: z.number().min(0).max(0.9).default(0.1),
+  buffer_ratio: z.number().min(0).max(0.9).optional(),
   buffer_tokens: z.number().int().positive().optional(),
 });
 export type CompactionConfig = z.infer<typeof CompactionConfigSchema>;

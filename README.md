@@ -73,7 +73,7 @@ Use `/hub` to inspect workers and `/tasks` to open the task board. The agent can
 
 ### Sessions you can resume
 
-Sessions and messages are stored in `.agent/memory.db`, which is ignored by Git. Orchivox keeps the mode, model, token usage, and session cost. Tool activity is shown while a turn runs.
+Sessions and messages are stored outside the project, under `$XDG_DATA_HOME/orchivox/projects/<project>-<hash>/` or `~/.local/share/orchivox/projects/<project>-<hash>/`. History, snapshots, and worker worktrees live beside that database. Set `ORCHIVOX_STATE_HOME` to override the base directory. Orchivox keeps the mode, model, token usage, and session cost. Tool activity is shown while a turn runs.
 
 - `/sessions` opens the session manager and search.
 - `/fork` branches a conversation from a selected turn.
@@ -106,7 +106,7 @@ You can also set a model per mode and a reasoning effort per mode. Model capabil
 
 - Project instructions can come from `AGENTS.md`, `CLAUDE.md`, and the file named by the project directive, such as `.agent/agents/AGENTS.md`.
 - Markdown rule files under `.agent/rules/` can be loaded by file pattern.
-- Skills can add focused instructions and tool policies.
+- Skills can add focused instructions and tool policies. A skill is advertised by name and description, loaded for the turn when mentioned or requested, and reloaded after compaction. The full body is never kept in every system prompt.
 - Plugins can add runtime tools from `.agent/plugins/`.
 - Custom slash commands live in `.agent/commands/`.
 - Stream rules can abort and retry a generation when the output matches a pattern.
@@ -298,11 +298,18 @@ providers:
     model_capabilities:
       gpt-4.1:
         context_window: 1047576
+        max_input: 1047576
+        max_output: 32768
         vision: true
         tool_calling: true
 ```
 
 Use overrides when the provider does not expose the model metadata you need.
+Orchivox reads limits from the models.dev catalog and probes Ollama, vLLM, LM
+Studio, llama.cpp, and LiteLLM endpoints at startup. If a provider rejects a
+request with a context-length error, Orchivox records the reported limit in
+`~/.cache/orchivox/model-limits.json` and uses it on the next turn. Unknown
+models fall back to 200,000 context tokens and 32,000 output tokens.
 
 ## Running Orchivox
 
@@ -322,6 +329,21 @@ orchivox
 ```
 
 The linked command uses the source entry point in `bin/orchivox.js`. If `orchivox` is not on your `PATH`, run `bun run bin/orchivox.js`. If you do not want to link it, use `bun run src/index.ts` from the repository.
+
+### Version, diagnostics, and updates
+
+```bash
+orchivox --version
+orchivox doctor
+orchivox update --check
+orchivox update
+```
+
+`--version` shows the version, commit, entrypoint, and whether the working tree is dirty. `doctor` also shows which config file wins, the secrets file, the session database, and terminal details. `update` refuses to run on a dirty working tree so local changes are never overwritten. Use `--binary` to rebuild the compiled binary after pulling.
+
+Inside the TUI, `/about` shows the same entrypoint and config source, `/doctor` shows diagnostics, and `/update` checks for new commits.
+
+Set `ORCHIVOX_INPUT_DEBUG=1` before starting the TUI to log raw key sequences to `~/.cache/orchivox/input-debug.log`. This is useful when a terminal reports Enter or Shift+Enter differently.
 
 ### Headless prompt
 
@@ -459,7 +481,7 @@ src/vcs/         Git worktrees, snapshots, atomic commits
 src/api/         OpenAI, Anthropic, OpenAPI, and task endpoints
 scripts/         build scripts
 bin/             command launcher
-.agent/          local config, rules, skills, plugins, snapshots, state
+.agent/          optional project config, rules, skills, plugins, commands
 assets/          logo and README image
 ```
 

@@ -35,18 +35,6 @@ export async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-export async function ensureAgentExcluded(repoRoot: string): Promise<void> {
-  const { stdout } = await runGit(repoRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  const rawPath = stdout.trim();
-  const excludePath = rawPath.startsWith("/") ? rawPath : `${repoRoot}/${rawPath}`;
-  const file = Bun.file(excludePath);
-  const current = (await file.exists()) ? await file.text() : "";
-  const entries = new Set(current.split("\n").map((line) => line.trim()));
-  if (entries.has(".agent/") || entries.has(".agent")) return;
-  const prefix = current.length === 0 || current.endsWith("\n") ? "" : "\n";
-  await Bun.write(excludePath, `${current}${prefix}.agent/\n`);
-}
-
 function collectEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(globalThis.process.env)) {

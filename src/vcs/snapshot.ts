@@ -1,6 +1,7 @@
 import { mkdir } from "node:fs/promises";
 
-import { ensureAgentExcluded, runGit } from "./git";
+import { resolveProjectState } from "../runtime-paths";
+import { runGit } from "./git";
 
 export interface SnapshotEntry {
   id: string;
@@ -23,13 +24,12 @@ export class SnapshotManager {
   private readonly root: string;
   private readonly indexDir: string;
 
-  constructor(options: { repoRoot?: string } = {}) {
+  constructor(options: { repoRoot?: string; stateDir?: string } = {}) {
     this.root = options.repoRoot ?? globalThis.process.cwd();
-    this.indexDir = `${this.root}/.agent/snapshots`;
+    this.indexDir = options.stateDir ?? resolveProjectState(this.root).snapshotsDir;
   }
 
   async captureSnapshot(label: string): Promise<string> {
-    await ensureAgentExcluded(this.root);
     const tree = await this.writeTree();
     const history = await this.readHistory();
     if (history.cursor < history.entries.length - 1) {

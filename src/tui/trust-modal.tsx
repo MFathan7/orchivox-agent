@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text, useInput } from "ink";
 
 import { OrchivoxLogo } from "./logo";
+import { isMouseSequence } from "./mouse";
 import { getTheme, type Theme } from "./theme";
 
 export interface WorkspaceTrustPromptProps {
@@ -25,6 +26,7 @@ export function WorkspaceTrustPrompt({
   const [selectedIndex, setSelectedIndex] = React.useState(0);
 
   useInput((input, key) => {
+    if (isMouseSequence(input)) return;
     if (key.upArrow || input === "k") {
       setSelectedIndex((prev) => (prev > 0 ? prev - 1 : OPTIONS.length - 1));
       return;

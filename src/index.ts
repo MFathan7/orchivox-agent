@@ -9,6 +9,7 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
+import { formatAppInfo, formatDoctor, getAppInfo, runUpdate } from "./app-info";
 import { compactMessages, extractSummary } from "./agent/compaction";
 import { generateSessionTitle, messageText } from "./agent/session-title";
 import type { SkillDocument } from "./agent/skills";
@@ -24,15 +25,23 @@ import { MemoryDatabase, type SessionRecord } from "./memory/sqlite";
 import { McpClientManager } from "./mcp/client";
 import { McpToolServer } from "./mcp/server";
 import { InterceptedProvider, loadStreamRules, type StreamRule } from "./provider/interceptor";
+import { subscribeLearnedLimits } from "./provider/limit-cache";
 import { loadModelCatalogSync, refreshModelCatalog, type ModelCatalog } from "./provider/model-catalog";
-import { warmOllamaProvider } from "./provider/ollama-introspect";
+import { primeRuntimeMetadata } from "./provider/runtime-metadata";
 import { ProviderRouter, type LLMProvider } from "./provider/router";
+import { ensureProjectState, resolveProjectState, type ProjectStatePaths } from "./runtime-paths";
 import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
 import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
 import { runGit } from "./vcs/git";
 import { WorktreeManager } from "./vcs/worktree";
 import { formatContextUsage, formatContextWindow, formatCost, formatTokenCount } from "./tui/format";
-import { installSynchronizedOutput, OrchivoxApp, type ChatEntryView, type InputAction } from "./tui/app";
+import {
+  installSynchronizedOutput,
+  OrchivoxApp,
+  type ChatEntryView,
+  type InputAction,
+  type ThinkingSegmentView,
+} from "./tui/app";
 import { buildTranscriptEntries } from "./tui/transcript";
 import type { FileAttachmentRef } from "./tui/composer";
 import type { PendingQuestion } from "./tui/question-modal";
@@ -47,12 +56,15 @@ import type { SessionModalTab } from "./tui/session-modal";
 import { AgentModeSchema, type AgentMode, type Message } from "./types/schema";
 
 export interface CliOptions {
-  command: "tui" | "serve" | "prompt" | "mcp";
+  command: "tui" | "serve" | "prompt" | "mcp" | "update" | "doctor";
   port?: number;
   prompt?: string;
   format: "text" | "json";
   mode: AgentMode;
   help: boolean;
+  version?: boolean;
+  updateCheck?: boolean;
+  updateBinary?: boolean;
   trust?: boolean;
   configPath?: string;
   secretsPath?: string;
@@ -68,6 +80,7 @@ export interface RuntimeHandle {
   router: ProviderRouter;
   database: MemoryDatabase;
   snapshots: SnapshotManager;
+  statePaths: ProjectStatePaths;
   plugins: { loaded: string[]; failed: Array<{ file: string; error: string }> };
   mcpServers: string[];
   close: () => Promise<void>;
@@ -83,8 +96,11 @@ const HELP_TEXT = [
   '  orchivox -p "task" [-f text|json] [--mode plan|build|ultrawork]',
   "                                       headless run for scripts and CI pipelines",
   "  orchivox mcp                         expose the agent tools as an MCP server on stdio",
+  "  orchivox update [--check] [--binary] update the source checkout",
+  "  orchivox doctor                      show entrypoint, config, and terminal diagnostics",
   "",
   "flags: -p/--prompt, -f/--format, --mode, --port, --trust, -h/--help",
+  "       --version                       print the version and commit",
   "       --config <path>                 use a specific config file",
   "       --secrets <path>                use a specific secrets file",
 ].join("\n");
@@ -94,6 +110,9 @@ export function parseCliArgs(argv: string[]): CliOptions {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "-h" || arg === "--help") options.help = true;
+    else if (arg === "--version") options.version = true;
+    else if (arg === "--check") options.updateCheck = true;
+    else if (arg === "--binary") options.updateBinary = true;
     else if (arg === "--trust") options.trust = true;
     else if (arg === "--config") {
       const value = argv[++index];
@@ -105,6 +124,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
       options.secretsPath = value;
     } else if (arg === "serve") options.command = "serve";
     else if (arg === "mcp") options.command = "mcp";
+    else if (arg === "update") options.command = "update";
+    else if (arg === "doctor") options.command = "doctor";
     else if (arg === "-p" || arg === "--prompt") {
       options.command = "prompt";
       options.prompt = argv[++index] ?? "";
@@ -133,7 +154,7 @@ export function modeToProfile(mode: AgentMode): AgentProfile {
 }
 
 export function reasoningEffortToRequest(level: string): string | undefined {
-  if (level === "off" || level === "none") return undefined;
+  if (level === "default" || level === "off" || level === "none") return undefined;
   return level;
 }
 
@@ -212,19 +233,20 @@ export async function bootstrap(
     secretsPath: resolved.secretsPath,
     fallbackSecretsPaths: resolved.fallbackSecretsPaths,
   });
-  const database = new MemoryDatabase(`${root}/.agent/memory.db`);
+  const statePaths = await ensureProjectState(root);
+  const database = new MemoryDatabase(statePaths.memoryDb);
   const rules = new RulesLoader({ rootPath: root });
   const streamRules = await loadStreamRules(`${root}/.agent/rules/stream_rules.yaml`);
   const catalog = loadModelCatalogSync();
+  await primeRuntimeMetadata(config.providers).catch(() => undefined);
   const router = new InterceptingRouter(config, streamRules, catalog);
   void refreshModelCatalog(catalog).then(() => router.refresh()).catch(() => undefined);
-  for (const profile of Object.values(config.providers)) {
-    if (profile.kind === "ollama" && profile.enabled) {
-      void warmOllamaProvider(profile).then(() => router.refresh()).catch(() => undefined);
-    }
-  }
-  const snapshots = new SnapshotManager({ repoRoot: root });
-  const worktrees = new WorktreeManager({ repoRoot: root });
+  const unsubscribeLearned = subscribeLearnedLimits(() => router.refresh());
+  const snapshots = new SnapshotManager({ repoRoot: root, stateDir: statePaths.snapshotsDir });
+  const worktrees = new WorktreeManager({
+    repoRoot: root,
+    worktreesDir: statePaths.worktreesDir,
+  });
   const lsp = await startLspClient(config, root);
   const lifecycle = buildHashEditLifecycle({ snapshots, lsp });
 
@@ -253,9 +275,11 @@ export async function bootstrap(
     router,
     database,
     snapshots,
+    statePaths,
     plugins,
     mcpServers: mcpReport.connected.map((entry) => entry.server),
     close: async () => {
+      unsubscribeLearned();
       await orchestrator.bgProcesses.stopAll();
       await mcpClient.close();
       await lsp?.dispose();
@@ -311,6 +335,25 @@ export async function main(
     return { close: async () => undefined };
   }
 
+  if (options.version) {
+    print(formatAppInfo(await getAppInfo()));
+    return { close: async () => undefined };
+  }
+
+  if (options.command === "doctor") {
+    print(await formatDoctor());
+    return { close: async () => undefined };
+  }
+
+  if (options.command === "update") {
+    const result = await runUpdate({
+      check: options.updateCheck,
+      binary: options.updateBinary,
+    });
+    print(result.output);
+    return { close: async () => undefined };
+  }
+
   if (options.command === "tui") {
     const cwd = globalThis.process.cwd();
     const trustManager = new WorkspaceTrustManager();
@@ -358,7 +401,6 @@ export async function main(
     const request = AgentRunRequestSchema.parse({
       profile: modeToProfile(options.mode),
       messages: [{ id: "prompt-1", role: "user", content: [{ type: "text", text: options.prompt ?? "" }] }],
-      max_tokens: 4096,
     });
     const result = await runtime.orchestrator.runOnce(request);
     print(formatHeadlessResult(result, options.format));
@@ -387,11 +429,11 @@ async function runTuiSession(
     messages: [] as Message[],
     mode: "build" as AgentMode,
     currentTheme: "tokyonight" as ThemeName,
-    reasoningEffort: "medium" as ReasoningEffortLevel,
+    reasoningEffort: "default" as ReasoningEffortLevel,
     reasoningByMode: {
-      plan: "medium",
-      build: "medium",
-      ultrawork: "medium",
+      plan: "default",
+      build: "default",
+      ultrawork: "default",
     } as Record<AgentMode, ReasoningEffortLevel>,
     streamingText: "",
     liveEntry: undefined as ChatEntryView | undefined,
@@ -415,18 +457,27 @@ async function runTuiSession(
     hubOpen: false,
     notice: undefined as string | undefined,
   };
+  const normalizeReasoningForMode = (
+    mode: AgentMode,
+    preferred: ReasoningEffortLevel | string,
+  ): ReasoningEffortLevel => {
+    const options = runtime.router.reasoningOptionsForMode(mode);
+    return (options.includes(preferred) ? preferred : "default") as ReasoningEffortLevel;
+  };
+  const normalizeAllReasoning = (): void => {
+    for (const mode of ["plan", "build", "ultrawork"] as AgentMode[]) {
+      state.reasoningByMode[mode] = normalizeReasoningForMode(mode, state.reasoningByMode[mode]);
+    }
+    state.reasoningEffort = state.reasoningByMode[state.mode];
+  };
   for (const mode of ["plan", "build", "ultrawork"] as AgentMode[]) {
     const configured = runtime.config.modes[mode]?.reasoning;
     if (configured) state.reasoningByMode[mode] = configured as ReasoningEffortLevel;
   }
-  state.reasoningEffort = state.reasoningByMode[state.mode];
+  normalizeAllReasoning();
   const setActiveMode = (next: AgentMode): void => {
     state.mode = next;
-    const options = runtime.router.reasoningOptionsForMode(next);
-    const stored = state.reasoningByMode[next];
-    state.reasoningEffort = options.includes(stored)
-      ? stored
-      : ((options[0] as ReasoningEffortLevel | undefined) ?? "off");
+    state.reasoningEffort = normalizeReasoningForMode(next, state.reasoningByMode[next]);
   };
   const estimateContextTokens = (mode: AgentMode, messages: Message[]): number => {
     const overhead = runtime.orchestrator.estimateContextOverhead(mode);
@@ -650,10 +701,13 @@ async function runTuiSession(
     configPath: runtime.configPath,
     secretsPath: runtime.secretsPath,
     onRoleChange: (role: "main" | "fast" | "advisor", provider: string, model: string) => {
+      normalizeAllReasoning();
       setNotice(`${role} now uses ${provider} / ${model}`);
     },
     onModeModelChange: (mode: ConfigMode, provider: string, model: string) => {
       runtime.router.setModeModel(mode, provider, model);
+      state.reasoningByMode[mode] = normalizeReasoningForMode(mode, state.reasoningByMode[mode]);
+      if (state.mode === mode) state.reasoningEffort = state.reasoningByMode[mode];
       setNotice(`${mode} mode now uses ${provider} / ${model}`);
     },
     onModeReasoningChange: (mode: ConfigMode, reasoning: string) => {
@@ -848,6 +902,7 @@ async function runTuiSession(
   const rerender = (): void => {
     instance.rerender(React.createElement(OrchivoxApp, view()));
   };
+  const unsubscribeCapabilities = runtime.router.onCapabilitiesChanged(rerender);
 
   const activityTimer = setInterval(() => {
     const workers = runtime.orchestrator.subagents.listWorkers();
@@ -918,6 +973,8 @@ async function runTuiSession(
         const compaction = await compactMessages(state.messages, {
           provider,
           contextWindow: capabilities.context_window,
+          inputLimit: capabilities.max_input,
+          outputLimit: capabilities.max_output,
           keepTokens: compactionConfig.keep_tokens,
           bufferTokens: compactionConfig.buffer_tokens,
           bufferRatio: compactionConfig.buffer_ratio,
@@ -964,6 +1021,26 @@ async function runTuiSession(
       mode: turnMode,
       model: turnModel,
     };
+    const thinkingSegments: ThinkingSegmentView[] = [];
+    let activeThinking: ThinkingSegmentView | undefined;
+    let thinkingCounter = 0;
+    const closeThinkingSegment = (): void => {
+      if (!activeThinking) return;
+      activeThinking.completedAt = Date.now();
+      activeThinking = undefined;
+    };
+    const startThinkingSegment = (): ThinkingSegmentView => {
+      const segment: ThinkingSegmentView = {
+        id: `thinking-${Date.now().toString(36)}-${++thinkingCounter}`,
+        text: "",
+        startedAt: Date.now(),
+        toolIndex: liveEntry.toolCalls?.length ?? 0,
+      };
+      thinkingSegments.push(segment);
+      activeThinking = segment;
+      liveEntry.thinkingSegments = thinkingSegments;
+      return segment;
+    };
     state.liveEntry = liveEntry;
     activeAbortController = new AbortController();
     let lastLiveRender = 0;
@@ -982,7 +1059,6 @@ async function runTuiSession(
           ...(targetAgent ? { agent: targetAgent } : {}),
           session_id: sessionId,
         },
-        max_tokens: 4096,
         reasoning_effort: reasoningEffortToRequest(state.reasoningEffort),
       });
       let answer = "";
@@ -991,22 +1067,38 @@ async function runTuiSession(
       let firstTokenAt: number | undefined;
       let lastTokenAt: number | undefined;
       let lastToolEndAt = turnStartedAt;
+      let thinkingStartedAt: number | undefined;
+      let thinkingCompletedAt: number | undefined;
       let completionTokens = 0;
       for await (const event of runtime.orchestrator.runStream(request, activeAbortController.signal)) {
         if (event.type === "token") {
           const now = Date.now();
           if (firstTokenAt === undefined) firstTokenAt = now;
           lastTokenAt = now;
+          closeThinkingSegment();
           answer += event.text;
           liveEntry.text = answer;
           state.streamingText = answer;
           renderLive();
+        } else if (event.type === "final_text") {
+          answer = event.text;
+          liveEntry.text = answer;
+          state.streamingText = answer;
+          renderLive(true);
         } else if (event.type === "thinking_token") {
           if (!event.text.startsWith("[tool]") && !event.text.startsWith("[snapshot]")) {
+            if (thinkingStartedAt === undefined) thinkingStartedAt = Date.now();
+            thinkingCompletedAt = Date.now();
+            const segment = activeThinking ?? startThinkingSegment();
+            segment.text += event.text;
+            liveEntry.thinkingStartedAt = thinkingStartedAt;
+            liveEntry.thinkingCompletedAt = thinkingCompletedAt;
             liveEntry.thinking = `${liveEntry.thinking ?? ""}${event.text}`;
+            liveEntry.thinkingSegments = thinkingSegments;
           }
           renderLive();
         } else if (event.type === "tool_start") {
+          closeThinkingSegment();
           liveEntry.toolCalls = [
             ...(liveEntry.toolCalls ?? []),
             {
@@ -1113,8 +1205,12 @@ async function runTuiSession(
         completionTokens > 0 && generationMs > 0
           ? completionTokens / (generationMs / 1000)
           : undefined;
+      closeThinkingSegment();
       pushEntry("assistant", answer || "(no output)", {
         thinking: liveEntry.thinking,
+        thinkingSegments: thinkingSegments.map((segment) => ({ ...segment })),
+        thinkingStartedAt,
+        thinkingCompletedAt,
         toolCalls: liveEntry.toolCalls,
         files: liveEntry.files,
         mode: turnMode,
@@ -1122,7 +1218,12 @@ async function runTuiSession(
         tokensPerSecond,
       });
       if (finishReason === "length") {
-        pushEntry("system", "turn stopped at the turn limit; send another message to continue");
+        pushEntry(
+          "system",
+          "response hit the output token limit; raise Max output in /models or send another message to continue",
+        );
+      } else if (finishReason === "turn_limit") {
+        pushEntry("system", "agent turn limit reached; send another message to continue");
       }
       const assistantMsg: Message = {
         id: `assistant-${Date.now().toString(36)}`,
@@ -1134,6 +1235,8 @@ async function runTuiSession(
           model: turnModel,
           tokens_per_second: tokensPerSecond,
           completion_tokens: completionTokens,
+          thinking_segments: thinkingSegments.map((segment) => ({ ...segment })),
+          tool_calls: liveEntry.toolCalls ?? [],
         },
       };
       state.messages = [...state.messages, assistantMsg];
@@ -1280,6 +1383,37 @@ async function runTuiSession(
         rerender();
         break;
       }
+      case "/about": {
+        const info = await getAppInfo();
+        pushEntry(
+          "system",
+          [
+            formatAppInfo(info),
+            `config     ${runtime.configPath} (${runtime.configSource})`,
+            `secrets    ${runtime.secretsPath} (${runtime.secretsSource})`,
+            `state      ${runtime.statePaths.dataDir}`,
+            `database   ${runtime.statePaths.memoryDb}`,
+          ].join("\n"),
+        );
+        break;
+      }
+      case "/doctor": {
+        pushEntry("system", await formatDoctor());
+        break;
+      }
+      case "/update": {
+        setNotice("Checking for updates...");
+        try {
+          const result = await runUpdate({ check: true });
+          pushEntry("system", result.output);
+        } catch (error) {
+          pushEntry(
+            "system",
+            `update check failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        break;
+      }
       case "/stats": {
         const sessionCount = runtime.database.listSessions().length;
         const snapshotHistory = await runtime.snapshots.getHistory();
@@ -1300,13 +1434,15 @@ async function runTuiSession(
           `  Active Agent Mode : ${state.mode}`,
           `  Mode Model        : ${modeModel ? `${modeModel.provider} / ${modeModel.model}` : "not configured"}`,
           `  Context Used      : ${formatContextUsage(state.contextTokens, contextWindow)}`,
-          `  Context Window    : ${formatContextWindow(contextWindow)} (${capabilities.source ?? "inferred"})`,
+          `  Context Window    : ${formatContextWindow(contextWindow)} (${capabilities.limit_sources?.context ?? capabilities.source ?? "default"})`,
+          `  Input Limit       : ${capabilities.max_input ? `${formatContextWindow(capabilities.max_input)} (${capabilities.limit_sources?.input ?? "default"})` : "follows context"}`,
+          `  Output Limit      : ${formatContextWindow(capabilities.max_output)} (${capabilities.limit_sources?.output ?? "default"})`,
           `  Reasoning Level   : ${state.reasoningEffort} (${state.mode})`,
           `  Visual Theme      : ${state.currentTheme}`,
           `  Connected MCP     : ${runtime.mcpServers.length > 0 ? runtime.mcpServers.join(", ") : "none"}`,
           `  Loaded Plugins    : ${runtime.plugins.loaded.length > 0 ? runtime.plugins.loaded.join(", ") : "none"}`,
           `  Skills Installed  : ${skillCount}`,
-          `  Active Skills     : ${state.activeSkills.length > 0 ? state.activeSkills.join(", ") : "none"}`,
+          `  Session Skills    : ${state.activeSkills.length > 0 ? state.activeSkills.join(", ") : "none"}`,
           `  Task Board        : ${taskSummary.completed}/${taskSummary.total} completed, ${taskSummary.running} running, ${taskSummary.blocked} blocked`,
           `  Git Branch        : ${branch}`,
           `  VCS Snapshots     : ${snapshotCount} snapshots recorded`,
@@ -1327,7 +1463,7 @@ async function runTuiSession(
           `System chars     : ${snapshot.system.length}`,
           `Tools            : ${snapshot.toolCount}`,
           `Available skills : ${snapshot.availableSkills}`,
-          `Active skills    : ${snapshot.activeSkills.join(", ") || "none"}`,
+          `Session skills   : ${snapshot.activeSkills.join(", ") || "none"}`,
           `Skill mentions   : ${snapshot.skillMentions.join(", ") || "none"}`,
           "",
           "----- system prompt -----",
@@ -1384,6 +1520,8 @@ async function runTuiSession(
           const result = await compactMessages(state.messages, {
             provider,
             contextWindow: capabilities.context_window,
+            inputLimit: capabilities.max_input,
+            outputLimit: capabilities.max_output,
             keepTokens: compactionConfig.keep_tokens,
             bufferTokens: compactionConfig.buffer_tokens,
             bufferRatio: compactionConfig.buffer_ratio,
@@ -1539,6 +1677,7 @@ async function runTuiSession(
   const cleanupSignals = () => {
     if (noticeTimer) clearTimeout(noticeTimer);
     clearInterval(activityTimer);
+    unsubscribeCapabilities();
     synced.uninstall();
     process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[?1049l");
     void runtime.close().then(() => {
@@ -1551,6 +1690,7 @@ async function runTuiSession(
   await instance.waitUntilExit();
   if (noticeTimer) clearTimeout(noticeTimer);
   clearInterval(activityTimer);
+  unsubscribeCapabilities();
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);

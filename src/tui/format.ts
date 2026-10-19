@@ -31,7 +31,8 @@ export function contextUsagePercent(used = 0, window?: number): number | undefin
 export function formatContextUsage(used = 0, window?: number): string {
   const tokenText = formatContextTokenCount(used);
   const percent = contextUsagePercent(used, window);
-  return percent === undefined ? tokenText : `${tokenText} (${percent}%)`;
+  if (percent === undefined) return tokenText;
+  return `${tokenText} / ${formatContextTokenCount(window ?? 0)} (${percent}%)`;
 }
 
 export function formatCost(costUsd: number): string {

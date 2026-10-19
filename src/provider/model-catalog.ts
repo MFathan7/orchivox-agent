@@ -48,7 +48,7 @@ export interface LoadModelCatalogOptions {
 }
 
 const DEFAULT_URL = "https://models.dev/api.json";
-const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 5000;
 
 export function defaultCatalogCachePath(): string {

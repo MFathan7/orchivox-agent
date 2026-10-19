@@ -36,6 +36,9 @@ export const HELP_SECTIONS: HelpSection[] = [
       { keys: "/commit", description: "Split changes into atomic commits" },
       { keys: "/compact", description: "Compact the context window" },
       { keys: "/stats", description: "Show session and workspace stats" },
+      { keys: "/about", description: "Show version, entrypoint, and config source" },
+      { keys: "/doctor", description: "Show terminal and config diagnostics" },
+      { keys: "/update", description: "Check for a newer Orchivox commit" },
       { keys: "/plugins", description: "List active plugins" },
       { keys: "/collab", description: "Start a live sharing relay" },
       { keys: "/clear", description: "Clear the transcript" },
@@ -46,7 +49,7 @@ export const HELP_SECTIONS: HelpSection[] = [
     title: "Editing",
     rows: [
       { keys: "Enter", description: "Send the prompt" },
-      { keys: "Shift+Enter", description: "Insert a newline" },
+      { keys: "Shift+Enter", description: "Insert a newline (Ctrl+J works when Shift+Enter is unavailable)" },
       { keys: "Ctrl+Left/Right", description: "Move by word" },
       { keys: "Ctrl+Backspace", description: "Delete the previous word" },
       { keys: "Ctrl+Delete", description: "Delete the next word" },

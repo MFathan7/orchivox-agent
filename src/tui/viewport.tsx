@@ -3,12 +3,12 @@ import { Box, Text, useInput, useStdin } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
 import type { ChatEntryView, WriteTarget } from "./app";
-import { DiffView, ThinkingBlock, ToolCallBadge } from "./diff-view";
+import { DiffView, ThinkingBlock, ThinkingTimeline, ToolCallBadge } from "./diff-view";
 import { parseMouseClick } from "./mouse";
 import { activityCalls, activitySummary, groupToolCalls } from "./tool-groups";
 import { formatTokenCount } from "./format";
 import { WelcomeBanner } from "./logo";
-import { MarkdownView } from "./markdown";
+import { estimateMarkdownLines, MarkdownView } from "./markdown";
 import { getTheme, type Theme } from "./theme";
 import { wrapText } from "./text-wrap";
 
@@ -163,18 +163,31 @@ export function estimateEntryLines(
   if (entry.role === "user") {
     return wrapText(entry.text, Math.max(1, safeWidth - 2)).length + 2;
   }
-  let lines = countWrappedLines(entry.text, safeWidth);
-  if (entry.thinking) {
-    const thinkingOpen = !entry.live && thinkingExpanded;
-    lines += thinkingOpen
-      ? 3 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 4))
-      : 3;
+  let lines =
+    entry.role === "assistant"
+      ? estimateMarkdownLines(entry.text, safeWidth)
+      : countWrappedLines(entry.text, safeWidth);
+  if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
+    const visibleSegments = entry.live
+      ? entry.thinkingSegments.filter((segment) => segment.completedAt !== undefined)
+      : entry.thinkingSegments;
+    for (const segment of visibleSegments) {
+      lines += thinkingExpanded
+        ? 1 + countWrappedLines(segment.text, Math.max(1, safeWidth - 2))
+        : 1;
+    }
+  } else if (entry.thinking && !entry.live) {
+    lines += thinkingExpanded ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2)) : 1;
   }
   const activity = groupToolCalls(entry.toolCalls);
-  if (activity.total > 0) {
-    lines += 1 + (expandedGroups.has(entry.id) ? activity.total : 0);
+  if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
+    lines += entry.toolCalls?.length ?? 0;
+  } else {
+    if (activity.total > 0) {
+      lines += 1 + (expandedGroups.has(entry.id) ? activity.total : 0);
+    }
+    lines += activity.others.length;
   }
-  lines += activity.others.length;
   lines += (entry.files?.length ?? 0) * (collapsed ? 1 : 10);
   if (entry.live) lines += 1;
   if (entry.diff) lines += collapsed ? 1 : 10;
@@ -214,12 +227,24 @@ export function findActivityRowAt(
   for (const entry of visible) {
     const activity = groupToolCalls(entry.toolCalls);
     if (entry.role === "assistant" && activity.total > 0) {
-      const thinkingOpen = !entry.live && thinkingExpanded;
-      const thinking = entry.thinking
-        ? thinkingOpen
-          ? 3 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 4))
-          : 3
-        : 0;
+      let thinking = 0;
+      if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
+        const visibleSegments = entry.live
+          ? entry.thinkingSegments.filter((segment) => segment.completedAt !== undefined)
+          : entry.thinkingSegments;
+        thinking = visibleSegments.reduce(
+          (total, segment) =>
+            total +
+            (thinkingExpanded
+              ? 1 + countWrappedLines(segment.text, Math.max(1, safeWidth - 2))
+              : 1),
+          0,
+        );
+      } else if (entry.thinking && !entry.live) {
+        thinking = thinkingExpanded
+          ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2))
+          : 1;
+      }
       const headerRow = row + (entry.live ? 1 : 0) + thinking;
       if (Math.abs(clickRow - headerRow) <= 1) return entry;
     }
@@ -419,6 +444,8 @@ export function ScrollableChatViewport({
           const elapsed = entry.startedAt ? Math.max(0, Math.floor((Date.now() - entry.startedAt) / 1000)) : 0;
           const files = entry.live ? (entry.files ?? []).slice(-2) : (entry.files ?? []);
           const activity = groupToolCalls(entry.toolCalls);
+          const segmented = Boolean(entry.thinkingSegments && entry.thinkingSegments.length > 0);
+          const allCalls = entry.toolCalls ?? [];
           const liveText = entry.live
             ? entry.text.split("\n").slice(-Math.max(4, height - 4)).join("\n")
             : entry.text;
@@ -431,7 +458,7 @@ export function ScrollableChatViewport({
                     {running
                       ? (running.label ?? toolDisplay(running.name).label)
                       : entry.text
-                        ? "Writing"
+                        ? "Answering"
                         : entry.thinking
                           ? "Thinking"
                           : "Working"}
@@ -451,7 +478,7 @@ export function ScrollableChatViewport({
                     collapsed ? (
                       <Text color={theme.muted}>summary hidden (Ctrl+O to expand)</Text>
                     ) : (
-                      <MarkdownView content={entry.text} theme={theme} />
+                      <MarkdownView content={entry.text} width={width} theme={theme} />
                     )
                   ) : null}
                   {entry.compaction?.error ? (
@@ -489,15 +516,57 @@ export function ScrollableChatViewport({
                   ))}
                 </Box>
               ) : null}
-              {entry.thinking ? (
+              {segmented ? (
+                <Box flexDirection="column">
+                  {entry.thinkingSegments?.map((segment, index) => {
+                    const next = entry.thinkingSegments?.[index + 1];
+                    const start = segment.toolIndex;
+                    const end = next ? next.toolIndex : allCalls.length;
+                    const showSegment = !entry.live || segment.completedAt !== undefined;
+                    return (
+                      <Box key={segment.id} flexDirection="column">
+                        {showSegment ? (
+                          <ThinkingTimeline
+                            segments={[segment]}
+                            expanded={thinkingExpanded}
+                            live={entry.live}
+                            width={width}
+                            theme={theme}
+                          />
+                        ) : null}
+                        {allCalls.slice(start, end).map((call, callIndex) => (
+                          <Box key={`${segment.id}-tool-${callIndex}`} paddingLeft={2}>
+                            <ToolCallBadge
+                              name={call.name}
+                              label={call.label}
+                              detail={call.detail}
+                              argumentsSummary={collapsed ? "" : call.argumentsSummary}
+                              durationMs={call.durationMs}
+                              status={call.status}
+                              lspStatus={call.lspStatus}
+                              theme={theme}
+                            />
+                          </Box>
+                        ))}
+                      </Box>
+                    );
+                  })}
+                </Box>
+              ) : entry.thinking && !entry.live ? (
                 <ThinkingBlock
                   key={`${entry.id}-thinking-${thinkingExpanded ? "open" : "closed"}`}
                   text={entry.thinking}
-                  defaultOpen={entry.live ? false : thinkingExpanded}
+                  defaultOpen={thinkingExpanded}
+                  durationMs={
+                    entry.thinkingStartedAt !== undefined && entry.thinkingCompletedAt !== undefined
+                      ? entry.thinkingCompletedAt - entry.thinkingStartedAt
+                      : undefined
+                  }
+                  width={width}
                   theme={theme}
                 />
               ) : null}
-              {activity.total > 0 ? (
+              {!segmented && activity.total > 0 ? (
                 <Box flexDirection="column">
                   <Text>
                     <Text color={theme.muted}>
@@ -523,7 +592,7 @@ export function ScrollableChatViewport({
                     : null}
                 </Box>
               ) : null}
-              {activity.others.map((call, index) => (
+              {!segmented && activity.others.map((call, index) => (
                 <ToolCallBadge
                   key={`${entry.id}-tool-${index}`}
                   name={call.name}
@@ -553,6 +622,7 @@ export function ScrollableChatViewport({
                       oldLabel={`a/${file.path}`}
                       newLabel={`b/${file.path}`}
                       unified
+                      width={width}
                       theme={theme}
                     />
                   )}
@@ -570,13 +640,14 @@ export function ScrollableChatViewport({
                     oldLabel={entry.diff.oldLabel}
                     newLabel={entry.diff.newLabel}
                     unified={entry.diff.unified ?? false}
+                    width={width}
                     theme={theme}
                   />
                 )
               ) : null}
               {entry.role === "assistant" && entry.text ? (
                 <Box marginY={1} flexDirection="column">
-                  <MarkdownView content={liveText} theme={theme} />
+                  <MarkdownView content={liveText} width={width} theme={theme} />
                   {!entry.live &&
                   (entry.mode || entry.model || entry.tokensPerSecond !== undefined) ? (
                     <Text color={theme.muted}>
@@ -601,7 +672,7 @@ export function ScrollableChatViewport({
             <Text color={theme.badge.running} dimColor>
               ... streaming
             </Text>
-            <MarkdownView content={streamingText} theme={theme} />
+            <MarkdownView content={streamingText} width={width} theme={theme} />
           </Box>
         ) : null}
       </Box>

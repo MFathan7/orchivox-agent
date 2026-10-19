@@ -22,12 +22,20 @@ import { OrchivoxLogo } from "./logo";
 import { ModelConfigModal } from "./model-modal";
 import { SessionTimeTravelModal, type SessionModalTab } from "./session-modal";
 import { SkillsModal } from "./skills-modal";
-import { contextUsagePercent, formatContextUsage, formatCost } from "./format";
+import {
+  contextUsagePercent,
+  formatContextUsage,
+  formatContextWindow,
+  formatCost,
+  formatTokenCount,
+  truncateText,
+} from "./format";
 import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { ThemeProvider, getTheme, type ThemeName } from "./theme";
 import {
   ScrollableChatViewport,
   WorkspaceSidebar,
+  countWrappedLines,
   useTerminalSize,
   type SidebarFile,
   type SidebarSubagent,
@@ -78,11 +86,22 @@ export interface ChatCompactionView {
   error?: string;
 }
 
+export interface ThinkingSegmentView {
+  id: string;
+  text: string;
+  startedAt: number;
+  completedAt?: number;
+  toolIndex: number;
+}
+
 export interface ChatEntryView {
   id: string;
   role: "user" | "assistant" | "system" | "compaction";
   text: string;
   thinking?: string;
+  thinkingSegments?: ThinkingSegmentView[];
+  thinkingStartedAt?: number;
+  thinkingCompletedAt?: number;
   toolCalls?: ChatToolCallView[];
   files?: ChatFileChangeView[];
   live?: boolean;
@@ -361,7 +380,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         : contextPercent >= 80
           ? theme.badge.running
           : theme.muted;
-  const [sidebarVisible, setSidebarVisible] = React.useState(terminalSize.columns >= 100);
+  const [sidebarVisible, setSidebarVisible] = React.useState(terminalSize.columns >= 110);
   const [composerRows, setComposerRows] = React.useState(4);
   const [chatOffsetFromBottom, setChatOffsetFromBottom] = React.useState(0);
   const handleComposerRows = React.useCallback((rows: number) => setComposerRows(rows), []);
@@ -446,7 +465,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   }));
 
   const innerWidth = Math.max(20, terminalSize.columns - 2);
-  const chromeRows = 3 + (statusMessage || escArmed ? 1 : 0);
+  const narrow = innerWidth < 60;
+  const compact = innerWidth < 80;
+  const statusText = escArmed ? "Press Esc again to stop the current turn" : statusMessage;
+  const statusRows = statusText ? countWrappedLines(statusText, innerWidth) : 0;
+  const chromeRows = 3 + statusRows;
   const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
   const chatScrollStep = Math.max(3, Math.floor(viewportHeight / 4));
   const { stdin } = useStdin();
@@ -461,10 +484,16 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
       stdin.off("data", onData);
     };
   }, [hasModalOpen, chatScrollStep]);
-  const showSidebar = sidebarVisible && innerWidth >= 60;
+  const showSidebar = sidebarVisible && innerWidth >= 90;
   const chatWidth = showSidebar ? Math.max(20, Math.floor(innerWidth * 0.72)) : innerWidth;
   const sidebarWidth = showSidebar ? Math.max(20, innerWidth - chatWidth) : 0;
   const divider = "─".repeat(innerWidth);
+  const contextLabel = narrow
+    ? `${formatTokenCount(contextTokens)}/${formatContextWindow(modeCapabilities?.context_window)}`
+    : formatContextUsage(contextTokens, modeCapabilities?.context_window);
+  const modeHint = narrow ? "" : truncateText(MODE_HINTS[mode], Math.max(12, innerWidth - 20));
+  const modeModelLabel =
+    compact || !modeModel ? "" : ` · ${truncateText(`${modeModel.provider} / ${modeModel.model}`, 36)}`;
 
   const runCommand = (command: string): void => {
     onSubmit(command, { kind: "command", command, raw: command });
@@ -476,25 +505,23 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         <Box justifyContent="space-between">
           <Box gap={1}>
             <OrchivoxLogo variant="compact" theme={theme} />
-            <Text bold color={theme.text}>{projectName}</Text>
-            <Text color={theme.muted}>· {branch}</Text>
+            <Text bold color={theme.text}>
+              {truncateText(projectName, narrow ? 18 : 28)}
+            </Text>
+            {!narrow ? <Text color={theme.muted}>· {truncateText(branch, 18)}</Text> : null}
           </Box>
           <Box gap={1}>
-            <Text color={contextColor}>
-              {formatContextUsage(contextTokens, modeCapabilities?.context_window)}
-            </Text>
-            <Text color={theme.muted}>·</Text>
-            <Text color={theme.text}>{formatCost(totalCostUsd)}</Text>
+            <Text color={contextColor}>{contextLabel}</Text>
+            {!compact ? <Text color={theme.muted}>·</Text> : null}
+            {!compact ? <Text color={theme.text}>{formatCost(totalCostUsd)}</Text> : null}
           </Box>
         </Box>
         <Text color={theme.border.passive}>{divider}</Text>
         <Box gap={1}>
           <Text color={modePalette.primary}>●</Text>
           <Text bold color={modePalette.primary}>{mode.toUpperCase()}</Text>
-          <Text color={theme.muted}>
-            {MODE_HINTS[mode]}
-            {modeModel ? ` · ${modeModel.provider} / ${modeModel.model}` : ""}
-          </Text>
+          {modeHint ? <Text color={theme.muted}>{modeHint}</Text> : null}
+          {modeModelLabel ? <Text color={theme.muted}>{modeModelLabel}</Text> : null}
         </Box>
 
         {props.pendingApproval && props.onApprovalDecision ? (
@@ -537,17 +564,17 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         ) : reasoningPickerOpen ? (
           <ChoiceModal
             title="Thinking effort"
-            subtitle={`Current: ${props.reasoningEffort ?? "medium"}`}
+            subtitle={`Current: ${props.reasoningEffort ?? "default"}`}
             options={reasoningLevels.map((level) => ({
               id: level.id,
               label: level.label,
               description: level.description,
-              current: level.id === (props.reasoningEffort ?? "medium"),
+              current: level.id === (props.reasoningEffort ?? "default"),
             }))}
             initialIndex={Math.max(
               0,
               reasoningLevels.findIndex(
-                (level) => level.id === (props.reasoningEffort ?? "medium"),
+                (level) => level.id === (props.reasoningEffort ?? "default"),
               ),
             )}
             width={innerWidth}
@@ -574,6 +601,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             secretsPath={secretsPath}
             theme={theme}
             initialView={modelsView}
+            initialTarget={mode}
             onClose={() => setModelsOpen(false)}
             onViewChange={setModelsView}
             onSaved={(message) => onStatusMessage?.(message)}
@@ -703,6 +731,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             mode={mode}
             theme={theme}
             width={innerWidth}
+            maxRows={Math.max(6, Math.floor(terminalSize.rows / 3))}
             streaming={streaming}
             onLayoutRows={handleComposerRows}
             onModeToggle={() => {

@@ -3,6 +3,7 @@ import { Box, Text, useInput } from "ink";
 
 import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import { DiffView } from "./diff-view";
+import { isMouseSequence } from "./mouse";
 import { getTheme, type Theme } from "./theme";
 
 export interface ToolApprovalModalProps {
@@ -42,6 +43,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
   }
 
   useInput((input, key) => {
+    if (isMouseSequence(input)) return;
     if (feedbackMode) {
       if (key.return) {
         const trimmed = feedbackText.trim();

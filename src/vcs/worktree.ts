@@ -1,4 +1,7 @@
-import { ensureAgentExcluded, pathExists, runGit } from "./git";
+import { mkdir } from "node:fs/promises";
+
+import { resolveProjectState } from "../runtime-paths";
+import { pathExists, runGit } from "./git";
 
 export interface MergeResult {
   success: boolean;
@@ -10,13 +13,15 @@ const WORKER_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 export class WorktreeManager {
   private readonly root: string;
+  private readonly worktreesDir: string;
 
-  constructor(options: { repoRoot?: string } = {}) {
+  constructor(options: { repoRoot?: string; worktreesDir?: string } = {}) {
     this.root = options.repoRoot ?? globalThis.process.cwd();
+    this.worktreesDir = options.worktreesDir ?? resolveProjectState(this.root).worktreesDir;
   }
 
   worktreePath(workerId: string): string {
-    return `${this.root}/.agent/worktrees/${workerId}`;
+    return `${this.worktreesDir}/${workerId}`;
   }
 
   branchName(workerId: string): string {
@@ -25,7 +30,7 @@ export class WorktreeManager {
 
   async createWorktree(workerId: string): Promise<string> {
     assertWorkerId(workerId);
-    await ensureAgentExcluded(this.root);
+    await mkdir(this.worktreesDir, { recursive: true });
     const target = this.worktreePath(workerId);
     if (await pathExists(target)) {
       throw new Error(`worktree already exists for worker "${workerId}"`);
@@ -36,7 +41,6 @@ export class WorktreeManager {
 
   async mergeAndCleanup(workerId: string): Promise<MergeResult> {
     assertWorkerId(workerId);
-    await ensureAgentExcluded(this.root);
     const target = this.worktreePath(workerId);
     const branch = this.branchName(workerId);
     if (!(await pathExists(target))) {

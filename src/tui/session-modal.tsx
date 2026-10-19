@@ -5,6 +5,7 @@ import type { MemoryDatabase, MessageSearchHit, SessionRecord } from "../memory/
 import type { RestoreResult, SnapshotEntry, SnapshotHistory, SnapshotManager } from "../vcs/snapshot";
 import type { Message } from "../types/schema";
 import { truncateText } from "./format";
+import { isMouseSequence } from "./mouse";
 import { deleteSessionFromList } from "./session-actions";
 import { getTheme, type Theme } from "./theme";
 import { useTerminalSize } from "./viewport";
@@ -145,6 +146,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
   }, [database, activeSessionId, activeSessionMessages]);
 
   useInput((input, key) => {
+    if (isMouseSequence(input)) return;
     if (key.escape) {
       onClose();
       return;

@@ -10,6 +10,7 @@ import {
   type TextBlock,
   type TokenPricing,
 } from "../types/schema";
+import { learnLimitsFromError } from "./limit-cache";
 import type { LLMProvider } from "./router";
 import { iterateSse } from "./sse";
 
@@ -158,10 +159,12 @@ export class AnthropicCompatProvider implements LLMProvider {
     }
 
     if (!response.ok) {
+      const message = await readErrorBody(response);
+      learnLimitsFromError(this.baseUrl, model, message);
       yield {
         type: "error",
         code: `http_${response.status}`,
-        message: await readErrorBody(response),
+        message,
         recoverable: false,
       };
       yield { type: "done", finish_reason: "error" };

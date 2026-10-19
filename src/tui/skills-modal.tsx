@@ -3,6 +3,7 @@ import { Box, Text, useInput } from "ink";
 
 import type { SkillDocument } from "../agent/skills";
 import { truncateText } from "./format";
+import { isMouseSequence } from "./mouse";
 import { getTheme, type Theme } from "./theme";
 
 export interface SkillsModalProps {
@@ -28,6 +29,7 @@ export function SkillsModal({
   const clamped = Math.max(0, Math.min(skills.length - 1, selected));
 
   useInput((input, key) => {
+    if (isMouseSequence(input)) return;
     if (key.escape) {
       onClose();
       return;
@@ -81,7 +83,7 @@ export function SkillsModal({
                 <Text bold={isSelected} color={theme.text}>{nameLabel}</Text>
                 <Text color={theme.muted}> · {skill.scope}</Text>
                 {activeSkills.includes(skill.name) ? (
-                  <Text color={theme.accent}> · active</Text>
+                  <Text color={theme.accent}> · used</Text>
                 ) : null}
                 {description ? (
                   <Text color={theme.muted}> · {truncateText(description, descriptionWidth)}</Text>

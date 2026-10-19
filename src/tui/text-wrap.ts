@@ -28,6 +28,27 @@ export function displayWidth(text: string): number {
   return width;
 }
 
+/** Hard-wraps a line at a display width without collapsing whitespace. */
+export function wrapPreservingWhitespace(line: string, width: number): string[] {
+  const max = Math.max(1, width);
+  if (line.length === 0) return [""];
+  const rows: string[] = [];
+  let current = "";
+  let currentWidth = 0;
+  for (const char of line) {
+    const charWidth = charDisplayWidth(char);
+    if (current.length > 0 && currentWidth + charWidth > max) {
+      rows.push(current);
+      current = "";
+      currentWidth = 0;
+    }
+    current += char;
+    currentWidth += charWidth;
+  }
+  rows.push(current);
+  return rows;
+}
+
 /**
  * Wraps plain text to a display width, preserving explicit newlines and
  * hard-breaking words that are wider than the line.

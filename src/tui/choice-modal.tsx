@@ -1,6 +1,7 @@
 import React from "react";
 import { Box, Text, useInput } from "ink";
 
+import { isMouseSequence } from "./mouse";
 import { getTheme, type Theme } from "./theme";
 
 export interface ChoiceOption {
@@ -38,6 +39,7 @@ export function ChoiceModal({
   const clamped = Math.max(0, Math.min(options.length - 1, selected));
 
   useInput((input, key) => {
+    if (isMouseSequence(input)) return;
     if (key.escape) {
       onCancel();
       return;

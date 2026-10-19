@@ -26,7 +26,7 @@ import {
 import { discoverLocalProviders, type DiscoveredProvider } from "../provider/discover";
 import { displayNameForModel } from "../provider/model-name";
 import { findMissingModels } from "../provider/model-sync";
-import { inspectOllamaModel } from "../provider/ollama-introspect";
+import { refreshRuntimeMetadata } from "../provider/runtime-metadata";
 import type { ProviderReferences, ProviderRouter, ProviderSummary } from "../provider/router";
 import { filterFuzzy } from "./autocomplete";
 import { REASONING_LEVELS, reasoningLevelsFor, type ReasoningEffortLevel } from "./command-palette";
@@ -151,6 +151,7 @@ const CAPABILITY_FIELDS = [
   "pdf",
   "parallel_tool_calls",
   "context_window",
+  "max_input",
   "max_output",
 ] as const;
 type CapabilityField = (typeof CAPABILITY_FIELDS)[number];
@@ -164,6 +165,7 @@ interface CapabilitiesDraft {
   pdf: boolean;
   parallel_tool_calls: boolean;
   context_window: string;
+  max_input: string;
   max_output: string;
 }
 
@@ -176,6 +178,7 @@ const EMPTY_CAPABILITIES_DRAFT: CapabilitiesDraft = {
   pdf: false,
   parallel_tool_calls: true,
   context_window: "",
+  max_input: "",
   max_output: "",
 };
 
@@ -189,12 +192,20 @@ function draftFromCapabilities(capabilities: ModelCapabilities): CapabilitiesDra
     pdf: capabilities.pdf,
     parallel_tool_calls: capabilities.parallel_tool_calls,
     context_window: capabilities.context_window !== undefined ? String(capabilities.context_window) : "",
+    max_input: capabilities.max_input !== undefined ? String(capabilities.max_input) : "",
     max_output: capabilities.max_output !== undefined ? String(capabilities.max_output) : "",
   };
 }
 
-function isCapabilityBoolean(field: CapabilityField): field is Exclude<CapabilityField, "context_window" | "max_output"> {
-  return field !== "context_window" && field !== "max_output";
+const LIMIT_FIELDS = ["context_window", "max_input", "max_output"] as const;
+type LimitField = (typeof LIMIT_FIELDS)[number];
+
+function isCapabilityBoolean(field: CapabilityField): field is Exclude<CapabilityField, LimitField> {
+  return !(LIMIT_FIELDS as readonly string[]).includes(field);
+}
+
+function isLimitField(field: CapabilityField): field is LimitField {
+  return (LIMIT_FIELDS as readonly string[]).includes(field);
 }
 
 interface ModelEntry {
@@ -278,6 +289,7 @@ export interface ModelConfigModalProps {
   secretsPath: string;
   theme?: Theme;
   initialView?: "models" | "providers";
+  initialTarget?: ConfigRole | ConfigMode;
   onViewChange?: (view: "models" | "providers") => void;
   onClose: () => void;
   onSaved?: (message: string) => void;
@@ -319,20 +331,21 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     secretsPath,
     theme = getTheme("tokyonight"),
     initialView,
+    initialTarget,
     onViewChange,
     onClose,
     onSaved,
     onRoleChange,
     onModeModelChange,
     onModeReasoningChange,
-    reasoningEffort = "medium",
+    reasoningEffort = "default",
     onReasoningChange,
   } = props;
 
   const [view, setView] = React.useState<ModalView>(
     initialView === "providers" ? "providers" : "models",
   );
-  const [targetRole, setTargetRole] = React.useState<ModelTarget>("main");
+  const [targetRole, setTargetRole] = React.useState<ModelTarget>(initialTarget ?? "main");
   const [query, setQuery] = React.useState("");
   const [queryCursor, setQueryCursor] = React.useState(0);
   const [selectedIndex, setSelectedIndex] = React.useState(0);
@@ -366,7 +379,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   const [capField, setCapField] = React.useState(0);
   const [capDraft, setCapDraft] = React.useState<CapabilitiesDraft>(EMPTY_CAPABILITIES_DRAFT);
   const [capOverride, setCapOverride] = React.useState(false);
-  const [capSource, setCapSource] = React.useState<string>("inferred");
+  const [capSource, setCapSource] = React.useState<string>("default");
   const didSelectTarget = React.useRef(false);
   const rawSequence = React.useRef("");
   const { stdin } = useStdin();
@@ -851,8 +864,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       setSelectedIndex(0);
       forceRender();
 
-      if (targetRole === "main" || isModeTarget(targetRole)) {
-        const levels = levelOptions(targetRole);
+      const levels = levelOptions(targetRole);
+      if ((targetRole === "main" || isModeTarget(targetRole)) && levels.length > 1) {
         const current = isModeTarget(targetRole) ? router.getModeReasoning(targetRole) : reasoningEffort;
         setReasoningIndex(Math.max(0, levels.findIndex((level) => level.id === current)));
         setView("reasoning");
@@ -874,21 +887,21 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       setCapTarget({ provider, model });
       setCapReturnView(returnView);
       setCapDraft(draftFromCapabilities(capabilities));
-      setCapSource(capabilities.source ?? "inferred");
+      setCapSource(capabilities.source ?? "default");
       setCapOverride(Boolean(router.capabilitiesOverrideFor(provider, model)));
       setCapField(0);
       setStatus(undefined);
       setError(undefined);
       setView("capabilities");
 
-      const summary = router.listProviders().find((entry) => entry.name === provider);
-      if (summary?.kind === "ollama") {
-        void inspectOllamaModel(summary.baseUrl, model)
-          .then((live) => {
-            if (!live) return;
+      const profile = router.getProviderProfile(provider);
+      if (profile && profile.kind !== "anthropic") {
+        void refreshRuntimeMetadata(profile)
+          .then(() => {
+            router.refresh();
             const refreshed = router.capabilitiesFor(provider, model);
             setCapDraft(draftFromCapabilities(refreshed));
-            setCapSource(refreshed.source ?? "inferred");
+            setCapSource(refreshed.source ?? "default");
             forceRender();
           })
           .catch(() => undefined);
@@ -911,6 +924,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     };
     const contextWindow = Number.parseInt(capDraft.context_window, 10);
     if (Number.isFinite(contextWindow) && contextWindow > 0) patch.context_window = contextWindow;
+    const maxInput = Number.parseInt(capDraft.max_input, 10);
+    if (Number.isFinite(maxInput) && maxInput > 0) patch.max_input = maxInput;
     const maxOutput = Number.parseInt(capDraft.max_output, 10);
     if (Number.isFinite(maxOutput) && maxOutput > 0) patch.max_output = maxOutput;
 
@@ -934,7 +949,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       router.setModelCapabilities(capTarget.provider, capTarget.model, undefined);
       const capabilities = router.capabilitiesFor(capTarget.provider, capTarget.model);
       setCapDraft(draftFromCapabilities(capabilities));
-      setCapSource(capabilities.source ?? "inferred");
+      setCapSource(capabilities.source ?? "default");
       setCapOverride(false);
       setStatus("reset to automatic capabilities");
       setError(undefined);
@@ -1591,47 +1606,38 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         return;
       }
 
-      const step = fieldName === "context_window" ? 1024 : 256;
-      const minimum = fieldName === "context_window" ? 1024 : 256;
-      const maximum = fieldName === "context_window" ? 2_000_000 : 200_000;
+      const limitField = isLimitField(fieldName) ? fieldName : "context_window";
+      const step = limitField === "max_output" ? 256 : 1024;
+      const minimum = limitField === "max_output" ? 256 : 1024;
+      const maximum = limitField === "max_output" ? 200_000 : 2_000_000;
       if (key.leftArrow || key.rightArrow) {
         const delta = key.leftArrow ? -step : step;
         setCapDraft((previous) => {
-          const current = Number.parseInt(previous[fieldName], 10);
+          const current = Number.parseInt(previous[limitField], 10);
           const base = Number.isFinite(current) && current > 0 ? current : minimum;
           const next = String(Math.max(minimum, Math.min(maximum, base + delta)));
-          return fieldName === "context_window"
-            ? { ...previous, context_window: next }
-            : { ...previous, max_output: next };
+          return { ...previous, [limitField]: next };
         });
         return;
       }
 
       if (key.ctrl && input === "u") {
-        setCapDraft((previous) =>
-          fieldName === "context_window"
-            ? { ...previous, context_window: "" }
-            : { ...previous, max_output: "" },
-        );
+        setCapDraft((previous) => ({ ...previous, [limitField]: "" }));
         return;
       }
 
       if (isBackspaceKey(key, input) || isDeleteKey(key, input)) {
-        setCapDraft((previous) =>
-          fieldName === "context_window"
-            ? { ...previous, context_window: previous.context_window.slice(0, -1) }
-            : { ...previous, max_output: previous.max_output.slice(0, -1) },
-        );
+        setCapDraft((previous) => ({
+          ...previous,
+          [limitField]: previous[limitField].slice(0, -1),
+        }));
         return;
       }
 
       if (/^[0-9]$/.test(input)) {
         setCapDraft((previous) => {
-          const raw = `${previous[fieldName]}${input}`.replace(/^0+(?=\d)/, "");
-          const next = raw.slice(0, 8);
-          return fieldName === "context_window"
-            ? { ...previous, context_window: next }
-            : { ...previous, max_output: next };
+          const raw = `${previous[limitField]}${input}`.replace(/^0+(?=\d)/, "");
+          return { ...previous, [limitField]: raw.slice(0, 8) };
         });
       }
       return;
@@ -1939,6 +1945,9 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
               selectedCaps.context_window
                 ? `${Math.round(selectedCaps.context_window / 1000)}k ctx`
                 : undefined,
+              selectedCaps.max_input
+                ? `${Math.round(selectedCaps.max_input / 1000)}k in`
+                : undefined,
               selectedCaps.max_output
                 ? `${Math.round(selectedCaps.max_output / 1000)}k out`
                 : undefined,
@@ -2212,6 +2221,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       { field: "pdf", label: "PDF input", value: capDraft.pdf ? "on" : "off" },
       { field: "parallel_tool_calls", label: "Parallel tools", value: capDraft.parallel_tool_calls ? "on" : "off" },
       { field: "context_window", label: "Context window", value: capDraft.context_window || "(auto)" },
+      { field: "max_input", label: "Input limit", value: capDraft.max_input || "(follows context)" },
       { field: "max_output", label: "Max output", value: capDraft.max_output || "(auto)" },
     ];
 

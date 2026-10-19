@@ -68,7 +68,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/build", description: "Switch to build mode (approval on write)" },
   { name: "/ultrawork", description: "Switch to autonomous ultrawork mode" },
   { name: "/theme", args: "<name>", requiresArgs: true, description: "Change or inspect the terminal theme" },
-  { name: "/reasoning", args: "<off|low|med|high|max>", requiresArgs: false, description: "Set thinking effort" },
+  { name: "/reasoning", args: "<default|low|med|high|max>", requiresArgs: false, description: "Set thinking effort" },
   { name: "/palette", description: "Search actions and settings" },
   { name: "/sessions", description: "Open session manager and past conversation search" },
   { name: "/fork", description: "Fork active conversation from a specific turn" },
@@ -83,6 +83,9 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/commit", description: "Analyze git diff and create atomic commits" },
   { name: "/compact", description: "Compact conversation history to save context tokens" },
   { name: "/stats", description: "Show session and workspace statistics" },
+  { name: "/about", description: "Show version, commit, entrypoint, and config source" },
+  { name: "/doctor", description: "Show entrypoint, config, and terminal diagnostics" },
+  { name: "/update", description: "Check for a newer Orchivox commit" },
   { name: "/plugins", description: "List loaded and active agent plugins" },
   { name: "/collab", description: "Start live terminal sharing relay session" },
   { name: "/clear", description: "Clear chat screen" },
@@ -523,7 +526,8 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
     return null;
   }
 
-  const popupWidth = Math.max(30, width);
+  const popupWidth = Math.max(24, width);
+  const compactPopup = popupWidth < 72;
   const descWidth = Math.max(12, Math.min(48, popupWidth - 34));
   const commandDescWidth = Math.max(12, popupWidth - 42);
 
@@ -574,6 +578,15 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
           const isSelected = actualIndex === clampedSelected;
 
           if (trigger === "command") {
+            if (compactPopup) {
+              return (
+                <Text key={item.id} color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                  {isSelected ? "❯ " : "  "}
+                  {truncateText(item.label, Math.max(8, popupWidth - 6))}
+                  {item.detail ? <Text color={theme.muted}> {truncateText(item.detail, 8)}</Text> : null}
+                </Text>
+              );
+            }
             return (
               <Box key={item.id}>
                 <Box width={13}>
@@ -599,6 +612,14 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
           }
 
           if (trigger === "file") {
+            if (compactPopup) {
+              return (
+                <Text key={item.id} color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                  {isSelected ? "❯ " : "  "}
+                  {truncateText(item.label, Math.max(8, popupWidth - 6))}
+                </Text>
+              );
+            }
             const labelWidth = Math.max(16, popupWidth - descWidth - 6);
             const detailBudget = item.detail ? item.detail.length + 1 : 0;
             return (
@@ -619,6 +640,14 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
             );
           }
 
+          if (compactPopup) {
+            return (
+              <Text key={item.id} color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                {isSelected ? "❯ " : "  "}
+                {truncateText(item.label, Math.max(8, popupWidth - 6))}
+              </Text>
+            );
+          }
           return (
             <Box key={item.id}>
               <Box width={24}>

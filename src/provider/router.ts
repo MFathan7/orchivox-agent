@@ -8,8 +8,9 @@ import {
   type CatalogModel,
   type ModelCatalog,
 } from "./model-catalog";
-import { getCachedOllamaCapabilities } from "./ollama-introspect";
+import { getLearnedLimits } from "./limit-cache";
 import { OpenAICompatProvider } from "./openai-compat";
+import { getRuntimeMetadata } from "./runtime-metadata";
 
 export interface LLMProvider {
   streamChat(req: ChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown>;
@@ -53,6 +54,7 @@ export class ProviderRouter {
   private readonly config: AppConfig;
   private readonly catalog: ModelCatalog | undefined;
   private readonly instances = new Map<string, LLMProvider>();
+  private readonly capabilityListeners = new Set<() => void>();
 
   constructor(config: AppConfig, options: { catalog?: ModelCatalog } = {}) {
     this.config = config;
@@ -100,8 +102,9 @@ export class ProviderRouter {
     const key = model ?? profile.models[0] ?? "";
     const catalogProvider = catalogProviderForProfile(profile);
     const catalogModel = findCatalogModel(this.catalog, catalogProvider, key);
-    const ollama = profile.kind === "ollama" ? getCachedOllamaCapabilities(profile.base_url, key) : undefined;
-    return resolveModelCapabilities(profile, model, { catalogModel, ollama });
+    const runtime = getRuntimeMetadata(profile.base_url, key);
+    const learned = getLearnedLimits(profile.base_url, key);
+    return resolveModelCapabilities(profile, model, { catalogModel, runtime, learned });
   }
 
   capabilitiesForRole(role: ProviderRole): ModelCapabilities {
@@ -111,16 +114,28 @@ export class ProviderRouter {
         tool_calling: true,
         reasoning: false,
         vision: false,
-        context_window: 32_768,
-        max_output: 4_096,
+        context_window: 200_000,
+        max_output: 32_000,
         structured_output: false,
         temperature: true,
         pdf: false,
         parallel_tool_calls: true,
-        source: "inferred",
+        source: "default",
+        limit_sources: { context: "default", output: "default" },
       };
     }
     return this.capabilitiesFor(ref.provider, ref.model);
+  }
+
+  onCapabilitiesChanged(listener: () => void): () => void {
+    this.capabilityListeners.add(listener);
+    return () => {
+      this.capabilityListeners.delete(listener);
+    };
+  }
+
+  notifyCapabilitiesChanged(): void {
+    for (const listener of this.capabilityListeners) listener();
   }
 
   getMode(mode: AgentMode): LLMProvider {
@@ -154,11 +169,18 @@ export class ProviderRouter {
   }
 
   private reasoningOptionsFor(capabilities: ModelCapabilities): string[] {
-    if (!capabilities.reasoning) return ["off"];
+    const options = new Set<string>(["default"]);
+    if (!capabilities.reasoning) return [...options];
     const efforts = capabilities.reasoning_efforts?.length
       ? capabilities.reasoning_efforts
       : ["low", "medium", "high"];
-    return ["off", ...new Set(efforts.map((value) => value.toLowerCase()))];
+    for (const effort of efforts) {
+      const value = effort.toLowerCase();
+      if (value === "default" || value === "none") continue;
+      options.add(value);
+    }
+    if (capabilities.reasoning_budget_max !== undefined) options.add("max");
+    return [...options];
   }
 
   setModeModel(mode: AgentMode, provider: string, model: string): void {
@@ -332,6 +354,7 @@ export class ProviderRouter {
 
   refresh(): void {
     this.instances.clear();
+    this.notifyCapabilitiesChanged();
   }
 
   provider(profileName: string, model?: string): LLMProvider {

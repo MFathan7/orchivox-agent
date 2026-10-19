@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
@@ -141,31 +141,21 @@ export class CustomCommandEngine {
   }
 
   async ensureDefaults(): Promise<void> {
-    if (!existsSync(this.commandsDir)) {
-      await mkdir(this.commandsDir, { recursive: true });
-    }
-
     for (const [filename, def] of Object.entries(DEFAULT_COMMANDS)) {
-      const filePath = resolve(this.commandsDir, filename);
-      if (!existsSync(filePath)) {
-        const frontmatterLines = [
-          "---",
-          def.frontmatter.description ? `description: ${def.frontmatter.description}` : "",
-          def.frontmatter.agent ? `agent: ${def.frontmatter.agent}` : "",
-          def.frontmatter.model ? `model: ${def.frontmatter.model}` : "",
-          def.frontmatter.subtask !== undefined ? `subtask: ${def.frontmatter.subtask}` : "",
-          "---",
-        ].filter(Boolean);
-
-        const content = `${frontmatterLines.join("\n")}\n${def.template}\n`;
-        await writeFile(filePath, content, "utf8");
-      }
+      const name = filename.replace(/\.md$/, "");
+      if (this.cachedCommands.has(name)) continue;
+      this.cachedCommands.set(name, {
+        name,
+        filePath: resolve(this.commandsDir, filename),
+        frontmatter: def.frontmatter,
+        template: def.template,
+      });
     }
   }
 
   async loadCommands(): Promise<Map<string, CustomCommand>> {
     await this.ensureDefaults();
-    const map = new Map<string, CustomCommand>();
+    const map = new Map(this.cachedCommands);
 
     try {
       const entries = await readdir(this.commandsDir, { withFileTypes: true });
@@ -183,7 +173,7 @@ export class CustomCommandEngine {
         });
       }
     } catch {
-      // Return currently loaded map if directory read fails.
+      // A missing project commands directory is normal.
     }
 
     this.cachedCommands = map;

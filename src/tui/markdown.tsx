@@ -1,10 +1,12 @@
 import React from "react";
 import { Box, Text } from "ink";
 
+import { displayWidth, wrapPreservingWhitespace, wrapText } from "./text-wrap";
 import { getTheme, type Theme } from "./theme";
 
 export interface MarkdownViewProps {
   content: string;
+  width?: number;
   theme?: Theme;
 }
 
@@ -418,57 +420,169 @@ export function renderInline(text: string, theme: Theme): React.ReactNode[] {
   return nodes;
 }
 
-function truncateCell(value: string, width: number): string {
-  const text = value.trim();
-  if (text.length <= width) return text;
-  if (width <= 3) return text.slice(0, width);
-  return `${text.slice(0, width - 3)}...`;
+export function inlinePlainText(text: string): string {
+  return text
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/~~([^~\n]+)~~/g, "$1")
+    .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "$1")
+    .replace(/(?<![\w])_([^_\n]+)_(?![\w])/g, "$1")
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, "$1")
+    .replace(/<(https?:\/\/[^>\s]+)>/g, "$1");
 }
 
-function padCell(value: string, width: number): string {
-  return truncateCell(value, width).padEnd(width);
+function truncateDisplay(value: string, width: number): string {
+  if (displayWidth(value) <= width) return value;
+  if (width <= 3) return value.slice(0, Math.max(0, width));
+  let output = "";
+  let used = 0;
+  for (const char of value) {
+    const charWidth = displayWidth(char);
+    if (used + charWidth > width - 3) break;
+    output += char;
+    used += charWidth;
+  }
+  return `${output}...`;
 }
 
-function renderTable(block: Extract<MarkdownBlock, { kind: "table" }>, index: number, theme: Theme): React.ReactElement {
+function cellView(value: string, width: number): { text: string; plain: string; truncated: boolean } {
+  const plain = inlinePlainText(value).trim();
+  if (displayWidth(plain) <= width) return { text: value, plain, truncated: false };
+  const text = truncateDisplay(plain, width);
+  return { text, plain: text, truncated: true };
+}
+
+function renderTable(
+  block: Extract<MarkdownBlock, { kind: "table" }>,
+  index: number,
+  theme: Theme,
+  width: number,
+): React.ReactElement {
   const columnCount = Math.max(
     block.headers.length,
     ...block.rows.map((row) => row.length),
     0,
   );
-  const widths = Array.from({ length: columnCount }, (_, column) => {
+  const available = Math.max(12, width - 2);
+  if (available < 30 || columnCount === 0) {
+    return (
+      <Box key={index} flexDirection="column">
+        {block.rows.map((row, rowIndex) => (
+          <Box key={`row-${rowIndex}`} flexDirection="column" marginTop={rowIndex === 0 ? 0 : 1}>
+            {block.headers.map((header, column) => (
+              <Text key={`cell-${rowIndex}-${column}`}>
+                <Text color={theme.accent} bold>{header}: </Text>
+                <Text color={theme.text}>{renderInline(row[column] ?? "", theme)}</Text>
+              </Text>
+            ))}
+          </Box>
+        ))}
+      </Box>
+    );
+  }
+
+  const rawWidths = Array.from({ length: columnCount }, (_, column) => {
     const values = [block.headers[column] ?? "", ...block.rows.map((row) => row[column] ?? "")];
-    return Math.min(28, Math.max(3, ...values.map((value) => value.length)));
+    return Math.min(
+      28,
+      Math.max(3, ...values.map((value) => displayWidth(inlinePlainText(value).trim()))),
+    );
   });
+  const separators = Math.max(0, columnCount - 1) * 3;
+  const total = rawWidths.reduce((sum, value) => sum + value, 0) + separators;
+  const scale = total > available ? available / total : 1;
+  const widths = rawWidths.map((value) => Math.max(3, Math.floor(value * scale)));
 
   return (
     <Box key={index} flexDirection="column">
       <Text>
-        {Array.from({ length: columnCount }, (_, column) => (
-          <Text key={`head-${column}`} bold color={theme.accent}>
-            {padCell(block.headers[column] ?? "", widths[column])}
-            {column < columnCount - 1 ? " │ " : ""}
-          </Text>
-        ))}
+        {Array.from({ length: columnCount }, (_, column) => {
+          const cell = cellView(block.headers[column] ?? "", widths[column]);
+          return (
+            <Text key={`head-${column}`} bold color={theme.accent}>
+              {cell.truncated ? cell.text : renderInline(cell.text, theme)}
+              {" ".repeat(Math.max(0, widths[column] - displayWidth(cell.plain)))}
+              {column < columnCount - 1 ? " │ " : ""}
+            </Text>
+          );
+        })}
       </Text>
       <Text color={theme.border.passive}>
-        {widths.map((width) => "─".repeat(width)).join("─┼─")}
+        {widths.map((value) => "─".repeat(value)).join("─┼─")}
       </Text>
       {block.rows.map((row, rowIndex) => (
         <Text key={`row-${rowIndex}`}>
-          {Array.from({ length: columnCount }, (_, column) => (
-            <Text key={`cell-${rowIndex}-${column}`} color={theme.text}>
-              {padCell(row[column] ?? "", widths[column])}
-              {column < columnCount - 1 ? " │ " : ""}
-            </Text>
-          ))}
+          {Array.from({ length: columnCount }, (_, column) => {
+            const cell = cellView(row[column] ?? "", widths[column]);
+            return (
+              <Text key={`cell-${rowIndex}-${column}`} color={theme.text}>
+                {cell.truncated ? cell.text : renderInline(cell.text, theme)}
+                {" ".repeat(Math.max(0, widths[column] - displayWidth(cell.plain)))}
+                {column < columnCount - 1 ? " │ " : ""}
+              </Text>
+            );
+          })}
         </Text>
       ))}
     </Box>
   );
 }
 
-export function MarkdownView({ content, theme = getTheme("tokyonight") }: MarkdownViewProps): React.ReactElement {
+function codeTokenColor(kind: HighlightToken["kind"], theme: Theme): string {
+  if (kind === "keyword") return theme.syntax.keyword;
+  if (kind === "string") return theme.syntax.string;
+  if (kind === "comment") return theme.syntax.comment;
+  if (kind === "number") return theme.syntax.number;
+  return theme.text;
+}
+
+const lineEstimateCache = new Map<string, number>();
+
+export function estimateMarkdownLines(content: string, width: number): number {
+  const safeWidth = Math.max(12, width);
+  const cacheKey = `${safeWidth}\u0000${content}`;
+  const cached = lineEstimateCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const blocks = parseMarkdown(content);
+  let lines = 0;
+  for (const block of blocks) {
+    if (block.kind === "heading" || block.kind === "paragraph") {
+      const text = block.kind === "heading" ? block.text : block.lines.join("\n");
+      lines += Math.max(1, wrapText(text, safeWidth).length);
+    } else if (block.kind === "code") {
+      lines += 1;
+      for (const line of block.lines) {
+        lines += Math.max(1, wrapPreservingWhitespace(line, Math.max(8, safeWidth - 6)).length);
+      }
+    } else if (block.kind === "bullet" || block.kind === "task" || block.kind === "numbered") {
+      for (const item of block.items) {
+        const prefix = 2 + item.indent * 2;
+        lines += Math.max(1, wrapText(item.text, Math.max(8, safeWidth - prefix)).length);
+      }
+    } else if (block.kind === "quote") {
+      for (const line of block.lines) {
+        lines += Math.max(1, wrapText(line, Math.max(8, safeWidth - 2)).length);
+      }
+    } else if (block.kind === "table") {
+      lines += safeWidth < 30 ? Math.max(1, block.rows.length) : 2 + block.rows.length;
+    } else {
+      lines += 1;
+    }
+  }
+  const result = Math.max(1, lines);
+  if (lineEstimateCache.size > 300) lineEstimateCache.clear();
+  lineEstimateCache.set(cacheKey, result);
+  return result;
+}
+
+export function MarkdownView({
+  content,
+  width = 80,
+  theme = getTheme("tokyonight"),
+}: MarkdownViewProps): React.ReactElement {
   const blocks = React.useMemo(() => parseMarkdown(content), [content]);
+  const safeWidth = Math.max(12, width);
+
   return (
     <Box flexDirection="column">
       {blocks.map((block, index) => {
@@ -476,59 +590,60 @@ export function MarkdownView({ content, theme = getTheme("tokyonight") }: Markdo
           case "heading":
             return (
               <Text key={index} bold color={block.level === 1 ? theme.accent : theme.text}>
-                {block.level === 1 ? "" : block.level === 2 ? "  " : "    "}
                 {renderInline(block.text, theme)}
               </Text>
             );
-          case "code":
+          case "code": {
+            const showNumbers = safeWidth >= 60;
+            const gutter = showNumbers ? 4 : 0;
+            const codeWidth = Math.max(8, safeWidth - gutter - 2);
             return (
-              <Box key={index} flexDirection="column" borderStyle="round" borderColor={theme.border.active} paddingX={1}>
-                <Text color={theme.syntax.type} bold>
-                  {block.language || "code"}
-                </Text>
-                {block.lines.map((line, lineIndex) => (
-                  <Text key={lineIndex}>
-                    <Text color={theme.muted}>{String(lineIndex + 1).padStart(3, " ")} | </Text>
-                    {highlightLine(line, block.language).map((token, tokenIndex) => (
-                      <Text
-                        key={tokenIndex}
-                        color={
-                          token.kind === "keyword"
-                            ? theme.syntax.keyword
-                            : token.kind === "string"
-                              ? theme.syntax.string
-                              : token.kind === "comment"
-                                ? theme.syntax.comment
-                                : token.kind === "number"
-                                  ? theme.syntax.number
-                                  : theme.text
-                        }
-                      >
-                        {token.text}
-                      </Text>
-                    ))}
+              <Box key={index} flexDirection="column">
+                {block.language ? (
+                  <Text color={theme.syntax.type} bold>
+                    {block.language}
                   </Text>
-                ))}
+                ) : null}
+                {block.lines.flatMap((line, lineIndex) =>
+                  wrapPreservingWhitespace(line, codeWidth).map((chunk, chunkIndex) => (
+                    <Text key={`${lineIndex}-${chunkIndex}`}>
+                      <Text color={theme.border.passive}>▎ </Text>
+                      {showNumbers ? (
+                        <Text color={theme.muted}>
+                          {chunkIndex === 0 ? `${String(lineIndex + 1).padStart(3, " ")} | ` : "    | "}
+                        </Text>
+                      ) : null}
+                      {highlightLine(chunk, block.language).map((token, tokenIndex) => (
+                        <Text key={tokenIndex} color={codeTokenColor(token.kind, theme)}>
+                          {token.text}
+                        </Text>
+                      ))}
+                    </Text>
+                  )),
+                )}
               </Box>
             );
+          }
           case "hr":
             return (
               <Text key={index} color={theme.border.passive}>
-                {"─".repeat(24)}
+                {"─".repeat(Math.max(8, Math.min(safeWidth, 48)))}
               </Text>
             );
           case "table":
-            return renderTable(block, index, theme);
+            return renderTable(block, index, theme, safeWidth);
           case "task":
             return (
               <Box key={index} flexDirection="column">
                 {block.items.map((item, itemIndex) => (
-                  <Text key={itemIndex}>
+                  <Box key={itemIndex} flexDirection="row">
                     <Text color={item.checked ? theme.accent : theme.muted}>
                       {`${"  ".repeat(item.indent)}${item.checked ? "● " : "○ "}`}
                     </Text>
-                    {renderInline(item.text, theme)}
-                  </Text>
+                    <Box flexDirection="column" flexShrink={1}>
+                      <Text color={theme.text}>{renderInline(item.text, theme)}</Text>
+                    </Box>
+                  </Box>
                 ))}
               </Box>
             );
@@ -536,10 +651,12 @@ export function MarkdownView({ content, theme = getTheme("tokyonight") }: Markdo
             return (
               <Box key={index} flexDirection="column">
                 {block.items.map((item, itemIndex) => (
-                  <Text key={itemIndex}>
+                  <Box key={itemIndex} flexDirection="row">
                     <Text color={theme.accent}>{`${"  ".repeat(item.indent)}- `}</Text>
-                    {renderInline(item.text, theme)}
-                  </Text>
+                    <Box flexDirection="column" flexShrink={1}>
+                      <Text color={theme.text}>{renderInline(item.text, theme)}</Text>
+                    </Box>
+                  </Box>
                 ))}
               </Box>
             );
@@ -547,28 +664,41 @@ export function MarkdownView({ content, theme = getTheme("tokyonight") }: Markdo
             return (
               <Box key={index} flexDirection="column">
                 {block.items.map((item, itemIndex) => (
-                  <Text key={itemIndex}>
-                    <Text color={theme.accent}>{`${"  ".repeat(item.indent)}${itemIndex + 1}. `}</Text>
-                    {renderInline(item.text, theme)}
-                  </Text>
+                  <Box key={itemIndex} flexDirection="row">
+                    <Text color={theme.accent}>
+                      {`${"  ".repeat(item.indent)}${itemIndex + 1}. `}
+                    </Text>
+                    <Box flexDirection="column" flexShrink={1}>
+                      <Text color={theme.text}>{renderInline(item.text, theme)}</Text>
+                    </Box>
+                  </Box>
                 ))}
               </Box>
             );
           case "quote":
             return (
-              <Box key={index} flexDirection="column" borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
+              <Box key={index} flexDirection="column">
                 {block.lines.map((line, lineIndex) => (
-                  <Text key={lineIndex} color={theme.muted} italic>
-                    {renderInline(line, theme)}
-                  </Text>
+                  <Box key={lineIndex} flexDirection="row">
+                    <Text color={theme.border.passive}>▎ </Text>
+                    <Box flexDirection="column" flexShrink={1}>
+                      <Text color={theme.muted} italic>
+                        {renderInline(line, theme)}
+                      </Text>
+                    </Box>
+                  </Box>
                 ))}
               </Box>
             );
           default:
             return (
-              <Text key={index} color={theme.text}>
-                {renderInline(block.lines.join("\n"), theme)}
-              </Text>
+              <Box key={index} flexDirection="column">
+                {block.lines.map((line, lineIndex) => (
+                  <Text key={lineIndex} color={theme.text}>
+                    {renderInline(line, theme)}
+                  </Text>
+                ))}
+              </Box>
             );
         }
       })}

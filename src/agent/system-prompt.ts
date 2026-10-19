@@ -24,6 +24,22 @@ export const MODE_PROMPTS: Record<AgentMode, string> = {
   ].join(" "),
 };
 
+const TASK_PROMPTS = {
+  study: [
+    "You are in PROJECT STUDY mode.",
+    "Read the provided project evidence and write a report about what exists.",
+    "Do not write, edit, or replace code. Do not continue a previous implementation.",
+    "Do not output a patch, a file rewrite, or a plan to build something.",
+    "Answer only the user's request.",
+  ].join(" "),
+  review: [
+    "You are answering a question about existing code.",
+    "Use the provided evidence and report findings, behavior, and risks.",
+    "Do not rewrite the file unless the user explicitly asks for a fix.",
+    "Answer the question directly.",
+  ].join(" "),
+} as const;
+
 const IDENTITY = [
   "You are Orchivox, a general-purpose agent running in the user's terminal.",
   "You help with coding and everyday questions, using the environment and tools when needed.",
@@ -76,6 +92,7 @@ const STYLE = [
 
 export interface SystemPromptOptions {
   mode: AgentMode;
+  task?: keyof typeof TASK_PROMPTS;
   repoRoot: string;
   branch?: string;
   platform?: string;
@@ -97,7 +114,7 @@ export function buildSystemPrompt(options: SystemPromptOptions): string {
   if (options.compact) return compactSystemPrompt(options);
   const sections: string[] = [
     IDENTITY,
-    MODE_PROMPTS[options.mode],
+    options.task ? TASK_PROMPTS[options.task] : MODE_PROMPTS[options.mode],
     environmentSection(options),
     CAPABILITY,
   ];
@@ -141,8 +158,9 @@ function timeParts(options: SystemPromptOptions): { date: string; time: string; 
 
 function compactSystemPrompt(options: SystemPromptOptions): string {
   const { date, time, timezone } = timeParts(options);
-  const modeLine =
-    options.mode === "plan"
+  const modeLine = options.task
+    ? TASK_PROMPTS[options.task]
+    : options.mode === "plan"
       ? "You are in plan mode: read-only, do not modify files. Inspect and plan."
       : options.mode === "ultrawork"
         ? "You are in ultrawork mode: keep working until the task is complete."

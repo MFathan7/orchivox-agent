@@ -348,6 +348,7 @@ function toAnthropicStopReason(reason: AgentRunResult["finish_reason"]): string 
     case "stop":
       return "end_turn";
     case "length":
+    case "turn_limit":
       return "max_tokens";
     case "tool_calls":
       return "tool_use";

@@ -1,6 +1,51 @@
 import type { SessionCompaction } from "../memory/sqlite";
 import type { AgentMode, Message } from "../types/schema";
-import type { ChatEntryView } from "./app";
+import type { ChatEntryView, ChatToolCallView, ThinkingSegmentView } from "./app";
+
+function thinkingSegmentsFromMetadata(value: unknown): ThinkingSegmentView[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const segments = value.flatMap((entry): ThinkingSegmentView[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    if (typeof record.text !== "string" || typeof record.startedAt !== "number") return [];
+    return [
+      {
+        id: typeof record.id === "string" ? record.id : `thinking-${record.startedAt}`,
+        text: record.text,
+        startedAt: record.startedAt,
+        completedAt: typeof record.completedAt === "number" ? record.completedAt : undefined,
+        toolIndex: typeof record.toolIndex === "number" ? record.toolIndex : 0,
+      },
+    ];
+  });
+  return segments.length > 0 ? segments : undefined;
+}
+
+function toolCallsFromMetadata(value: unknown): ChatToolCallView[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const calls = value.flatMap((entry): ChatToolCallView[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    if (typeof record.name !== "string") return [];
+    return [
+      {
+        id: typeof record.id === "string" ? record.id : `tool-${record.name}`,
+        name: record.name,
+        label: typeof record.label === "string" ? record.label : record.name,
+        detail: typeof record.detail === "string" ? record.detail : undefined,
+        argumentsSummary:
+          typeof record.argumentsSummary === "string" ? record.argumentsSummary : "",
+        status:
+          record.status === "running" || record.status === "ok" || record.status === "error"
+            ? record.status
+            : undefined,
+        durationMs: typeof record.durationMs === "number" ? record.durationMs : undefined,
+        lspStatus: typeof record.lspStatus === "string" ? record.lspStatus : undefined,
+      },
+    ];
+  });
+  return calls.length > 0 ? calls : undefined;
+}
 
 export function messageEntryText(message: Message): string {
   return message.content
@@ -61,10 +106,19 @@ export function buildTranscriptEntries(
       Number.isFinite(metadata.tokens_per_second)
         ? metadata.tokens_per_second
         : undefined;
+    const thinkingSegments = thinkingSegmentsFromMetadata(metadata?.thinking_segments);
+    const toolCalls = toolCallsFromMetadata(metadata?.tool_calls);
     entries.push({
       id: `entry-${index + 1}`,
       role: message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user",
       text: messageEntryText(message),
+      ...(thinkingSegments
+        ? {
+            thinkingSegments,
+            thinking: thinkingSegments.map((segment) => segment.text).join("\n"),
+          }
+        : {}),
+      ...(toolCalls ? { toolCalls } : {}),
       ...(message.role === "assistant" && (mode || model || tokensPerSecond !== undefined)
         ? { mode, model, tokensPerSecond }
         : {}),

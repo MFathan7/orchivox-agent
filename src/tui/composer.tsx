@@ -1,8 +1,10 @@
 import React from "react";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { Box, Text, useInput, useStdin } from "ink";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
+import { resolveProjectState } from "../runtime-paths";
 import type { AgentMode } from "../types/schema";
 import { formatLine, readText, splitLines } from "../tools/hashline-edit";
 import {
@@ -23,6 +25,7 @@ import {
   findNextWordEnd,
   findPreviousWordStart,
 } from "./text-edit";
+import { charDisplayWidth, displayWidth, wrapText } from "./text-wrap";
 
 export {
   deleteNextWord,
@@ -55,6 +58,21 @@ const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGES_PER_MESSAGE = 4;
 
+const RAW_NEWLINE_SEQUENCES = new Set([
+  "\n",
+  "\x1b\n",
+  "\u001b\r",
+  "\x1b[13;2u",
+  "\x1b[13;2~",
+  "\x1b[13;3u",
+  "\x1b[13;3~",
+  "\x1b[13;5u",
+  "\x1b[13;5~",
+  "\x1b[27;2;13~",
+  "\x1b[27;3;13~",
+  "\x1b[27;5;13~",
+]);
+
 export function imageMimeType(filePath: string): string | undefined {
   const dot = filePath.lastIndexOf(".");
   if (dot === -1) return undefined;
@@ -74,6 +92,7 @@ export interface PromptComposerProps {
   theme?: Theme;
   repoRoot?: string;
   width?: number;
+  maxRows?: number;
   placeholder?: string;
   historyFilePath?: string;
   disabled?: boolean;
@@ -98,7 +117,7 @@ export class PersistentCommandHistory {
 
   constructor(filePath?: string, repoRoot?: string) {
     const root = repoRoot ?? globalThis.process.cwd();
-    this.filePath = filePath ?? resolve(root, ".agent", "history.json");
+    this.filePath = filePath ?? resolveProjectState(root).history;
     this.loadSync();
   }
 
@@ -136,6 +155,7 @@ export class PersistentCommandHistory {
     this.resetPointer();
 
     try {
+      mkdirSync(dirname(this.filePath), { recursive: true });
       await Bun.write(this.filePath, JSON.stringify(this.history, null, 2));
     } catch {
       // History is best effort and never blocks sending a prompt.
@@ -361,7 +381,7 @@ export function getCursorOffset(lines: string[], targetLine: number, targetCol: 
   return offset + clampedCol;
 }
 
-export { charDisplayWidth, displayWidth } from "./text-wrap";
+export { charDisplayWidth, displayWidth };
 
 export function splitLineAtCursor(line: string, col: number): { before: string; cursorChar: string; after: string } {
   const chars = Array.from(line);
@@ -380,6 +400,98 @@ export function splitLineAtCursor(line: string, col: number): { before: string; 
   return { before, cursorChar: cursorChar ?? " ", after };
 }
 
+export interface VisualRow {
+  lineIndex: number;
+  text: string;
+  start: number;
+  end: number;
+}
+
+export function wrapLineSegments(
+  line: string,
+  width: number,
+): Array<{ text: string; start: number; end: number }> {
+  const max = Math.max(1, width);
+  if (line.length === 0) return [{ text: "", start: 0, end: 0 }];
+
+  const segments: Array<{ text: string; start: number; end: number }> = [];
+  let start = 0;
+  let index = 0;
+  let currentWidth = 0;
+  let lastSpaceEnd = -1;
+
+  for (const char of line) {
+    const charWidth = displayWidth(char);
+    if (index > start && currentWidth + charWidth > max) {
+      const breakAt = lastSpaceEnd > start ? lastSpaceEnd : index;
+      segments.push({ text: line.slice(start, breakAt), start, end: breakAt });
+      start = breakAt;
+      currentWidth = displayWidth(line.slice(start, index));
+      lastSpaceEnd = -1;
+    }
+    if (/\s/.test(char)) lastSpaceEnd = index + char.length;
+    currentWidth += charWidth;
+    index += char.length;
+  }
+
+  if (start < line.length || segments.length === 0) {
+    segments.push({ text: line.slice(start), start, end: line.length });
+  }
+  return segments;
+}
+
+export function buildVisualRows(text: string, width: number): VisualRow[] {
+  const lines = text.split("\n");
+  const rows: VisualRow[] = [];
+  lines.forEach((line, lineIndex) => {
+    for (const segment of wrapLineSegments(line, width)) {
+      rows.push({ lineIndex, text: segment.text, start: segment.start, end: segment.end });
+    }
+  });
+  return rows.length > 0 ? rows : [{ lineIndex: 0, text: "", start: 0, end: 0 }];
+}
+
+export function offsetAtVisualPosition(
+  rows: VisualRow[],
+  rowIndex: number,
+  visualCol: number,
+): number {
+  if (rows.length === 0) return 0;
+  const row = rows[Math.max(0, Math.min(rows.length - 1, rowIndex))];
+  let width = 0;
+  let offset = row.start;
+  for (const char of row.text) {
+    if (width + displayWidth(char) > visualCol) break;
+    width += displayWidth(char);
+    offset += char.length;
+  }
+  return offset;
+}
+
+export function locateCursorRow(
+  rows: VisualRow[],
+  lineIndex: number,
+  col: number,
+): { row: number; col: number } {
+  let candidate = -1;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (row.lineIndex !== lineIndex) continue;
+    if (col >= row.start && col <= row.end) candidate = index;
+    if (col >= row.start && col < row.end) {
+      return { row: index, col: displayWidth(row.text.slice(0, col - row.start)) };
+    }
+  }
+  if (candidate >= 0) {
+    const row = rows[candidate];
+    return {
+      row: candidate,
+      col: displayWidth(row.text.slice(0, Math.max(0, Math.min(col - row.start, row.text.length)))),
+    };
+  }
+  return { row: Math.max(0, rows.length - 1), col: 0 };
+}
+
 function normalizeInsertedText(input: string): string {
   return input.replace(/\r\n?/g, "\n").replace(/\t/g, "  ");
 }
@@ -390,6 +502,7 @@ export function PromptComposer(props: PromptComposerProps) {
     theme = getTheme("tokyonight"),
     repoRoot,
     width,
+    maxRows,
     placeholder = "Ask Orchivox, / for commands, @ for files, $ for skills",
     historyFilePath,
     disabled = false,
@@ -414,9 +527,13 @@ export function PromptComposer(props: PromptComposerProps) {
   const [autocompleteContext, setAutocompleteContext] = React.useState<TriggerContext | null>(null);
   const [autocompleteItems, setAutocompleteItems] = React.useState<AutocompleteItem[]>([]);
   const [autocompleteSelected, setAutocompleteSelected] = React.useState(0);
+  const autocompleteRequestRef = React.useRef(0);
+  const [inputScroll, setInputScroll] = React.useState(0);
 
   const { internal_eventEmitter } = useStdin();
   const lastRawInputRef = React.useRef<string>("");
+  const insertNewlineRef = React.useRef<() => void>(() => {});
+  const rawNewlineHandledRef = React.useRef(0);
   const undoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
   const redoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
   const pastedRef = React.useRef<PastedEntry[]>([]);
@@ -426,8 +543,25 @@ export function PromptComposer(props: PromptComposerProps) {
     const emitter = internal_eventEmitter as
       | { prependListener?: (event: string, listener: (data: Buffer | string) => void) => void; removeListener?: (event: string, listener: (data: Buffer | string) => void) => void }
       | undefined;
+    const debugInput = process.env.ORCHIVOX_INPUT_DEBUG?.trim() ?? "";
     const onRaw = (data: Buffer | string) => {
       lastRawInputRef.current = typeof data === "string" ? data : data.toString("utf8");
+      if (debugInput) {
+        try {
+          const directory = join(homedir(), ".cache", "orchivox");
+          mkdirSync(directory, { recursive: true });
+          appendFileSync(
+            join(directory, "input-debug.log"),
+            `${new Date().toISOString()} term=${process.env.TERM ?? "unknown"} data=${JSON.stringify(lastRawInputRef.current)}\n`,
+          );
+        } catch {
+          // Input diagnostics must never block typing.
+        }
+      }
+      if (RAW_NEWLINE_SEQUENCES.has(lastRawInputRef.current)) {
+        rawNewlineHandledRef.current = Date.now();
+        insertNewlineRef.current();
+      }
     };
     emitter?.prependListener?.("input", onRaw);
     return () => {
@@ -463,9 +597,11 @@ export function PromptComposer(props: PromptComposerProps) {
     }
 
     let cancelled = false;
+    const requestID = autocompleteRequestRef.current + 1;
+    autocompleteRequestRef.current = requestID;
 
     void queryAutocomplete(text, cursorPos, repoRoot).then((result) => {
-      if (cancelled) return;
+      if (cancelled || requestID !== autocompleteRequestRef.current) return;
       if (result && result.items.length > 0) {
         setAutocompleteContext(result.context);
         setAutocompleteItems(result.items);
@@ -519,7 +655,8 @@ export function PromptComposer(props: PromptComposerProps) {
   };
 
   const handleInsertAutocomplete = (item: AutocompleteItem): void => {
-    const context = detectTriggerContext(text, cursorPos);
+    const live = detectTriggerContext(text, cursorPos);
+    const context = live && live.trigger === item.trigger ? live : autocompleteContext;
     if (!context || context.trigger !== item.trigger) {
       dismissAutocomplete();
       return;
@@ -553,6 +690,7 @@ export function PromptComposer(props: PromptComposerProps) {
       cursorPos + normalized.length,
     );
   };
+  insertNewlineRef.current = () => insertPlainOrPasted("\n");
 
   const handleFinalSubmit = async (explicitText?: string): Promise<void> => {
     const raw = explicitText ?? text;
@@ -591,6 +729,7 @@ export function PromptComposer(props: PromptComposerProps) {
 
   useInput((input, key) => {
     if (disabled) return;
+    if (Date.now() - rawNewlineHandledRef.current < 40) return;
 
     const raw = lastRawInputRef.current;
     if (isMouseSequence(raw) || isMouseSequence(input)) return;
@@ -670,10 +809,17 @@ export function PromptComposer(props: PromptComposerProps) {
       (key.return && key.shift) ||
       (key.return && key.meta) ||
       (key.return && key.ctrl) ||
+      (key.ctrl && (input === "j" || sequence === "\n")) ||
+      sequence === "\n" ||
       sequence === "\u001b\r" ||
+      sequence === "\x1b\n" ||
       sequence === "\x1b[13;2u" ||
-      sequence === "\x1b[27;2;13~" ||
+      sequence === "\x1b[13;2~" ||
+      sequence === "\x1b[13;3u" ||
+      sequence === "\x1b[13;3~" ||
       sequence === "\x1b[13;5u" ||
+      sequence === "\x1b[13;5~" ||
+      sequence === "\x1b[27;2;13~" ||
       sequence === "\x1b[27;3;13~" ||
       sequence === "\x1b[27;5;13~";
 
@@ -755,9 +901,9 @@ export function PromptComposer(props: PromptComposerProps) {
         onScrollLine?.(1);
         return;
       }
-      if (line > 0) {
-        const nextCol = Math.min(col, lines[line - 1].length);
-        setCursorPos(getCursorOffset(lines, line - 1, nextCol));
+      if (cursorSpot.row > 0) {
+        if (autocompleteContext) dismissAutocomplete();
+        setCursorPos(offsetAtVisualPosition(visualRows, cursorSpot.row - 1, cursorSpot.col));
         return;
       }
       const prevCommand = historyManager.getPrevious(text);
@@ -776,9 +922,9 @@ export function PromptComposer(props: PromptComposerProps) {
         onScrollLine?.(-1);
         return;
       }
-      if (line < lines.length - 1) {
-        const nextCol = Math.min(col, lines[line + 1].length);
-        setCursorPos(getCursorOffset(lines, line + 1, nextCol));
+      if (cursorSpot.row < visualRows.length - 1) {
+        if (autocompleteContext) dismissAutocomplete();
+        setCursorPos(offsetAtVisualPosition(visualRows, cursorSpot.row + 1, cursorSpot.col));
         return;
       }
       const nextEntry = historyManager.getNext();
@@ -928,10 +1074,44 @@ export function PromptComposer(props: PromptComposerProps) {
   const totalTokens = attachedFiles.reduce((sum, item) => sum + item.tokens, 0);
   const imageCount = attachedFiles.filter((item) => item.kind === "image").length;
 
+  const maxPrefixWidth = lines.length > 1 ? String(lines.length).length + 3 : 2;
+  const textWidth = Math.max(8, (width ?? 80) - 4 - maxPrefixWidth);
+  const visualRows = buildVisualRows(text, textWidth);
+  const cursorSpot = locateCursorRow(visualRows, activeLine, activeCol);
+  const maxVisibleRows = Math.max(3, maxRows ?? 8);
+
+  React.useLayoutEffect(() => {
+    setInputScroll((previous) => {
+      const maxOffset = Math.max(0, visualRows.length - maxVisibleRows);
+      if (cursorSpot.row < previous) return Math.max(0, Math.min(cursorSpot.row, maxOffset));
+      if (cursorSpot.row >= previous + maxVisibleRows) {
+        return Math.max(0, Math.min(cursorSpot.row - maxVisibleRows + 1, maxOffset));
+      }
+      return Math.min(previous, maxOffset);
+    });
+  }, [cursorSpot.row, visualRows.length, maxVisibleRows]);
+
+  const visibleStart = Math.min(inputScroll, Math.max(0, visualRows.length - maxVisibleRows));
+  const visibleRows = visualRows.slice(visibleStart, visibleStart + maxVisibleRows);
+
   const popupVisible = autocompleteItems.length > 0 && autocompleteContext !== null;
   const popupRows = popupVisible ? Math.min(6, autocompleteItems.length) + 4 : 0;
   const attachmentRows = attachedFiles.length > 0 ? 1 : 0;
-  const layoutRows = popupRows + attachmentRows + lines.length + 2 + 1;
+  const effectivePlaceholder =
+    (width ?? 80) < 55
+      ? "Ask Orchivox"
+      : (width ?? 80) < 70
+        ? "Ask Orchivox, / commands, @ files"
+        : placeholder;
+  const hintText =
+    (width ?? 80) < 60
+      ? "Enter send · Ctrl+J newline · / commands"
+      : (width ?? 80) < 80
+        ? "Tab mode · / commands · @ files · Enter send · Ctrl+J newline"
+        : "Tab mode · / commands · @ files · $ skills · Enter send · Shift+Enter newline (Ctrl+J)";
+  const hintRows = wrapText(hintText, Math.max(1, (width ?? 80) - 2)).length;
+  const layoutRows =
+    popupRows + attachmentRows + Math.min(visualRows.length, maxVisibleRows) + 2 + hintRows;
 
   React.useLayoutEffect(() => {
     onLayoutRows?.(layoutRows);
@@ -980,34 +1160,42 @@ export function PromptComposer(props: PromptComposerProps) {
         borderColor={modeStyle.primary}
         paddingX={1}
       >
-        {lines.length === 1 && lines[0].length === 0 ? (
+        {text.length === 0 ? (
           <Box>
             <Text color={modeStyle.primary} bold>
               ❯{" "}
             </Text>
-            <Text color={theme.muted}>{placeholder}</Text>
+            <Text color={theme.muted}>{effectivePlaceholder}</Text>
           </Box>
         ) : (
-          lines.map((lineContent, lineIndex) => {
-            const isCurrentLine = lineIndex === activeLine;
-            const prefix = lines.length > 1 ? `${lineIndex + 1} │ ` : "❯ ";
-            const displayLine = displayListLine(lineContent);
+          visibleRows.map((row, offset) => {
+            const visualIndex = visibleStart + offset;
+            const isCurrent = visualIndex === cursorSpot.row;
+            const firstOfLine = row.start === 0;
+            const prefix =
+              lines.length > 1
+                ? firstOfLine
+                  ? `${row.lineIndex + 1} │ `
+                  : `${" ".repeat(String(row.lineIndex + 1).length)} │ `
+                : firstOfLine
+                  ? "❯ "
+                  : "  ";
+            const displayLine = displayListLine(row.text);
 
-            if (!isCurrentLine) {
+            if (!isCurrent) {
               return (
-                <Box key={`line-${lineIndex}`}>
-                  <Text color={theme.border.passive}>
-                    {prefix}
-                  </Text>
+                <Box key={`row-${visualIndex}`}>
+                  <Text color={theme.border.passive}>{prefix}</Text>
                   <Text color={theme.text}>{displayLine}</Text>
                 </Box>
               );
             }
 
-            const { before, cursorChar, after } = splitLineAtCursor(displayLine, activeCol);
+            const cursorColumn = Math.max(0, Math.min(row.text.length, activeCol - row.start));
+            const { before, cursorChar, after } = splitLineAtCursor(displayLine, cursorColumn);
 
             return (
-              <Box key={`line-${lineIndex}`}>
+              <Box key={`row-${visualIndex}`}>
                 <Text color={modeStyle.primary} bold>
                   {prefix}
                 </Text>
@@ -1024,7 +1212,7 @@ export function PromptComposer(props: PromptComposerProps) {
 
       <Box paddingX={1}>
         <Text color={theme.muted}>
-          Tab mode · / commands · @ files · $ skills · Ctrl+P palette · Enter send · Shift+Enter newline
+          {hintText}
         </Text>
       </Box>
     </Box>

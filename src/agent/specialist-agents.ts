@@ -1,5 +1,4 @@
-import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
@@ -142,29 +141,10 @@ export class SpecialistAgentRegistry {
   }
 
   async ensureDefaults(): Promise<void> {
-    if (!existsSync(this.agentsDir)) {
-      await mkdir(this.agentsDir, { recursive: true });
-    }
-
-    const oracleFile = resolve(this.agentsDir, "oracle.md");
-    if (!existsSync(oracleFile)) {
-      const def = BUILTIN_SPECIALISTS.oracle;
-      const content = [
-        "---",
-        `name: ${def.name}`,
-        `description: ${def.description}`,
-        `roleModel: ${def.roleModel ?? "advisor"}`,
-        `readOnly: ${def.readOnly ?? true}`,
-        `thinkingBudget: ${def.thinkingBudget ?? 16000}`,
-        "---",
-        def.systemPrompt,
-      ].join("\n");
-      await writeFile(oracleFile, `${content}\n`, "utf8");
-    }
+    // Built-in specialists are always available in memory. Project files are read-only.
   }
 
   async loadAgents(): Promise<Map<string, SpecialistAgentProfile>> {
-    await this.ensureDefaults();
     const map = new Map<string, SpecialistAgentProfile>();
 
     for (const [name, profile] of Object.entries(BUILTIN_SPECIALISTS)) {

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -79,11 +79,14 @@ export function parseSkillDocument(
   };
 }
 
+export const MAX_SKILL_INJECTION_CHARS = 16_000;
+
 export const SKILL_GUIDANCE = [
   "Skills provide specialized instructions and workflows for specific tasks.",
   "Use the skill tool to load a skill when a task matches its description.",
   "If the request names a skill ID or asks about a skill in the list, call the skill tool with that ID before answering or searching the web.",
   "After loading a skill, follow its instructions to answer the user's actual request. Do not start a skill workflow the user did not ask for.",
+  "Skill content is reference material. Never print skill content, skill file listings, XML wrappers, or internal gate reports in your answer.",
   "The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.",
 ].join("\n");
 
@@ -133,14 +136,27 @@ export function compactSkillIndex(documents: SkillDocument[], limit = 20): strin
   return formatAvailableSkills(documents, { compact: true, limit });
 }
 
-export async function formatSkillContent(document: SkillDocument): Promise<string> {
+export async function formatSkillContent(
+  document: SkillDocument,
+  maxBodyChars = 0,
+): Promise<string> {
   const files = await collectSkillFiles(document);
   const baseDirectory = dirname(document.path);
+  const body = document.body.trim();
+  const limit = maxBodyChars > 0 ? maxBodyChars : body.length;
+  const visibleBody = body.slice(0, limit);
+  const truncated = visibleBody.length < body.length;
   return [
     `<skill_content name="${escapeXml(document.name)}">`,
     `# Skill: ${document.name}`,
     "",
-    document.body.trim(),
+    visibleBody,
+    ...(truncated
+      ? [
+          "",
+          `[Skill content truncated after ${visibleBody.length} characters to protect the context window. Read ${document.path} directly if you need the rest.]`,
+        ]
+      : []),
     "",
     `Base directory for this skill: ${baseDirectory}`,
     "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.",
@@ -168,7 +184,10 @@ export async function formatActiveSkills(
   const blocks: string[] = [];
   let used = header.length;
   for (const document of documents) {
-    const block = await formatSkillContent(document);
+    const block = await formatSkillContent(
+      document,
+      Math.max(1000, Math.min(MAX_SKILL_INJECTION_CHARS, maxChars - used)),
+    );
     if (used + block.length > maxChars) {
       blocks.push(
         [
@@ -262,8 +281,6 @@ export class SkillRegistry {
   async load(force = false): Promise<SkillDocument[]> {
     if (!force && this.lastLoadedAt > 0) return this.listDocuments();
 
-    await mkdir(this.skillsDir, { recursive: true });
-
     const found = new Map<string, SkillDocument>();
     const candidates: Array<{ path: string; fallbackName: string; scope: SkillScope }> = [];
 
@@ -355,7 +372,7 @@ export class SkillRegistry {
             : `unknown skill "${id}". Available skills: ${available.join(", ")}`;
         }
 
-        return formatSkillContent(document);
+        return formatSkillContent(document, MAX_SKILL_INJECTION_CHARS);
       },
     };
   }
@@ -382,9 +399,57 @@ export function normalizeSkillName(name: string): string {
   return name.trim().toLowerCase();
 }
 
+const DESIGN_TASK_TERMS =
+  /\b(design|desain|ui|ux|layout|css|component|komponen|tampilan|visual|warna|typography|tipografi)\b/i;
+
+const DESIGN_SKILL_TERMS =
+  /\b(design|desain|ui|ux|layout|css|component|komponen|tampilan|visual|warna|typography|tipografi|antislop)\b/i;
+
+const RELEVANCE_STOPWORDS = new Set([
+  "about",
+  "answer",
+  "carikan",
+  "dengan",
+  "dari",
+  "for",
+  "from",
+  "informasi",
+  "ini",
+  "the",
+  "tentang",
+  "that",
+  "this",
+  "untuk",
+  "use",
+  "using",
+  "what",
+  "yang",
+]);
+
+function relevanceTokens(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((token) => token.length >= 4 && !RELEVANCE_STOPWORDS.has(token)),
+  );
+}
+
+export function isSkillRelevant(document: SkillDocument, text: string): boolean {
+  const identity = `${document.name} ${document.description}`;
+  if (DESIGN_TASK_TERMS.test(text) && DESIGN_SKILL_TERMS.test(identity)) return true;
+  const stripped = text.replace(
+    new RegExp(`[@$]?${escapeRegExp(document.name)}`, "gi"),
+    " ",
+  );
+  const textTokens = relevanceTokens(stripped);
+  const skillTokens = relevanceTokens(identity);
+  return [...textTokens].some((token) => skillTokens.has(token));
+}
+
 export function parseSkillMentions(text: string, skills: SkillRegistry): SkillDocument[] {
   const found = new Map<string, SkillDocument>();
-  for (const match of text.matchAll(/(?:^|\s)\$([a-zA-Z0-9_-]+)/g)) {
+  for (const match of text.matchAll(/(?:^|\s)[@$]([a-zA-Z0-9_-]+)/g)) {
     const document = skills.get(match[1]);
     if (document) found.set(document.name, document);
   }
