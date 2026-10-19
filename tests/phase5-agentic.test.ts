@@ -282,7 +282,7 @@ describe("Live activity rendering", () => {
       { stdout: stream as unknown as NodeJS.WriteStream, patchConsole: false },
     );
 
-    expect(output).toContain("read_file");
+    expect(output).toContain("Reading file");
     expect(output).toContain("src/a.ts");
     expect(output).toContain("partial answer");
     instance.unmount();

@@ -1,10 +1,11 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { parseDocument, type Document } from "yaml";
+import { isSeq, parseDocument, type Document } from "yaml";
 
 import type { ModelCapabilitiesPatch, ProviderProfile } from "./loader";
 
 export type ConfigRole = "main" | "fast" | "advisor";
+export type ConfigMode = "plan" | "build" | "ultrawork";
 
 const ROLE_KEYS: Record<ConfigRole, string> = {
   main: "main_model",
@@ -74,6 +75,49 @@ export async function saveRoleSelection(
   const document = await readDocument(configPath);
   ensureMap(document, "roles");
   document.setIn(["roles", ROLE_KEYS[role]], { provider, model });
+  await writeDocument(configPath, document);
+}
+
+export async function saveModeSelection(
+  configPath: string,
+  mode: ConfigMode,
+  provider: string,
+  model: string,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "modes");
+  document.setIn(["modes", mode, "model"], { provider, model });
+  await writeDocument(configPath, document);
+}
+
+export async function saveModeReasoning(
+  configPath: string,
+  mode: ConfigMode,
+  reasoning: string,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "modes");
+  document.setIn(["modes", mode, "reasoning"], reasoning);
+  await writeDocument(configPath, document);
+}
+
+export async function appendProviderModel(
+  configPath: string,
+  provider: string,
+  model: string,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "providers");
+  if (!document.getIn(["providers", provider])) {
+    throw new Error(`unknown provider "${provider}" in ${configPath}`);
+  }
+  const node = document.getIn(["providers", provider, "models"], true);
+  if (isSeq(node)) {
+    const values = node.toJSON() as unknown;
+    if (!Array.isArray(values) || !values.includes(model)) node.add(model);
+  } else {
+    document.setIn(["providers", provider, "models"], [model]);
+  }
   await writeDocument(configPath, document);
 }
 

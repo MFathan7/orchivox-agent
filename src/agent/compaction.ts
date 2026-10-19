@@ -11,7 +11,7 @@ const DEFAULT_BUFFER_RATIO = 0.1;
 const SUMMARY_SYSTEM = [
   "You compress conversation history for a coding agent.",
   "Produce a compact Markdown summary that lets another agent continue the work.",
-  "Use these sections: ## Objective, ## Requirements, ## Decisions, ## Completed, ## Active, ## Blockers, ## Next Move, ## Relevant Files.",
+  "Use these sections: ## Objective, ## Requirements, ## Decisions, ## Completed, ## Active, ## Active Skills, ## Blockers, ## Next Move, ## Relevant Files.",
   "Keep decisions, conventions, exact file paths, and active todo items with their status.",
   "Drop chit-chat, tool noise, and stale intermediate output.",
   "If a previous summary is provided, merge it with the new conversation and keep it current.",
@@ -68,15 +68,43 @@ function isSummaryMessage(message: Message): boolean {
 }
 
 function selectTail(conversation: Message[], keepTokens: number): { tail: Message[]; older: Message[] } {
-  let tailTokens = 0;
+  if (conversation.length === 0) return { tail: [], older: [] };
+  const start = recentStart(conversation, keepTokens);
+  return { tail: conversation.slice(start), older: conversation.slice(0, start) };
+}
+
+/**
+ * Picks where the retained recent conversation starts, mirroring opencode:
+ * drop the oldest messages until the rest fit the keep budget, snap to a user
+ * message so a turn stays together, and when everything fits keep only the
+ * latest exchange so manual compaction still has an older part to summarize.
+ */
+function recentStart(conversation: Message[], keepTokens: number): number {
+  let kept = 0;
   let start = conversation.length;
   for (let index = conversation.length - 1; index >= 0; index -= 1) {
     const cost = estimateMessageTokens(conversation[index]);
-    if (start < conversation.length && tailTokens + cost > keepTokens) break;
-    tailTokens += cost;
+    if (start < conversation.length && kept + cost > keepTokens) break;
+    kept += cost;
     start = index;
   }
-  return { tail: conversation.slice(start), older: conversation.slice(0, start) };
+  start = Math.min(start, conversation.length - 1);
+
+  const boundary = lastUserIndex(conversation, start);
+  if (boundary > 0) return boundary;
+
+  const latestUser = lastUserIndex(conversation, conversation.length - 1);
+  if (latestUser > 0) return latestUser;
+
+  return conversation.length;
+}
+
+function lastUserIndex(conversation: Message[], maxIndex: number): number {
+  const limit = Math.min(maxIndex, conversation.length - 1);
+  for (let index = limit; index >= 0; index -= 1) {
+    if (conversation[index].role === "user") return index;
+  }
+  return -1;
 }
 
 export async function compactMessages(messages: Message[], options: CompactionOptions): Promise<CompactionResult> {

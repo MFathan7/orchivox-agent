@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, delimiter, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -11,6 +11,7 @@ export const SkillFrontmatterSchema = z.object({
   name: z.string().min(1).optional(),
   description: z.string().min(1).optional(),
   when_to_use: z.string().min(1).optional(),
+  autoinvoke: z.boolean().optional(),
   allowed_tools: z.array(z.string().min(1)).optional(),
   model_role: z.enum(["main", "fast", "advisor"]).optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
@@ -23,6 +24,7 @@ export interface SkillDocument {
   name: string;
   description: string;
   whenToUse?: string;
+  autoinvoke?: boolean;
   allowedTools?: string[];
   modelRole?: "main" | "fast" | "advisor";
   path: string;
@@ -68,12 +70,155 @@ export function parseSkillDocument(
     name,
     description,
     whenToUse: frontmatter.when_to_use,
+    autoinvoke: frontmatter.autoinvoke !== false,
     allowedTools: frontmatter.allowed_tools,
     modelRole: frontmatter.model_role,
     path,
     scope,
     body: body.trim(),
   };
+}
+
+export const SKILL_GUIDANCE = [
+  "Skills provide specialized instructions and workflows for specific tasks.",
+  "Use the skill tool to load a skill when a task matches its description.",
+  "If the request names a skill ID or asks about a skill in the list, call the skill tool with that ID before answering or searching the web.",
+  "After loading a skill, follow its instructions to answer the user's actual request. Do not start a skill workflow the user did not ask for.",
+  "The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.",
+].join("\n");
+
+export interface SkillIndexOptions {
+  compact?: boolean;
+  limit?: number;
+  descriptionLimit?: number;
+}
+
+export function formatAvailableSkills(
+  documents: SkillDocument[],
+  options: SkillIndexOptions = {},
+): string {
+  const autoDocuments = documents.filter((document) => document.autoinvoke !== false);
+  if (autoDocuments.length === 0) {
+    return [SKILL_GUIDANCE, "No skills are currently available."].join("\n");
+  }
+
+  const limit = options.limit ?? (options.compact ? 12 : 1000);
+  const descriptionLimit = options.descriptionLimit ?? (options.compact ? 80 : 0);
+  const available = autoDocuments.slice(0, limit).map((document) => {
+    const description =
+      descriptionLimit > 0 && document.description.length > descriptionLimit
+        ? `${document.description.slice(0, Math.max(0, descriptionLimit - 3)).trimEnd()}...`
+        : document.description;
+    return { document, description };
+  });
+
+  const lines = available.flatMap(({ document, description }) => [
+    "  <skill>",
+    `    <id>${escapeXml(document.name)}</id>`,
+    `    <name>${escapeXml(document.name)}</name>`,
+    `    <description>${escapeXml(description.replace(/\s+/g, " ").trim())}</description>`,
+    "  </skill>",
+  ]);
+  const footer =
+    autoDocuments.length > available.length
+      ? ["More skills are available. Use skill_list to see all."]
+      : [];
+
+  return [SKILL_GUIDANCE, "<available_skills>", ...lines, "</available_skills>", ...footer].join(
+    "\n",
+  );
+}
+
+export function compactSkillIndex(documents: SkillDocument[], limit = 20): string {
+  return formatAvailableSkills(documents, { compact: true, limit });
+}
+
+export async function formatSkillContent(document: SkillDocument): Promise<string> {
+  const files = await collectSkillFiles(document);
+  const baseDirectory = dirname(document.path);
+  return [
+    `<skill_content name="${escapeXml(document.name)}">`,
+    `# Skill: ${document.name}`,
+    "",
+    document.body.trim(),
+    "",
+    `Base directory for this skill: ${baseDirectory}`,
+    "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.",
+    "Note: file list is sampled.",
+    "",
+    "<skill_files>",
+    ...files.map((file) => `<file>${escapeXml(file)}</file>`),
+    "</skill_files>",
+    "</skill_content>",
+  ].join("\n");
+}
+
+export async function formatActiveSkills(
+  documents: SkillDocument[],
+  maxChars = 80_000,
+): Promise<string> {
+  if (documents.length === 0) return "";
+
+  const header = [
+    "# Active skills",
+    ...documents.map((document) => `- ${document.name}: follow the loaded <skill_content>.`),
+    "- Follow the loaded skill before using web search or general knowledge.",
+  ].join("\n");
+
+  const blocks: string[] = [];
+  let used = header.length;
+  for (const document of documents) {
+    const block = await formatSkillContent(document);
+    if (used + block.length > maxChars) {
+      blocks.push(
+        [
+          `<skill_content name="${escapeXml(document.name)}">`,
+          `# Skill: ${document.name}`,
+          "",
+          `[Content omitted to stay within the context budget. Call the skill tool with id "${document.name}" to reload it.]`,
+          "</skill_content>",
+        ].join("\n"),
+      );
+      used += 220;
+      continue;
+    }
+    blocks.push(block);
+    used += block.length;
+  }
+
+  return [header, "", ...blocks].join("\n\n");
+}
+
+async function collectSkillFiles(document: SkillDocument): Promise<string[]> {
+  if (basename(document.path) !== "SKILL.md") return [basename(document.path)];
+
+  const root = dirname(document.path);
+  const files: string[] = [basename(document.path)];
+  const walk = async (directory: string, prefix: string, depth: number): Promise<void> => {
+    if (files.length >= 20 || depth > 2) return;
+    let entries: Array<{ name: string; isDirectory: () => boolean }> = [];
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (files.length >= 20) break;
+      if (entry.name.startsWith(".")) continue;
+      const relative = prefix.length > 0 ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        await walk(join(directory, entry.name), relative, depth + 1);
+      } else if (relative !== "SKILL.md") {
+        files.push(relative);
+      }
+    }
+  };
+  await walk(root, "", 0);
+  return files;
+}
+
+function escapeXml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 export class SkillRegistry {
@@ -175,19 +320,12 @@ export class SkillRegistry {
     return this.skills.get(normalizeSkillName(name));
   }
 
-  buildIndexPrompt(limit = 40): string {
-    const documents = this.listDocuments().slice(0, limit);
-    if (documents.length === 0) {
-      return [
-        "Skills: none installed.",
-        `Add one as ${join(this.skillsDir, "<name>", "SKILL.md")} with yaml frontmatter (name, description).`,
-      ].join(" ");
-    }
+  buildIndexPrompt(options: SkillIndexOptions = {}): string {
+    return formatAvailableSkills(this.listDocuments(), options);
+  }
 
-    return [
-      "Available skills. Call the `skill` tool with the exact name to load the full instructions before using a skill.",
-      ...documents.map((document) => `- ${document.name}: ${document.description}`),
-    ].join("\n");
+  listAvailableDocuments(): SkillDocument[] {
+    return this.listDocuments().filter((document) => document.autoinvoke !== false);
   }
 
   registerTools(registry: ToolRegistry): void {
@@ -199,38 +337,25 @@ export class SkillRegistry {
     return {
       name: "skill",
       description:
-        "Load the full instructions for an installed skill by name. Call this when the task matches a skill description, then follow the loaded instructions.",
+        "Load a specialized skill's instructions and resources into the current conversation when the task at hand matches its description. The skill ID must match an available skill or a skill explicitly referenced by the user. If the request names a skill ID from <available_skills>, call this tool with that ID before answering or searching the web.",
       parameters: z.object({
-        name: z.string().min(1).describe("Skill name exactly as listed in the system prompt"),
+        id: z
+          .string()
+          .min(1)
+          .describe("The ID of an available skill or a skill explicitly referenced by the user."),
       }),
       readOnly: true,
-      execute: (args) => {
-        const { name } = args as { name: string };
-        const document = this.get(name);
+      execute: async (args) => {
+        const { id } = args as { id: string };
+        const document = this.get(id);
         if (!document) {
           const available = this.listDocuments().map((entry) => entry.name);
           return available.length === 0
-            ? `unknown skill "${name}": no skills are installed`
-            : `unknown skill "${name}". Available skills: ${available.join(", ")}`;
+            ? `unknown skill "${id}": no skills are installed`
+            : `unknown skill "${id}". Available skills: ${available.join(", ")}`;
         }
 
-        return [
-          `# Skill: ${document.name}`,
-          document.description,
-          document.whenToUse ? `When to use: ${document.whenToUse}` : "",
-          document.allowedTools
-            ? `Allowed tools for this turn: ${
-                document.allowedTools.length > 0
-                  ? `${document.allowedTools.join(", ")} (plus core read-only tools)`
-                  : "none (core read-only tools only)"
-              }`
-            : "",
-          `Source: ${document.path}`,
-          "",
-          document.body,
-        ]
-          .filter((line) => line.length > 0)
-          .join("\n");
+        return formatSkillContent(document);
       },
     };
   }
@@ -238,14 +363,15 @@ export class SkillRegistry {
   private skillListTool(): AgentTool {
     return {
       name: "skill_list",
-      description: "List installed skills with their descriptions and source paths.",
+      description:
+        "List installed skills with their IDs and descriptions. Use the skill tool with an ID to load one.",
       parameters: z.object({}),
       readOnly: true,
       execute: () => {
         const documents = this.listDocuments();
         if (documents.length === 0) return "no skills are installed";
         return documents
-          .map((document) => `- ${document.name}: ${document.description} (${document.scope}, ${document.path})`)
+          .map((document) => `- ${document.name}: ${document.description} (${document.scope})`)
           .join("\n");
       },
     };
@@ -254,6 +380,32 @@ export class SkillRegistry {
 
 export function normalizeSkillName(name: string): string {
   return name.trim().toLowerCase();
+}
+
+export function parseSkillMentions(text: string, skills: SkillRegistry): SkillDocument[] {
+  const found = new Map<string, SkillDocument>();
+  for (const match of text.matchAll(/(?:^|\s)\$([a-zA-Z0-9_-]+)/g)) {
+    const document = skills.get(match[1]);
+    if (document) found.set(document.name, document);
+  }
+  return [...found.values()];
+}
+
+export function matchSkillNames(text: string, skills: SkillRegistry): SkillDocument[] {
+  const found = new Map<string, SkillDocument>();
+  for (const document of skills.listAvailableDocuments()) {
+    if (document.name.length < 3) continue;
+    const pattern = new RegExp(
+      `(^|[^a-z0-9_-])${escapeRegExp(document.name)}([^a-z0-9_-]|$)`,
+      "i",
+    );
+    if (pattern.test(text)) found.set(document.name, document);
+  }
+  return [...found.values()];
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export function defaultSkillsDirectory(repoRoot: string): string {

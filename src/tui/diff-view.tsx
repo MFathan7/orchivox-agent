@@ -3,6 +3,7 @@ import React from "react";
 import { Box, Text } from "ink";
 import { useInput } from "ink";
 
+import { toolDisplay } from "../agent/tool-display";
 import { computeLineHash } from "../tools/hashline-edit";
 import { getTheme, type Theme } from "./theme";
 
@@ -18,6 +19,8 @@ export interface DiffViewProps {
 
 export interface ToolCallBadgeProps {
   name: string;
+  label?: string;
+  detail?: string;
   argumentsSummary: string;
   durationMs?: number;
   status?: "running" | "ok" | "error";
@@ -172,7 +175,8 @@ export function DiffView({
 
 export function ToolCallBadge({
   name,
-  argumentsSummary,
+  label,
+  detail,
   durationMs,
   status = "ok",
   lspStatus,
@@ -183,13 +187,9 @@ export function ToolCallBadge({
   return (
     <Box gap={1} marginY={0}>
       <Text color={statusColor} bold>
-        {statusIcon} {name}
+        {statusIcon} {label ?? toolDisplay(name).label}
       </Text>
-      {argumentsSummary ? (
-        <Text color={theme.muted}>
-          {argumentsSummary.length > 60 ? `${argumentsSummary.slice(0, 57)}...` : argumentsSummary}
-        </Text>
-      ) : null}
+      {detail ? <Text color={theme.muted}>{detail}</Text> : null}
       {durationMs !== undefined ? <Text color={theme.muted}>{durationMs}ms</Text> : null}
       {lspStatus ? <Text color={theme.badge.running}>lsp:{lspStatus}</Text> : null}
     </Box>

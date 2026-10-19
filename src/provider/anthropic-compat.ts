@@ -391,10 +391,11 @@ export function buildMessagesPayload(
   if (req.reasoning_effort && capabilities.reasoning) {
     const minBudget = capabilities.reasoning_budget_min ?? 1024;
     const maxBudget = capabilities.reasoning_budget_max ?? 8192;
+    const effort = req.reasoning_effort.toLowerCase();
     const requested =
-      req.reasoning_effort === "high"
+      effort === "high" || effort === "max" || effort === "xhigh"
         ? maxBudget
-        : req.reasoning_effort === "medium"
+        : effort === "medium"
           ? Math.min(4096, maxBudget)
           : Math.min(1024, maxBudget);
     const headroom = Math.max(minBudget, req.max_tokens - 1024);

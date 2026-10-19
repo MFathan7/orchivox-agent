@@ -1,7 +1,7 @@
-import { resolveModelCapabilities, type AppConfig, type ModelCapabilities, type ModelCapabilitiesPatch, type ProviderProfile } from "../config/loader";
-import type { ChatRequest, StreamEvent } from "../types/schema";
+import { resolveModelCapabilities, type AppConfig, type ModeSettings, type ModelCapabilities, type ModelCapabilitiesPatch, type ProviderProfile } from "../config/loader";
+import type { AgentMode, ChatRequest, StreamEvent } from "../types/schema";
 import { AnthropicCompatProvider } from "./anthropic-compat";
-import { catalogProviderForKind, findCatalogModel, type ModelCatalog } from "./model-catalog";
+import { catalogProviderForKind, findCatalogModel, type CatalogModel, type ModelCatalog } from "./model-catalog";
 import { getCachedOllamaCapabilities } from "./ollama-introspect";
 import { OpenAICompatProvider } from "./openai-compat";
 
@@ -70,6 +70,10 @@ export class ProviderRouter {
     return this.capabilitiesForProfile(profile, model);
   }
 
+  providerKind(providerName: string): string | undefined {
+    return this.config.providers[providerName]?.kind;
+  }
+
   capabilitiesForProfile(profile: ProviderProfile, model?: string): ModelCapabilities {
     const key = model ?? profile.models[0] ?? "";
     const catalogProvider = catalogProviderForKind(profile.kind, profile.catalog_provider);
@@ -95,6 +99,71 @@ export class ProviderRouter {
       };
     }
     return this.capabilitiesFor(ref.provider, ref.model);
+  }
+
+  getMode(mode: AgentMode): LLMProvider {
+    const model = this.config.modes[mode]?.model;
+    return model ? this.provider(model.provider, model.model) : this.get("main");
+  }
+
+  getModeSettings(mode: AgentMode): ModeSettings {
+    return this.config.modes[mode];
+  }
+
+  getModeModel(mode: AgentMode): { provider: string; model: string } | undefined {
+    return this.config.modes[mode]?.model ?? this.getRole("main");
+  }
+
+  getModeReasoning(mode: AgentMode): string | undefined {
+    return this.config.modes[mode]?.reasoning;
+  }
+
+  capabilitiesForMode(mode: AgentMode): ModelCapabilities {
+    const model = this.config.modes[mode]?.model;
+    return model ? this.capabilitiesFor(model.provider, model.model) : this.capabilitiesForRole("main");
+  }
+
+  reasoningOptionsForMode(mode: AgentMode): string[] {
+    return this.reasoningOptionsFor(this.capabilitiesForMode(mode));
+  }
+
+  reasoningOptionsForRole(role: ProviderRole): string[] {
+    return this.reasoningOptionsFor(this.capabilitiesForRole(role));
+  }
+
+  private reasoningOptionsFor(capabilities: ModelCapabilities): string[] {
+    if (!capabilities.reasoning) return ["off"];
+    const efforts = capabilities.reasoning_efforts?.length
+      ? capabilities.reasoning_efforts
+      : ["low", "medium", "high"];
+    return ["off", ...new Set(efforts.map((value) => value.toLowerCase()))];
+  }
+
+  setModeModel(mode: AgentMode, provider: string, model: string): void {
+    const profile = this.config.providers[provider];
+    if (!profile) throw new Error(`unknown provider profile "${provider}"`);
+    this.config.modes[mode] = { ...this.config.modes[mode], model: { provider, model } };
+  }
+
+  setModeReasoning(mode: AgentMode, reasoning: string): void {
+    this.config.modes[mode] = { ...this.config.modes[mode], reasoning };
+  }
+
+  listCatalogModels(providerName: string): CatalogModel[] {
+    const profile = this.config.providers[providerName];
+    if (!profile) return [];
+    const catalogProvider = catalogProviderForKind(profile.kind, profile.catalog_provider);
+    const provider = catalogProvider ? this.catalog?.providers[catalogProvider] : undefined;
+    return provider ? Object.values(provider.models) : [];
+  }
+
+  addModel(providerName: string, model: string): void {
+    const profile = this.config.providers[providerName];
+    if (!profile) throw new Error(`unknown provider profile "${providerName}"`);
+    if (!profile.models.includes(model)) profile.models.push(model);
+    for (const key of [...this.instances.keys()]) {
+      if (key.startsWith(`${providerName}\u0000`)) this.instances.delete(key);
+    }
   }
 
   capabilitiesOverrideFor(providerName: string, model: string): ModelCapabilitiesPatch | undefined {

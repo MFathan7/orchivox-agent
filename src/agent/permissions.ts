@@ -153,6 +153,71 @@ export function evaluateShellRisk(command: string, cwd: string): ShellRiskDetail
   };
 }
 
+const PLAN_READ_ONLY_COMMANDS = new Set([
+  "date",
+  "pwd",
+  "whoami",
+  "id",
+  "uname",
+  "hostname",
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "grep",
+  "rg",
+  "find",
+  "stat",
+  "file",
+  "du",
+  "df",
+  "which",
+  "type",
+]);
+
+const PLAN_READ_ONLY_GIT_COMMANDS = new Set([
+  "status",
+  "log",
+  "diff",
+  "show",
+  "rev-parse",
+  "ls-files",
+  "grep",
+]);
+
+const SHELL_CONTROL_PATTERN = /[><|;&`\n]|\$\(/;
+
+/**
+ * Returns true for shell commands that only inspect the workspace or system.
+ * Plan mode uses this to allow read-only commands while still blocking writes.
+ */
+export function isPlanReadOnlyShellCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed || SHELL_CONTROL_PATTERN.test(trimmed)) return false;
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  const name = tokens[0];
+  if (!name) return false;
+
+  if (name === "date") {
+    return !tokens.some((token) => token === "-s" || token === "--set");
+  }
+  if (name === "hostname") {
+    return tokens.length === 1;
+  }
+  if (name === "git") {
+    const sub = tokens[1];
+    return Boolean(sub && PLAN_READ_ONLY_GIT_COMMANDS.has(sub));
+  }
+  if (name === "find") {
+    return !tokens.some((token) =>
+      ["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf"].includes(token),
+    );
+  }
+
+  return PLAN_READ_ONLY_COMMANDS.has(name);
+}
+
 export async function calculateDiffPreview(
   toolName: string,
   args: Record<string, unknown>,
@@ -323,13 +388,23 @@ export class GranularPermissionEngine extends EventEmitter {
     }
 
     if (mode === "plan") {
-      if (!tool.readOnly) {
+      if (tool.readOnly) {
+        return { allowed: true };
+      }
+      if (tool.name === "bash" && typeof args.command === "string") {
+        const risk = evaluateShellRisk(args.command, this.repoRoot);
+        if (isPlanReadOnlyShellCommand(args.command) && risk.riskLevel === "low") {
+          return { allowed: true };
+        }
         return {
           allowed: false,
-          reason: `Tool "${tool.name}" modifies files or state, and PLAN mode only allows read-only tools.`,
+          reason: `PLAN mode allows only read-only shell commands. ${risk.warning ?? "Use a safe inspection command or switch to build mode."}`,
         };
       }
-      return { allowed: true };
+      return {
+        allowed: false,
+        reason: `Tool "${tool.name}" modifies files or state, and PLAN mode only allows read-only tools.`,
+      };
     }
 
     let shellRisk: ShellRiskDetails | undefined;

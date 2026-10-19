@@ -1,5 +1,5 @@
 import React from "react";
-import { Box, Text, render, useInput } from "ink";
+import { Box, Text, render, useInput, useStdin } from "ink";
 
 import type { AgentMode, Message } from "../types/schema";
 import type { SubagentWorkerState } from "../agent/subagent";
@@ -9,18 +9,21 @@ import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import type { ProviderRouter } from "../provider/router";
 import type { MemoryDatabase, SessionRecord } from "../memory/sqlite";
 import type { RestoreResult, SnapshotManager } from "../vcs/snapshot";
-import type { ConfigRole } from "../config/writer";
+import type { ConfigMode, ConfigRole } from "../config/writer";
 import { AgentHub, type AgentHubTab } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
 import { ChoiceModal } from "./choice-modal";
-import { CommandPaletteModal, REASONING_LEVELS, type ReasoningEffortLevel } from "./command-palette";
+import { CommandPaletteModal, REASONING_LEVELS, reasoningLevelsFor, type ReasoningEffortLevel } from "./command-palette";
 import { PromptComposer, type FileAttachmentRef } from "./composer";
 import { HelpOverlay } from "./help-overlay";
+import { QuestionModal, type PendingQuestion } from "./question-modal";
+import type { QuestionAnswer } from "../tools/question";
 import { OrchivoxLogo } from "./logo";
 import { ModelConfigModal } from "./model-modal";
 import { SessionTimeTravelModal, type SessionModalTab } from "./session-modal";
 import { SkillsModal } from "./skills-modal";
-import { formatCost, formatTokenCount } from "./format";
+import { contextUsagePercent, formatContextUsage, formatCost } from "./format";
+import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { ThemeProvider, getTheme, type ThemeName } from "./theme";
 import {
   ScrollableChatViewport,
@@ -50,6 +53,8 @@ export type InputAction =
 export interface ChatToolCallView {
   id?: string;
   name: string;
+  label?: string;
+  detail?: string;
   argumentsSummary: string;
   durationMs?: number;
   status?: "running" | "ok" | "error";
@@ -64,16 +69,29 @@ export interface ChatFileChangeView {
   deletions?: number;
 }
 
+export interface ChatCompactionView {
+  beforeTokens: number;
+  afterTokens: number;
+  removedMessages: number;
+  auto?: boolean;
+  status?: "running" | "done" | "error";
+  error?: string;
+}
+
 export interface ChatEntryView {
   id: string;
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "compaction";
   text: string;
   thinking?: string;
   toolCalls?: ChatToolCallView[];
   files?: ChatFileChangeView[];
   live?: boolean;
   startedAt?: number;
+  mode?: AgentMode;
+  model?: string;
+  tokensPerSecond?: number;
   diff?: { oldText: string; newText: string; oldLabel?: string; newLabel?: string; unified?: boolean };
+  compaction?: ChatCompactionView;
 }
 
 export interface OrchivoxAppProps {
@@ -82,6 +100,7 @@ export interface OrchivoxAppProps {
   mcpCount?: number;
   pluginCount?: number;
   totalTokens?: number;
+  contextTokens?: number;
   totalCostUsd?: number;
   entries: ChatEntryView[];
   streamingText?: string;
@@ -96,6 +115,8 @@ export interface OrchivoxAppProps {
   onKill?: (workerId: string) => void;
   pendingApproval?: ApprovalRequest;
   onApprovalDecision?: (decision: ApprovalDecision) => void;
+  pendingQuestion?: PendingQuestion;
+  onQuestionAnswer?: (answer: QuestionAnswer) => void;
   router?: ProviderRouter;
   database?: MemoryDatabase;
   snapshots?: SnapshotManager;
@@ -105,9 +126,12 @@ export interface OrchivoxAppProps {
   onThemeChange?: (theme: ThemeName) => void;
   reasoningEffort?: ReasoningEffortLevel;
   onReasoningEffortChange?: (effort: ReasoningEffortLevel) => void;
+  onModeModelChange?: (mode: ConfigMode, provider: string, model: string) => void;
+  onModeReasoningChange?: (mode: ConfigMode, reasoning: string) => void;
   onForkSession?: (forkedSession: SessionRecord) => void;
   onResumeSession?: (sessionId: string) => void;
   onNewSession?: () => void;
+  onSessionDeleted?: (sessionId: string) => void;
   onRestoreSnapshot?: (result: RestoreResult) => void;
   todos?: SidebarTodo[];
   modifiedFiles?: SidebarFile[];
@@ -128,6 +152,7 @@ export interface OrchivoxAppProps {
   onDispatchTasks?: () => void;
   onMergeTask?: (id: string) => void;
   skills?: SkillDocument[];
+  activeSkills?: string[];
   skillsOpen?: boolean;
   onSkillsOpenChange?: (open: boolean) => void;
   onReloadSkills?: () => void;
@@ -230,7 +255,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const {
     projectName = "orchivox-agent",
     branch = "main",
-    totalTokens = 0,
+    contextTokens = 0,
     totalCostUsd = 0,
     entries,
     streamingText,
@@ -311,8 +336,24 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const terminalSize = useTerminalSize();
   const theme = getTheme(props.currentTheme ?? "tokyonight");
   const modePalette = theme.modes[mode] ?? theme.modes.build;
+  const reasoningOptions = props.router
+    ? props.router.reasoningOptionsForMode(mode)
+    : REASONING_LEVELS.map((level) => level.id);
+  const reasoningLevels = reasoningLevelsFor(reasoningOptions);
+  const modeModel = props.router?.getModeModel(mode);
+  const modeCapabilities = props.router?.capabilitiesForMode(mode);
+  const contextPercent = contextUsagePercent(contextTokens, modeCapabilities?.context_window);
+  const contextColor =
+    contextPercent === undefined
+      ? theme.muted
+      : contextPercent >= 95
+        ? theme.badge.error
+        : contextPercent >= 80
+          ? theme.badge.running
+          : theme.muted;
   const [sidebarVisible, setSidebarVisible] = React.useState(terminalSize.columns >= 100);
   const [composerRows, setComposerRows] = React.useState(4);
+  const [chatOffsetFromBottom, setChatOffsetFromBottom] = React.useState(0);
   const handleComposerRows = React.useCallback((rows: number) => setComposerRows(rows), []);
   const [escArmed, setEscArmed] = React.useState(false);
   const escTimerRef = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -339,6 +380,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
 
   const hasModalOpen =
     Boolean(props.pendingApproval) ||
+    Boolean(props.pendingQuestion) ||
     helpOpen ||
     modelsOpen ||
     skillsOpen ||
@@ -349,6 +391,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     reasoningPickerOpen;
 
   useInput((input, key) => {
+    if (isMouseSequence(input)) return;
     if (key.escape) {
       if (hasModalOpen) return;
       if (!streaming || !onAbort) return;
@@ -370,6 +413,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
 
     if (hasModalOpen) return;
 
+    if ((key as { end?: boolean }).end) {
+      setChatOffsetFromBottom(0);
+      return;
+    }
+
     if (escArmed) {
       if (escTimerRef.current) clearTimeout(escTimerRef.current);
       escTimerRef.current = undefined;
@@ -390,6 +438,19 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const innerWidth = Math.max(20, terminalSize.columns - 2);
   const chromeRows = 3 + (statusMessage || escArmed ? 1 : 0);
   const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
+  const chatScrollStep = Math.max(3, Math.floor(viewportHeight / 4));
+  const { stdin } = useStdin();
+  React.useEffect(() => {
+    const onData = (data: Buffer): void => {
+      const delta = parseMouseWheel(data.toString());
+      if (delta === 0 || hasModalOpen) return;
+      setChatOffsetFromBottom((previous) => Math.max(0, previous + delta * chatScrollStep));
+    };
+    stdin.on("data", onData);
+    return () => {
+      stdin.off("data", onData);
+    };
+  }, [hasModalOpen, chatScrollStep]);
   const showSidebar = sidebarVisible && innerWidth >= 60;
   const chatWidth = showSidebar ? Math.max(20, Math.floor(innerWidth * 0.72)) : innerWidth;
   const sidebarWidth = showSidebar ? Math.max(20, innerWidth - chatWidth) : 0;
@@ -408,21 +469,34 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             <Text bold color={theme.text}>{projectName}</Text>
             <Text color={theme.muted}>· {branch}</Text>
           </Box>
-          <Text color={theme.muted}>
-            {formatTokenCount(totalTokens)} tok · <Text color={theme.text}>{formatCost(totalCostUsd)}</Text>
-          </Text>
+          <Box gap={1}>
+            <Text color={contextColor}>
+              {formatContextUsage(contextTokens, modeCapabilities?.context_window)}
+            </Text>
+            <Text color={theme.muted}>·</Text>
+            <Text color={theme.text}>{formatCost(totalCostUsd)}</Text>
+          </Box>
         </Box>
         <Text color={theme.border.passive}>{divider}</Text>
         <Box gap={1}>
           <Text color={modePalette.primary}>●</Text>
           <Text bold color={modePalette.primary}>{mode.toUpperCase()}</Text>
-          <Text color={theme.muted}>{MODE_HINTS[mode]}</Text>
+          <Text color={theme.muted}>
+            {MODE_HINTS[mode]}
+            {modeModel ? ` · ${modeModel.provider} / ${modeModel.model}` : ""}
+          </Text>
         </Box>
 
         {props.pendingApproval && props.onApprovalDecision ? (
           <ToolApprovalModal
             request={props.pendingApproval}
             onDecision={props.onApprovalDecision}
+          />
+        ) : props.pendingQuestion && props.onQuestionAnswer ? (
+          <QuestionModal
+            request={props.pendingQuestion}
+            onAnswer={props.onQuestionAnswer}
+            theme={theme}
           />
         ) : helpOpen ? (
           <HelpOverlay
@@ -454,7 +528,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <ChoiceModal
             title="Thinking effort"
             subtitle={`Current: ${props.reasoningEffort ?? "medium"}`}
-            options={REASONING_LEVELS.map((level) => ({
+            options={reasoningLevels.map((level) => ({
               id: level.id,
               label: level.label,
               description: level.description,
@@ -462,7 +536,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             }))}
             initialIndex={Math.max(
               0,
-              REASONING_LEVELS.findIndex(
+              reasoningLevels.findIndex(
                 (level) => level.id === (props.reasoningEffort ?? "medium"),
               ),
             )}
@@ -477,6 +551,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         ) : skillsOpen ? (
           <SkillsModal
             skills={props.skills ?? []}
+            activeSkills={props.activeSkills}
             width={innerWidth}
             theme={theme}
             onReload={props.onReloadSkills}
@@ -491,6 +566,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onClose={() => setModelsOpen(false)}
             onSaved={(message) => onStatusMessage?.(message)}
             onRoleChange={onRoleChange}
+            onModeModelChange={props.onModeModelChange}
+            onModeReasoningChange={props.onModeReasoningChange}
             reasoningEffort={props.reasoningEffort}
             onReasoningChange={props.onReasoningEffortChange}
           />
@@ -499,6 +576,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             router={props.router}
             currentTheme={props.currentTheme}
             reasoningEffort={props.reasoningEffort}
+            reasoningLevels={reasoningOptions}
             onSelectTheme={props.onThemeChange}
             onSelectReasoning={props.onReasoningEffortChange}
             onOpenModels={() => setModelsOpen(true)}
@@ -541,6 +619,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onResumeSession={props.onResumeSession}
             onForkSession={props.onForkSession}
             onNewSession={props.onNewSession}
+            onSessionDeleted={props.onSessionDeleted}
             onRestoreSnapshot={props.onRestoreSnapshot}
             onClose={() => setSessionTab(null)}
           />
@@ -574,6 +653,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 repoPath={globalThis.process.cwd()}
                 branch={branch}
                 resetKey={props.activeSessionId}
+                offsetFromBottom={chatOffsetFromBottom}
+                onOffsetChange={setChatOffsetFromBottom}
+                topOffset={3}
               />
             </Box>
             {showSidebar ? (
@@ -612,7 +694,15 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onOpenHub={() => setHubOpen(true)}
             onOpenPalette={() => setPaletteOpen(true)}
             onOpenSessions={() => setSessionTab("sessions")}
+            onScrollLine={(delta) =>
+              setChatOffsetFromBottom((value) => Math.max(0, value + delta * chatScrollStep))
+            }
+            onScrollPage={(delta) =>
+              setChatOffsetFromBottom((value) => Math.max(0, value + delta * viewportHeight))
+            }
+            onScrollToBottom={() => setChatOffsetFromBottom(0)}
             onSubmit={(payload) => {
+              setChatOffsetFromBottom(0);
               const action = interpretInput(payload.rawText);
               if (action.kind === "command") {
                 if (action.command === "/help") {

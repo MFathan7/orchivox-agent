@@ -15,8 +15,10 @@ import type { SkillDocument } from "./agent/skills";
 import type { ApprovalDecision, ApprovalRequest } from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
 import { loadConfig, type AppConfig } from "./config/loader";
+import { saveModeReasoning, type ConfigMode } from "./config/writer";
 import { LSPClient } from "./ide/lsp-client";
 import { RulesLoader } from "./memory/rules-loader";
+import { estimateMessageTokens } from "./memory/hindsight";
 import { MemoryDatabase, type SessionRecord } from "./memory/sqlite";
 import { McpClientManager } from "./mcp/client";
 import { McpToolServer } from "./mcp/server";
@@ -28,9 +30,13 @@ import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
 import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
 import { runGit } from "./vcs/git";
 import { WorktreeManager } from "./vcs/worktree";
-import { formatCost, formatTokenCount } from "./tui/format";
+import { formatContextUsage, formatContextWindow, formatCost, formatTokenCount } from "./tui/format";
 import { installSynchronizedOutput, OrchivoxApp, type ChatEntryView, type InputAction } from "./tui/app";
-import type { FileAttachmentRef } from "./tui/composer";import type { HashlineLifecycle } from "./tools/hashline-edit";
+import { buildTranscriptEntries } from "./tui/transcript";
+import type { FileAttachmentRef } from "./tui/composer";
+import type { PendingQuestion } from "./tui/question-modal";
+import type { QuestionAnswer } from "./tools/question";
+import type { HashlineLifecycle } from "./tools/hashline-edit";
 import type { ThemeName } from "./tui/theme";
 import { basename, relative } from "node:path";
 import { WorkspaceTrustManager } from "./security/workspace-trust";
@@ -109,11 +115,8 @@ export function modeToProfile(mode: AgentMode): AgentProfile {
   return "orchivox-main";
 }
 
-export function reasoningEffortToRequest(
-  level: ReasoningEffortLevel,
-): "low" | "medium" | "high" | undefined {
-  if (level === "off") return undefined;
-  if (level === "max") return "high";
+export function reasoningEffortToRequest(level: string): string | undefined {
+  if (level === "off" || level === "none") return undefined;
   return level;
 }
 
@@ -339,7 +342,7 @@ async function runTuiSession(
   print: (text: string) => void,
 ): Promise<{ close: () => Promise<void> }> {
   // xterm modifyOtherKeys level 1: makes Shift+Enter distinct from Enter.
-  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[>4;1m");
+  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[>4;1m\x1b[?1000h\x1b[?1006h");
 
   const projectName = basename(globalThis.process.cwd());
   const root = globalThis.process.cwd();
@@ -352,10 +355,16 @@ async function runTuiSession(
     mode: "build" as AgentMode,
     currentTheme: "tokyonight" as ThemeName,
     reasoningEffort: "medium" as ReasoningEffortLevel,
+    reasoningByMode: {
+      plan: "medium",
+      build: "medium",
+      ultrawork: "medium",
+    } as Record<AgentMode, ReasoningEffortLevel>,
     streamingText: "",
     liveEntry: undefined as ChatEntryView | undefined,
     modifiedFiles: new Map<string, { path: string; additions: number; deletions: number }>(),
     totalTokens: 0,
+    contextTokens: 0,
     totalPromptTokens: 0,
     totalCompletionTokens: 0,
     totalCostUsd: 0,
@@ -365,22 +374,49 @@ async function runTuiSession(
     modelsOpen: false,
     skillsOpen: false,
     skills: runtime.orchestrator.skills.listDocuments() as SkillDocument[],
+    activeSkills: [] as string[],
     hubTab: "workers" as "workers" | "tasks",
     paletteOpen: false,
     sessionTab: null as SessionModalTab | null,
     hubOpen: false,
     notice: undefined as string | undefined,
   };
+  for (const mode of ["plan", "build", "ultrawork"] as AgentMode[]) {
+    const configured = runtime.config.modes[mode]?.reasoning;
+    if (configured) state.reasoningByMode[mode] = configured as ReasoningEffortLevel;
+  }
+  state.reasoningEffort = state.reasoningByMode[state.mode];
+  const setActiveMode = (next: AgentMode): void => {
+    state.mode = next;
+    const options = runtime.router.reasoningOptionsForMode(next);
+    const stored = state.reasoningByMode[next];
+    state.reasoningEffort = options.includes(stored)
+      ? stored
+      : ((options[0] as ReasoningEffortLevel | undefined) ?? "off");
+  };
+  const estimateContextTokens = (mode: AgentMode, messages: Message[]): number => {
+    const overhead = runtime.orchestrator.estimateContextOverhead(mode);
+    return overhead + messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+  };
   let relay: CollabRelay | undefined;
   let branch = "unknown";
   let pendingApproval: ApprovalRequest | undefined;
   let approvalResolver: ((decision: ApprovalDecision) => void) | undefined;
+  let pendingQuestion: PendingQuestion | undefined;
+  let questionResolver: ((answer: QuestionAnswer) => void) | undefined;
   let activeAbortController: AbortController | undefined;
 
   runtime.orchestrator.permissions.setApprovalHandler((request) => {
     return new Promise<ApprovalDecision>((resolve) => {
       pendingApproval = request;
       approvalResolver = resolve;
+      rerender();
+    });
+  });
+  runtime.orchestrator.setQuestionHandler((request) => {
+    return new Promise<QuestionAnswer>((resolve) => {
+      pendingQuestion = request;
+      questionResolver = resolve;
       rerender();
     });
   });
@@ -394,6 +430,27 @@ async function runTuiSession(
   const pushEntry = (role: ChatEntryView["role"], text: string, extra?: Partial<ChatEntryView>): void => {
     state.counter += 1;
     state.entries = [...state.entries, { id: `entry-${state.counter}`, role, text, ...extra }];
+  };
+
+  const pushCompactionEntry = (compaction: {
+    summary?: string;
+    beforeTokens: number;
+    afterTokens: number;
+    removedMessages: number;
+    auto?: boolean;
+    status?: "running" | "done" | "error";
+    error?: string;
+  }): void => {
+    pushEntry("compaction", compaction.summary ?? "", {
+      compaction: {
+        beforeTokens: compaction.beforeTokens,
+        afterTokens: compaction.afterTokens,
+        removedMessages: compaction.removedMessages,
+        auto: compaction.auto,
+        status: compaction.status ?? "done",
+        error: compaction.error,
+      },
+    });
   };
 
   const sessionTitle = (text: string): string => {
@@ -462,6 +519,24 @@ async function runTuiSession(
     rerender();
   };
 
+  const resetToWelcome = (): void => {
+    state.sessionId = undefined;
+    state.sessionEpoch += 1;
+    state.entries = [];
+    state.messages = [];
+    state.liveEntry = undefined;
+    state.streamingText = "";
+    state.activeSkills = [];
+    state.contextTokens = 0;
+    state.totalTokens = 0;
+    state.totalPromptTokens = 0;
+    state.totalCompletionTokens = 0;
+    state.totalCostUsd = 0;
+    state.modifiedFiles.clear();
+    state.counter = 0;
+    state.busy = false;
+  };
+
   const reloadSkills = async (): Promise<void> => {
     state.skills = await runtime.orchestrator.skills.load(true);
     rerender();
@@ -473,6 +548,7 @@ async function runTuiSession(
     mcpCount: runtime.mcpServers.length,
     pluginCount: runtime.plugins.loaded.length,
     totalTokens: state.totalTokens,
+    contextTokens: state.contextTokens,
     totalCostUsd: state.totalCostUsd,
     entries: state.entries,
     streamingText: state.streamingText,
@@ -500,6 +576,7 @@ async function runTuiSession(
     },
     skillsOpen: state.skillsOpen,
     skills: state.skills,
+    activeSkills: state.activeSkills,
     onSkillsOpenChange: (open: boolean) => {
       state.skillsOpen = open;
       rerender();
@@ -532,6 +609,22 @@ async function runTuiSession(
     onRoleChange: (role: "main" | "fast" | "advisor", provider: string, model: string) => {
       setNotice(`${role} now uses ${provider} / ${model}`);
     },
+    onModeModelChange: (mode: ConfigMode, provider: string, model: string) => {
+      runtime.router.setModeModel(mode, provider, model);
+      setNotice(`${mode} mode now uses ${provider} / ${model}`);
+    },
+    onModeReasoningChange: (mode: ConfigMode, reasoning: string) => {
+      state.reasoningByMode[mode] = reasoning as ReasoningEffortLevel;
+      if (state.mode === mode) state.reasoningEffort = reasoning as ReasoningEffortLevel;
+      runtime.router.setModeReasoning(mode, reasoning);
+      void saveModeReasoning(`${root}/.agent/config.yaml`, mode, reasoning).catch((error) => {
+        setNotice(
+          `Could not save reasoning: ${error instanceof Error ? error.message : String(error)}`,
+          6000,
+        );
+      });
+      setNotice(`${mode} mode thinking effort: ${reasoning}`);
+    },
     paletteOpen: state.paletteOpen,
     onPaletteOpenChange: (open: boolean) => {
       state.paletteOpen = open;
@@ -554,6 +647,14 @@ async function runTuiSession(
     reasoningEffort: state.reasoningEffort,
     onReasoningEffortChange: (effort: ReasoningEffortLevel) => {
       state.reasoningEffort = effort;
+      state.reasoningByMode[state.mode] = effort;
+      runtime.router.setModeReasoning(state.mode, effort);
+      void saveModeReasoning(`${root}/.agent/config.yaml`, state.mode, effort).catch((error) => {
+        setNotice(
+          `Could not save reasoning: ${error instanceof Error ? error.message : String(error)}`,
+          6000,
+        );
+      });
       pushEntry("system", `model reasoning level set to: ${effort}`);
       rerender();
     },
@@ -569,17 +670,12 @@ async function runTuiSession(
       const msgs = runtime.database.loadMessages(sessionId);
       const history = runtime.database.loadFullMessages(sessionId);
       state.messages = msgs;
-      state.entries = history.map((m, idx) => ({
-        id: `entry-${idx + 1}`,
-        role: m.role === "system" ? "system" : m.role === "assistant" ? "assistant" : "user",
-        text: m.content
-          .map((b) => (b.type === "text" ? b.text : ""))
-          .filter(Boolean)
-          .join(" "),
-      }));
-      state.counter = history.length;
+      state.activeSkills = runtime.database.listSessionSkills(sessionId).map((skill) => skill.name);
+      state.entries = buildTranscriptEntries(history, runtime.database.getCompaction(sessionId));
+      state.counter = state.entries.length;
       const sess = runtime.database.getSession(sessionId);
-      if (sess) state.mode = sess.mode;
+      if (sess) setActiveMode(sess.mode);
+      state.contextTokens = estimateContextTokens(state.mode, state.messages);
       state.totalTokens = sess?.totalTokens ?? 0;
       state.totalCostUsd = sess?.totalCostUsd ?? 0;
       state.totalPromptTokens = 0;
@@ -597,7 +693,7 @@ async function runTuiSession(
       }
       state.sessionId = forked.id;
       state.sessionEpoch += 1;
-      state.mode = forked.mode;
+      setActiveMode(forked.mode);
       state.liveEntry = undefined;
       state.modifiedFiles.clear();
       state.totalTokens = forked.totalTokens ?? 0;
@@ -607,20 +703,34 @@ async function runTuiSession(
       const msgs = runtime.database.loadMessages(forked.id);
       const history = runtime.database.loadFullMessages(forked.id);
       state.messages = msgs;
-      state.entries = history.map((m, idx) => ({
-        id: `entry-${idx + 1}`,
-        role: m.role === "system" ? "system" : m.role === "assistant" ? "assistant" : "user",
-        text: m.content
-          .map((b) => (b.type === "text" ? b.text : ""))
-          .filter(Boolean)
-          .join(" "),
-      }));
-      state.counter = history.length;
+      state.contextTokens = estimateContextTokens(state.mode, state.messages);
+      state.activeSkills = runtime.database.listSessionSkills(forked.id).map((skill) => skill.name);
+      state.entries = buildTranscriptEntries(history, runtime.database.getCompaction(forked.id));
+      state.counter = state.entries.length;
       pushEntry("system", `session forked to: ${forked.title}`);
       rerender();
     },
     onRestoreSnapshot: (result: RestoreResult) => {
       pushEntry("system", `restored snapshot ${result.snapshotId}: ${result.restoredFiles.length} file(s) restored`);
+      rerender();
+    },
+    onSessionDeleted: (sessionId: string) => {
+      if (state.sessionId !== sessionId) return;
+      activeAbortController?.abort();
+      if (questionResolver) {
+        const resolve = questionResolver;
+        questionResolver = undefined;
+        pendingQuestion = undefined;
+        resolve({ selected: [], cancelled: true });
+      }
+      if (approvalResolver) {
+        const resolve = approvalResolver;
+        approvalResolver = undefined;
+        pendingApproval = undefined;
+        resolve({ approved: false, choice: "deny", reason: "Active session deleted." });
+      }
+      resetToWelcome();
+      setNotice("Session deleted. Starting a new draft.", 5000);
       rerender();
     },
     pendingApproval,
@@ -631,8 +741,16 @@ async function runTuiSession(
       resolver?.(decision);
       rerender();
     },
+    pendingQuestion,
+    onQuestionAnswer: (answer: QuestionAnswer) => {
+      const resolver = questionResolver;
+      pendingQuestion = undefined;
+      questionResolver = undefined;
+      resolver?.(answer);
+      rerender();
+    },
     onModeChange: (next: AgentMode) => {
-      state.mode = next;
+      setActiveMode(next);
       rerender();
     },
     onSteer: (workerId: string, instruction: string) => {
@@ -650,6 +768,18 @@ async function runTuiSession(
       rerender();
     },
     onAbort: () => {
+      if (questionResolver) {
+        const resolve = questionResolver;
+        questionResolver = undefined;
+        pendingQuestion = undefined;
+        resolve({ selected: [], cancelled: true });
+      }
+      if (approvalResolver) {
+        const resolve = approvalResolver;
+        approvalResolver = undefined;
+        pendingApproval = undefined;
+        resolve({ approved: false, choice: "deny", reason: "Cancelled by user." });
+      }
       if (activeAbortController) {
         activeAbortController.abort();
         pushEntry("system", "process cancelled by user.");
@@ -701,6 +831,10 @@ async function runTuiSession(
       rerender();
       return;
     }
+    if (state.sessionId && !runtime.database.getSession(state.sessionId)) {
+      resetToWelcome();
+      setNotice("The active session was deleted. Starting a new session.", 5000);
+    }
     pushEntry("user", displayUserText ?? promptText);
     for (const attachment of attachments ?? []) {
       if (attachment.kind === "image" && attachment.error) {
@@ -736,8 +870,8 @@ async function runTuiSession(
     const compactionConfig = runtime.config.compaction;
     if (compactionConfig.auto) {
       try {
-        const provider = runtime.router.get("main");
-        const capabilities = runtime.router.capabilitiesForRole("main");
+        const provider = runtime.router.getMode(state.mode);
+        const capabilities = runtime.router.capabilitiesForMode(state.mode);
         const compaction = await compactMessages(state.messages, {
           provider,
           contextWindow: capabilities.context_window,
@@ -749,23 +883,32 @@ async function runTuiSession(
         });
         if (compaction.didCompact) {
           state.messages = compaction.messages;
+          state.contextTokens = compaction.afterTokens;
           runtime.database.saveCompaction(sessionId, {
             summary: compaction.summary ?? "",
             tail_start_message_id: compaction.tailStartMessageId,
             before_tokens: compaction.beforeTokens,
             after_tokens: compaction.afterTokens,
             created_at: Date.now(),
+            removed_messages: compaction.removedMessages,
+            auto: true,
           });
-          pushEntry(
-            "system",
-            `Context compacted: ${formatTokenCount(compaction.beforeTokens)} -> ${formatTokenCount(compaction.afterTokens)} tokens`,
-          );
+          pushCompactionEntry({
+            summary: compaction.summary,
+            beforeTokens: compaction.beforeTokens,
+            afterTokens: compaction.afterTokens,
+            removedMessages: compaction.removedMessages,
+            auto: true,
+          });
           rerender();
         }
       } catch {
         // Compaction is best effort; the turn can still proceed.
       }
     }
+    const turnMode = state.mode;
+    const turnModel = runtime.router.getModeModel(turnMode)?.model;
+    const turnStartedAt = Date.now();
     const liveEntry: ChatEntryView = {
       id: "live",
       role: "assistant",
@@ -774,7 +917,9 @@ async function runTuiSession(
       toolCalls: [],
       files: [],
       live: true,
-      startedAt: Date.now(),
+      startedAt: turnStartedAt,
+      mode: turnMode,
+      model: turnModel,
     };
     state.liveEntry = liveEntry;
     activeAbortController = new AbortController();
@@ -788,7 +933,7 @@ async function runTuiSession(
     rerender();
     try {
       const request = AgentRunRequestSchema.parse({
-        profile: modeToProfile(state.mode),
+        profile: modeToProfile(turnMode),
         messages: state.messages,
         metadata: {
           ...(targetAgent ? { agent: targetAgent } : {}),
@@ -798,9 +943,17 @@ async function runTuiSession(
         reasoning_effort: reasoningEffortToRequest(state.reasoningEffort),
       });
       let answer = "";
+      let sawUsage = false;
       let finishReason: string | undefined;
+      let firstTokenAt: number | undefined;
+      let lastTokenAt: number | undefined;
+      let lastToolEndAt = turnStartedAt;
+      let completionTokens = 0;
       for await (const event of runtime.orchestrator.runStream(request, activeAbortController.signal)) {
         if (event.type === "token") {
+          const now = Date.now();
+          if (firstTokenAt === undefined) firstTokenAt = now;
+          lastTokenAt = now;
           answer += event.text;
           liveEntry.text = answer;
           state.streamingText = answer;
@@ -816,12 +969,17 @@ async function runTuiSession(
             {
               id: event.id,
               name: event.name,
+              label: event.label,
+              detail: event.file_path
+                ? relative(root, event.file_path) || event.file_path
+                : event.detail,
               argumentsSummary: event.arguments_summary,
               status: "running",
             },
           ];
           renderLive(true);
         } else if (event.type === "tool_end") {
+          lastToolEndAt = Date.now();
           liveEntry.toolCalls = (liveEntry.toolCalls ?? []).map((call) =>
             call.id === event.id
               ? { ...call, status: event.status, durationMs: event.duration_ms }
@@ -847,12 +1005,24 @@ async function runTuiSession(
             deletions: (existing?.deletions ?? 0) + event.deletions,
           });
           renderLive(true);
+        } else if (event.type === "prompt_preflight") {
+          state.activeSkills = event.active_skills;
+          renderLive(true);
         } else if (event.type === "skill_activated") {
+          if (!state.activeSkills.includes(event.name)) {
+            state.activeSkills = [...state.activeSkills, event.name];
+          }
           const scope =
             event.allowed_tools.length > 0
               ? `tools limited to ${event.allowed_tools.join(", ")}`
               : "core read-only tools only";
-          pushEntry("system", `skill ${event.name} active · ${scope}`);
+          const trigger =
+            event.trigger === "auto"
+              ? " (auto)"
+              : event.trigger === "mention"
+                ? " (mention)"
+                : "";
+          pushEntry("system", `skill ${event.name} active${trigger} · ${scope}`);
           renderLive(true);
         } else if (event.type === "advisor_note") {
           pushEntry("system", `[advisor note] ${event.note}`);
@@ -861,10 +1031,14 @@ async function runTuiSession(
           pushEntry("system", `[bg_process ${event.processId}] ${event.status}`);
           renderLive(true);
         } else if (event.type === "compaction") {
-          pushEntry(
-            "system",
-            `Context compacted: ${formatTokenCount(event.before_tokens)} -> ${formatTokenCount(event.after_tokens)} tokens`,
-          );
+          state.contextTokens = event.after_tokens;
+          pushCompactionEntry({
+            summary: event.summary,
+            beforeTokens: event.before_tokens,
+            afterTokens: event.after_tokens,
+            removedMessages: event.removed_messages,
+            auto: event.reason !== "manual",
+          });
           renderLive(true);
         } else if (event.type === "error") {
           pushEntry("system", `provider error: ${event.message}`);
@@ -873,6 +1047,9 @@ async function runTuiSession(
           finishReason = event.finish_reason;
         } else if (event.type === "usage") {
           const usedTokens = event.prompt_tokens + event.completion_tokens;
+          sawUsage = true;
+          completionTokens = event.completion_tokens;
+          state.contextTokens = event.total_tokens ?? usedTokens;
           state.totalTokens += usedTokens;
           state.totalPromptTokens += event.prompt_tokens;
           state.totalCompletionTokens += event.completion_tokens;
@@ -885,10 +1062,21 @@ async function runTuiSession(
           renderLive();
         }
       }
+      const speedStart = Math.max(lastToolEndAt, firstTokenAt ?? lastToolEndAt);
+      const streamedMs = (lastTokenAt ?? 0) - speedStart;
+      const totalMs = (lastTokenAt ?? Date.now()) - turnStartedAt;
+      const generationMs = streamedMs >= 500 ? streamedMs : Math.max(500, totalMs);
+      const tokensPerSecond =
+        completionTokens > 0 && generationMs > 0
+          ? completionTokens / (generationMs / 1000)
+          : undefined;
       pushEntry("assistant", answer || "(no output)", {
         thinking: liveEntry.thinking,
         toolCalls: liveEntry.toolCalls,
         files: liveEntry.files,
+        mode: turnMode,
+        model: turnModel,
+        tokensPerSecond,
       });
       if (finishReason === "length") {
         pushEntry("system", "turn stopped at the turn limit; send another message to continue");
@@ -898,8 +1086,15 @@ async function runTuiSession(
         role: "assistant",
         content: [{ type: "text", text: answer }],
         created_at: Date.now(),
+        metadata: {
+          mode: turnMode,
+          model: turnModel,
+          tokens_per_second: tokensPerSecond,
+          completion_tokens: completionTokens,
+        },
       };
       state.messages = [...state.messages, assistantMsg];
+      if (!sawUsage) state.contextTokens = estimateContextTokens(state.mode, state.messages);
       try {
         runtime.database.saveMessage(sessionId, assistantMsg);
       } catch {
@@ -925,24 +1120,24 @@ async function runTuiSession(
         break;
       }
       case "/plan": {
-        state.mode = "plan";
+        setActiveMode("plan");
         setNotice("Mode: plan (read-only)");
         break;
       }
       case "/build": {
-        state.mode = "build";
+        setActiveMode("build");
         setNotice("Mode: build (approval on write)");
         break;
       }
       case "/ultrawork": {
-        state.mode = "ultrawork";
+        setActiveMode("ultrawork");
         setNotice("Mode: ultrawork (autonomous)");
         break;
       }
       case "/mode": {
         const targetMode = args.trim().toLowerCase();
         if (targetMode === "plan" || targetMode === "build" || targetMode === "ultrawork") {
-          state.mode = targetMode as AgentMode;
+          setActiveMode(targetMode as AgentMode);
           setNotice(`Mode: ${targetMode}`);
         } else if (!targetMode) {
           setNotice(`Current mode: ${state.mode}. Options: plan, build, ultrawork`);
@@ -966,13 +1161,29 @@ async function runTuiSession(
       case "/reasoning": {
         let targetReasoning = args.trim().toLowerCase();
         if (targetReasoning === "med") targetReasoning = "medium";
-        if (targetReasoning === "off" || targetReasoning === "low" || targetReasoning === "medium" || targetReasoning === "high" || targetReasoning === "max") {
-          state.reasoningEffort = targetReasoning as ReasoningEffortLevel;
+        const options = runtime.router.reasoningOptionsForMode(state.mode);
+        if (targetReasoning && options.includes(targetReasoning)) {
+          state.reasoningByMode[state.mode] = targetReasoning as ReasoningEffortLevel;
+          state.reasoningEffort = state.reasoningByMode[state.mode];
+          runtime.router.setModeReasoning(state.mode, targetReasoning);
+          void saveModeReasoning(`${root}/.agent/config.yaml`, state.mode, targetReasoning).catch(
+            (error) => {
+              setNotice(
+                `Could not save reasoning: ${error instanceof Error ? error.message : String(error)}`,
+                6000,
+              );
+            },
+          );
           setNotice(`Thinking effort: ${targetReasoning}`);
         } else if (!targetReasoning) {
-          setNotice(`Current thinking effort: ${state.reasoningEffort}. Options: off, low, medium, high, max`);
+          setNotice(
+            `Current thinking effort (${state.mode}): ${state.reasoningEffort}. Options: ${options.join(", ")}`,
+          );
         } else {
-          setNotice(`Unknown thinking effort "${targetReasoning}". Options: off, low, medium, high, max`, 8000);
+          setNotice(
+            `Unknown thinking effort "${targetReasoning}". Options: ${options.join(", ")}`,
+            8000,
+          );
         }
         break;
       }
@@ -1025,6 +1236,9 @@ async function runTuiSession(
         const snapshotCount = snapshotHistory.entries.length;
         const taskSummary = runtime.orchestrator.tasks.summary();
         const skillCount = runtime.orchestrator.skills.listDocuments().length;
+        const modeModel = runtime.router.getModeModel(state.mode);
+        const capabilities = runtime.router.capabilitiesForMode(state.mode);
+        const contextWindow = capabilities.context_window;
         pushEntry("system", [
           "Session Statistics:",
           `  Active Session ID : ${state.sessionId ?? "(draft)"}`,
@@ -1034,15 +1248,40 @@ async function runTuiSession(
           `    Output tokens   : ${formatTokenCount(state.totalCompletionTokens, false)}`,
           `  Estimated Cost    : ${formatCost(state.totalCostUsd)}`,
           `  Active Agent Mode : ${state.mode}`,
-          `  Reasoning Level   : ${state.reasoningEffort}`,
+          `  Mode Model        : ${modeModel ? `${modeModel.provider} / ${modeModel.model}` : "not configured"}`,
+          `  Context Used      : ${formatContextUsage(state.contextTokens, contextWindow)}`,
+          `  Context Window    : ${formatContextWindow(contextWindow)} (${capabilities.source ?? "inferred"})`,
+          `  Reasoning Level   : ${state.reasoningEffort} (${state.mode})`,
           `  Visual Theme      : ${state.currentTheme}`,
           `  Connected MCP     : ${runtime.mcpServers.length > 0 ? runtime.mcpServers.join(", ") : "none"}`,
           `  Loaded Plugins    : ${runtime.plugins.loaded.length > 0 ? runtime.plugins.loaded.join(", ") : "none"}`,
           `  Skills Installed  : ${skillCount}`,
+          `  Active Skills     : ${state.activeSkills.length > 0 ? state.activeSkills.join(", ") : "none"}`,
           `  Task Board        : ${taskSummary.completed}/${taskSummary.total} completed, ${taskSummary.running} running, ${taskSummary.blocked} blocked`,
           `  Git Branch        : ${branch}`,
           `  VCS Snapshots     : ${snapshotCount} snapshots recorded`,
           `  Saved Sessions    : ${sessionCount} total sessions in database`,
+        ].join("\n"));
+        rerender();
+        break;
+      }
+      case "/debug": {
+        const snapshot = runtime.orchestrator.getLastPromptInfo(state.sessionId);
+        if (!snapshot) {
+          pushEntry("system", "No prompt captured yet. Send a message first.");
+          rerender();
+          break;
+        }
+        pushEntry("system", [
+          `Prompt style     : ${snapshot.style}`,
+          `System chars     : ${snapshot.system.length}`,
+          `Tools            : ${snapshot.toolCount}`,
+          `Available skills : ${snapshot.availableSkills}`,
+          `Active skills    : ${snapshot.activeSkills.join(", ") || "none"}`,
+          `Skill mentions   : ${snapshot.skillMentions.join(", ") || "none"}`,
+          "",
+          "----- system prompt -----",
+          snapshot.system,
         ].join("\n"));
         rerender();
         break;
@@ -1081,13 +1320,13 @@ async function runTuiSession(
         }
         let provider: LLMProvider;
         try {
-          provider = runtime.router.get("main");
+          provider = runtime.router.getMode(state.mode);
         } catch (error) {
           pushEntry("system", `compact failed: ${error instanceof Error ? error.message : String(error)}`);
           break;
         }
         const compactionConfig = runtime.config.compaction;
-        const capabilities = runtime.router.capabilitiesForRole("main");
+        const capabilities = runtime.router.capabilitiesForMode(state.mode);
         state.busy = true;
         setNotice("Compacting session context...", 30_000);
         rerender();
@@ -1103,10 +1342,14 @@ async function runTuiSession(
             force: true,
           });
           if (!result.didCompact) {
-            pushEntry("system", "nothing to compact");
+            pushEntry(
+              "system",
+              `nothing to compact (${formatTokenCount(result.beforeTokens)} tokens)`,
+            );
             setNotice("Nothing to compact", 4000);
           } else {
             state.messages = result.messages;
+            state.contextTokens = result.afterTokens;
             if (state.sessionId) {
               runtime.database.saveCompaction(state.sessionId, {
                 summary: result.summary ?? "",
@@ -1114,12 +1357,17 @@ async function runTuiSession(
                 before_tokens: result.beforeTokens,
                 after_tokens: result.afterTokens,
                 created_at: Date.now(),
+                removed_messages: result.removedMessages,
+                auto: false,
               });
             }
-            pushEntry(
-              "system",
-              `Context compacted: ${formatTokenCount(result.beforeTokens)} -> ${formatTokenCount(result.afterTokens)} tokens (removed ${result.removedMessages} message(s))`,
-            );
+            pushCompactionEntry({
+              summary: result.summary,
+              beforeTokens: result.beforeTokens,
+              afterTokens: result.afterTokens,
+              removedMessages: result.removedMessages,
+              auto: false,
+            });
             setNotice("Context compacted", 4000);
           }
         } catch (error) {
@@ -1169,8 +1417,10 @@ async function runTuiSession(
         state.counter = 0;
         state.streamingText = "";
         state.liveEntry = undefined;
+        state.activeSkills = [];
         state.modifiedFiles.clear();
         state.totalTokens = 0;
+        state.contextTokens = 0;
         state.totalPromptTokens = 0;
         state.totalCompletionTokens = 0;
         state.totalCostUsd = 0;
@@ -1232,7 +1482,7 @@ async function runTuiSession(
       await handleCommand(action.command, action.args ?? "", action.raw ?? text);
       return;
     }
-    if (action.ultrawork) state.mode = "ultrawork";
+    if (action.ultrawork) setActiveMode("ultrawork");
     await executeTurn(text, undefined, undefined, attachments);
   };
 
@@ -1240,7 +1490,7 @@ async function runTuiSession(
     if (noticeTimer) clearTimeout(noticeTimer);
     clearInterval(activityTimer);
     synced.uninstall();
-    process.stdout.write("\x1b[>4;0m\x1b[?1049l");
+    process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[?1049l");
     void runtime.close().then(() => {
       process.exit(0);
     });
@@ -1254,7 +1504,7 @@ async function runTuiSession(
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);
-  process.stdout.write("\x1b[>4;0m\x1b[?1049l");
+  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[?1049l");
   await relay?.close();
   await runtime.close();
   print("session closed");

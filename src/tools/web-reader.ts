@@ -2,6 +2,10 @@ import { z } from "zod";
 
 import type { AgentTool, ToolRegistry } from "./registry";
 
+export type WebSearchProvider = "tavily" | "brave" | "exa" | "duckduckgo";
+export type WebSearchProviderChoice = WebSearchProvider | "random";
+export type WebFetchFormat = "markdown" | "text" | "html";
+
 export interface WebReaderOptions {
   fetchImpl?: typeof fetch;
   env?: Record<string, string | undefined>;
@@ -11,12 +15,30 @@ export interface WebReaderOptions {
     exa?: string;
     duckduckgo?: string;
   };
+  search?: {
+    enabled?: boolean;
+    provider?: WebSearchProviderChoice;
+  };
+  fetch?: {
+    enabled?: boolean;
+  };
+}
+
+export interface WebFetchOptions extends WebReaderOptions {
+  format?: WebFetchFormat;
+  timeout?: number;
 }
 
 interface SearchResult {
   title: string;
   url: string;
   snippet: string;
+  published?: string;
+}
+
+export interface WebSearchResult {
+  provider: WebSearchProvider;
+  results: SearchResult[];
 }
 
 const DEFAULT_ENDPOINTS = {
@@ -26,25 +48,39 @@ const DEFAULT_ENDPOINTS = {
   duckduckgo: "https://html.duckduckgo.com/html/",
 };
 
+const DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; Orchivox/1.0; +https://github.com/orchivox)";
+const MAX_FETCH_CHARS = 200_000;
+const DEFAULT_FETCH_TIMEOUT_SECONDS = 30;
+const MAX_FETCH_TIMEOUT_SECONDS = 120;
+const DEFAULT_SEARCH_RESULTS = 8;
+const NO_RESULTS = "No search results found. Please try a different query.";
+
+const providerCooldowns = new Map<WebSearchProvider, number>();
+
+export function resetWebSearchCooldowns(): void {
+  providerCooldowns.clear();
+}
+
 export function registerWebTools(registry: ToolRegistry, options: WebReaderOptions = {}): void {
-  registry.register(createWebSearchTool(options));
-  registry.register(createWebFetchTool(options));
+  if (options.search?.enabled !== false) registry.register(createWebSearchTool(options));
+  if (options.fetch?.enabled !== false) registry.register(createWebFetchTool(options));
 }
 
 export function createWebSearchTool(options: WebReaderOptions = {}): AgentTool {
   return {
     name: "web_search",
-    description:
-      "Search the web. Uses Tavily, Brave, or Exa when their API keys are set (TAVILY_API_KEY, BRAVE_API_KEY, EXA_API_KEY) and falls back to DuckDuckGo.",
+    description: [
+      "Search the web for current information beyond your knowledge cutoff.",
+      `The current year is ${new Date().getFullYear()}. Use this year when searching for recent information or current events.`,
+    ].join(" "),
     parameters: z.object({
-      query: z.string().min(1),
-      maxResults: z.number().int().positive().max(20).default(8),
-      provider: z.enum(["tavily", "brave", "exa", "duckduckgo"]).optional(),
+      query: z.string().min(1).describe("Web search query."),
     }),
     readOnly: true,
     execute: async (args) => {
-      const request = args as { query: string; maxResults: number; provider?: "tavily" | "brave" | "exa" | "duckduckgo" };
-      return webSearch(request, options);
+      const request = args as { query: string };
+      const result = await webSearch(request, options);
+      return formatSearchResults(request.query, result);
     },
   };
 }
@@ -53,48 +89,126 @@ export function createWebFetchTool(options: WebReaderOptions = {}): AgentTool {
   return {
     name: "web_fetch",
     description:
-      "Fetch a URL and return readable Markdown with section anchors. Understands plain HTML pages, GitHub repositories and files, arXiv papers, and PDF documents.",
+      "Fetch content from an HTTP or HTTPS URL as markdown, text, or HTML. Markdown is the default. Understands plain HTML pages, GitHub repositories and files, arXiv papers, and PDF documents.",
     parameters: z.object({
-      url: z.string().min(1),
-      maxChars: z.number().int().positive().max(200_000).default(20_000),
+      url: z.string().min(1).describe("The HTTP or HTTPS URL to fetch."),
+      format: z
+        .enum(["markdown", "text", "html"])
+        .default("markdown")
+        .describe("Output format. Defaults to markdown."),
+      timeout: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_FETCH_TIMEOUT_SECONDS)
+        .optional()
+        .describe(`Optional timeout in seconds (maximum: ${MAX_FETCH_TIMEOUT_SECONDS}).`),
     }),
     readOnly: true,
     execute: async (args) => {
-      const request = args as { url: string; maxChars: number };
-      const markdown = await webFetch(request.url, options);
-      return markdown.length > request.maxChars
-        ? `${markdown.slice(0, request.maxChars)}\n\n... truncated after ${request.maxChars} characters`
-        : markdown;
+      const request = args as { url: string; format: WebFetchFormat; timeout?: number };
+      return webFetch(request.url, { ...options, format: request.format, timeout: request.timeout });
     },
   };
 }
 
-async function webSearch(
-  request: { query: string; maxResults: number; provider?: "tavily" | "brave" | "exa" | "duckduckgo" },
-  options: WebReaderOptions,
-): Promise<string> {
-  const order: Array<"tavily" | "brave" | "exa" | "duckduckgo"> = request.provider
-    ? [request.provider]
-    : ["tavily", "brave", "exa", "duckduckgo"];
+function formatSearchResults(query: string, result: WebSearchResult): string {
+  if (result.results.length === 0) return NO_RESULTS;
+  const lines = [`# Search results for "${query}" (${result.provider})`, ""];
+  for (const item of result.results) {
+    lines.push(`## [${item.title || item.url}](${item.url})`);
+    if (item.published) lines.push(`Published: ${item.published}`);
+    if (item.snippet) lines.push("", item.snippet);
+    lines.push("");
+  }
+  return lines.join("\n").trim();
+}
+
+export async function webSearch(
+  request: { query: string; maxResults?: number },
+  options: WebReaderOptions = {},
+): Promise<WebSearchResult> {
+  const env = options.env ?? globalThis.process.env;
+  const providers = providerOrder(options.search?.provider, env);
   const errors: string[] = [];
-  for (const provider of order) {
+  let lastProvider: WebSearchProvider = providers[0] ?? "duckduckgo";
+  const now = Date.now();
+  for (const provider of providers) {
+    lastProvider = provider;
+    if ((providerCooldowns.get(provider) ?? 0) > now) continue;
     try {
-      const results = await searchWith(provider, request.query, request.maxResults, options);
-      if (results.length === 0) continue;
-      return [
-        `# Search results for "${request.query}" (${provider})`,
-        "",
-        ...results.map((result, index) => `${index + 1}. [${result.title}](${result.url})\n   ${result.snippet}`),
-      ].join("\n");
+      const results = await searchWith(
+        provider,
+        request.query,
+        request.maxResults ?? DEFAULT_SEARCH_RESULTS,
+        options,
+      );
+      if (results.length === 0) {
+        errors.push(`${provider}: no results`);
+        continue;
+      }
+      return { provider, results };
     } catch (error) {
+      if (error instanceof WebSearchRateLimitError) {
+        setProviderCooldown(provider, error.retryAfterMs);
+      }
       errors.push(`${provider}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  throw new Error(`search failed for every provider. ${errors.join("; ")}`);
+  if (errors.length === 0) {
+    throw new Error("search failed because every provider is cooling down");
+  }
+  return { provider: lastProvider, results: [] };
+}
+
+function providerOrder(
+  choice: WebSearchProviderChoice | undefined,
+  env: Record<string, string | undefined>,
+): WebSearchProvider[] {
+  const available: WebSearchProvider[] = [];
+  if (env.TAVILY_API_KEY) available.push("tavily");
+  if (env.BRAVE_API_KEY) available.push("brave");
+  if (env.EXA_API_KEY) available.push("exa");
+  available.push("duckduckgo");
+  if (!choice || choice === "random") return available;
+  return [choice, ...available.filter((provider) => provider !== choice)];
+}
+
+class WebSearchRateLimitError extends Error {
+  readonly retryAfterMs: number;
+
+  constructor(provider: WebSearchProvider, retryAfterMs: number) {
+    super(`${provider} rate limited`);
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function setProviderCooldown(provider: WebSearchProvider, retryAfterMs: number): void {
+  providerCooldowns.set(provider, Date.now() + Math.max(1000, retryAfterMs));
+}
+
+function parseRetryAfter(value: string | null): number {
+  if (!value) return 60_000;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  const timestamp = Date.parse(value);
+  if (Number.isFinite(timestamp)) return Math.max(1000, timestamp - Date.now());
+  return 60_000;
+}
+
+function searchInit(init: RequestInit): RequestInit {
+  return { ...init, signal: AbortSignal.timeout(30_000) };
+}
+
+function assertSearchResponse(response: Response, provider: WebSearchProvider): void {
+  if (response.status === 429) {
+    throw new WebSearchRateLimitError(provider, parseRetryAfter(response.headers.get("retry-after")));
+  }
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
 }
 
 async function searchWith(
-  provider: "tavily" | "brave" | "exa" | "duckduckgo",
+  provider: WebSearchProvider,
   query: string,
   maxResults: number,
   options: WebReaderOptions,
@@ -105,52 +219,79 @@ async function searchWith(
 
   if (provider === "tavily") {
     const key = requireKey(env, "TAVILY_API_KEY");
-    const response = await fetchImpl(endpoints.tavily, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-      body: JSON.stringify({ query, max_results: maxResults }),
-    });
-    const body = (await readJson(response)) as { results?: Array<{ title?: string; url?: string; content?: string }> };
+    const response = await fetchImpl(
+      endpoints.tavily,
+      searchInit({
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        body: JSON.stringify({ query, max_results: maxResults }),
+      }),
+    );
+    assertSearchResponse(response, provider);
+    const body = (await readJson(response)) as {
+      results?: Array<{ title?: string; url?: string; content?: string; published_date?: string }>;
+    };
     return (body.results ?? []).map((item) => ({
       title: item.title ?? item.url ?? "untitled",
       url: item.url ?? "",
       snippet: item.content ?? "",
+      published: item.published_date,
     }));
   }
 
   if (provider === "brave") {
     const key = requireKey(env, "BRAVE_API_KEY");
-    const response = await fetchImpl(`${endpoints.brave}?q=${encodeURIComponent(query)}&count=${maxResults}`, {
-      headers: { accept: "application/json", "x-subscription-token": key },
-    });
+    const response = await fetchImpl(
+      `${endpoints.brave}?q=${encodeURIComponent(query)}&count=${maxResults}`,
+      searchInit({ headers: { accept: "application/json", "x-subscription-token": key } }),
+    );
+    assertSearchResponse(response, provider);
     const body = (await readJson(response)) as {
-      web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
+      web?: {
+        results?: Array<{
+          title?: string;
+          url?: string;
+          description?: string;
+          age?: string;
+          page_age?: string;
+        }>;
+      };
     };
     return (body.web?.results ?? []).map((item) => ({
       title: item.title ?? item.url ?? "untitled",
       url: item.url ?? "",
       snippet: item.description ?? "",
+      published: item.age ?? item.page_age,
     }));
   }
 
   if (provider === "exa") {
     const key = requireKey(env, "EXA_API_KEY");
-    const response = await fetchImpl(endpoints.exa, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": key },
-      body: JSON.stringify({ query, numResults: maxResults }),
-    });
-    const body = (await readJson(response)) as { results?: Array<{ title?: string; url?: string; text?: string }> };
+    const response = await fetchImpl(
+      endpoints.exa,
+      searchInit({
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": key },
+        body: JSON.stringify({ query, numResults: maxResults }),
+      }),
+    );
+    assertSearchResponse(response, provider);
+    const body = (await readJson(response)) as {
+      results?: Array<{ title?: string; url?: string; text?: string; publishedDate?: string }>;
+    };
     return (body.results ?? []).map((item) => ({
       title: item.title ?? item.url ?? "untitled",
       url: item.url ?? "",
       snippet: item.text ?? "",
+      published: item.publishedDate,
     }));
   }
 
-  const response = await fetchImpl(`${endpoints.duckduckgo}?q=${encodeURIComponent(query)}`, {
-    headers: { accept: "text/html" },
-  });
+  const response = await fetchImpl(
+    `${endpoints.duckduckgo}?q=${encodeURIComponent(query)}`,
+    searchInit({ headers: { accept: "text/html" } }),
+  );
+  assertSearchResponse(response, provider);
   return parseDuckDuckGo(await response.text(), maxResults);
 }
 
@@ -199,97 +340,265 @@ export function classifyWebUrl(url: string): WebFetchKind {
   return "html";
 }
 
-export async function webFetch(url: string, options: WebReaderOptions = {}): Promise<string> {
+export async function webFetch(url: string, options: WebFetchOptions = {}): Promise<string> {
+  assertHttpUrl(url);
+  const format = options.format ?? "markdown";
+  const timeoutMs = (options.timeout ?? DEFAULT_FETCH_TIMEOUT_SECONDS) * 1000;
   const kind = classifyWebUrl(url);
+
   switch (kind) {
     case "arxiv":
-      return fetchArxiv(url, options);
+      return fetchArxiv(url, options, format, timeoutMs);
     case "github-repo":
     case "github-file":
-      return fetchGithub(url, kind, options);
+      return fetchGithub(url, kind, options, timeoutMs);
     case "pdf":
-      return fetchPdf(url, options);
+      return fetchPdf(url, options, timeoutMs);
     case "raw-text": {
-      const fetchImpl = options.fetchImpl ?? fetch;
-      const response = await fetchImpl(url);
-      return `# ${url}\n\n\`\`\`\n${await response.text()}\n\`\`\``;
+      const { text, contentType } = await fetchText(url, options, "text", timeoutMs);
+      return formatFetchOutput(url, contentType, "text", truncate(text));
     }
-    default:
-      return fetchHtml(url, options);
+    default: {
+      const { text, contentType } = await fetchText(url, options, format, timeoutMs);
+      const output = convertHtml(text, contentType, format, url);
+      return formatFetchOutput(url, contentType, format, truncate(output));
+    }
   }
 }
 
-async function fetchHtml(url: string, options: WebReaderOptions): Promise<string> {
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const response = await fetchImpl(url, { headers: { accept: "text/html" } });
-  return htmlToMarkdown(await response.text(), url);
+function assertHttpUrl(url: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("URL must use http:// or https://");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("URL must use http:// or https://");
+  }
+  return parsed;
 }
 
-async function fetchArxiv(url: string, options: WebReaderOptions): Promise<string> {
+function fetchHeaders(format: WebFetchFormat): Record<string, string> {
+  const accept =
+    format === "markdown"
+      ? "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1"
+      : format === "text"
+        ? "text/plain;q=1.0, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1"
+        : "text/html;q=1.0, application/xhtml+xml;q=0.9, text/plain;q=0.8, text/markdown;q=0.7, */*;q=0.1";
+  return {
+    "user-agent": DEFAULT_USER_AGENT,
+    accept,
+    "accept-language": "en-US,en;q=0.9",
+  };
+}
+
+async function requestWithCloudflareRetry(
+  url: string,
+  options: WebFetchOptions,
+  format: WebFetchFormat,
+  timeoutMs: number,
+): Promise<Response> {
   const fetchImpl = options.fetchImpl ?? fetch;
+  const init: RequestInit = {
+    headers: fetchHeaders(format),
+    signal: AbortSignal.timeout(timeoutMs),
+  };
+  let response = await fetchImpl(url, init);
+  if (response.status === 403 && response.headers.get("cf-mitigated") === "challenge") {
+    response = await fetchImpl(url, {
+      ...init,
+      headers: { ...fetchHeaders(format), "user-agent": "orchivox" },
+    });
+  }
+  return response;
+}
+
+function mimeFrom(contentType: string): string {
+  return contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+}
+
+function isTextualMime(mime: string): boolean {
+  return (
+    !mime ||
+    mime.startsWith("text/") ||
+    mime === "application/json" ||
+    mime.endsWith("+json") ||
+    mime === "application/xml" ||
+    mime.endsWith("+xml") ||
+    mime === "application/javascript" ||
+    mime === "application/x-javascript"
+  );
+}
+
+function isImageMime(mime: string): boolean {
+  return mime.startsWith("image/");
+}
+
+async function fetchText(
+  url: string,
+  options: WebFetchOptions,
+  format: WebFetchFormat,
+  timeoutMs: number,
+): Promise<{ text: string; contentType: string }> {
+  const response = await requestWithCloudflareRetry(url, options, format, timeoutMs);
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+  const contentType = response.headers.get("content-type") ?? "";
+  const mime = mimeFrom(contentType);
+  if (isImageMime(mime)) throw new Error(`unsupported image content type: ${mime}`);
+  if (mime === "application/pdf") throw new Error("PDF responses use the pdf path");
+  if (!isTextualMime(mime)) throw new Error(`unsupported content type: ${mime || "unknown"}`);
+  return { text: await response.text(), contentType };
+}
+
+function convertHtml(content: string, contentType: string, format: WebFetchFormat, url: string): string {
+  if (format === "html") return content;
+  if (!contentType.toLowerCase().includes("text/html")) return content;
+  return format === "markdown" ? htmlToMarkdown(content, url) : htmlToText(content);
+}
+
+export function htmlToText(html: string): string {
+  return decodeEntities(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+}
+
+function truncate(text: string): string {
+  if (text.length <= MAX_FETCH_CHARS) return text;
+  return `${text.slice(0, MAX_FETCH_CHARS)}\n\n... truncated after ${MAX_FETCH_CHARS} characters`;
+}
+
+function formatFetchOutput(
+  url: string,
+  contentType: string,
+  format: WebFetchFormat,
+  output: string,
+): string {
+  return `URL: ${url}\nContent-Type: ${contentType || "unknown"}\nFormat: ${format}\n\n${output}`;
+}
+
+async function fetchArxiv(
+  url: string,
+  options: WebFetchOptions,
+  format: WebFetchFormat,
+  timeoutMs: number,
+): Promise<string> {
   const idMatch = /arxiv\.org\/(?:abs|pdf|html)\/([0-9]+\.[0-9]+(?:v\d+)?)/.exec(url);
   const id = idMatch?.[1];
   if (id) {
     const htmlUrl = `https://arxiv.org/html/${id}`;
-    const htmlResponse = await fetchImpl(htmlUrl, { headers: { accept: "text/html" } }).catch(() => undefined);
-    if (htmlResponse && htmlResponse.ok) {
-      return htmlToMarkdown(await htmlResponse.text(), htmlUrl);
+    try {
+      const { text, contentType } = await fetchText(htmlUrl, options, format, timeoutMs);
+      return formatFetchOutput(
+        htmlUrl,
+        contentType,
+        format,
+        truncate(convertHtml(text, contentType, format, htmlUrl)),
+      );
+    } catch {
+      // Fall back to the abstract page.
     }
   }
   const absUrl = id ? `https://arxiv.org/abs/${id}` : url;
-  const response = await fetchImpl(absUrl, { headers: { accept: "text/html" } });
-  return htmlToMarkdown(await response.text(), absUrl);
+  const { text, contentType } = await fetchText(absUrl, options, format, timeoutMs);
+  return formatFetchOutput(
+    absUrl,
+    contentType,
+    format,
+    truncate(convertHtml(text, contentType, format, absUrl)),
+  );
 }
 
-async function fetchGithub(url: string, kind: "github-repo" | "github-file", options: WebReaderOptions): Promise<string> {
+async function fetchGithub(
+  url: string,
+  kind: "github-repo" | "github-file",
+  options: WebFetchOptions,
+  timeoutMs: number,
+): Promise<string> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const parsed = new URL(url);
   const parts = parsed.pathname.split("/").filter(Boolean);
   const owner = parts[0] ?? "";
   const repo = parts[1] ?? "";
+  const init = (headers: Record<string, string>): RequestInit => ({
+    headers: { ...headers, "user-agent": DEFAULT_USER_AGENT },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
   if (parts.length === 2) {
     const sections: string[] = [`# GitHub: ${owner}/${repo}`];
     for (const branch of ["main", "master"]) {
-      const readme = await fetchImpl(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/README.md`).catch(
-        () => undefined,
-      );
+      const readme = await fetchImpl(
+        `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/README.md`,
+        init({ accept: "text/plain" }),
+      ).catch(() => undefined);
       if (readme && readme.ok) {
         sections.push(`## README (${branch})\n\n${await readme.text()}`);
         break;
       }
     }
-    const contents = await fetchImpl(`https://api.github.com/repos/${owner}/${repo}/contents/`, {
-      headers: { accept: "application/vnd.github+json" },
-    }).catch(() => undefined);
+    const contents = await fetchImpl(
+      `https://api.github.com/repos/${owner}/${repo}/contents/`,
+      init({ accept: "application/vnd.github+json" }),
+    ).catch(() => undefined);
     if (contents && contents.ok) {
       const entries = (await readJson(contents)) as Array<{ name?: string; type?: string }>;
       sections.push(
         `## Top level entries\n\n${entries.map((entry) => `- ${entry.type === "dir" ? "dir" : "file"}: ${entry.name}`).join("\n")}`,
       );
     }
-    return sections.join("\n\n");
+    return formatFetchOutput(url, "text/markdown", "markdown", truncate(sections.join("\n\n")));
   }
+
   if (kind === "github-file") {
     const branch = parts[3] ?? "main";
     const path = parts.slice(4).join("/");
-    const raw = await fetchImpl(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`);
-    return `# ${owner}/${repo}: ${path}\n\n\`\`\`\n${await raw.text()}\n\`\`\``;
+    const raw = await fetchImpl(
+      `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`,
+      init({ accept: "text/plain" }),
+    );
+    if (!raw.ok) throw new Error(`HTTP ${raw.status} for ${owner}/${repo}/${path}`);
+    return formatFetchOutput(
+      url,
+      raw.headers.get("content-type") ?? "text/plain",
+      "markdown",
+      truncate(`# ${owner}/${repo}: ${path}\n\n\`\`\`\n${await raw.text()}\n\`\`\``),
+    );
   }
+
   const branch = parts[3] ?? "main";
   const path = parts.slice(4).join("/");
-  const contents = await fetchImpl(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, {
-    headers: { accept: "application/vnd.github+json" },
-  });
+  const contents = await fetchImpl(
+    `https://api.github.com/repos/${owner}/${repo}/contents/${path}`,
+    init({ accept: "application/vnd.github+json" }),
+  );
+  if (!contents.ok) throw new Error(`HTTP ${contents.status} for ${owner}/${repo}/${path}`);
   const entries = (await readJson(contents)) as Array<{ name?: string; type?: string }>;
-  return `# ${owner}/${repo}: tree ${path || "/"}\n\n${entries.map((entry) => `- ${entry.type === "dir" ? "dir" : "file"}: ${entry.name}`).join("\n")}`;
+  return formatFetchOutput(
+    url,
+    "application/json",
+    "markdown",
+    truncate(
+      `# ${owner}/${repo}: tree ${path || "/"}\n\n${entries.map((entry) => `- ${entry.type === "dir" ? "dir" : "file"}: ${entry.name}`).join("\n")}`,
+    ),
+  );
 }
 
-async function fetchPdf(url: string, options: WebReaderOptions): Promise<string> {
+async function fetchPdf(url: string, options: WebFetchOptions, timeoutMs: number): Promise<string> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const response = await fetchImpl(url);
+  const response = await fetchImpl(url, {
+    headers: { "user-agent": DEFAULT_USER_AGENT },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
   const bytes = new Uint8Array(await response.arrayBuffer());
   const text = await extractPdfText(bytes);
-  return `# PDF: ${url}\n\n${text}`;
+  return formatFetchOutput(url, "application/pdf", "text", truncate(text));
 }
 
 export function htmlToMarkdown(html: string, baseUrl: string): string {

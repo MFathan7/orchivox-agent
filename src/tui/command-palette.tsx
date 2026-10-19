@@ -5,7 +5,7 @@ import type { ProviderRole, ProviderRouter } from "../provider/router";
 import { filterFuzzy } from "./autocomplete";
 import { getTheme, type Theme, type ThemeName, THEME_ORDER } from "./theme";
 
-export type ReasoningEffortLevel = "off" | "low" | "medium" | "high" | "max";
+export type ReasoningEffortLevel = "off" | "low" | "medium" | "high" | "max" | (string & {});
 
 export interface PaletteItem {
   id: string;
@@ -22,6 +22,7 @@ export interface CommandPaletteModalProps {
   router: ProviderRouter;
   currentTheme?: ThemeName;
   reasoningEffort?: ReasoningEffortLevel;
+  reasoningLevels?: string[];
   onSelectReasoning?: (effort: ReasoningEffortLevel) => void;
   onSelectTheme?: (theme: ThemeName) => void;
   onOpenModels?: () => void;
@@ -38,11 +39,29 @@ export const REASONING_LEVELS: Array<{ id: ReasoningEffortLevel; label: string; 
   { id: "max", label: "Max", description: "Maximum reasoning for difficult tasks (32,768 tokens)", tokens: 32768 },
 ];
 
+export function reasoningLevelsFor(
+  efforts: string[],
+): Array<{ id: ReasoningEffortLevel; label: string; description: string; tokens: number }> {
+  const known = new Map(REASONING_LEVELS.map((level) => [level.id, level]));
+  return efforts.map((effort) => {
+    const id = effort as ReasoningEffortLevel;
+    return (
+      known.get(id) ?? {
+        id,
+        label: effort,
+        description: "Model-specific reasoning effort",
+        tokens: 0,
+      }
+    );
+  });
+}
+
 export function CommandPaletteModal(props: CommandPaletteModalProps) {
   const {
     router,
     currentTheme = "tokyonight",
     reasoningEffort = "medium",
+    reasoningLevels,
     onSelectReasoning,
     onSelectTheme,
     onOpenModels,
@@ -50,6 +69,11 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     onClose,
     theme = getTheme(currentTheme),
   } = props;
+
+  const levels = React.useMemo(
+    () => reasoningLevelsFor(reasoningLevels ?? REASONING_LEVELS.map((level) => level.id)),
+    [reasoningLevels],
+  );
 
   const [query, setQuery] = React.useState("");
   const [selectedIndex, setSelectedIndex] = React.useState(0);
@@ -74,7 +98,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       });
     }
 
-    for (const level of REASONING_LEVELS) {
+    for (const level of levels) {
       const isCurrent = reasoningEffort === level.id;
       list.push({
         id: `reasoning-${level.id}`,
@@ -137,7 +161,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     }
 
     return list;
-  }, [router, currentTheme, reasoningEffort, onSelectReasoning, onSelectTheme, onOpenModels, onAction, onClose]);
+  }, [router, currentTheme, reasoningEffort, levels, onSelectReasoning, onSelectTheme, onOpenModels, onAction, onClose]);
 
   const source = React.useMemo(() => {
     const trimmed = query.trim();

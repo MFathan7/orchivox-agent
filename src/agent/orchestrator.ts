@@ -6,7 +6,7 @@ import type {
   AgentProfile,
   IAgentRunner,
 } from "../api/server";
-import type { AppConfig, CompactionConfig } from "../config/loader";
+import type { AppConfig, CompactionConfig, WebFetchConfig, WebSearchConfig } from "../config/loader";
 import { structuredPatch } from "diff";
 import { registerAstTools } from "../ide/ast-compress";
 import { registerCodeIntelTools } from "../ide/code-intel";
@@ -40,6 +40,7 @@ import { ToolRegistry } from "../tools/registry";
 import { PersistentShellTool } from "../tools/shell";
 import { BackgroundProcessManager } from "../tools/bg-process";
 import { createInspectImageTool } from "../tools/vision";
+import { registerWebTools } from "../tools/web-reader";
 import {
   ChatRequestSchema,
   type AgentMode,
@@ -55,11 +56,29 @@ import type { SnapshotManager } from "../vcs/snapshot";
 import type { WorktreeManager } from "../vcs/worktree";
 import { AdvisorReviewer } from "./advisor";
 import { compactMessages, estimateTextTokens, estimateToolsTokens, extractSummary } from "./compaction";
+import { filterToolsForMode } from "./tool-set";
 import { CustomCommandEngine } from "./custom-commands";
 import { HookRunner, type PluginLoadReport } from "./hooks";
 import { GranularPermissionEngine } from "./permissions";
 import { SpecialistAgentRegistry, type SpecialistAgentProfile } from "./specialist-agents";
-import { SkillRegistry } from "./skills";
+import {
+  isCapabilityQuestion,
+  isProjectIdentityQuestion,
+  isProjectQuestion,
+  isProjectStudyRequest,
+  loadProjectContext,
+  looksLikeNonAnswer,
+  type ProjectContext,
+} from "./project-context";
+import { createQuestionTool, type QuestionHandler } from "../tools/question";
+import { toolDisplay } from "./tool-display";
+import {
+  formatActiveSkills,
+  matchSkillNames,
+  parseSkillMentions,
+  SkillRegistry,
+  type SkillDocument,
+} from "./skills";
 import { SubagentManager, type SubagentTaskInput, type SubagentTaskResult, type SubagentWorkerState } from "./subagent";
 import { buildSystemPrompt } from "./system-prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
@@ -81,6 +100,17 @@ export interface AgentOrchestratorOptions {
   maxTurns?: number;
   contextTokenBudget?: number;
   permissions?: GranularPermissionEngine;
+  onQuestion?: QuestionHandler;
+}
+
+export interface PromptSnapshot {
+  system: string;
+  style: "full" | "compact";
+  toolCount: number;
+  availableSkills: number;
+  activeSkills: string[];
+  skillMentions: string[];
+  capturedAt: number;
 }
 
 const PROFILE_MODES: Record<AgentProfile, AgentMode> = {
@@ -96,6 +126,7 @@ const SUBAGENT_BLOCKED_TOOLS = new Set([
   "task_cancel",
   "task_merge",
   "task_wait",
+  "question",
 ]);
 
 export class AgentOrchestrator implements IAgentRunner {
@@ -114,6 +145,9 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly router: ProviderRouter;
   private readonly snapshots: SnapshotManager;
   private readonly rules: RulesLoader;
+  private readonly database: MemoryDatabase;
+  private readonly ephemeralSkills = new Set<string>();
+  private readonly lastPrompts = new Map<string, PromptSnapshot>();
   private readonly hindsight: HindsightMemory;
   private readonly lsp: LSPClient | undefined;
   private readonly hashEditLifecycle: HashlineLifecycle | undefined;
@@ -121,15 +155,21 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly maxTurns: number;
   private readonly contextTokenBudget: number;
   private readonly compactionConfig: CompactionConfig;
+  private readonly webSearchConfig: WebSearchConfig;
+  private readonly webFetchConfig: WebFetchConfig;
+  private readonly promptStyle: "auto" | "full" | "compact";
   private branch: string | undefined;
   private globalRules = "";
+  private projectContext: ProjectContext | undefined;
   private readonly taskRequests = new Map<string, AgentTaskRequest>();
   private readonly pendingDiagnostics = new Map<string, string>();
+  private questionHandler: QuestionHandler | undefined;
 
   constructor(options: AgentOrchestratorOptions) {
     this.router = options.router;
     this.snapshots = options.snapshots;
     this.rules = options.rules;
+    this.database = options.database;
     this.lsp = options.lsp;
     this.hashEditLifecycle = options.hashEditLifecycle;
     this.root = options.repoRoot ?? globalThis.process.cwd();
@@ -137,7 +177,11 @@ export class AgentOrchestrator implements IAgentRunner {
     this.contextTokenBudget = options.contextTokenBudget ?? 200_000;
     this.compactionConfig =
       options.config?.compaction ?? { auto: true, keep_tokens: 15_000, buffer_ratio: 0.1 };
+    this.webSearchConfig = options.config?.websearch ?? { enabled: true, provider: "random" };
+    this.webFetchConfig = options.config?.webfetch ?? { enabled: true };
+    this.promptStyle = options.config?.prompt?.style ?? "auto";
     this.permissions = options.permissions ?? new GranularPermissionEngine({ repoRoot: this.root });
+    this.questionHandler = options.onQuestion;
     this.registry = new ToolRegistry({ permissions: this.permissions });
     this.hindsight = new HindsightMemory(options.database);
     this.hooks = new HookRunner({ hooks: options.config?.hooks, cwd: this.root });
@@ -160,25 +204,39 @@ export class AgentOrchestrator implements IAgentRunner {
     this.registerDefaultTools();
   }
 
+  setQuestionHandler(handler: QuestionHandler | undefined): void {
+    this.questionHandler = handler;
+  }
+
   async initialize(): Promise<PluginLoadReport> {
     await this.customCommands.ensureDefaults();
     await this.specialistAgents.ensureDefaults();
     await this.skills.load(true);
     this.globalRules = await this.rules.getGlobalRules();
+    this.projectContext = await loadProjectContext(this.root);
     const branch = await runGit(this.root, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true });
     this.branch = branch.exitCode === 0 ? branch.stdout.trim() || undefined : undefined;
     return this.hooks.loadUserPlugins(this.registry);
   }
 
   estimateContextOverhead(mode: AgentMode): number {
+    const providerRef = this.router.getModeModel(mode);
+    const compact = this.useCompactPrompt(providerRef?.provider);
     const system = buildSystemPrompt({
       mode,
       repoRoot: this.root,
       branch: this.branch,
       agentInstructions: this.globalRules,
-      skillsIndex: this.skills.buildIndexPrompt(),
+      projectSummary: this.projectContext?.summary,
+      skillsIndex: this.skills.buildIndexPrompt({ compact }),
+      compact,
     });
-    return estimateTextTokens(system) + estimateToolsTokens(this.registry.listDefinitions());
+    const tools = filterToolsForMode(this.registry.listDefinitions(), mode);
+    return estimateTextTokens(system) + estimateToolsTokens(tools);
+  }
+
+  getLastPromptInfo(sessionId?: string): PromptSnapshot | undefined {
+    return sessionId ? this.lastPrompts.get(sessionId) : undefined;
   }
 
   async runOnce(request: AgentRunRequest): Promise<AgentRunResult> {
@@ -258,6 +316,14 @@ export class AgentOrchestrator implements IAgentRunner {
     };
 
     this.registry.register(createReadFileTool());
+    this.registry.register(
+      createQuestionTool(async (request) => {
+        if (!this.questionHandler) {
+          throw new Error("The question tool is unavailable in this client.");
+        }
+        return this.questionHandler(request);
+      }),
+    );
     this.registry.register(createHashEditTool(lifecycle));
     this.registry.register(createCreateFileTool(lifecycle));
     this.registry.register(createDeleteFileTool(lifecycle));
@@ -277,6 +343,10 @@ export class AgentOrchestrator implements IAgentRunner {
     this.registry.register(createDiagnosticsCheckTool({ lsp: this.lsp, repoRoot: this.root }));
     this.bgProcesses.registerTools(this.registry);
     this.registry.register(createInspectImageTool({ router: this.router, repoRoot: this.root }));
+    registerWebTools(this.registry, {
+      search: this.webSearchConfig,
+      fetch: this.webFetchConfig,
+    });
     registerCodeIntelTools(this.registry, { lsp: this.lsp, repoRoot: this.root });
     if (this.lsp) this.lsp.registerTools(this.registry);
   }
@@ -303,6 +373,7 @@ export class AgentOrchestrator implements IAgentRunner {
     }
 
     let messages: Message[] = [...request.messages];
+    const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
 
     const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
     if (lastUserIdx !== -1) {
@@ -325,46 +396,170 @@ export class AgentOrchestrator implements IAgentRunner {
       }
     }
 
-    if (!activeSpecialist && messages.length > 0) {
-      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-      const lastText = lastUserMsg?.content
-        .map((b) => (b.type === "text" ? b.text : ""))
-        .join(" ");
-      if (lastText) {
-        const mention = await this.specialistAgents.parseMention(lastText);
-        if (mention?.profile) {
-          activeSpecialist = mention.profile;
-        }
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    const lastText =
+      lastUserMsg?.content.map((b) => (b.type === "text" ? b.text : "")).join(" ") ?? "";
+    if (!activeSpecialist && lastText) {
+      const mention = await this.specialistAgents.parseMention(lastText);
+      if (mention?.profile) {
+        activeSpecialist = mention.profile;
       }
     }
 
-    const requestedRole = activeSpecialist?.roleModel ?? "main";
-    const roleName: "main" | "fast" | "advisor" =
-      requestedRole === "advisor" || requestedRole === "fast" || requestedRole === "main"
-        ? requestedRole
-        : "main";
-    const provider = this.router.get(roleName);
-    const capabilities = this.router.capabilitiesForRole(roleName);
+    const requestedRole: "main" | "fast" | "advisor" | undefined =
+      activeSpecialist?.roleModel === "advisor" ||
+      activeSpecialist?.roleModel === "fast" ||
+      activeSpecialist?.roleModel === "main"
+        ? activeSpecialist.roleModel
+        : undefined;
+    const provider = requestedRole ? this.router.get(requestedRole) : this.router.getMode(mode);
+    const providerRef = requestedRole ? this.router.getRole(requestedRole) : this.router.getModeModel(mode);
+    const capabilities = requestedRole
+      ? this.router.capabilitiesForRole(requestedRole)
+      : this.router.capabilitiesForMode(mode);
     if (!capabilities.vision) messages = stripImageBlocks(messages);
-    const system = buildSystemPrompt({
+
+    const compact = this.useCompactPrompt(providerRef?.provider);
+    const mentionedSkills = lastText ? parseSkillMentions(lastText, this.skills) : [];
+    for (const document of mentionedSkills) {
+      const newlyActivated = this.activateSkill(sessionId, document.name);
+      if (newlyActivated) {
+        sink({
+          type: "skill_activated",
+          name: document.name,
+          allowed_tools: document.allowedTools ?? [],
+          trigger: "mention",
+        });
+      }
+    }
+    const namedSkills = compact && lastText ? matchSkillNames(lastText, this.skills) : [];
+    for (const document of namedSkills) {
+      const newlyActivated = this.activateSkill(sessionId, document.name);
+      if (newlyActivated) {
+        sink({
+          type: "skill_activated",
+          name: document.name,
+          allowed_tools: document.allowedTools ?? [],
+          trigger: "auto",
+        });
+      }
+    }
+    const explicitWebIntent = /\b(web|internet|online|search|cari di web|cari online)\b/i.test(
+      lastText,
+    );
+    const skillPriorityHint =
+      namedSkills.length > 0 && !explicitWebIntent
+        ? [
+            "# Skill priority",
+            `The request mentions ${namedSkills
+              .map((document) => `"${document.name}"`)
+              .join(", ")}. Follow the loaded skill instead of using web search.`,
+          ].join("\n")
+        : "";
+    const projectQuestion =
+      lastText.length > 0 && this.projectContext
+        ? isProjectQuestion(lastText, this.projectContext)
+        : false;
+    const projectStudy = lastText.length > 0 ? isProjectStudyRequest(lastText) : false;
+    const projectIdentity =
+      lastText.length > 0 && this.projectContext
+        ? isProjectIdentityQuestion(lastText, this.projectContext)
+        : false;
+    const capabilityQuestion = lastText.length > 0 ? isCapabilityQuestion(lastText) : false;
+    const specificHint = projectStudy
+      ? [
+          "# Project study",
+          "The user asked you to study the current project. Inspect the codebase with read, search, and command tools. Read package.json, README.md, source files, and tests. If a file is missing, continue with the others. Do not stop at AGENTS.md and do not summarize the agent instructions.",
+          "When done, write a concise report: what the project is, main modules and responsibilities, how the pieces fit together, and how to run and test it.",
+          'Start with what the project is. Do not write a plan or a status update. Do not greet. Do not ask "How can I help you today?". Do not list every file you read. Reply in the user\'s language.',
+        ].join("\n")
+      : projectIdentity
+        ? [
+            "# Project question",
+            "The user is asking what this project is. Answer from the # Project section in 2 to 4 sentences. Do not read AGENTS.md, do not list skills, and do not greet.",
+          ].join("\n")
+        : capabilityQuestion
+          ? [
+              "# Capability question",
+              "The user is asking what you can do. Answer from the # Capability and # Project sections with 3 to 5 concise bullets. Do not read files, do not list raw tool names, and do not greet.",
+            ].join("\n")
+          : projectQuestion && !explicitWebIntent
+            ? [
+                "# Project question",
+                "The user is asking about this project. Answer from the # Project section first. Only read local files if the summary does not contain the answer. Do not list tools or skills, and do not use web search.",
+              ].join("\n")
+            : "";
+    const extraHints = [skillPriorityHint, specificHint].filter(Boolean).join("\n\n");
+
+    const contextWindow = capabilities.context_window ?? this.contextTokenBudget;
+    const maxActiveChars = Math.max(8_000, Math.floor(contextWindow * 4 * 0.2));
+    const activeSkillDocs = this.activeSkillDocuments(sessionId);
+    const activeSkillsBlock = await formatActiveSkills(activeSkillDocs, maxActiveChars);
+    const promptBase = {
       mode,
       repoRoot: this.root,
       branch: this.branch,
       agentInstructions: this.globalRules,
       specialistPrompt: activeSpecialist?.systemPrompt,
-      skillsIndex: this.skills.buildIndexPrompt(),
-      extra: request.system,
-    });
-    let tools = this.combineTools(request.tools);
+      projectSummary: this.projectContext?.summary,
+      skillsIndex: this.skills.buildIndexPrompt({ compact }),
+      extra: [request.system, extraHints].filter(Boolean).join("\n\n") || undefined,
+      compact,
+    };
+    let system = buildSystemPrompt({ ...promptBase, activeSkills: activeSkillsBlock });
+    let tools = this.combineTools(request.tools, mode);
     if (!capabilities.tool_calling) tools = [];
     if (activeSpecialist) {
       tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
     }
+    let overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
+    const availableSkillCount = this.skills.listAvailableDocuments().length;
+    const mentionedSkillNames = [
+      ...new Set([...mentionedSkills, ...namedSkills].map((document) => document.name)),
+    ];
+    const initialActiveSkillNames = activeSkillDocs.map((document) => document.name);
+    const promptStyle = compact ? ("compact" as const) : ("full" as const);
+    const capturePrompt = (documents: SkillDocument[]): void => {
+      this.rememberPrompt(sessionId, {
+        system,
+        style: promptStyle,
+        toolCount: tools.length,
+        availableSkills: availableSkillCount,
+        activeSkills: documents.map((document) => document.name),
+        skillMentions: mentionedSkillNames,
+        capturedAt: Date.now(),
+      });
+    };
+    capturePrompt(activeSkillDocs);
+    sink({
+      type: "prompt_preflight",
+      style: promptStyle,
+      system_chars: system.length,
+      tool_count: tools.length,
+      available_skills: availableSkillCount,
+      active_skills: initialActiveSkillNames,
+      skill_mentions: mentionedSkillNames,
+    });
+
+    const rebuildSystem = async (): Promise<void> => {
+      const documents = this.activeSkillDocuments(sessionId);
+      const block = await formatActiveSkills(documents, maxActiveChars);
+      system = buildSystemPrompt({ ...promptBase, activeSkills: block });
+      overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
+      capturePrompt(documents);
+    };
+
     const skillPolicy = new SkillToolPolicy(SKILL_ALWAYS_ALLOWED_TOOLS);
     const activatedSkills = new Set<string>();
+    for (const document of activeSkillDocs) {
+      activatedSkills.add(document.name);
+      if (document.allowedTools !== undefined) skillPolicy.activate(document.allowedTools);
+    }
     const totals = zeroUsage();
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
+    let projectNudged = false;
+    const bufferStudyTokens = projectStudy;
 
     const specialistBudget = activeSpecialist?.thinkingBudget ?? 0;
     const capabilityBudget = capabilities.reasoning ? (capabilities.reasoning_budget_max ?? 8192) : 0;
@@ -375,9 +570,49 @@ export class AgentOrchestrator implements IAgentRunner {
     const maxTokens = capabilities.max_output
       ? Math.min(requestedMaxTokens, capabilities.max_output)
       : requestedMaxTokens;
-    const contextWindow = capabilities.context_window ?? this.contextTokenBudget;
-    const overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
     let compactedRetry = false;
+
+    const retryProjectStudy = async (originalText: string): Promise<string> => {
+      if (!this.projectContext) return originalText;
+      const fallback = `${this.projectContext.summary}\n\nI could not inspect more files in this turn. This summary comes from the project metadata.`;
+      const retrySystem = [
+        "You are Orchivox, a helpful coding agent.",
+        "# Project",
+        this.projectContext.summary,
+        "# Task",
+        "The user asked you to study the project. Write a concise report in the user's language.",
+        "Start with what the project is. Include main modules, architecture, and how to run and test it.",
+        "Do not greet. Do not list the files you read. Do not describe the agent instructions or skills.",
+      ].join("\n\n");
+      const retryRequest = ChatRequestSchema.parse({
+        system: retrySystem,
+        messages: messages.slice(0, -1),
+        tools,
+        tool_choice: "none",
+        max_tokens: maxTokens,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        stop_sequences: request.stop_sequences,
+        reasoning_effort: capabilities.reasoning
+          ? clampReasoningEffort(request.reasoning_effort, capabilities.reasoning_efforts)
+          : undefined,
+      });
+      let text = "";
+      try {
+        for await (const event of provider.streamChat(retryRequest, signal)) {
+          if (event.type === "token") text += event.text;
+          else if (event.type === "usage") accumulateUsage(totals, event);
+        }
+      } catch {
+        return fallback;
+      }
+      const candidate = text.trim();
+      if (candidate.length === 0) return fallback;
+      if (looksLikeNonAnswer(candidate, this.projectContext, { requireProjectMention: true })) {
+        return fallback;
+      }
+      return candidate;
+    };
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
       if (this.compactionConfig.auto) {
@@ -399,6 +634,8 @@ export class AgentOrchestrator implements IAgentRunner {
             after_tokens: compaction.afterTokens,
             summary_tokens: compaction.summaryTokens,
             summary: compaction.summary,
+            removed_messages: compaction.removedMessages,
+            tail_start_message_id: compaction.tailStartMessageId,
           });
         }
       }
@@ -409,12 +646,23 @@ export class AgentOrchestrator implements IAgentRunner {
         messages.push(makeMessage(`turn-${turn}-advisor`, "system", advisorNote));
       }
 
-      const turnTools = skillPolicy.filter(tools);
+      const guardWebTools =
+        turn === 0 &&
+        !explicitWebIntent &&
+        (projectStudy || projectQuestion || (compact && namedSkills.length > 0));
+      const forceNoTools = turn === 0 && (projectIdentity || capabilityQuestion);
+      const turnTools = forceNoTools
+        ? []
+        : skillPolicy.filter(
+            guardWebTools
+              ? tools.filter((tool) => tool.name !== "web_search" && tool.name !== "web_fetch")
+              : tools,
+          );
       const chatRequest = ChatRequestSchema.parse({
         system,
         messages,
         tools: turnTools,
-        tool_choice: turnTools.length > 0 ? request.tool_choice.mode : "none",
+        tool_choice: forceNoTools ? "none" : turnTools.length > 0 ? request.tool_choice.mode : "none",
         max_tokens: maxTokens,
         temperature: request.temperature,
         top_p: request.top_p,
@@ -431,7 +679,7 @@ export class AgentOrchestrator implements IAgentRunner {
         switch (event.type) {
           case "token":
             accumulator.addText(event.text);
-            sink(event);
+            if (!bufferStudyTokens) sink(event);
             break;
           case "thinking_token":
             accumulator.addThinking(event.text, event.signature);
@@ -485,6 +733,8 @@ export class AgentOrchestrator implements IAgentRunner {
             after_tokens: forced.afterTokens,
             summary_tokens: forced.summaryTokens,
             summary: forced.summary,
+            removed_messages: forced.removedMessages,
+            tail_start_message_id: forced.tailStartMessageId,
           });
           continue;
         }
@@ -493,6 +743,13 @@ export class AgentOrchestrator implements IAgentRunner {
       const assistantMessage = accumulator.toMessage(`turn-${turn}`);
       messages.push(assistantMessage);
       const toolUses = assistantMessage.content.filter((block) => block.type === "tool_use");
+
+      if (toolUses.length === 0 && !turnError && !accumulator.hasTextOutput()) {
+        const fallback = accumulator.reasoningOutput();
+        if (fallback.trim().length > 0 && !bufferStudyTokens) {
+          sink({ type: "token", text: fallback });
+        }
+      }
 
       if (toolUses.length === 0 || turnError) {
         if (!turnError && mode === "ultrawork") {
@@ -512,21 +769,41 @@ export class AgentOrchestrator implements IAgentRunner {
             continue;
           }
         }
+        let finalMessage = assistantMessage;
+        if (projectStudy && !turnError) {
+          const originalText = assistantMessage.content
+            .map((block) => (block.type === "text" ? block.text : ""))
+            .join("\n")
+            .trim();
+          let finalText = originalText;
+          if (looksLikeNonAnswer(originalText, this.projectContext, { requireProjectMention: true })) {
+            finalText = await retryProjectStudy(originalText);
+          }
+          if (bufferStudyTokens) {
+            sink({ type: "token", text: finalText });
+          }
+          if (finalText !== originalText) {
+            finalMessage = makeMessage(assistantMessage.id, "assistant", finalText);
+          }
+        }
         await this.hooks.runOnStop({});
         const finalReason: FinishReason = turnError ? "error" : finishReason;
         sink(usageEvent(totals));
         sink({ type: "done", finish_reason: finalReason });
-        return { message: assistantMessage, usage: totals, finish_reason: finalReason };
+        return { message: finalMessage, usage: totals, finish_reason: finalReason };
       }
 
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         const filePath = extractFilePath(call.arguments);
         const toolStartedAt = Date.now();
+        const display = toolDisplay(call.name, call.arguments);
         sink({
           type: "tool_start",
           id: call.id,
           name: call.name,
+          label: display.label,
+          detail: display.detail,
           arguments_summary: summarizeArguments(call.arguments),
           file_path: filePath,
         });
@@ -558,16 +835,24 @@ export class AgentOrchestrator implements IAgentRunner {
           continue;
         }
 
+        let skillDocument: SkillDocument | undefined;
         if (call.name === "skill") {
-          const skillName = typeof call.arguments.name === "string" ? call.arguments.name : undefined;
+          const skillName =
+            typeof call.arguments.id === "string"
+              ? call.arguments.id
+              : typeof call.arguments.name === "string"
+                ? call.arguments.name
+                : undefined;
           const document = skillName ? this.skills.get(skillName) : undefined;
-          if (document?.allowedTools !== undefined && !activatedSkills.has(document.name)) {
+          if (document && !activatedSkills.has(document.name)) {
+            skillDocument = document;
             activatedSkills.add(document.name);
-            skillPolicy.activate(document.allowedTools);
+            if (document.allowedTools !== undefined) skillPolicy.activate(document.allowedTools);
             sink({
               type: "skill_activated",
               name: document.name,
-              allowed_tools: [...document.allowedTools],
+              allowed_tools: document.allowedTools ?? [],
+              trigger: "tool",
             });
           }
         }
@@ -649,7 +934,40 @@ export class AgentOrchestrator implements IAgentRunner {
         }
 
         messages.push(toolResultMessage(call, content, result.is_error));
+        if (skillDocument) {
+          this.activateSkill(sessionId, skillDocument.name);
+          await rebuildSystem();
+        }
         if (filePath && mutates && mode !== "plan") this.advisor.scheduleReview();
+      }
+
+      if (toolUses.length > 0 && !projectNudged) {
+        if (projectStudy) {
+          projectNudged = true;
+          messages.push(
+            makeMessage(
+              `turn-${turn}-study`,
+              "user",
+              [
+                "# Final answer",
+                "You have some tool results. If you need more information, call more read, search, or command tools now. If a file is missing, continue with package.json and src/.",
+                "Do not write a plan or a status update. When you have enough, write the project report.",
+                "Start with what the project is. Include main modules, architecture, and how to run and test it.",
+                "Do not greet. Do not list the files you read. Do not describe the agent instructions or skills.",
+                "Reply in the user's language.",
+              ].join(" "),
+            ),
+          );
+        } else if (projectQuestion) {
+          projectNudged = true;
+          messages.push(
+            makeMessage(
+              `turn-${turn}-answer`,
+              "user",
+              "Answer the user's question now using the tool results. Start with the answer. Do not greet. Do not list the files you read.",
+            ),
+          );
+        }
       }
     }
 
@@ -664,6 +982,55 @@ export class AgentOrchestrator implements IAgentRunner {
       usage: totals,
       finish_reason: "length",
     };
+  }
+
+  private activeSkillNames(sessionId: string | undefined): string[] {
+    const names = new Set(this.ephemeralSkills);
+    if (sessionId) {
+      try {
+        for (const skill of this.database.listSessionSkills(sessionId)) names.add(skill.name);
+      } catch {
+        // Fall back to the in-memory set if the session is unavailable.
+      }
+    }
+    return [...names];
+  }
+
+  private activeSkillDocuments(sessionId: string | undefined): SkillDocument[] {
+    return this.activeSkillNames(sessionId)
+      .map((name) => this.skills.get(name))
+      .filter((document): document is SkillDocument => Boolean(document));
+  }
+
+  private activateSkill(sessionId: string | undefined, name: string): boolean {
+    const document = this.skills.get(name);
+    if (!document) return false;
+    const alreadyActive = this.activeSkillNames(sessionId).includes(document.name);
+    if (sessionId) {
+      try {
+        this.database.activateSessionSkill(sessionId, document.name);
+      } catch {
+        this.ephemeralSkills.add(document.name);
+      }
+    } else {
+      this.ephemeralSkills.add(document.name);
+    }
+    return !alreadyActive;
+  }
+
+  private rememberPrompt(sessionId: string | undefined, snapshot: PromptSnapshot): void {
+    if (!sessionId) return;
+    this.lastPrompts.set(sessionId, snapshot);
+    if (this.lastPrompts.size > 32) {
+      const oldest = this.lastPrompts.keys().next().value;
+      if (oldest) this.lastPrompts.delete(oldest);
+    }
+  }
+
+  private useCompactPrompt(providerName: string | undefined): boolean {
+    if (this.promptStyle === "full") return false;
+    if (this.promptStyle === "compact") return true;
+    return providerName ? this.router.providerKind(providerName) === "ollama" : false;
   }
 
   private readOnlyToolNames(): ReadonlySet<string> {
@@ -736,16 +1103,27 @@ export class AgentOrchestrator implements IAgentRunner {
       }
     }
 
-    const requestedRole = input.roleModel ?? specialist?.roleModel ?? "main";
-    const role = requestedRole === "advisor" || requestedRole === "fast" ? requestedRole : "main";
+    const requestedRole = input.roleModel ?? specialist?.roleModel;
+    const role: "main" | "fast" | "advisor" | undefined =
+      requestedRole === "advisor" || requestedRole === "fast" || requestedRole === "main"
+        ? requestedRole
+        : undefined;
+    const mode = input.mode ?? "build";
+    const providerName =
+      input.provider ??
+      (role ? this.router.getRole(role)?.provider : this.router.getModeModel(mode)?.provider);
     const provider =
       input.provider && input.model
         ? this.router.provider(input.provider, input.model)
-        : this.router.get(role);
+        : role
+          ? this.router.get(role)
+          : this.router.getMode(mode);
     const capabilities =
       input.provider && input.model
         ? this.router.capabilitiesFor(input.provider, input.model)
-        : this.router.capabilitiesForRole(role);
+        : role
+          ? this.router.capabilitiesForRole(role)
+          : this.router.capabilitiesForMode(mode);
     const messages: Message[] = [];
     const scope = input.worktreePath
       ? `Work only inside this directory: ${input.worktreePath}\n\n`
@@ -753,7 +1131,10 @@ export class AgentOrchestrator implements IAgentRunner {
     messages.push(makeMessage("subagent-task", "user", `${scope}${input.task}`));
     const totals = zeroUsage();
 
-    let tools = this.registry.listDefinitions().filter((tool) => !SUBAGENT_BLOCKED_TOOLS.has(tool.name));
+    const effectiveMode = input.mode ?? (specialist?.readOnly ? "plan" : "build");
+    let tools = filterToolsForMode(this.registry.listDefinitions(), effectiveMode).filter(
+      (tool) => !SUBAGENT_BLOCKED_TOOLS.has(tool.name),
+    );
     if (!capabilities.tool_calling) tools = [];
     if (specialist) {
       tools = this.specialistAgents.filterTools(specialist, tools, this.readOnlyToolNames());
@@ -762,14 +1143,16 @@ export class AgentOrchestrator implements IAgentRunner {
     const subagentMaxTokens = capabilities.max_output
       ? Math.min(requestedMaxTokens, capabilities.max_output)
       : requestedMaxTokens;
-    const effectiveMode = input.mode ?? (specialist?.readOnly ? "plan" : "build");
+    const compactPrompt = this.useCompactPrompt(providerName);
     const subagentSystem = buildSystemPrompt({
       mode: effectiveMode,
       repoRoot: this.root,
       branch: this.branch,
       agentInstructions: this.globalRules,
       specialistPrompt: specialist?.systemPrompt,
-      skillsIndex: this.skills.buildIndexPrompt(),
+      projectSummary: this.projectContext?.summary,
+      skillsIndex: this.skills.buildIndexPrompt({ compact: compactPrompt }),
+      compact: compactPrompt,
     });
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
@@ -823,8 +1206,11 @@ export class AgentOrchestrator implements IAgentRunner {
     return { output: `subagent stopped after ${this.maxTurns} turns`, usage: totals };
   }
 
-  private combineTools(requestTools: AgentRunRequest["tools"]): ReturnType<ToolRegistry["listDefinitions"]> {
-    const combined = this.registry.listDefinitions();
+  private combineTools(
+    requestTools: AgentRunRequest["tools"],
+    mode: AgentMode,
+  ): ReturnType<ToolRegistry["listDefinitions"]> {
+    const combined = filterToolsForMode(this.registry.listDefinitions(), mode);
     for (const tool of requestTools) {
       const existing = combined.findIndex((entry) => entry.name === tool.name);
       if (existing >= 0) combined[existing] = tool;
@@ -880,6 +1266,19 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 }
 
+export function stripThinkTags(text: string): string {
+  return text
+    .replace(/^\s*<\/think(?:ing)?>\s*/i, "")
+    .replace(/\s*<\/think(?:ing)?>\s*$/i, "");
+}
+
+export function cleanReasoningAnswer(text: string): string {
+  return text
+    .replace(/\b(?:Let me|I should|I will|I need to)\b[^.!?]*[.!?]\s*/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 class TurnAccumulator {
   private text = "";
   private thinking = "";
@@ -913,19 +1312,38 @@ class TurnAccumulator {
   }
 
   textOutput(): string {
-    return this.text;
+    const text = stripThinkTags(this.text);
+    if (text.trim().length > 0) return text;
+    return cleanReasoningAnswer(stripThinkTags(this.thinking));
+  }
+
+  hasTextOutput(): boolean {
+    return stripThinkTags(this.text).trim().length > 0;
+  }
+
+  reasoningOutput(): string {
+    return cleanReasoningAnswer(stripThinkTags(this.thinking));
   }
 
   toMessage(id: string): Message {
     const content: Message["content"] = [];
-    if (this.thinking.length > 0) {
+    const text = stripThinkTags(this.text);
+    const reasoning = stripThinkTags(this.thinking);
+    const answer = cleanReasoningAnswer(reasoning);
+    const useReasoningAsText =
+      this.drafts.size === 0 && text.trim().length === 0 && answer.trim().length > 0;
+    if (reasoning.length > 0 && !useReasoningAsText) {
       content.push({
         type: "thinking",
-        thinking: this.thinking,
+        thinking: reasoning,
         ...(this.thinkingSignature ? { signature: this.thinkingSignature } : {}),
       });
     }
-    if (this.text.length > 0) content.push({ type: "text", text: this.text });
+    if (useReasoningAsText) {
+      content.push({ type: "text", text: answer });
+    } else if (text.length > 0) {
+      content.push({ type: "text", text });
+    }
     for (const draft of this.drafts.values()) {
       const ready = this.ready.get(draft.id);
       const argumentsObject = ready
@@ -1027,19 +1445,24 @@ function isContextOverflow(message: string): boolean {
 }
 
 function clampReasoningEffort(
-  requested: "low" | "medium" | "high" | undefined,
+  requested: string | undefined,
   supported: string[] | undefined,
-): "low" | "medium" | "high" | undefined {  if (!requested) return undefined;
+): string | undefined {
+  if (!requested) return undefined;
   if (!supported || supported.length === 0) return requested;
-  const normalized = new Set(supported.map((value) => value.toLowerCase()));
-  if (normalized.has(requested)) return requested;
-  const order: Array<"low" | "medium" | "high"> = ["low", "medium", "high"];
-  const requestedIndex = order.indexOf(requested);
+  const normalized = new Map(supported.map((value) => [value.toLowerCase(), value]));
+  const direct = normalized.get(requested.toLowerCase());
+  if (direct) return direct;
+  const order = ["low", "medium", "high"];
+  const requestedIndex = order.indexOf(requested.toLowerCase());
+  if (requestedIndex === -1) return undefined;
   for (let index = requestedIndex - 1; index >= 0; index -= 1) {
-    if (normalized.has(order[index])) return order[index];
+    const fallback = normalized.get(order[index]);
+    if (fallback) return fallback;
   }
   for (let index = requestedIndex + 1; index < order.length; index += 1) {
-    if (normalized.has(order[index])) return order[index];
+    const fallback = normalized.get(order[index]);
+    if (fallback) return fallback;
   }
   return undefined;
 }

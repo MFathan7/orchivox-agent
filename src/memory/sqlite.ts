@@ -22,6 +22,8 @@ export interface SessionCompaction {
   before_tokens: number;
   after_tokens: number;
   created_at: number;
+  removed_messages?: number;
+  auto?: boolean;
 }
 
 export interface HindsightNoteRecord {
@@ -55,6 +57,7 @@ interface MessageRow {
   session_id: string;
   role: string;
   content_json: string;
+  metadata_json: string | null;
   created_at: number;
 }
 
@@ -105,10 +108,18 @@ CREATE TABLE IF NOT EXISTS messages (
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   role TEXT NOT NULL,
   content_json TEXT NOT NULL,
+  metadata_json TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(message_id UNINDEXED, session_id UNINDEXED, role, content);
+CREATE TABLE IF NOT EXISTS session_skills (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  skill_name TEXT NOT NULL,
+  activated_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, skill_name)
+);
+CREATE INDEX IF NOT EXISTS idx_session_skills_session ON session_skills(session_id, activated_at);
 CREATE TABLE IF NOT EXISTS hindsight_notes (
   id TEXT PRIMARY KEY,
   topic TEXT NOT NULL UNIQUE,
@@ -157,6 +168,10 @@ export class MemoryDatabase implements TaskStore {
     const sessionColumns = this.db.query("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
     if (!sessionColumns.some((column) => column.name === "compaction_json")) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN compaction_json TEXT;");
+    }
+    const messageColumns = this.db.query("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+    if (!messageColumns.some((column) => column.name === "metadata_json")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN metadata_json TEXT;");
     }
   }
 
@@ -217,6 +232,31 @@ export class MemoryDatabase implements TaskStore {
       .run(Date.now(), sessionId);
   }
 
+  activateSessionSkill(sessionId: string, skillName: string): void {
+    const session = this.getSession(sessionId);
+    if (!session) throw new Error(`unknown session "${sessionId}"`);
+    const now = Date.now();
+    this.db
+      .query(
+        "INSERT INTO session_skills (session_id, skill_name, activated_at) VALUES (?, ?, ?) ON CONFLICT(session_id, skill_name) DO UPDATE SET activated_at = excluded.activated_at",
+      )
+      .run(sessionId, skillName, now);
+    this.db.query("UPDATE sessions SET updated_at = ? WHERE id = ?").run(now, sessionId);
+  }
+
+  listSessionSkills(sessionId: string): Array<{ name: string; activatedAt: number }> {
+    const rows = this.db
+      .query(
+        "SELECT skill_name, activated_at FROM session_skills WHERE session_id = ? ORDER BY activated_at ASC, skill_name ASC",
+      )
+      .all(sessionId) as Array<{ skill_name: string; activated_at: number }>;
+    return rows.map((row) => ({ name: row.skill_name, activatedAt: row.activated_at }));
+  }
+
+  clearSessionSkills(sessionId: string): void {
+    this.db.query("DELETE FROM session_skills WHERE session_id = ?").run(sessionId);
+  }
+
   addSessionUsage(id: string, tokens: number, costUsd: number): void {
     this.db
       .query(
@@ -256,6 +296,7 @@ export class MemoryDatabase implements TaskStore {
         id: newId,
         role: msg.role,
         content: msg.content,
+        metadata: msg.metadata,
         created_at: msg.created_at,
       });
     }
@@ -272,6 +313,9 @@ export class MemoryDatabase implements TaskStore {
         });
       }
     }
+    for (const skill of this.listSessionSkills(sourceSessionId)) {
+      this.activateSessionSkill(forked.id, skill.name);
+    }
     return forked;
   }
 
@@ -280,9 +324,10 @@ export class MemoryDatabase implements TaskStore {
     if (!session) throw new Error(`unknown session "${sessionId}"`);
     const createdAt = message.created_at ?? Date.now();
     const content = stripInlineImages(message.content);
+    const metadata = message.metadata ? JSON.stringify(message.metadata) : null;
     this.db
-      .query("INSERT INTO messages (id, session_id, role, content_json, created_at) VALUES (?, ?, ?, ?, ?)")
-      .run(message.id, sessionId, message.role, JSON.stringify(content), createdAt);
+      .query("INSERT INTO messages (id, session_id, role, content_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(message.id, sessionId, message.role, JSON.stringify(content), metadata, createdAt);
     this.db
       .query("INSERT INTO messages_fts (message_id, session_id, role, content) VALUES (?, ?, ?, ?)")
       .run(message.id, sessionId, message.role, plainText(content));
@@ -293,25 +338,36 @@ export class MemoryDatabase implements TaskStore {
     const rows = this.loadFullMessages(sessionId);
     const compaction = this.getCompaction(sessionId);
     if (!compaction) return rows;
-    if (compaction.tail_start_message_id) {
-      const index = rows.findIndex((message) => message.id === compaction.tail_start_message_id);
-      if (index !== -1) {
-        return [summaryMessage(compaction), ...rows.slice(index)];
-      }
-    }
-    return rows;
+    if (!compaction.tail_start_message_id) return [summaryMessage(compaction)];
+    const index = rows.findIndex((message) => message.id === compaction.tail_start_message_id);
+    if (index === -1) return [summaryMessage(compaction)];
+    return [summaryMessage(compaction), ...rows.slice(index)];
   }
 
   loadFullMessages(sessionId: string): Message[] {
     const rows = this.db
       .query("SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC")
       .all(sessionId) as unknown as MessageRow[];
-    return rows.map((row) => ({
-      id: row.id,
-      role: row.role as Role,
-      content: JSON.parse(row.content_json) as Message["content"],
-      created_at: row.created_at,
-    }));
+    return rows.map((row) => {
+      let metadata: Message["metadata"];
+      if (row.metadata_json) {
+        try {
+          const parsed: unknown = JSON.parse(row.metadata_json);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            metadata = parsed as Message["metadata"];
+          }
+        } catch {
+          // Ignore malformed metadata.
+        }
+      }
+      return {
+        id: row.id,
+        role: row.role as Role,
+        content: JSON.parse(row.content_json) as Message["content"],
+        metadata,
+        created_at: row.created_at,
+      };
+    });
   }
 
   searchMessages(query: string, options: { sessionId?: string; limit?: number } = {}): MessageSearchHit[] {

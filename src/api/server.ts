@@ -39,7 +39,7 @@ export const AgentRunRequestSchema = z.object({
   top_p: z.number().min(0).max(1).optional(),
   stop_sequences: z.array(z.string().min(1)).default([]),
   metadata: z.record(z.string(), z.unknown()).optional(),
-  reasoning_effort: z.enum(["low", "medium", "high"]).optional(),
+  reasoning_effort: z.string().min(1).optional(),
 });
 export type AgentRunRequest = z.infer<typeof AgentRunRequestSchema>;
 

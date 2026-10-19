@@ -1,5 +1,7 @@
 import { readdir } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 
+import { findProjectDirective } from "../agent/project-context";
 import { pathExists } from "../vcs/git";
 
 export interface RulesLoaderOptions {
@@ -34,13 +36,25 @@ export class RulesLoader {
   }
 
   async getGlobalRules(): Promise<string> {
+    const rootAgents = `${this.root}/AGENTS.md`;
+    let rootAgentsContent = "";
+    if (await pathExists(rootAgents)) {
+      rootAgentsContent = (await Bun.file(rootAgents).text()).trimEnd();
+    }
+    const directive = findProjectDirective(rootAgentsContent);
+    const directivePath = directive
+      ? isAbsolute(directive)
+        ? directive
+        : resolve(this.root, directive)
+      : undefined;
     const candidates = [
-      `${this.root}/AGENTS.md`,
+      rootAgents,
       `${this.root}/CLAUDE.md`,
       `${this.root}/.agent/rules/general.md`,
+      ...(directivePath ? [directivePath] : []),
     ];
     const sections: string[] = [];
-    for (const candidate of candidates) {
+    for (const candidate of new Set(candidates)) {
       if (this.injected.has(candidate)) continue;
       if (!(await pathExists(candidate))) continue;
       this.injected.add(candidate);

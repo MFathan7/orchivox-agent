@@ -5,6 +5,7 @@ import type { MemoryDatabase, MessageSearchHit, SessionRecord } from "../memory/
 import type { RestoreResult, SnapshotEntry, SnapshotHistory, SnapshotManager } from "../vcs/snapshot";
 import type { Message } from "../types/schema";
 import { truncateText } from "./format";
+import { deleteSessionFromList } from "./session-actions";
 import { getTheme, type Theme } from "./theme";
 import { useTerminalSize } from "./viewport";
 
@@ -19,6 +20,7 @@ export interface SessionTimeTravelModalProps {
   onResumeSession?: (sessionId: string) => void;
   onForkSession?: (forkedSession: SessionRecord) => void;
   onNewSession?: () => void;
+  onSessionDeleted?: (sessionId: string) => void;
   onRestoreSnapshot?: (result: RestoreResult) => void;
   onClose: () => void;
   theme?: Theme;
@@ -55,6 +57,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
     onResumeSession,
     onForkSession,
     onNewSession,
+    onSessionDeleted,
     onRestoreSnapshot,
     onClose,
     theme = getTheme("tokyonight"),
@@ -203,10 +206,18 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
       if ((input === "d" || input === "D" || key.delete) && searchQuery.length === 0) {
         const s = sessions[sessionIndex];
         if (s) {
-          database.deleteSession(s.id);
-          setStatusNotice(`Session "${s.title}" deleted successfully.`);
-          refreshSessions();
-          setSessionIndex((prev) => Math.max(0, prev - 1));
+          const result = deleteSessionFromList({
+            database,
+            session: s,
+            activeSessionId,
+            onSessionDeleted,
+            onClose,
+          });
+          if (result.deleted && !result.closed) {
+            setStatusNotice(`Session "${s.title}" deleted successfully.`);
+            refreshSessions();
+            setSessionIndex((prev) => Math.max(0, prev - 1));
+          }
         }
         return;
       }

@@ -10,6 +10,30 @@ export function formatTokenCount(count: number, compact = true): string {
   return `${value >= 100 ? Math.round(value) : value.toFixed(1).replace(/\.0$/, "")}M`;
 }
 
+function formatContextTokenCount(count: number): string {
+  const safe = Math.max(0, Math.round(count));
+  if (safe < 1_000) return String(safe);
+  if (safe < 1_000_000) {
+    return `${(safe / 1_000).toFixed(1).replace(/\.0$/, "")}K`;
+  }
+  return `${(safe / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+export function formatContextWindow(tokens?: number): string {
+  return tokens && tokens > 0 ? formatContextTokenCount(tokens) : "unknown";
+}
+
+export function contextUsagePercent(used = 0, window?: number): number | undefined {
+  if (!window || window <= 0) return undefined;
+  return Math.min(100, Math.round((Math.max(0, used) / window) * 100));
+}
+
+export function formatContextUsage(used = 0, window?: number): string {
+  const tokenText = formatContextTokenCount(used);
+  const percent = contextUsagePercent(used, window);
+  return percent === undefined ? tokenText : `${tokenText} (${percent}%)`;
+}
+
 export function formatCost(costUsd: number): string {
   if (!Number.isFinite(costUsd) || costUsd <= 0) return "$0.0000";
   if (costUsd < 0.0001) return "<$0.0001";

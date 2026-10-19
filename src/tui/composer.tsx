@@ -7,13 +7,15 @@ import type { AgentMode } from "../types/schema";
 import { formatLine, readText, splitLines } from "../tools/hashline-edit";
 import {
   AutocompletePopup,
-  BUILTIN_SLASH_COMMANDS,
   queryAutocomplete,
   type AutocompleteItem,
   type TriggerContext,
 } from "./autocomplete";
+import { continueList, displayListLine } from "./list-format";
+import { collapsePastedText, expandPastedText, pastedPlaceholderAfter, pastedPlaceholderBefore, type PastedEntry } from "./paste";
 import { getTheme, type Theme } from "./theme";
 import { formatTokenCount } from "./format";
+import { isMouseSequence } from "./mouse";
 
 export interface FileAttachmentRef {
   raw: string;
@@ -38,14 +40,6 @@ const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGES_PER_MESSAGE = 4;
-
-const INSTANT_COMMANDS = new Set<string>([
-  ...BUILTIN_SLASH_COMMANDS.filter((command) => command.args === undefined).map(
-    (command) => command.name,
-  ),
-  "/mode",
-  "/reasoning",
-]);
 
 export function imageMimeType(filePath: string): string | undefined {
   const dot = filePath.lastIndexOf(".");
@@ -77,6 +71,9 @@ export interface PromptComposerProps {
   onOpenSessions?: () => void;
   onOpenHelp?: () => void;
   onLayoutRows?: (rows: number) => void;
+  onScrollLine?: (delta: number) => void;
+  onScrollPage?: (delta: number) => void;
+  onScrollToBottom?: () => void;
 }
 
 export class PersistentCommandHistory {
@@ -431,35 +428,7 @@ export function deleteNextWord(text: string, cursorPos: number): { nextText: str
   return { nextText, nextCursor: cursorPos };
 }
 
-export function charDisplayWidth(char: string): number {
-  const code = char.codePointAt(0) ?? 0;
-  if (code === 0) return 0;
-  if (code < 32 || (code >= 0x7f && code < 0xa0)) return 0;
-  if (code === 0x200d) return 0;
-  if (code >= 0x0300 && code <= 0x036f) return 0;
-
-  const wide =
-    (code >= 0x1100 && code <= 0x115f) ||
-    code === 0x2329 ||
-    code === 0x232a ||
-    (code >= 0x2e80 && code <= 0xa4cf) ||
-    (code >= 0xac00 && code <= 0xd7a3) ||
-    (code >= 0xf900 && code <= 0xfaff) ||
-    (code >= 0xfe10 && code <= 0xfe19) ||
-    (code >= 0xfe30 && code <= 0xfe6f) ||
-    (code >= 0xff00 && code <= 0xff60) ||
-    (code >= 0xffe0 && code <= 0xffe6) ||
-    (code >= 0x1f300 && code <= 0x1faff) ||
-    (code >= 0x20000 && code <= 0x3fffd);
-
-  return wide ? 2 : 1;
-}
-
-export function displayWidth(text: string): number {
-  let width = 0;
-  for (const char of text) width += charDisplayWidth(char);
-  return width;
-}
+export { charDisplayWidth, displayWidth } from "./text-wrap";
 
 export function splitLineAtCursor(line: string, col: number): { before: string; cursorChar: string; after: string } {
   const chars = Array.from(line);
@@ -499,6 +468,9 @@ export function PromptComposer(props: PromptComposerProps) {
     onOpenSessions,
     onOpenHelp,
     onLayoutRows,
+    onScrollLine,
+    onScrollPage,
+    onScrollToBottom,
   } = props;
 
   const [text, setText] = React.useState("");
@@ -514,6 +486,7 @@ export function PromptComposer(props: PromptComposerProps) {
   const lastRawInputRef = React.useRef<string>("");
   const undoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
   const redoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
+  const pastedRef = React.useRef<PastedEntry[]>([]);
 
   React.useEffect(() => {
     const emitter = internal_eventEmitter as
@@ -606,8 +579,27 @@ export function PromptComposer(props: PromptComposerProps) {
     setAutocompleteItems([]);
   };
 
+  const insertPlainOrPasted = (value: string): void => {
+    const normalized = normalizeInsertedText(value);
+    const pasted = collapsePastedText(normalized);
+    if (pasted) {
+      pastedRef.current.push(pasted);
+      commitEdit(
+        `${text.slice(0, cursorPos)}${pasted.label}${text.slice(cursorPos)}`,
+        cursorPos + pasted.label.length,
+      );
+      return;
+    }
+    commitEdit(
+      `${text.slice(0, cursorPos)}${normalized}${text.slice(cursorPos)}`,
+      cursorPos + normalized.length,
+    );
+  };
+
   const handleFinalSubmit = async (explicitText?: string): Promise<void> => {
-    const trimmed = (explicitText ?? text).trim();
+    const raw = explicitText ?? text;
+    const expanded = explicitText ? raw : expandPastedText(raw, pastedRef.current);
+    const trimmed = expanded.trim();
     if (!trimmed) return;
 
     const lower = trimmed.toLowerCase();
@@ -624,6 +616,7 @@ export function PromptComposer(props: PromptComposerProps) {
     setAttachedFiles([]);
     setAutocompleteContext(null);
     setAutocompleteItems([]);
+    pastedRef.current = [];
     undoStack.current = [];
     redoStack.current = [];
 
@@ -638,23 +631,17 @@ export function PromptComposer(props: PromptComposerProps) {
     }
   };
 
-  const submitExactCommand = (item: AutocompleteItem): boolean => {
-    if (!autocompleteContext || autocompleteContext.trigger !== "command") return false;
-    if (item.trigger !== "command") return false;
-    const typed = `/${autocompleteContext.query.trim().toLowerCase()}`;
-    if (item.label.toLowerCase() !== typed) return false;
-    if (!INSTANT_COMMANDS.has(item.label)) return false;
-    setAutocompleteContext(null);
-    setAutocompleteItems([]);
-    void handleFinalSubmit(item.label);
-    return true;
-  };
-
   useInput((input, key) => {
     if (disabled) return;
 
     const raw = lastRawInputRef.current;
+    if (isMouseSequence(raw) || isMouseSequence(input)) return;
     const sequence = raw.startsWith("\x1b") ? raw : input.length > 0 ? input : raw;
+    const bracketed = /^\x1b\[200~([\s\S]*)\x1b\[201~$/.exec(raw);
+    if (bracketed) {
+      insertPlainOrPasted(bracketed[1]);
+      return;
+    }
 
     if (autocompleteItems.length > 0 && autocompleteContext) {
       if (key.upArrow) {
@@ -673,7 +660,12 @@ export function PromptComposer(props: PromptComposerProps) {
       if (key.tab || key.return) {
         const selected = autocompleteItems[autocompleteSelected];
         if (selected) {
-          if (key.return && submitExactCommand(selected)) return;
+          if (key.return && selected.trigger === "command" && selected.requiresArgs !== true) {
+            setAutocompleteContext(null);
+            setAutocompleteItems([]);
+            void handleFinalSubmit(selected.label);
+            return;
+          }
           handleInsertAutocomplete(selected);
           return;
         }
@@ -705,6 +697,16 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
+    if (key.pageUp) {
+      onScrollPage?.(1);
+      return;
+    }
+
+    if (key.pageDown) {
+      onScrollPage?.(-1);
+      return;
+    }
+
     const { line, col, lines } = getLineAndColumn(text, cursorPos);
 
     const isExplicitNewline =
@@ -729,6 +731,11 @@ export function PromptComposer(props: PromptComposerProps) {
         before = before.slice(0, -1);
       }
       const after = text.slice(cursorPos);
+      const continued = continueList(`${before}${after}`, before.length);
+      if (continued) {
+        commitEdit(continued.text, continued.cursor);
+        return;
+      }
       commitEdit(`${before}\n${after}`, before.length + 1);
       return;
     }
@@ -775,30 +782,47 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
+    const altUp =
+      (key.meta && key.upArrow) ||
+      sequence === "\x1b[1;3A" ||
+      sequence === "\x1b[27;3;65~";
+    const altDown =
+      (key.meta && key.downArrow) ||
+      sequence === "\x1b[1;3B" ||
+      sequence === "\x1b[27;3;66~";
+
     if (key.upArrow) {
+      if (altUp) {
+        onScrollLine?.(1);
+        return;
+      }
       if (line > 0) {
         const nextCol = Math.min(col, lines[line - 1].length);
         setCursorPos(getCursorOffset(lines, line - 1, nextCol));
-      } else {
-        const prevCommand = historyManager.getPrevious(text);
-        if (prevCommand !== null) {
-          setText(prevCommand);
-          setCursorPos(prevCommand.length);
-        }
+        return;
+      }
+      const prevCommand = historyManager.getPrevious(text);
+      if (prevCommand !== null) {
+        setText(prevCommand);
+        setCursorPos(prevCommand.length);
       }
       return;
     }
 
     if (key.downArrow) {
+      if (altDown) {
+        onScrollLine?.(-1);
+        return;
+      }
       if (line < lines.length - 1) {
         const nextCol = Math.min(col, lines[line + 1].length);
         setCursorPos(getCursorOffset(lines, line + 1, nextCol));
-      } else {
-        const nextEntry = historyManager.getNext();
-        if (nextEntry !== null) {
-          setText(nextEntry.text);
-          setCursorPos(nextEntry.text.length);
-        }
+        return;
+      }
+      const nextEntry = historyManager.getNext();
+      if (nextEntry !== null) {
+        setText(nextEntry.text);
+        setCursorPos(nextEntry.text.length);
       }
       return;
     }
@@ -819,6 +843,10 @@ export function PromptComposer(props: PromptComposerProps) {
     }
 
     if ((key.ctrl && (input === "e" || sequence === "\x05")) || (key as { end?: boolean }).end || sequence === "\x1b[F" || sequence === "\x1b[4~") {
+      if (text.length === 0 && onScrollToBottom) {
+        onScrollToBottom();
+        return;
+      }
       setCursorPos(getCursorOffset(lines, line, lines[line].length));
       return;
     }
@@ -841,6 +869,11 @@ export function PromptComposer(props: PromptComposerProps) {
       sequence === "\x1b[3;3~" ||
       (key.meta && (input === "d" || sequence === "\x1bd"));
     if (isForwardWordDelete) {
+      const placeholder = pastedPlaceholderAfter(text, cursorPos);
+      if (placeholder) {
+        commitEdit(`${text.slice(0, placeholder.start)}${text.slice(placeholder.end)}`, placeholder.start);
+        return;
+      }
       const { nextText, nextCursor } = deleteNextWord(text, cursorPos);
       commitEdit(nextText, nextCursor);
       return;
@@ -859,6 +892,11 @@ export function PromptComposer(props: PromptComposerProps) {
       sequence === "\x1b[8;5~" ||
       sequence === "\x1b\x7f";
     if (isWordBackspace) {
+      const placeholder = pastedPlaceholderBefore(text, cursorPos);
+      if (placeholder) {
+        commitEdit(`${text.slice(0, placeholder.start)}${text.slice(placeholder.end)}`, placeholder.start);
+        return;
+      }
       const { nextText, nextCursor } = deletePreviousWord(text, cursorPos);
       commitEdit(nextText, nextCursor);
       return;
@@ -869,6 +907,11 @@ export function PromptComposer(props: PromptComposerProps) {
       sequence === "\x04" ||
       (key.ctrl && input === "d");
     if (isForwardDelete) {
+      const placeholder = pastedPlaceholderAfter(text, cursorPos);
+      if (placeholder) {
+        commitEdit(`${text.slice(0, placeholder.start)}${text.slice(placeholder.end)}`, placeholder.start);
+        return;
+      }
       if (cursorPos < text.length) {
         commitEdit(`${text.slice(0, cursorPos)}${text.slice(cursorPos + 1)}`, cursorPos);
       }
@@ -879,6 +922,11 @@ export function PromptComposer(props: PromptComposerProps) {
       key.backspace ||
       sequence === "\x7f";
     if (isBackspace) {
+      const placeholder = pastedPlaceholderBefore(text, cursorPos);
+      if (placeholder) {
+        commitEdit(`${text.slice(0, placeholder.start)}${text.slice(placeholder.end)}`, placeholder.start);
+        return;
+      }
       if (cursorPos > 0) {
         commitEdit(`${text.slice(0, cursorPos - 1)}${text.slice(cursorPos)}`, cursorPos - 1);
       }
@@ -902,8 +950,7 @@ export function PromptComposer(props: PromptComposerProps) {
       !input.startsWith("\x1b");
 
     if (isPrintable) {
-      const inserted = normalizeInsertedText(input);
-      commitEdit(`${text.slice(0, cursorPos)}${inserted}${text.slice(cursorPos)}`, cursorPos + inserted.length);
+      insertPlainOrPasted(input);
     }
   });
 
@@ -975,6 +1022,7 @@ export function PromptComposer(props: PromptComposerProps) {
           lines.map((lineContent, lineIndex) => {
             const isCurrentLine = lineIndex === activeLine;
             const prefix = lines.length > 1 ? `${lineIndex + 1} │ ` : "❯ ";
+            const displayLine = displayListLine(lineContent);
 
             if (!isCurrentLine) {
               return (
@@ -982,12 +1030,12 @@ export function PromptComposer(props: PromptComposerProps) {
                   <Text color={theme.border.passive}>
                     {prefix}
                   </Text>
-                  <Text color={theme.text}>{lineContent}</Text>
+                  <Text color={theme.text}>{displayLine}</Text>
                 </Box>
               );
             }
 
-            const { before, cursorChar, after } = splitLineAtCursor(lineContent, activeCol);
+            const { before, cursorChar, after } = splitLineAtCursor(displayLine, activeCol);
 
             return (
               <Box key={`line-${lineIndex}`}>

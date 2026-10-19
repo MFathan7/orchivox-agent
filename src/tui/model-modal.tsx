@@ -10,20 +10,29 @@ import {
   type ProviderProfile,
 } from "../config/loader";
 import {
+  appendProviderModel,
+  saveModeReasoning,
+  saveModeSelection,
   saveModelCapabilities,
   saveProviderProfile,
   saveRoleSelection,
+  type ConfigMode,
   type ConfigRole,
 } from "../config/writer";
 import { discoverLocalProviders, type DiscoveredProvider } from "../provider/discover";
 import { inspectOllamaModel } from "../provider/ollama-introspect";
 import type { ProviderRouter } from "../provider/router";
 import { filterFuzzy } from "./autocomplete";
-import { REASONING_LEVELS, type ReasoningEffortLevel } from "./command-palette";
+import { REASONING_LEVELS, reasoningLevelsFor, type ReasoningEffortLevel } from "./command-palette";
 import { getTheme, type Theme } from "./theme";
 
 const PROVIDER_KINDS = ProviderKindSchema.options;
-const ROLE_ORDER: ConfigRole[] = ["main", "fast", "advisor"];
+type ModelTarget = ConfigRole | ConfigMode;
+const TARGET_ORDER: ModelTarget[] = ["main", "fast", "advisor", "plan", "build", "ultrawork"];
+
+function isModeTarget(target: ModelTarget): target is ConfigMode {
+  return target === "plan" || target === "build" || target === "ultrawork";
+}
 const FORM_FIELDS = ["name", "kind", "baseUrl", "apiKey", "models"] as const;
 type FormField = (typeof FORM_FIELDS)[number];
 
@@ -139,6 +148,8 @@ export interface ModelConfigModalProps {
   onClose: () => void;
   onSaved?: (message: string) => void;
   onRoleChange?: (role: ConfigRole, provider: string, model: string) => void;
+  onModeModelChange?: (mode: ConfigMode, provider: string, model: string) => void;
+  onModeReasoningChange?: (mode: ConfigMode, reasoning: string) => void;
   reasoningEffort?: ReasoningEffortLevel;
   onReasoningChange?: (effort: ReasoningEffortLevel) => void;
 }
@@ -178,12 +189,14 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     onClose,
     onSaved,
     onRoleChange,
+    onModeModelChange,
+    onModeReasoningChange,
     reasoningEffort = "medium",
     onReasoningChange,
   } = props;
 
   const [view, setView] = React.useState<"discover" | "assign" | "connect" | "capabilities" | "reasoning">("discover");
-  const [targetRole, setTargetRole] = React.useState<ConfigRole>("main");
+  const [targetRole, setTargetRole] = React.useState<ModelTarget>("main");
   const [query, setQuery] = React.useState("");
   const [selectedIndex, setSelectedIndex] = React.useState(0);
   const [discovered, setDiscovered] = React.useState<DiscoveredProvider[]>([]);
@@ -206,13 +219,41 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   const configuredModels = router.listAllConfiguredModels();
   const activeFormField: FormField = FORM_FIELDS[field] ?? "name";
 
+  const allModels = React.useMemo(() => {
+    const seen = new Set(configuredModels.map((entry) => `${entry.provider}\u0000${entry.model}`));
+    const list: Array<{
+      provider: string;
+      model: string;
+      kind: string;
+      source: "config" | "catalog";
+    }> = configuredModels.map((entry) => ({ ...entry, source: "config" as const }));
+
+    for (const provider of providers) {
+      if (!provider.enabled) continue;
+      for (const model of router.listCatalogModels(provider.name)) {
+        const key = `${provider.name}\u0000${model.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        list.push({ provider: provider.name, model: model.id, kind: provider.kind, source: "catalog" });
+      }
+    }
+
+    return list;
+  }, [configuredModels, providers, router]);
+
+  const levelOptions = (target: ModelTarget) => {
+    if (isModeTarget(target)) return reasoningLevelsFor(router.reasoningOptionsForMode(target));
+    if (target === "main") return reasoningLevelsFor(router.reasoningOptionsForRole("main"));
+    return REASONING_LEVELS;
+  };
+
   const filteredModels = React.useMemo(() => {
     const trimmed = query.trim();
-    if (!trimmed) return configuredModels;
-    return filterFuzzy(trimmed, configuredModels, (entry) => `${entry.provider} ${entry.model}`, 30).map(
+    if (!trimmed) return allModels;
+    return filterFuzzy(trimmed, allModels, (entry) => `${entry.provider} ${entry.model}`, 30).map(
       (entry) => entry.item,
     );
-  }, [configuredModels, query]);
+  }, [allModels, query]);
 
   const discoverEntries = React.useMemo<DiscoverEntry[]>(() => {
     const entries: DiscoverEntry[] = [];
@@ -296,21 +337,34 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
 
   const assignModel = async (provider: string, model: string): Promise<void> => {
     try {
-      router.setRole(targetRole, provider, model);
-      await saveRoleSelection(configPath, targetRole, provider, model);
-      onRoleChange?.(targetRole, provider, model);
+      const configured = router
+        .listAllConfiguredModels()
+        .some((entry) => entry.provider === provider && entry.model === model);
+      if (!configured) {
+        await appendProviderModel(configPath, provider, model);
+        router.addModel(provider, model);
+      }
+
+      if (isModeTarget(targetRole)) {
+        router.setModeModel(targetRole, provider, model);
+        await saveModeSelection(configPath, targetRole, provider, model);
+        onModeModelChange?.(targetRole, provider, model);
+      } else {
+        router.setRole(targetRole, provider, model);
+        await saveRoleSelection(configPath, targetRole, provider, model);
+        onRoleChange?.(targetRole, provider, model);
+      }
+
       setStatus(`${targetRole} now uses ${provider} / ${model}`);
       setError(undefined);
       setQuery("");
       setSelectedIndex(0);
       forceRender();
-      if (targetRole === "main") {
-        setReasoningIndex(
-          Math.max(
-            0,
-            REASONING_LEVELS.findIndex((level) => level.id === reasoningEffort),
-          ),
-        );
+
+      if (targetRole === "main" || isModeTarget(targetRole)) {
+        const levels = levelOptions(targetRole);
+        const current = isModeTarget(targetRole) ? router.getModeReasoning(targetRole) : reasoningEffort;
+        setReasoningIndex(Math.max(0, levels.findIndex((level) => level.id === current)));
         setView("reasoning");
       } else {
         onClose();
@@ -476,25 +530,25 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     }
 
     if (view === "reasoning") {
+      const levels = levelOptions(targetRole);
       if (key.escape) {
         onClose();
         return;
       }
       if (key.upArrow) {
-        setReasoningIndex((value) =>
-          value > 0 ? value - 1 : Math.max(0, REASONING_LEVELS.length - 1),
-        );
+        setReasoningIndex((value) => (value > 0 ? value - 1 : Math.max(0, levels.length - 1)));
         return;
       }
       if (key.downArrow) {
-        setReasoningIndex((value) =>
-          value < REASONING_LEVELS.length - 1 ? value + 1 : 0,
-        );
+        setReasoningIndex((value) => (value < levels.length - 1 ? value + 1 : 0));
         return;
       }
       if (key.return) {
-        const level = REASONING_LEVELS[reasoningIndex];
-        if (level) onReasoningChange?.(level.id);
+        const level = levels[reasoningIndex];
+        if (level) {
+          if (isModeTarget(targetRole)) onModeReasoningChange?.(targetRole, level.id);
+          else onReasoningChange?.(level.id);
+        }
         onClose();
       }
       return;
@@ -506,8 +560,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         return;
       }
       if (input === "r") {
-        const index = ROLE_ORDER.indexOf(targetRole);
-        setTargetRole(ROLE_ORDER[(index + 1) % ROLE_ORDER.length]);
+        const index = TARGET_ORDER.indexOf(targetRole);
+        setTargetRole(TARGET_ORDER[(index + 1) % TARGET_ORDER.length]);
         return;
       }
       if (input === "a") {
@@ -712,7 +766,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   });
 
   if (view === "discover") {
-    const activeRole = router.getRole(targetRole);
+    const activeModel = isModeTarget(targetRole) ? router.getModeModel(targetRole) : router.getRole(targetRole);
     const configuredNames = new Set(providers.map((provider) => provider.name));
     const localModelCount = discovered.reduce((total, provider) => total + Math.min(provider.models.length, 10), 0);
 
@@ -724,11 +778,11 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         </Box>
 
         <Text>
-          <Text color={theme.muted}>Role </Text>
+          <Text color={theme.muted}>Target </Text>
           <Text bold color={theme.text}>{targetRole}</Text>
           <Text color={theme.muted}>
             {" · "}
-            {activeRole ? `${activeRole.provider} / ${activeRole.model}` : "not configured"}
+            {activeModel ? `${activeModel.provider} / ${activeModel.model}` : "not configured"}
             {"  (r cycle)"}
           </Text>
         </Text>
@@ -783,7 +837,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         {error ? <Text color={theme.badge.error}>{error}</Text> : null}
 
         <Text color={theme.muted}>
-          Enter assign/connect · r role · a assign all · c connect · Esc close
+          Enter assign/connect · r target · a assign all · c connect · Esc close
         </Text>
       </Box>
     );
@@ -823,7 +877,11 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
               <Text key={`${entry.provider}-${entry.model}`}>
                 <Text color={isSelected ? theme.accent : theme.muted}>{isSelected ? "❯ " : "  "}</Text>
                 <Text bold={isSelected} color={theme.text}>{entry.model}</Text>
-                <Text color={theme.muted}> · {entry.provider} ({entry.kind})</Text>
+                <Text color={theme.muted}>
+                  {" · "}
+                  {entry.provider} ({entry.kind})
+                  {entry.source === "catalog" ? " · catalog" : ""}
+                </Text>
               </Text>
             );
           })
@@ -848,8 +906,10 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   }
 
   if (view === "reasoning") {
-    const active = router.getRole(targetRole);
-    const clamped = Math.max(0, Math.min(REASONING_LEVELS.length - 1, reasoningIndex));
+    const active = isModeTarget(targetRole) ? router.getModeModel(targetRole) : router.getRole(targetRole);
+    const levels = levelOptions(targetRole);
+    const currentLevel = isModeTarget(targetRole) ? router.getModeReasoning(targetRole) : reasoningEffort;
+    const clamped = Math.max(0, Math.min(levels.length - 1, reasoningIndex));
 
     return (
       <Box flexDirection="column" paddingX={1}>
@@ -860,9 +920,9 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         <Text color={theme.muted}>
           {active ? `${targetRole} now uses ${active.provider} / ${active.model}` : "Model assigned"}
         </Text>
-        {REASONING_LEVELS.map((level, index) => {
+        {levels.map((level, index) => {
           const isActive = index === clamped;
-          const isCurrent = level.id === reasoningEffort;
+          const isCurrent = level.id === currentLevel;
           return (
             <Text key={level.id}>
               <Text color={isActive ? theme.accent : theme.muted}>{isActive ? "❯ " : "  "}</Text>

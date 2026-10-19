@@ -112,7 +112,7 @@ export const ChatRequestSchema = z.object({
   top_p: z.number().min(0).max(1).optional(),
   max_tokens: z.number().int().positive(),
   stop_sequences: z.array(z.string().min(1)).default([]),
-  reasoning_effort: z.enum(["low", "medium", "high"]).optional(),
+  reasoning_effort: z.string().min(1).optional(),
   response_format: z.record(z.string(), z.unknown()).optional(),
 });
 export type ChatRequest = z.infer<typeof ChatRequestSchema>;
@@ -340,6 +340,8 @@ export const ToolStartEventSchema = z.object({
   type: z.literal("tool_start"),
   id: z.string().min(1),
   name: z.string().min(1),
+  label: z.string().optional(),
+  detail: z.string().optional(),
   arguments_summary: z.string().default(""),
   file_path: z.string().optional(),
 });
@@ -369,8 +371,20 @@ export const SkillActivatedEventSchema = z.object({
   type: z.literal("skill_activated"),
   name: z.string().min(1),
   allowed_tools: z.array(z.string()).default([]),
+  trigger: z.enum(["tool", "mention", "auto"]).optional(),
 });
 export type SkillActivatedEvent = z.infer<typeof SkillActivatedEventSchema>;
+
+export const PromptPreflightEventSchema = z.object({
+  type: z.literal("prompt_preflight"),
+  style: z.enum(["full", "compact"]),
+  system_chars: z.number().int().nonnegative(),
+  tool_count: z.number().int().nonnegative(),
+  available_skills: z.number().int().nonnegative(),
+  active_skills: z.array(z.string()).default([]),
+  skill_mentions: z.array(z.string()).default([]),
+});
+export type PromptPreflightEvent = z.infer<typeof PromptPreflightEventSchema>;
 
 export const CompactionEventSchema = z.object({
   type: z.literal("compaction"),
@@ -379,6 +393,8 @@ export const CompactionEventSchema = z.object({
   after_tokens: z.number().int().nonnegative(),
   summary_tokens: z.number().int().nonnegative().default(0),
   summary: z.string().optional(),
+  removed_messages: z.number().int().nonnegative().default(0),
+  tail_start_message_id: z.string().optional(),
 });
 export type CompactionEvent = z.infer<typeof CompactionEventSchema>;
 
@@ -398,6 +414,7 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   ToolEndEventSchema,
   FileChangeEventSchema,
   SkillActivatedEventSchema,
+  PromptPreflightEventSchema,
   CompactionEventSchema,
 ]);
 export type StreamEvent = z.infer<typeof StreamEventSchema>;

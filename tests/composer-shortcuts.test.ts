@@ -166,7 +166,7 @@ describe("Composer Shortcuts & Word Deletion", () => {
     expect(output).toContain("AGENT");
     instance2.unmount();
 
-    // 3. Entries with user chat should hide WelcomeBanner and render user prompt with ❯
+    // 3. Entries with user chat should hide WelcomeBanner and render the user rail
     output = "";
     const instance3 = render(
       React.createElement(ScrollableChatViewport, {
@@ -182,7 +182,8 @@ describe("Composer Shortcuts & Word Deletion", () => {
         patchConsole: false,
       },
     );
-    expect(output).toContain("❯ hello Orchivox");
+    expect(output).toContain("▌");
+    expect(output).toContain("hello Orchivox");
     // Welcome Banner title is hidden during active conversation
     expect(output).not.toContain("Type a prompt to begin");
     instance3.unmount();

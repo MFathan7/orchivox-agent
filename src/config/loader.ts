@@ -257,10 +257,46 @@ export const CompactionConfigSchema = z.object({
 });
 export type CompactionConfig = z.infer<typeof CompactionConfigSchema>;
 
+export const WebSearchConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  provider: z.enum(["tavily", "brave", "exa", "duckduckgo", "random"]).default("random"),
+});
+export type WebSearchConfig = z.infer<typeof WebSearchConfigSchema>;
+
+export const WebFetchConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+});
+export type WebFetchConfig = z.infer<typeof WebFetchConfigSchema>;
+
+export const PromptConfigSchema = z.object({
+  style: z.enum(["auto", "full", "compact"]).default("auto"),
+});
+export type PromptConfig = z.infer<typeof PromptConfigSchema>;
+
+export const ModeModelSchema = z.object({
+  provider: z.string().min(1),
+  model: z.string().min(1),
+});
+export type ModeModel = z.infer<typeof ModeModelSchema>;
+
+export const ModeSettingsSchema = z.object({
+  model: ModeModelSchema.optional(),
+  reasoning: z.string().min(1).optional(),
+});
+export type ModeSettings = z.infer<typeof ModeSettingsSchema>;
+
+export const ModesConfigSchema = z.object({
+  plan: ModeSettingsSchema.prefault({}),
+  build: ModeSettingsSchema.prefault({}),
+  ultrawork: ModeSettingsSchema.prefault({}),
+});
+export type ModesConfig = z.infer<typeof ModesConfigSchema>;
+
 export const AppConfigSchema = z.object({
   version: z.number().int().positive().default(1),
   providers: z.record(z.string().min(1), ProviderProfileSchema).default({}),
   roles: RolesConfigSchema.default({}),
+  modes: ModesConfigSchema.prefault({}),
   inbound_server: InboundServerConfigSchema.prefault({}),
   lsp: z
     .object({
@@ -275,6 +311,9 @@ export const AppConfigSchema = z.object({
   hooks: HooksConfigSchema.prefault({}),
   sandbox: SandboxConfigSchema.prefault({}),
   compaction: CompactionConfigSchema.prefault({}),
+  websearch: WebSearchConfigSchema.prefault({}),
+  webfetch: WebFetchConfigSchema.prefault({}),
+  prompt: PromptConfigSchema.prefault({}),
 });
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 

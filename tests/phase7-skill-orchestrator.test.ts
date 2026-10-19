@@ -16,6 +16,7 @@ import { WorktreeManager } from "../src/vcs/worktree";
 
 class ScriptedProvider implements LLMProvider {
   readonly calls: string[][] = [];
+  readonly systems: string[] = [];
   private turn = 0;
 
   async listModels(): Promise<string[]> {
@@ -25,17 +26,32 @@ class ScriptedProvider implements LLMProvider {
   async *streamChat(request: ChatRequest): AsyncGenerator<StreamEvent, void, unknown> {
     this.turn += 1;
     this.calls.push(request.tools.map((tool) => tool.name));
+    this.systems.push(request.system ?? "");
     if (this.turn === 1) {
       yield {
         type: "tool_call_ready",
         id: "call-skill",
         name: "skill",
-        arguments: { name: "pdf" },
+        arguments: { id: "pdf" },
       };
       yield { type: "done", finish_reason: "tool_calls" };
       return;
     }
     yield { type: "token", text: "done" };
+    yield { type: "done", finish_reason: "stop" };
+  }
+}
+
+class TextOnlyProvider implements LLMProvider {
+  readonly systems: string[] = [];
+
+  async listModels(): Promise<string[]> {
+    return [];
+  }
+
+  async *streamChat(request: ChatRequest): AsyncGenerator<StreamEvent, void, unknown> {
+    this.systems.push(request.system ?? "");
+    yield { type: "token", text: "ok" };
     yield { type: "done", finish_reason: "stop" };
   }
 }
@@ -89,6 +105,9 @@ describe("Skill policy in the orchestrator", () => {
         repoRoot: repo,
       });
       await orchestrator.initialize();
+      expect(orchestrator.registry.has("web_search")).toBe(true);
+      expect(orchestrator.registry.has("web_fetch")).toBe(true);
+      database.createSession({ id: "sess-skill", title: "skill policy", mode: "build" });
 
       const result = await orchestrator.runOnce(
         AgentRunRequestSchema.parse({
@@ -97,9 +116,10 @@ describe("Skill policy in the orchestrator", () => {
             {
               id: "u1",
               role: "user",
-              content: [{ type: "text", text: "Use the pdf skill to read the file." }],
+              content: [{ type: "text", text: "Read the attached document." }],
             },
           ],
+          metadata: { session_id: "sess-skill" },
           max_tokens: 128,
         }),
       );
@@ -112,6 +132,31 @@ describe("Skill policy in the orchestrator", () => {
       expect(provider.calls[1]).toContain("todo_write");
       expect(provider.calls[1]).not.toContain("hash_edit");
       expect(provider.calls[1]).not.toContain("spawn_subagents");
+      expect(provider.systems[0]).toContain("<available_skills>");
+      expect(provider.systems[0]).toContain("<id>pdf</id>");
+      expect(provider.systems[1]).toContain("# Active skills");
+      expect(provider.systems[1]).toContain('<skill_content name="pdf">');
+      expect(database.listSessionSkills("sess-skill").map((skill) => skill.name)).toEqual(["pdf"]);
+
+      const textProvider = new TextOnlyProvider();
+      router.get = () => textProvider;
+      await orchestrator.runOnce(
+        AgentRunRequestSchema.parse({
+          profile: "orchivox-main",
+          messages: [
+            {
+              id: "u2",
+              role: "user",
+              content: [{ type: "text", text: "What should we do next?" }],
+            },
+          ],
+          metadata: { session_id: "sess-skill" },
+          max_tokens: 128,
+        }),
+      );
+      expect(textProvider.systems[0]).toContain("# Active skills");
+      expect(textProvider.systems[0]).toContain('<skill_content name="pdf">');
+      expect(orchestrator.getLastPromptInfo("sess-skill")?.activeSkills).toEqual(["pdf"]);
       database.close();
     } finally {
       await rm(repo, { recursive: true, force: true });

@@ -81,9 +81,11 @@ describe("Skill registry", () => {
     expect(registry.get("PDF")?.description).toContain("PDF files");
 
     const index = registry.buildIndexPrompt();
-    expect(index).toContain("Available skills");
-    expect(index).toContain("pdf: Extract text and tables");
-    expect(index).toContain("Notes: Summarize meeting notes");
+    expect(index).toContain("<available_skills>");
+    expect(index).toContain("<id>pdf</id>");
+    expect(index).toContain("<description>Extract text and tables from PDF files.</description>");
+    expect(index).toContain("<id>Notes</id>");
+    expect(index).toContain("<description>Summarize meeting notes into decisions.</description>");
     expect(index).not.toContain("Inspect the file");
   });
 
@@ -118,12 +120,12 @@ describe("Skill registry", () => {
     const tools = new ToolRegistry();
     registry.registerTools(tools);
 
-    const loaded = await tools.run({ id: "t1", name: "skill", arguments: { name: "pdf" } }, "build");
+    const loaded = await tools.run({ id: "t1", name: "skill", arguments: { id: "pdf" } }, "build");
     expect(loaded.is_error).toBe(false);
     expect(String(loaded.content)).toContain("# Skill: pdf");
     expect(String(loaded.content)).toContain("Inspect the file.");
 
-    const missing = await tools.run({ id: "t2", name: "skill", arguments: { name: "nope" } }, "build");
+    const missing = await tools.run({ id: "t2", name: "skill", arguments: { id: "nope" } }, "build");
     expect(String(missing.content)).toContain("Available skills");
 
     const list = await tools.run({ id: "t3", name: "skill_list", arguments: {} }, "plan");
@@ -136,7 +138,7 @@ describe("Skill registry", () => {
     createdDirs.push(repo);
     const registry = new SkillRegistry({ repoRoot: repo, includeGlobalDirectories: false });
     expect(await registry.load(true)).toEqual([]);
-    expect(registry.buildIndexPrompt()).toContain("Skills: none installed.");
+    expect(registry.buildIndexPrompt()).toContain("No skills are currently available.");
   });
 });
 

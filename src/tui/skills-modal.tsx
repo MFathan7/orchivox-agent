@@ -7,6 +7,7 @@ import { getTheme, type Theme } from "./theme";
 
 export interface SkillsModalProps {
   skills: SkillDocument[];
+  activeSkills?: string[];
   width?: number;
   theme?: Theme;
   onReload?: () => void;
@@ -15,6 +16,7 @@ export interface SkillsModalProps {
 
 export function SkillsModal({
   skills,
+  activeSkills = [],
   width = 100,
   theme = getTheme("tokyonight"),
   onReload,
@@ -78,6 +80,9 @@ export function SkillsModal({
                 <Text color={isSelected ? theme.accent : theme.muted}>{isSelected ? "❯ " : "  "}</Text>
                 <Text bold={isSelected} color={theme.text}>{nameLabel}</Text>
                 <Text color={theme.muted}> · {skill.scope}</Text>
+                {activeSkills.includes(skill.name) ? (
+                  <Text color={theme.accent}> · active</Text>
+                ) : null}
                 {description ? (
                   <Text color={theme.muted}> · {truncateText(description, descriptionWidth)}</Text>
                 ) : null}

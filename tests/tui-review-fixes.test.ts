@@ -46,20 +46,31 @@ describe("TUI review fixes", () => {
             role: "assistant",
             text: "FINAL_ANSWER",
             thinking: "REASONING_BLOCK",
-            toolCalls: [{ name: "read_file", argumentsSummary: "src/index.ts", status: "ok" as const }],
+            toolCalls: [
+              {
+                name: "read_file",
+                label: "Reading file",
+                detail: "src/index.ts",
+                argumentsSummary: "src/index.ts",
+                status: "ok" as const,
+              },
+            ],
           },
         ],
         width: 100,
         height: 40,
         theme: getTheme("tokyonight"),
         initiallyCollapsed: false,
+        initiallyExpandedActivity: true,
       }),
     );
 
     const output = captured.read();
-    expect(output).toContain("REASONING_BLOCK");
+    expect(output).toContain("Thinking");
+    expect(output).toContain("Reading file");
+    expect(output).toContain("src/index.ts");
     expect(output).toContain("FINAL_ANSWER");
-    expect(output.indexOf("REASONING_BLOCK")).toBeLessThan(output.indexOf("FINAL_ANSWER"));
+    expect(output.indexOf("Thinking")).toBeLessThan(output.indexOf("FINAL_ANSWER"));
     captured.unmount();
   });
 

@@ -1,5 +1,7 @@
 # Dependencies
 node_modules/
+/docs/
+AGENTS.md
 
 # Build output
 dist/

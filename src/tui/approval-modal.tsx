@@ -20,6 +20,14 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
 
   const [feedbackMode, setFeedbackMode] = React.useState(false);
   const [feedbackText, setFeedbackText] = React.useState("");
+  const [selected, setSelected] = React.useState(0);
+  const actions = [
+    { id: "approve_once", label: "Approve once", color: theme.modes.build.primary },
+    { id: "always_allow", label: "Always allow", color: theme.modes.plan.primary },
+    { id: "deny", label: "Deny", color: theme.diff.removed },
+    { id: "deny_with_feedback", label: "Deny with feedback", color: theme.modes.ultrawork.primary },
+  ] as const;
+  const clamped = Math.max(0, Math.min(actions.length - 1, selected));
 
   const riskLevel = request.shellDetails?.riskLevel ?? "low";
   let borderColor = theme.border.active;
@@ -62,17 +70,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
       return;
     }
 
-    if (input === "y" || input === "Y") {
-      onDecision({ approved: true, choice: "approve_once" });
-      return;
-    }
-
-    if (input === "a" || input === "A") {
-      onDecision({ approved: true, choice: "always_allow" });
-      return;
-    }
-
-    if (input === "n" || input === "N" || key.escape) {
+    if (key.escape) {
       onDecision({
         approved: false,
         choice: "deny",
@@ -81,7 +79,30 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
       return;
     }
 
-    if (input === "f" || input === "F") {
+    if (key.upArrow) {
+      setSelected((value) => (value > 0 ? value - 1 : actions.length - 1));
+      return;
+    }
+
+    if (key.downArrow) {
+      setSelected((value) => (value < actions.length - 1 ? value + 1 : 0));
+      return;
+    }
+
+    if (!key.return) return;
+
+    const action = actions[clamped];
+    if (action.id === "approve_once") {
+      onDecision({ approved: true, choice: "approve_once" });
+    } else if (action.id === "always_allow") {
+      onDecision({ approved: true, choice: "always_allow" });
+    } else if (action.id === "deny") {
+      onDecision({
+        approved: false,
+        choice: "deny",
+        reason: "Tool execution cancelled by user.",
+      });
+    } else {
       setFeedbackMode(true);
       setFeedbackText("");
     }
@@ -182,26 +203,22 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
               <Text inverse color={theme.accent}> </Text>
             </Box>
             <Text dimColor>
-              Enter Send Feedback  |  Esc Cancel
+              Enter send feedback · Esc back
             </Text>
           </Box>
         ) : (
-          <Box justifyContent="space-between">
-            <Box gap={2}>
-              <Text color={theme.modes.build.primary} bold>
-                y Approve Once
+          <Box flexDirection="column">
+            {actions.map((action, index) => (
+              <Text key={action.id}>
+                <Text color={index === clamped ? theme.accent : theme.muted}>
+                  {index === clamped ? "❯ " : "  "}
+                </Text>
+                <Text bold={index === clamped} color={action.color}>
+                  {action.label}
+                </Text>
               </Text>
-              <Text color={theme.modes.plan.primary} bold>
-                a Always Allow
-              </Text>
-              <Text color={theme.diff.removed} bold>
-                n Deny
-              </Text>
-              <Text color={theme.modes.ultrawork.primary} bold>
-                f Deny with Feedback
-              </Text>
-            </Box>
-            <Text dimColor>Select an action hotkey</Text>
+            ))}
+            <Text dimColor>Up/Down move · Enter select · Esc deny</Text>
           </Box>
         )}
       </Box>

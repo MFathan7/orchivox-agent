@@ -21,6 +21,7 @@ export interface AutocompleteItem {
   detail?: string;
   kind?: string;
   score?: number;
+  requiresArgs?: boolean;
 }
 
 export interface FuzzyMatchResult {
@@ -53,15 +54,20 @@ function truncateText(text: string, max: number): string {
   return `${text.slice(0, max - 3)}...`;
 }
 
-export const BUILTIN_SLASH_COMMANDS: Array<{ name: string; args?: string; description: string }> = [
+export const BUILTIN_SLASH_COMMANDS: Array<{
+  name: string;
+  args?: string;
+  requiresArgs?: boolean;
+  description: string;
+}> = [
   { name: "/help", description: "Open the command reference panel" },
   { name: "/models", description: "Inspect roles, connect providers, and assign models" },
-  { name: "/mode", args: "<plan|build|ultrawork>", description: "Switch or inspect agent execution mode" },
+  { name: "/mode", args: "<plan|build|ultrawork>", requiresArgs: false, description: "Switch or inspect agent execution mode" },
   { name: "/plan", description: "Switch to plan mode (read-only)" },
   { name: "/build", description: "Switch to build mode (approval on write)" },
   { name: "/ultrawork", description: "Switch to autonomous ultrawork mode" },
-  { name: "/theme", args: "<name>", description: "Change or inspect the terminal theme" },
-  { name: "/reasoning", args: "<off|low|med|high|max>", description: "Set thinking effort" },
+  { name: "/theme", args: "<name>", requiresArgs: true, description: "Change or inspect the terminal theme" },
+  { name: "/reasoning", args: "<off|low|med|high|max>", requiresArgs: false, description: "Set thinking effort" },
   { name: "/palette", description: "Search actions and settings" },
   { name: "/sessions", description: "Open session manager and past conversation search" },
   { name: "/fork", description: "Fork active conversation from a specific turn" },
@@ -69,6 +75,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{ name: string; args?: string; descri
   { name: "/hub", description: "Open subagent manager to inspect or stop workers" },
   { name: "/tasks", description: "Open the multi-agent task board" },
   { name: "/skills", description: "Inspect installed skills" },
+  { name: "/debug", requiresArgs: false, description: "Inspect the last system prompt and active skills" },
   { name: "/new", description: "Start a fresh session and reset the view" },
   { name: "/undo", description: "Undo file modifications to the previous snapshot" },
   { name: "/redo", description: "Re-apply reverted snapshot" },
@@ -269,6 +276,10 @@ export function detectTriggerContext(text: string, cursorPos: number): TriggerCo
   return null;
 }
 
+export function requiresCommandArguments(template: string): boolean {
+  return /\$[1-9]\b/.test(template);
+}
+
 export async function fetchSlashCommands(repoRoot?: string): Promise<AutocompleteItem[]> {
   const now = Date.now();
   if (cachedCommands && now - cachedCommands.timestamp < CACHE_TTL_COMMANDS_MS) {
@@ -283,6 +294,7 @@ export async function fetchSlashCommands(repoRoot?: string): Promise<Autocomplet
     detail: command.args,
     description: command.description,
     kind: "command",
+    requiresArgs: command.requiresArgs ?? command.args !== undefined,
   }));
 
   const root = repoRoot ?? globalThis.process.cwd();
@@ -298,6 +310,7 @@ export async function fetchSlashCommands(repoRoot?: string): Promise<Autocomplet
         detail: cmd.frontmatter.agent ? `@${cmd.frontmatter.agent}` : "custom",
         description: cmd.frontmatter.description ?? "Custom markdown slash command",
         kind: "custom-command",
+        requiresArgs: requiresCommandArguments(cmd.template),
       });
     }
   } catch {

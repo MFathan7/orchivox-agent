@@ -1,11 +1,16 @@
 import React from "react";
-import { Box, Text, useInput } from "ink";
+import { Box, Text, useInput, useStdin } from "ink";
 
+import { toolDisplay } from "../agent/tool-display";
 import type { ChatEntryView, WriteTarget } from "./app";
 import { DiffView, ThinkingBlock, ToolCallBadge } from "./diff-view";
+import { parseMouseClick } from "./mouse";
+import { activityCalls, activitySummary, groupToolCalls } from "./tool-groups";
+import { formatTokenCount } from "./format";
 import { WelcomeBanner } from "./logo";
 import { MarkdownView } from "./markdown";
 import { getTheme, type Theme } from "./theme";
+import { wrapText } from "./text-wrap";
 
 export interface ScreenSize {
   columns: number;
@@ -59,6 +64,10 @@ export interface ScrollableChatViewportProps {
   repoPath?: string;
   branch?: string;
   resetKey?: string;
+  offsetFromBottom?: number;
+  onOffsetChange?: React.Dispatch<React.SetStateAction<number>>;
+  topOffset?: number;
+  initiallyExpandedActivity?: boolean;
 }
 
 export interface SplitPaneViewportProps extends ScrollableChatViewportProps {
@@ -66,7 +75,7 @@ export interface SplitPaneViewportProps extends ScrollableChatViewportProps {
   initialSidebarVisible?: boolean;
 }
 
-export const AUTO_SCROLL_PAUSED = "AUTO-SCROLL PAUSED · Press End / G to jump to bottom";
+export const AUTO_SCROLL_PAUSED = "AUTO-SCROLL PAUSED · Press End to jump to bottom";
 
 export class AlternateScreen {
   private readonly target: ScreenTarget;
@@ -92,7 +101,7 @@ export class AlternateScreen {
   enter(): void {
     if (this.entered) return;
     this.entered = true;
-    this.target.write("\u001b[?1049h");
+    this.target.write("\u001b[?1049h\u001b[?1000h\u001b[?1006h");
     this.target.on?.("resize", this.resizeListener);
   }
 
@@ -100,7 +109,7 @@ export class AlternateScreen {
     if (!this.entered) return;
     this.entered = false;
     this.target.removeListener?.("resize", this.resizeListener);
-    this.target.write("\u001b[?1049l");
+    this.target.write("\u001b[?1000l\u001b[?1006l\u001b[?1049l");
   }
 
   onChange(listener: (size: ScreenSize) => void): () => void {
@@ -136,17 +145,93 @@ export function countWrappedLines(text: string, width: number): number {
     .reduce((total, line) => total + Math.max(1, Math.ceil(line.length / safeWidth)), 0);
 }
 
-export function estimateEntryLines(entry: ChatEntryView, width: number, collapsed: boolean): number {
+export function estimateEntryLines(
+  entry: ChatEntryView,
+  width: number,
+  collapsed: boolean,
+  expandedGroups: ReadonlySet<string> = new Set(),
+  thinkingExpanded = false,
+): number {
   const safeWidth = Math.max(width, 20);
+  if (entry.role === "compaction") {
+    const header = 1;
+    const footer = entry.compaction?.status === "running" ? 0 : 1;
+    const body = collapsed ? 1 : countWrappedLines(entry.text, safeWidth);
+    const error = entry.compaction?.error ? 1 : 0;
+    return header + body + footer + error + 2;
+  }
+  if (entry.role === "user") {
+    return wrapText(entry.text, Math.max(1, safeWidth - 2)).length + 2;
+  }
   let lines = countWrappedLines(entry.text, safeWidth);
   if (entry.thinking) {
-    lines += collapsed ? 1 : 1 + countWrappedLines(entry.thinking, safeWidth - 2);
+    const thinkingOpen = !entry.live && thinkingExpanded;
+    lines += thinkingOpen
+      ? 3 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 4))
+      : 3;
   }
-  lines += entry.toolCalls?.length ?? 0;
+  const activity = groupToolCalls(entry.toolCalls);
+  if (activity.total > 0) {
+    lines += 1 + (expandedGroups.has(entry.id) ? activity.total : 0);
+  }
+  lines += activity.others.length;
   lines += (entry.files?.length ?? 0) * (collapsed ? 1 : 10);
   if (entry.live) lines += 1;
   if (entry.diff) lines += collapsed ? 1 : 10;
+  if (entry.role === "assistant") lines += 2;
+  if (
+    entry.role === "assistant" &&
+    entry.text &&
+    !entry.live &&
+    (entry.mode || entry.model || entry.tokensPerSecond !== undefined)
+  ) {
+    lines += 1;
+  }
   return lines;
+}
+
+export function findActivityRowAt(
+  entries: ChatEntryView[],
+  width: number,
+  height: number,
+  offsetFromBottom: number,
+  collapsed: boolean,
+  expandedGroups: ReadonlySet<string>,
+  clickRow: number,
+  thinkingExpanded = false,
+): ChatEntryView | undefined {
+  const safeWidth = Math.max(width, 20);
+  const visible = selectWindow(
+    entries,
+    width,
+    height,
+    offsetFromBottom,
+    collapsed,
+    expandedGroups,
+    thinkingExpanded,
+  );
+  let row = 0;
+  for (const entry of visible) {
+    const activity = groupToolCalls(entry.toolCalls);
+    if (entry.role === "assistant" && activity.total > 0) {
+      const thinkingOpen = !entry.live && thinkingExpanded;
+      const thinking = entry.thinking
+        ? thinkingOpen
+          ? 3 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 4))
+          : 3
+        : 0;
+      const headerRow = row + (entry.live ? 1 : 0) + thinking;
+      if (Math.abs(clickRow - headerRow) <= 1) return entry;
+    }
+    row += estimateEntryLines(entry, width, collapsed, expandedGroups, thinkingExpanded);
+  }
+  return undefined;
+}
+
+function dividerLine(label: string, width: number): string {
+  const head = `── ${label} `;
+  const safeWidth = Math.max(20, width);
+  return `${head}${"─".repeat(Math.max(0, safeWidth - head.length))}`;
 }
 
 export function selectWindow(
@@ -155,12 +240,14 @@ export function selectWindow(
   height: number,
   offsetFromBottom: number,
   collapsed: boolean,
+  expandedGroups: ReadonlySet<string> = new Set(),
+  thinkingExpanded = false,
 ): ChatEntryView[] {
   const selected: ChatEntryView[] = [];
   let budget = height + offsetFromBottom;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
-    const cost = estimateEntryLines(entry, width, collapsed);
+    const cost = estimateEntryLines(entry, width, collapsed, expandedGroups, thinkingExpanded);
     if (budget <= 0) break;
     selected.unshift(entry);
     budget -= cost;
@@ -201,38 +288,115 @@ export function ScrollableChatViewport({
   repoPath,
   branch,
   resetKey,
+  offsetFromBottom: controlledOffset,
+  onOffsetChange,
+  topOffset = 0,
+  initiallyExpandedActivity = false,
 }: ScrollableChatViewportProps): React.ReactElement {
-  const [offsetFromBottom, setOffsetFromBottom] = React.useState(0);
+  const [internalOffset, setInternalOffset] = React.useState(0);
+  const offsetFromBottom = controlledOffset ?? internalOffset;
+  const setOffsetFromBottom = onOffsetChange ?? setInternalOffset;
   const [collapsed, setCollapsed] = React.useState(initiallyCollapsed);
+  const [thinkingExpanded, setThinkingExpanded] = React.useState(false);
+  const allEntries = React.useMemo(
+    () => (liveEntry ? [...entries, liveEntry] : entries),
+    [entries, liveEntry],
+  );
+  const [expandedGroups, setExpandedGroups] = React.useState<Set<string>>(() => {
+    if (!initiallyExpandedActivity) return new Set();
+    return new Set(
+      allEntries
+        .filter((entry) => groupToolCalls(entry.toolCalls).total > 0)
+        .map((entry) => entry.id),
+    );
+  });
+  const { stdin } = useStdin();
 
   useInput(
     (input, key) => {
-      if (key.pageUp) {
-        setOffsetFromBottom((value) => value + height);
-        return;
-      }
-      if (key.pageDown) {
-        setOffsetFromBottom((value) => Math.max(0, value - height));
-        return;
-      }
-      if (input === "\u001b[F" || input === "\u001bOF") {
-        setOffsetFromBottom(0);
-        return;
-      }
       if (key.ctrl && input === "o") {
         setCollapsed((value) => !value);
+        setThinkingExpanded((value) => !value);
+        setExpandedGroups((previous) => {
+          if (previous.size > 0) return new Set();
+          return new Set(
+            allEntries
+              .filter((entry) => groupToolCalls(entry.toolCalls).total > 0)
+              .map((entry) => entry.id),
+          );
+        });
       }
     },
     { isActive: active },
   );
 
   const spinner = useSpinner(Boolean(liveEntry));
-  const allEntries = liveEntry ? [...entries, liveEntry] : entries;
-  const visible = selectWindow(allEntries, width, height, offsetFromBottom, collapsed);
+  const totalLines = allEntries.reduce(
+    (sum, entry) => sum + estimateEntryLines(entry, width, collapsed, expandedGroups, thinkingExpanded),
+    0,
+  );
+  const maxOffset = Math.max(0, totalLines - height);
+  const effectiveOffset = Math.min(offsetFromBottom, maxOffset);
+
+  React.useEffect(() => {
+    if (offsetFromBottom > maxOffset) setOffsetFromBottom(maxOffset);
+  }, [offsetFromBottom, maxOffset]);
+
+  React.useEffect(() => {
+    if (!active) return;
+    const onData = (data: Buffer): void => {
+      const click = parseMouseClick(data.toString());
+      if (!click) return;
+      const row = click.y - (topOffset + 1);
+      if (row < 0 || row >= height) return;
+      const target = findActivityRowAt(
+        allEntries,
+        width,
+        height,
+        effectiveOffset,
+        collapsed,
+        expandedGroups,
+        row,
+        thinkingExpanded,
+      );
+      if (!target) return;
+      setExpandedGroups((previous) => {
+        const next = new Set(previous);
+        if (next.has(target.id)) next.delete(target.id);
+        else next.add(target.id);
+        return next;
+      });
+    };
+    stdin.on("data", onData);
+    return () => {
+      stdin.off("data", onData);
+    };
+  }, [
+    active,
+    stdin,
+    topOffset,
+    height,
+    width,
+    effectiveOffset,
+    collapsed,
+    expandedGroups,
+    thinkingExpanded,
+    allEntries,
+  ]);
+
+  const visible = selectWindow(
+    allEntries,
+    width,
+    height,
+    effectiveOffset,
+    collapsed,
+    expandedGroups,
+    thinkingExpanded,
+  );
 
   React.useEffect(() => {
     setOffsetFromBottom(0);
-  }, [entries.length, resetKey]);
+  }, [resetKey]);
 
   const hasChatMessages = allEntries.some((e) => e.role === "user" || e.role === "assistant");
   const showWelcome = !hasChatMessages && !streamingText && !liveEntry;
@@ -254,7 +418,7 @@ export function ScrollableChatViewport({
           const running = entry.toolCalls?.find((call) => call.status === "running");
           const elapsed = entry.startedAt ? Math.max(0, Math.floor((Date.now() - entry.startedAt) / 1000)) : 0;
           const files = entry.live ? (entry.files ?? []).slice(-2) : (entry.files ?? []);
-          const toolCalls = entry.live ? (entry.toolCalls ?? []).slice(-6) : (entry.toolCalls ?? []);
+          const activity = groupToolCalls(entry.toolCalls);
           const liveText = entry.live
             ? entry.text.split("\n").slice(-Math.max(4, height - 4)).join("\n")
             : entry.text;
@@ -264,17 +428,56 @@ export function ScrollableChatViewport({
                 <Box gap={1} marginY={0}>
                   <Text color={theme.badge.running} bold>{spinner}</Text>
                   <Text color={theme.text} bold>
-                    {running ? running.name : entry.text ? "writing" : entry.thinking ? "thinking" : "working"}
+                    {running
+                      ? (running.label ?? toolDisplay(running.name).label)
+                      : entry.text
+                        ? "Writing"
+                        : entry.thinking
+                          ? "Thinking"
+                          : "Working"}
                   </Text>
                   {elapsed > 0 ? <Text color={theme.muted}>{elapsed}s</Text> : null}
                   <Text color={theme.muted}>Esc twice to stop</Text>
                 </Box>
               ) : null}
-              {entry.role === "user" ? (
-                <Box marginY={0}>
-                  <Text color={theme.accent} bold>
-                    ❯ {entry.text}
+              {entry.role === "compaction" ? (
+                <Box flexDirection="column" marginY={1}>
+                  <Text color={theme.border.passive}>
+                    {dividerLine(entry.compaction?.auto ? "auto compacted" : "compacted", width)}
                   </Text>
+                  {entry.compaction?.status === "running" ? (
+                    <Text color={theme.badge.running}>compacting...</Text>
+                  ) : entry.text ? (
+                    collapsed ? (
+                      <Text color={theme.muted}>summary hidden (Ctrl+O to expand)</Text>
+                    ) : (
+                      <MarkdownView content={entry.text} theme={theme} />
+                    )
+                  ) : null}
+                  {entry.compaction?.error ? (
+                    <Text color={theme.badge.error}>{entry.compaction.error}</Text>
+                  ) : null}
+                  {entry.compaction && entry.compaction.status !== "running" ? (
+                    <Text color={theme.border.passive}>
+                      {dividerLine(
+                        `${formatTokenCount(entry.compaction.beforeTokens)} -> ${formatTokenCount(entry.compaction.afterTokens)} tokens · ${entry.compaction.removedMessages} messages removed`,
+                        width,
+                      )}
+                    </Text>
+                  ) : null}
+                </Box>
+              ) : entry.role === "user" ? (
+                <Box flexDirection="column" marginY={1}>
+                  {wrapText(entry.text, Math.max(1, width - 2)).map((line, lineIndex) => (
+                    <Box key={`${entry.id}-line-${lineIndex}`}>
+                      <Text color={theme.accent} bold>
+                        ▌{" "}
+                      </Text>
+                      <Text color={theme.text} bold>
+                        {line || " "}
+                      </Text>
+                    </Box>
+                  ))}
                 </Box>
               ) : entry.role === "system" ? (
                 <Box marginY={0} flexDirection="column">
@@ -288,16 +491,44 @@ export function ScrollableChatViewport({
               ) : null}
               {entry.thinking ? (
                 <ThinkingBlock
-                  key={`${entry.id}-thinking-${collapsed ? "closed" : "open"}`}
+                  key={`${entry.id}-thinking-${thinkingExpanded ? "open" : "closed"}`}
                   text={entry.thinking}
-                  defaultOpen={entry.live ? false : !collapsed}
+                  defaultOpen={entry.live ? false : thinkingExpanded}
                   theme={theme}
                 />
               ) : null}
-              {toolCalls.map((call, index) => (
+              {activity.total > 0 ? (
+                <Box flexDirection="column">
+                  <Text>
+                    <Text color={theme.muted}>
+                      {expandedGroups.has(entry.id) ? "▾ " : "▸ "}
+                    </Text>
+                    <Text color={theme.text}>Activity: {activitySummary(activity)}</Text>
+                  </Text>
+                  {expandedGroups.has(entry.id)
+                    ? activityCalls(activity).map((call, index) => (
+                        <Box key={`${entry.id}-activity-${index}`} paddingLeft={2}>
+                          <ToolCallBadge
+                            name={call.name}
+                            label={call.label}
+                            detail={call.detail}
+                            argumentsSummary={collapsed ? "" : call.argumentsSummary}
+                            durationMs={call.durationMs}
+                            status={call.status}
+                            lspStatus={call.lspStatus}
+                            theme={theme}
+                          />
+                        </Box>
+                      ))
+                    : null}
+                </Box>
+              ) : null}
+              {activity.others.map((call, index) => (
                 <ToolCallBadge
                   key={`${entry.id}-tool-${index}`}
                   name={call.name}
+                  label={call.label}
+                  detail={call.detail}
                   argumentsSummary={collapsed ? "" : call.argumentsSummary}
                   durationMs={call.durationMs}
                   status={call.status}
@@ -344,8 +575,22 @@ export function ScrollableChatViewport({
                 )
               ) : null}
               {entry.role === "assistant" && entry.text ? (
-                <Box marginY={0} flexDirection="column">
+                <Box marginY={1} flexDirection="column">
                   <MarkdownView content={liveText} theme={theme} />
+                  {!entry.live &&
+                  (entry.mode || entry.model || entry.tokensPerSecond !== undefined) ? (
+                    <Text color={theme.muted}>
+                      {[
+                        entry.mode?.toUpperCase(),
+                        entry.model,
+                        entry.tokensPerSecond !== undefined && Number.isFinite(entry.tokensPerSecond)
+                          ? `${entry.tokensPerSecond.toFixed(1)} tok/s`
+                          : undefined,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </Text>
+                  ) : null}
                 </Box>
               ) : null}
             </Box>
