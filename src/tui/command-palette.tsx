@@ -133,7 +133,12 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     }
 
     const actions: Array<{ key: string; title: string; subtitle: string }> = [
-      { key: "open_models", title: "Model manager", subtitle: "Roles, providers, and connections (/models)" },
+      {
+        key: "open_models",
+        title: "Model manager",
+        subtitle: "Type to search models and assign roles (/models)",
+      },
+      { key: "open_connect", title: "Provider manager", subtitle: "Add, edit, enable, or delete providers (/connect)" },
       { key: "open_skills", title: "Skills", subtitle: "Inspect installed skills (/skills)" },
       { key: "open_tasks", title: "Task board", subtitle: "Multi-agent tasks and results (/tasks)" },
       { key: "open_sessions", title: "Sessions", subtitle: "Browse, search, fork, and restore (Ctrl+S)" },
@@ -201,7 +206,15 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       return;
     }
 
-    const isBackspace = Boolean(key.backspace || input === "\x7f" || input === "\b" || input === "\x1b[3~");
+    if (key.ctrl && input === "u") {
+      setQuery("");
+      setSelectedIndex(0);
+      return;
+    }
+
+    const isBackspace = Boolean(
+      key.backspace || key.delete || input === "\x7f" || input === "\b" || input === "\x1b[3~",
+    );
     if (isBackspace) {
       setQuery((prev) => prev.slice(0, -1));
       setSelectedIndex(0);

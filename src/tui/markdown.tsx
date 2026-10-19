@@ -270,7 +270,17 @@ export function parseMarkdown(content: string): MarkdownBlock[] {
     }
     blocks.push({ kind: "paragraph", lines: paragraph });
   }
-  return blocks;
+
+  const merged: MarkdownBlock[] = [];
+  for (const block of blocks) {
+    const previous = merged[merged.length - 1];
+    if (block.kind === "numbered" && previous?.kind === "numbered") {
+      previous.items.push(...block.items);
+    } else {
+      merged.push(block);
+    }
+  }
+  return merged;
 }
 
 export function highlightLine(line: string, language: string): HighlightToken[] {

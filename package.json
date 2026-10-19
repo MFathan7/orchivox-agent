@@ -14,7 +14,8 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "serve": "bun run src/server.ts",
-    "build:binary": "bun build ./src/index.ts --compile --outfile orchivox",
+    "build:binary": "bun run scripts/build-binary.ts",
+    "check:secrets": "bun run scripts/check-secrets.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

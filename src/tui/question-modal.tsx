@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text, useInput } from "ink";
 
 import type { QuestionAnswer, QuestionRequest } from "../tools/question";
+import { isMouseSequence } from "./mouse";
 import { getTheme, type Theme } from "./theme";
 
 export interface PendingQuestion extends QuestionRequest {
@@ -12,6 +13,11 @@ export interface QuestionModalProps {
   request: PendingQuestion;
   onAnswer: (answer: QuestionAnswer) => void;
   theme?: Theme;
+}
+
+export function normalizeQuestionOptionLabel(label: string): string {
+  const stripped = label.replace(/^\s*(?:\d+[.)]|[-*+])\s+/, "").trim();
+  return stripped.length > 0 ? stripped : label.trim();
 }
 
 export function QuestionModal({
@@ -28,8 +34,10 @@ export function QuestionModal({
   const customIndex = request.allow_custom ? request.options.length : -1;
   const total = request.options.length + (request.allow_custom ? 1 : 0);
   const clamped = Math.max(0, Math.min(total - 1, selected));
+  const labels = request.options.map((option) => normalizeQuestionOptionLabel(option.label));
 
   useInput((input, key) => {
+    if (isMouseSequence(input)) return;
     if (customMode) {
       if (key.escape) {
         setCustomMode(false);
@@ -43,7 +51,9 @@ export function QuestionModal({
           return;
         }
         const selectedLabels = request.multiple
-          ? request.options.filter((_, index) => toggled.has(index)).map((option) => option.label)
+          ? request.options.flatMap((option, index) =>
+              toggled.has(index) ? [labels[index] ?? normalizeQuestionOptionLabel(option.label)] : [],
+            )
           : [];
         onAnswer({ selected: selectedLabels, custom, cancelled: false });
         return;
@@ -72,6 +82,35 @@ export function QuestionModal({
       setSelected((value) => (value < total - 1 ? value + 1 : 0));
       return;
     }
+    if (/^[1-9]$/.test(input)) {
+      const index = Number(input) - 1;
+      const option = request.options[index];
+      if (option) {
+        setNotice("");
+        setSelected(index);
+        if (request.multiple) {
+          setToggled((previous) => {
+            const next = new Set(previous);
+            if (next.has(index)) next.delete(index);
+            else next.add(index);
+            return next;
+          });
+        } else {
+          onAnswer({
+            selected: [labels[index] ?? normalizeQuestionOptionLabel(option.label)],
+            cancelled: false,
+          });
+        }
+        return;
+      }
+      if (request.allow_custom && index === request.options.length) {
+        setSelected(index);
+        setNotice("");
+        setCustomMode(true);
+        setCustomText("");
+        return;
+      }
+    }
     if (input === " ") {
       if (clamped === customIndex) {
         setCustomMode(true);
@@ -99,14 +138,21 @@ export function QuestionModal({
           setNotice("Select at least one option with Space, or choose a custom answer.");
           return;
         }
-        const selectedLabels = request.options
-          .filter((_, index) => toggled.has(index))
-          .map((option) => option.label);
+        const selectedLabels = request.options.flatMap((option, index) =>
+          toggled.has(index)
+            ? [labels[index] ?? normalizeQuestionOptionLabel(option.label)]
+            : [],
+        );
         onAnswer({ selected: selectedLabels, cancelled: false });
         return;
       }
       const option = request.options[clamped];
-      if (option) onAnswer({ selected: [option.label], cancelled: false });
+      if (option) {
+        onAnswer({
+          selected: [labels[clamped] ?? normalizeQuestionOptionLabel(option.label)],
+          cancelled: false,
+        });
+      }
     }
   });
 
@@ -132,10 +178,13 @@ export function QuestionModal({
           return (
             <Text key={`${option.label}-${index}`}>
               <Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}</Text>
+              <Text color={theme.muted}>{`${index + 1}. `}</Text>
               {request.multiple ? (
                 <Text color={active ? theme.accent : theme.muted}>{checked ? "[x] " : "[ ] "}</Text>
               ) : null}
-              <Text bold={active} color={theme.text}>{option.label}</Text>
+              <Text bold={active} color={theme.text}>
+                {labels[index] ?? normalizeQuestionOptionLabel(option.label)}
+              </Text>
               {option.description ? <Text color={theme.muted}>  {option.description}</Text> : null}
             </Text>
           );
@@ -145,6 +194,7 @@ export function QuestionModal({
             <Text color={clamped === customIndex ? theme.accent : theme.muted}>
               {clamped === customIndex ? "❯ " : "  "}
             </Text>
+            <Text color={theme.muted}>{`${request.options.length + 1}. `}</Text>
             <Text color={theme.muted}>✎ Type a custom answer</Text>
           </Text>
         ) : null}
@@ -163,8 +213,8 @@ export function QuestionModal({
       ) : (
         <Text color={theme.muted}>
           {request.multiple
-            ? "Up/Down move · Space toggle · Enter submit · Esc cancel"
-            : "Up/Down move · Enter select · Esc cancel"}
+            ? "Up/Down move · 1-8 toggle · Space toggle · Enter submit · Esc cancel"
+            : "Up/Down move · 1-8 select · Enter select · Esc cancel"}
         </Text>
       )}
     </Box>

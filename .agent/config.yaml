@@ -1,75 +1,29 @@
+# Clean template. Add or edit providers with /connect, then assign models with /models.
+# To use your personal config in this repo, run: orchivox --config ~/.orchivox/config.yaml
 # Values written as ${NAME} are replaced from environment variables at load time.
 # A placeholder that resolves to nothing drops that key, so optional fields stay absent.
 version: 1
 
 providers:
-  openai_primary:
-    kind: openai
-    base_url: https://api.openai.com/v1
-    api_key: ${OPENAI_API_KEY}
-    # pricing fills cost_usd on the usage event; use the real per-million USD rates for the model.
-    # pricing:
-    #   input_usd_per_million_tokens: 0
-    #   output_usd_per_million_tokens: 0
-    models:
-      - gpt-4.1
-      - gpt-4.1-mini
-    timeout_ms: 60000
-    enabled: true
-
-  openclaude_gateway:
-    kind: openclaude
-    base_url: https://gateway.example.net/openclaude
-    api_key: ${OPENCLAUDE_API_KEY}
-    models:
-      - claude-sonnet-4-5
-      - claude-haiku-4-5
-    headers: {}
-    timeout_ms: 60000
-    enabled: true
-
-  ollama_local:
-    kind: ollama
-    base_url: http://127.0.0.1:11434/v1
-    models:
-      - qwen2.5-coder:7b
-      - llama3.2:3b
-    timeout_ms: 120000
-    enabled: true
-
-  openrouter:
-    kind: openrouter
-    base_url: https://openrouter.ai/api/v1
-    api_key: ${OPENROUTER_API_KEY}
-    models:
-      - openai/gpt-4.1-mini
-      - qwen/qwen-2.5-coder-32b-instruct
-    timeout_ms: 60000
-    enabled: false
   ollama:
     kind: ollama
     base_url: http://127.0.0.1:11434/v1
-    models:
-      - qwen3.5:9b
-      - haervwe/GLM-4.6V-Flash-9B:latest
-      - qwen2.5-coder:7b
-      - hermes3:latest
-      - gemma4:12b-it-qat
+    models: []
     model_capabilities: {}
     headers: {}
     timeout_ms: 60000
     enabled: true
+  Nvidia:
+    kind: openai
+    base_url: https://integrate.api.nvidia.com/v1
+    models: []
+    model_capabilities: {}
+    headers: {}
+    timeout_ms: 60000
+    enabled: true
+    catalog_provider: nvidia
 
-roles:
-  main_model:
-    provider: ollama
-    model: qwen3.5:9b
-  fast_model:
-    provider: ollama_local
-    model: llama3.2:3b
-  advisor_model:
-    provider: openclaude_gateway
-    model: claude-haiku-4-5
+roles: {}
 
 inbound_server:
   port: 8787
@@ -130,3 +84,6 @@ sandbox:
       deny: []
       # escalate decides what happens when a sandboxed action hits a rule that needs a human call.
       escalate: ask
+modes:
+  build:
+    reasoning: medium

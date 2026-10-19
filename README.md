@@ -90,6 +90,10 @@ Orchivox supports these provider kinds:
 - `ollama`
 - `openrouter`
 
+Use `/connect` to add, edit, enable, or delete providers. Choose **Custom provider** to connect any OpenAI-compatible or Anthropic-compatible endpoint with your own provider name and API URL. After a successful test, every model returned by the provider is saved. The provider manager shows installed local models and checks remote providers against their live model list when an API key is available.
+
+Use `/models` to browse models grouped by provider and assign a model to a role or mode. Type directly to search, without pressing `/`. `Ctrl+Backspace` or `Ctrl+Delete` deletes a word, `Ctrl+R` cycles the target role, `Ctrl+A` toggles non-chat models, and `Tab` opens Providers.
+
 Models are assigned by role:
 
 - `main_model` handles normal turns.
@@ -233,7 +237,36 @@ The loader replaces `${NAME}` placeholders from the environment. A placeholder t
 
 ## Configuration
 
-The main configuration file is `.agent/config.yaml`. The secrets file is `.agent/secrets.yaml`.
+Orchivox resolves config in this order:
+
+1. `--config <path>` and `--secrets <path>`
+2. `ORCHIVOX_CONFIG` and `ORCHIVOX_SECRETS`
+3. Project config: `.agent/config.yaml`
+4. Global config: `~/.orchivox/config.yaml`
+5. Empty defaults
+
+Project config wins over global config. Secrets resolve separately, and a missing project secrets file can fall back to `~/.orchivox/secrets.yaml`.
+
+```bash
+orchivox --config ~/.orchivox/config.yaml
+ORCHIVOX_CONFIG=~/.orchivox/config.yaml orchivox
+```
+
+The main configuration file is `.agent/config.yaml` or the active global config. The secrets file is `.agent/secrets.yaml` or `~/.orchivox/secrets.yaml`.
+
+Provider API keys belong in the secrets file, not in tracked config. The config writer strips `api_key` from provider profiles before saving config. Run `bun run check:secrets` before pushing to verify tracked files do not contain key-like values and that `.agent/secrets.yaml` is ignored.
+
+To share one config across projects:
+
+```bash
+mkdir -p ~/.orchivox
+chmod 700 ~/.orchivox
+cp .agent/config.yaml ~/.orchivox/config.yaml
+cp .agent/secrets.yaml ~/.orchivox/secrets.yaml
+chmod 600 ~/.orchivox/secrets.yaml
+```
+
+After that, projects without `.agent/config.yaml` use the global config automatically.
 
 | Key | What it controls |
 | --- | --- |
@@ -353,7 +386,8 @@ This exposes the agent tools as an MCP server over stdio. Orchivox also acts as 
 | Expand one activity group | Click the `Activity` row |
 | Scroll the transcript | Mouse wheel, `PageUp`, `PageDown` |
 | Stop the current turn | `Esc` twice |
-| Inspect model roles | `/models` |
+| Browse and search models | `/models` |
+| Add, edit, or delete providers | `/connect` |
 | Inspect snapshots | `/timeline` |
 | Undo or redo file changes | `/undo`, `/redo` |
 | Split the diff into commits | `/commit` |
@@ -378,6 +412,8 @@ The output is:
 ```text
 ./orchivox
 ```
+
+The build stubs Ink's optional React DevTools import, so the compiled binary does not need `react-devtools-core` at runtime. React DevTools is not available in the binary. Use `bun run start` when you need it.
 
 Run it directly:
 
@@ -421,6 +457,7 @@ src/ide/         LSP, DAP, AST compression, code intelligence
 src/memory/      SQLite sessions, rules, hindsight memory
 src/vcs/         Git worktrees, snapshots, atomic commits
 src/api/         OpenAI, Anthropic, OpenAPI, and task endpoints
+scripts/         build scripts
 bin/             command launcher
 .agent/          local config, rules, skills, plugins, snapshots, state
 assets/          logo and README image

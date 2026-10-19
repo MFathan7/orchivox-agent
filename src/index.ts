@@ -15,6 +15,7 @@ import type { SkillDocument } from "./agent/skills";
 import type { ApprovalDecision, ApprovalRequest } from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
 import { loadConfig, type AppConfig } from "./config/loader";
+import { resolveConfigPaths, type ConfigSource } from "./config/paths";
 import { saveModeReasoning, type ConfigMode } from "./config/writer";
 import { LSPClient } from "./ide/lsp-client";
 import { RulesLoader } from "./memory/rules-loader";
@@ -53,10 +54,16 @@ export interface CliOptions {
   mode: AgentMode;
   help: boolean;
   trust?: boolean;
+  configPath?: string;
+  secretsPath?: string;
 }
 
 export interface RuntimeHandle {
   config: AppConfig;
+  configPath: string;
+  secretsPath: string;
+  configSource: ConfigSource;
+  secretsSource: ConfigSource;
   orchestrator: AgentOrchestrator;
   router: ProviderRouter;
   database: MemoryDatabase;
@@ -78,6 +85,8 @@ const HELP_TEXT = [
   "  orchivox mcp                         expose the agent tools as an MCP server on stdio",
   "",
   "flags: -p/--prompt, -f/--format, --mode, --port, --trust, -h/--help",
+  "       --config <path>                 use a specific config file",
+  "       --secrets <path>                use a specific secrets file",
 ].join("\n");
 
 export function parseCliArgs(argv: string[]): CliOptions {
@@ -86,7 +95,15 @@ export function parseCliArgs(argv: string[]): CliOptions {
     const arg = argv[index];
     if (arg === "-h" || arg === "--help") options.help = true;
     else if (arg === "--trust") options.trust = true;
-    else if (arg === "serve") options.command = "serve";
+    else if (arg === "--config") {
+      const value = argv[++index];
+      if (!value) throw new Error("--config requires a file path");
+      options.configPath = value;
+    } else if (arg === "--secrets") {
+      const value = argv[++index];
+      if (!value) throw new Error("--secrets requires a file path");
+      options.secretsPath = value;
+    } else if (arg === "serve") options.command = "serve";
     else if (arg === "mcp") options.command = "mcp";
     else if (arg === "-p" || arg === "--prompt") {
       options.command = "prompt";
@@ -181,10 +198,19 @@ class InterceptingRouter extends ProviderRouter {
   }
 }
 
-export async function bootstrap(options: { repoRoot?: string } = {}): Promise<RuntimeHandle> {
+export async function bootstrap(
+  options: { repoRoot?: string; configPath?: string; secretsPath?: string } = {},
+): Promise<RuntimeHandle> {
   const root = options.repoRoot ?? globalThis.process.cwd();
-  const config = await loadConfig(`${root}/.agent/config.yaml`, globalThis.process.env, {
-    secretsPath: `${root}/.agent/secrets.yaml`,
+  const resolved = await resolveConfigPaths({
+    cwd: root,
+    configFlag: options.configPath,
+    secretsFlag: options.secretsPath,
+    env: globalThis.process.env,
+  });
+  const config = await loadConfig(resolved.configPath, globalThis.process.env, {
+    secretsPath: resolved.secretsPath,
+    fallbackSecretsPaths: resolved.fallbackSecretsPaths,
   });
   const database = new MemoryDatabase(`${root}/.agent/memory.db`);
   const rules = new RulesLoader({ rootPath: root });
@@ -219,6 +245,10 @@ export async function bootstrap(options: { repoRoot?: string } = {}): Promise<Ru
 
   return {
     config,
+    configPath: resolved.configPath,
+    secretsPath: resolved.secretsPath,
+    configSource: resolved.configSource,
+    secretsSource: resolved.secretsSource,
     orchestrator,
     router,
     database,
@@ -293,7 +323,10 @@ export async function main(
     }
   }
 
-  const runtime = await bootstrap();
+  const runtime = await bootstrap({
+    configPath: options.configPath,
+    secretsPath: options.secretsPath,
+  });
 
   if (options.command === "serve") {
     const gateway = new AgentGatewayServer({
@@ -372,6 +405,7 @@ async function runTuiSession(
     counter: 0,
     helpOpen: false,
     modelsOpen: false,
+    modelsView: "models" as "models" | "providers",
     skillsOpen: false,
     skills: runtime.orchestrator.skills.listDocuments() as SkillDocument[],
     activeSkills: [] as string[],
@@ -519,6 +553,10 @@ async function runTuiSession(
     rerender();
   };
 
+  if (runtime.configSource === "default") {
+    state.notice = "No config found. Use /connect to add a provider.";
+  }
+
   const resetToWelcome = (): void => {
     state.sessionId = undefined;
     state.sessionEpoch += 1;
@@ -570,8 +608,13 @@ async function runTuiSession(
       rerender();
     },
     modelsOpen: state.modelsOpen,
+    modelsView: state.modelsView,
     onModelsOpenChange: (open: boolean) => {
       state.modelsOpen = open;
+      rerender();
+    },
+    onModelsViewChange: (view: "models" | "providers") => {
+      state.modelsView = view;
       rerender();
     },
     skillsOpen: state.skillsOpen,
@@ -604,8 +647,8 @@ async function runTuiSession(
         setNotice(message, 12000);
       });
     },
-    configPath: `${root}/.agent/config.yaml`,
-    secretsPath: `${root}/.agent/secrets.yaml`,
+    configPath: runtime.configPath,
+    secretsPath: runtime.secretsPath,
     onRoleChange: (role: "main" | "fast" | "advisor", provider: string, model: string) => {
       setNotice(`${role} now uses ${provider} / ${model}`);
     },
@@ -617,7 +660,7 @@ async function runTuiSession(
       state.reasoningByMode[mode] = reasoning as ReasoningEffortLevel;
       if (state.mode === mode) state.reasoningEffort = reasoning as ReasoningEffortLevel;
       runtime.router.setModeReasoning(mode, reasoning);
-      void saveModeReasoning(`${root}/.agent/config.yaml`, mode, reasoning).catch((error) => {
+      void saveModeReasoning(runtime.configPath, mode, reasoning).catch((error) => {
         setNotice(
           `Could not save reasoning: ${error instanceof Error ? error.message : String(error)}`,
           6000,
@@ -649,7 +692,7 @@ async function runTuiSession(
       state.reasoningEffort = effort;
       state.reasoningByMode[state.mode] = effort;
       runtime.router.setModeReasoning(state.mode, effort);
-      void saveModeReasoning(`${root}/.agent/config.yaml`, state.mode, effort).catch((error) => {
+      void saveModeReasoning(runtime.configPath, state.mode, effort).catch((error) => {
         setNotice(
           `Could not save reasoning: ${error instanceof Error ? error.message : String(error)}`,
           6000,
@@ -1166,7 +1209,7 @@ async function runTuiSession(
           state.reasoningByMode[state.mode] = targetReasoning as ReasoningEffortLevel;
           state.reasoningEffort = state.reasoningByMode[state.mode];
           runtime.router.setModeReasoning(state.mode, targetReasoning);
-          void saveModeReasoning(`${root}/.agent/config.yaml`, state.mode, targetReasoning).catch(
+          void saveModeReasoning(runtime.configPath, state.mode, targetReasoning).catch(
             (error) => {
               setNotice(
                 `Could not save reasoning: ${error instanceof Error ? error.message : String(error)}`,
@@ -1193,6 +1236,13 @@ async function runTuiSession(
         break;
       }
       case "/models": {
+        state.modelsView = "models";
+        state.modelsOpen = true;
+        rerender();
+        break;
+      }
+      case "/connect": {
+        state.modelsView = "providers";
         state.modelsOpen = true;
         rerender();
         break;

@@ -398,17 +398,25 @@ export async function loadSecrets(path: string): Promise<SecretsConfig> {
 export async function loadConfig(
   path: string = CONFIG_PATH,
   env: EnvMap = process.env,
-  options: { secretsPath?: string } = {},
+  options: { secretsPath?: string; fallbackSecretsPaths?: string[] } = {},
 ): Promise<AppConfig> {
   const file = Bun.file(path);
   const config = (await file.exists()) ? parseConfigText(await file.text(), path, env) : defaultConfig();
-  if (!options.secretsPath) return config;
-
-  const secrets = await loadSecrets(options.secretsPath);
-  for (const [name, secret] of Object.entries(secrets.providers)) {
-    const profile = config.providers[name];
-    if (profile && !profile.api_key && secret.api_key) {
-      profile.api_key = secret.api_key;
+  const secretPaths = [
+    ...new Set(
+      [options.secretsPath, ...(options.fallbackSecretsPaths ?? [])].filter(
+        (secretPath): secretPath is string =>
+          typeof secretPath === "string" && secretPath.length > 0,
+      ),
+    ),
+  ];
+  for (const secretPath of secretPaths) {
+    const secrets = await loadSecrets(secretPath);
+    for (const [name, secret] of Object.entries(secrets.providers)) {
+      const profile = config.providers[name];
+      if (profile && !profile.api_key && secret.api_key) {
+        profile.api_key = secret.api_key;
+      }
     }
   }
   return config;

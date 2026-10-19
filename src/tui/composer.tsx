@@ -7,6 +7,7 @@ import type { AgentMode } from "../types/schema";
 import { formatLine, readText, splitLines } from "../tools/hashline-edit";
 import {
   AutocompletePopup,
+  detectTriggerContext,
   queryAutocomplete,
   type AutocompleteItem,
   type TriggerContext,
@@ -16,6 +17,19 @@ import { collapsePastedText, expandPastedText, pastedPlaceholderAfter, pastedPla
 import { getTheme, type Theme } from "./theme";
 import { formatTokenCount } from "./format";
 import { isMouseSequence } from "./mouse";
+import {
+  deleteNextWord,
+  deletePreviousWord,
+  findNextWordEnd,
+  findPreviousWordStart,
+} from "./text-edit";
+
+export {
+  deleteNextWord,
+  deletePreviousWord,
+  findNextWordEnd,
+  findPreviousWordStart,
+} from "./text-edit";
 
 export interface FileAttachmentRef {
   raw: string;
@@ -347,87 +361,6 @@ export function getCursorOffset(lines: string[], targetLine: number, targetCol: 
   return offset + clampedCol;
 }
 
-function isWordCharacter(char: string): boolean {
-  return /[a-zA-Z0-9_]/.test(char);
-}
-
-function isSpace(char: string): boolean {
-  return /\s/.test(char);
-}
-
-export function findPreviousWordStart(text: string, cursorPos: number): number {
-  let target = Math.max(0, Math.min(text.length, cursorPos));
-
-  while (target > 0 && isSpace(text[target - 1])) {
-    target -= 1;
-  }
-
-  if (target > 0 && isWordCharacter(text[target - 1])) {
-    while (target > 0 && isWordCharacter(text[target - 1])) {
-      target -= 1;
-    }
-    return target;
-  }
-
-  while (target > 0 && !isSpace(text[target - 1]) && !isWordCharacter(text[target - 1])) {
-    target -= 1;
-  }
-  while (target > 0 && isWordCharacter(text[target - 1])) {
-    target -= 1;
-  }
-
-  return target;
-}
-
-export function findNextWordEnd(text: string, cursorPos: number): number {
-  let target = Math.max(0, Math.min(text.length, cursorPos));
-
-  while (target < text.length && isSpace(text[target])) {
-    target += 1;
-  }
-
-  if (target < text.length && !isWordCharacter(text[target])) {
-    while (target < text.length && !isSpace(text[target]) && !isWordCharacter(text[target])) {
-      target += 1;
-    }
-  } else {
-    while (target < text.length && isWordCharacter(text[target])) {
-      target += 1;
-    }
-  }
-
-  return target;
-}
-
-export function deletePreviousWord(text: string, cursorPos: number): { nextText: string; nextCursor: number } {
-  if (cursorPos <= 0) return { nextText: text, nextCursor: 0 };
-  let target = Math.max(0, Math.min(text.length, cursorPos));
-
-  while (target > 0 && isSpace(text[target - 1])) {
-    target -= 1;
-  }
-
-  if (target > 0 && !isWordCharacter(text[target - 1])) {
-    while (target > 0 && !isSpace(text[target - 1]) && !isWordCharacter(text[target - 1])) {
-      target -= 1;
-    }
-  } else {
-    while (target > 0 && isWordCharacter(text[target - 1])) {
-      target -= 1;
-    }
-  }
-
-  const nextText = text.slice(0, target) + text.slice(cursorPos);
-  return { nextText, nextCursor: target };
-}
-
-export function deleteNextWord(text: string, cursorPos: number): { nextText: string; nextCursor: number } {
-  if (cursorPos >= text.length) return { nextText: text, nextCursor: cursorPos };
-  const target = findNextWordEnd(text, cursorPos);
-  const nextText = text.slice(0, cursorPos) + text.slice(target);
-  return { nextText, nextCursor: cursorPos };
-}
-
 export { charDisplayWidth, displayWidth } from "./text-wrap";
 
 export function splitLineAtCursor(line: string, col: number): { before: string; cursorChar: string; after: string } {
@@ -487,6 +420,7 @@ export function PromptComposer(props: PromptComposerProps) {
   const undoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
   const redoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
   const pastedRef = React.useRef<PastedEntry[]>([]);
+  const autocompleteSuppressedRef = React.useRef(false);
 
   React.useEffect(() => {
     const emitter = internal_eventEmitter as
@@ -522,6 +456,12 @@ export function PromptComposer(props: PromptComposerProps) {
   }, [text, repoRoot]);
 
   React.useEffect(() => {
+    if (autocompleteSuppressedRef.current) {
+      setAutocompleteContext(null);
+      setAutocompleteItems([]);
+      return;
+    }
+
     let cancelled = false;
 
     void queryAutocomplete(text, cursorPos, repoRoot).then((result) => {
@@ -543,6 +483,8 @@ export function PromptComposer(props: PromptComposerProps) {
 
   const commitEdit = (nextText: string, nextCursor: number): void => {
     if (nextText === text && nextCursor === cursorPos) return;
+    autocompleteSuppressedRef.current = false;
+    historyManager.resetPointer();
     undoStack.current.push({ text, cursor: cursorPos });
     if (undoStack.current.length > 200) undoStack.current.shift();
     redoStack.current = [];
@@ -553,6 +495,8 @@ export function PromptComposer(props: PromptComposerProps) {
   const undo = (): void => {
     const previous = undoStack.current.pop();
     if (!previous) return;
+    autocompleteSuppressedRef.current = false;
+    historyManager.resetPointer();
     redoStack.current.push({ text, cursor: cursorPos });
     setText(previous.text);
     setCursorPos(Math.min(previous.cursor, previous.text.length));
@@ -561,20 +505,34 @@ export function PromptComposer(props: PromptComposerProps) {
   const redo = (): void => {
     const next = redoStack.current.pop();
     if (!next) return;
+    autocompleteSuppressedRef.current = false;
+    historyManager.resetPointer();
     undoStack.current.push({ text, cursor: cursorPos });
     setText(next.text);
     setCursorPos(Math.min(next.cursor, next.text.length));
   };
 
+  const dismissAutocomplete = (): void => {
+    autocompleteSuppressedRef.current = true;
+    setAutocompleteContext(null);
+    setAutocompleteItems([]);
+  };
+
   const handleInsertAutocomplete = (item: AutocompleteItem): void => {
-    if (!autocompleteContext) return;
-    const before = text.slice(0, autocompleteContext.replaceStart);
-    const after = text.slice(autocompleteContext.replaceEnd);
+    const context = detectTriggerContext(text, cursorPos);
+    if (!context || context.trigger !== item.trigger) {
+      dismissAutocomplete();
+      return;
+    }
+
+    const before = text.slice(0, context.replaceStart);
+    const after = text.slice(context.replaceEnd);
     const inserted = item.insertText;
     const nextText = `${before}${inserted}${after}`;
     const nextCursor = before.length + inserted.length;
 
     commitEdit(nextText, nextCursor);
+    autocompleteSuppressedRef.current = true;
     setAutocompleteContext(null);
     setAutocompleteItems([]);
   };
@@ -653,8 +611,7 @@ export function PromptComposer(props: PromptComposerProps) {
         return;
       }
       if (key.escape) {
-        setAutocompleteContext(null);
-        setAutocompleteItems([]);
+        dismissAutocomplete();
         return;
       }
       if (key.tab || key.return) {
@@ -766,6 +723,7 @@ export function PromptComposer(props: PromptComposerProps) {
       sequence === "\x1bb" ||
       sequence === "\x1b[27;3;98~";
     if (isWordMoveLeft) {
+      if (autocompleteContext) dismissAutocomplete();
       setCursorPos(findPreviousWordStart(text, cursorPos));
       return;
     }
@@ -778,6 +736,7 @@ export function PromptComposer(props: PromptComposerProps) {
       sequence === "\x1bf" ||
       sequence === "\x1b[27;3;102~";
     if (isWordMoveRight) {
+      if (autocompleteContext) dismissAutocomplete();
       setCursorPos(findNextWordEnd(text, cursorPos));
       return;
     }
@@ -803,6 +762,9 @@ export function PromptComposer(props: PromptComposerProps) {
       }
       const prevCommand = historyManager.getPrevious(text);
       if (prevCommand !== null) {
+        autocompleteSuppressedRef.current = true;
+        setAutocompleteContext(null);
+        setAutocompleteItems([]);
         setText(prevCommand);
         setCursorPos(prevCommand.length);
       }
@@ -821,6 +783,9 @@ export function PromptComposer(props: PromptComposerProps) {
       }
       const nextEntry = historyManager.getNext();
       if (nextEntry !== null) {
+        autocompleteSuppressedRef.current = true;
+        setAutocompleteContext(null);
+        setAutocompleteItems([]);
         setText(nextEntry.text);
         setCursorPos(nextEntry.text.length);
       }
@@ -828,16 +793,19 @@ export function PromptComposer(props: PromptComposerProps) {
     }
 
     if (key.leftArrow) {
+      if (autocompleteContext) dismissAutocomplete();
       setCursorPos((prev) => Math.max(0, prev - 1));
       return;
     }
 
     if (key.rightArrow) {
+      if (autocompleteContext) dismissAutocomplete();
       setCursorPos((prev) => Math.min(text.length, prev + 1));
       return;
     }
 
     if ((key.ctrl && (input === "a" || sequence === "\x01")) || (key as { home?: boolean }).home || sequence === "\x1b[H" || sequence === "\x1b[1~") {
+      if (autocompleteContext) dismissAutocomplete();
       setCursorPos(getCursorOffset(lines, line, 0));
       return;
     }
@@ -847,6 +815,7 @@ export function PromptComposer(props: PromptComposerProps) {
         onScrollToBottom();
         return;
       }
+      if (autocompleteContext) dismissAutocomplete();
       setCursorPos(getCursorOffset(lines, line, lines[line].length));
       return;
     }

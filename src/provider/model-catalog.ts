@@ -75,6 +75,23 @@ export function catalogProviderForKind(kind: ProviderKind, override?: string): s
   }
 }
 
+export function catalogProviderForBaseUrl(baseUrl: string): string | undefined {
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return undefined;
+  }
+  if (host === "integrate.api.nvidia.com" || host.endsWith(".nvidia.com")) return "nvidia";
+  if (host === "api.openai.com") return "openai";
+  if (host === "api.anthropic.com") return "anthropic";
+  if (host === "openrouter.ai") return "openrouter";
+  if (host === "generativelanguage.googleapis.com") return "google";
+  if (host === "api.mistral.ai") return "mistral";
+  if (host === "api.deepseek.com") return "deepseek";
+  return undefined;
+}
+
 export function normalizeModelId(id: string): string {
   return id
     .toLowerCase()

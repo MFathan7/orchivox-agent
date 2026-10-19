@@ -121,6 +121,106 @@ export async function appendProviderModel(
   await writeDocument(configPath, document);
 }
 
+export async function replaceProviderModels(
+  configPath: string,
+  provider: string,
+  models: string[],
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "providers");
+  if (!document.getIn(["providers", provider])) {
+    throw new Error(`unknown provider "${provider}" in ${configPath}`);
+  }
+  const existingNode = document.getIn(["providers", provider, "models"], true);
+  const existingValues = isSeq(existingNode) ? ((existingNode.toJSON() as unknown) ?? []) : [];
+  const existingModels = Array.isArray(existingValues) ? existingValues : [];
+  for (const removed of existingModels) {
+    if (!models.includes(removed)) {
+      document.deleteIn(["providers", provider, "model_capabilities", removed]);
+      clearReferences(document, provider, removed);
+    }
+  }
+  document.setIn(["providers", provider, "models"], models);
+  await writeDocument(configPath, document);
+}
+
+export async function setProviderEnabled(
+  configPath: string,
+  provider: string,
+  enabled: boolean,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "providers");
+  if (!document.getIn(["providers", provider])) {
+    throw new Error(`unknown provider "${provider}" in ${configPath}`);
+  }
+  document.setIn(["providers", provider, "enabled"], enabled);
+  await writeDocument(configPath, document);
+}
+
+function nodeValue<T>(value: unknown): T | undefined {
+  if (value && typeof value === "object" && "toJSON" in value) {
+    return (value as { toJSON: () => T }).toJSON();
+  }
+  return value as T | undefined;
+}
+
+function clearReferences(document: Document, provider: string, model?: string): void {
+  for (const roleKey of Object.values(ROLE_KEYS)) {
+    const role = nodeValue<{ provider?: string; model?: string }>(
+      document.getIn(["roles", roleKey]),
+    );
+    if (role?.provider === provider && (model === undefined || role.model === model)) {
+      document.deleteIn(["roles", roleKey]);
+    }
+  }
+
+  for (const mode of ["plan", "build", "ultrawork"]) {
+    const selection = nodeValue<{ provider?: string; model?: string }>(
+      document.getIn(["modes", mode, "model"]),
+    );
+    if (selection?.provider === provider && (model === undefined || selection.model === model)) {
+      document.deleteIn(["modes", mode, "model"]);
+    }
+  }
+}
+
+export async function removeProviderModel(
+  configPath: string,
+  provider: string,
+  model: string,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "providers");
+  if (!document.getIn(["providers", provider])) {
+    throw new Error(`unknown provider "${provider}" in ${configPath}`);
+  }
+  const node = document.getIn(["providers", provider, "models"], true);
+  const values = isSeq(node) ? ((node.toJSON() as unknown) ?? []) : [];
+  const models = Array.isArray(values) ? values.filter((entry) => entry !== model) : [];
+  document.setIn(["providers", provider, "models"], models);
+  document.deleteIn(["providers", provider, "model_capabilities", model]);
+  clearReferences(document, provider, model);
+  await writeDocument(configPath, document);
+}
+
+export async function deleteProviderProfile(
+  configPath: string,
+  secretsPath: string,
+  provider: string,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  document.deleteIn(["providers", provider]);
+  clearReferences(document, provider);
+  await writeDocument(configPath, document);
+
+  const secrets = await readDocument(secretsPath);
+  if (secrets.getIn(["providers", provider]) !== undefined) {
+    secrets.deleteIn(["providers", provider]);
+    await writeDocument(secretsPath, secrets);
+  }
+}
+
 export async function saveModelCapabilities(
   configPath: string,
   provider: string,

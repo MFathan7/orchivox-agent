@@ -19,7 +19,8 @@ export const HELP_SECTIONS: HelpSection[] = [
     title: "Commands",
     rows: [
       { keys: "/help", description: "Open this panel" },
-      { keys: "/models", description: "Inspect roles and connect providers" },
+      { keys: "/models", description: "Type to search models and assign roles" },
+      { keys: "/connect", description: "Add, edit, enable, or delete providers" },
       { keys: "/palette", description: "Search actions and settings" },
       { keys: "/mode <name>", description: "Switch plan, build, or ultrawork" },
       { keys: "/theme <name>", description: "Switch the color preset" },

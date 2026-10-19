@@ -61,7 +61,8 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   description: string;
 }> = [
   { name: "/help", description: "Open the command reference panel" },
-  { name: "/models", description: "Inspect roles, connect providers, and assign models" },
+  { name: "/models", description: "Type to search models and assign roles" },
+  { name: "/connect", description: "Add, edit, enable, or delete providers" },
   { name: "/mode", args: "<plan|build|ultrawork>", requiresArgs: false, description: "Switch or inspect agent execution mode" },
   { name: "/plan", description: "Switch to plan mode (read-only)" },
   { name: "/build", description: "Switch to build mode (approval on write)" },

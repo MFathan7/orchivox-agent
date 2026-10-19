@@ -142,7 +142,9 @@ export interface OrchivoxAppProps {
   helpOpen?: boolean;
   onHelpOpenChange?: (open: boolean) => void;
   modelsOpen?: boolean;
+  modelsView?: "models" | "providers";
   onModelsOpenChange?: (open: boolean) => void;
+  onModelsViewChange?: (view: "models" | "providers") => void;
   hubOpen?: boolean;
   onHubOpenChange?: (open: boolean) => void;
   hubTab?: AgentHubTab;
@@ -283,6 +285,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
 
   const [internalHelpOpen, setInternalHelpOpen] = React.useState(false);
   const [internalModelsOpen, setInternalModelsOpen] = React.useState(false);
+  const [internalModelsView, setInternalModelsView] = React.useState<"models" | "providers">(
+    "models",
+  );
   const [internalSkillsOpen, setInternalSkillsOpen] = React.useState(false);
   const [internalHubOpen, setInternalHubOpen] = React.useState(false);
   const [internalHubTab, setInternalHubTab] = React.useState<AgentHubTab>("workers");
@@ -301,6 +306,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const setModelsOpen = (open: boolean) => {
     if (props.modelsOpen === undefined) setInternalModelsOpen(open);
     props.onModelsOpenChange?.(open);
+  };
+  const modelsView = props.modelsView ?? internalModelsView;
+  const setModelsView = (view: "models" | "providers") => {
+    if (props.modelsView === undefined) setInternalModelsView(view);
+    props.onModelsViewChange?.(view);
   };
 
   const hubOpen = props.hubOpen ?? internalHubOpen;
@@ -563,7 +573,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             configPath={configPath}
             secretsPath={secretsPath}
             theme={theme}
+            initialView={modelsView}
             onClose={() => setModelsOpen(false)}
+            onViewChange={setModelsView}
             onSaved={(message) => onStatusMessage?.(message)}
             onRoleChange={onRoleChange}
             onModeModelChange={props.onModeModelChange}
@@ -579,9 +591,16 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             reasoningLevels={reasoningOptions}
             onSelectTheme={props.onThemeChange}
             onSelectReasoning={props.onReasoningEffortChange}
-            onOpenModels={() => setModelsOpen(true)}
+            onOpenModels={() => {
+              setModelsView("models");
+              setModelsOpen(true);
+            }}
             onAction={(action) => {
               if (action === "open_models") {
+                setModelsView("models");
+                setModelsOpen(true);
+              } else if (action === "open_connect") {
+                setModelsView("providers");
                 setModelsOpen(true);
               } else if (action === "open_skills") {
                 props.onReloadSkills?.();
@@ -718,6 +737,12 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                   return;
                 }
                 if (action.command === "/models") {
+                  setModelsView("models");
+                  setModelsOpen(true);
+                  return;
+                }
+                if (action.command === "/connect") {
+                  setModelsView("providers");
                   setModelsOpen(true);
                   return;
                 }
