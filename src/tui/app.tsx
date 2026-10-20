@@ -22,6 +22,7 @@ import { OrchivoxLogo } from "./logo";
 import { ModelConfigModal } from "./model-modal";
 import { SessionTimeTravelModal, type SessionModalTab } from "./session-modal";
 import { SkillsModal } from "./skills-modal";
+import { WorkspaceTrustPrompt } from "./trust-modal";
 import {
   contextUsagePercent,
   formatContextUsage,
@@ -184,6 +185,10 @@ export interface OrchivoxAppProps {
   onRoleChange?: (role: ConfigRole, provider: string, model: string) => void;
   configPath?: string;
   secretsPath?: string;
+  isWorkspaceTrusted?: boolean;
+  workspacePath?: string;
+  onTrustWorkspace?: () => void;
+  onExitWorkspace?: () => void;
 }
 
 const MODE_ORDER: AgentMode[] = ["plan", "build", "ultrawork"];
@@ -380,7 +385,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         : contextPercent >= 80
           ? theme.badge.running
           : theme.muted;
-  const [sidebarVisible, setSidebarVisible] = React.useState(terminalSize.columns >= 110);
+  const [sidebarVisible, setSidebarVisible] = React.useState(false);
+  const [isWorkspaceTrusted, setIsWorkspaceTrusted] = React.useState(props.isWorkspaceTrusted ?? true);
+  React.useEffect(() => {
+    if (props.isWorkspaceTrusted !== undefined) {
+      setIsWorkspaceTrusted(props.isWorkspaceTrusted);
+    }
+  }, [props.isWorkspaceTrusted]);
   const [composerRows, setComposerRows] = React.useState(4);
   const [chatOffsetFromBottom, setChatOffsetFromBottom] = React.useState(0);
   const handleComposerRows = React.useCallback((rows: number) => setComposerRows(rows), []);
@@ -408,6 +419,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   };
 
   const hasModalOpen =
+    !isWorkspaceTrusted ||
     Boolean(props.pendingApproval) ||
     Boolean(props.pendingQuestion) ||
     helpOpen ||
@@ -469,7 +481,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const compact = innerWidth < 80;
   const statusText = escArmed ? "Press Esc again to stop the current turn" : statusMessage;
   const statusRows = statusText ? countWrappedLines(statusText, innerWidth) : 0;
-  const chromeRows = 3 + statusRows;
+  const chromeRows = 2 + statusRows;
   const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
   const chatScrollStep = Math.max(3, Math.floor(viewportHeight / 4));
   const { stdin } = useStdin();
@@ -484,16 +496,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
       stdin.off("data", onData);
     };
   }, [hasModalOpen, chatScrollStep]);
-  const showSidebar = sidebarVisible && innerWidth >= 90;
+  const showSidebar = sidebarVisible && innerWidth >= 120;
   const chatWidth = showSidebar ? Math.max(20, Math.floor(innerWidth * 0.72)) : innerWidth;
   const sidebarWidth = showSidebar ? Math.max(20, innerWidth - chatWidth) : 0;
   const divider = "─".repeat(innerWidth);
   const contextLabel = narrow
     ? `${formatTokenCount(contextTokens)}/${formatContextWindow(modeCapabilities?.context_window)}`
     : formatContextUsage(contextTokens, modeCapabilities?.context_window);
-  const modeHint = narrow ? "" : truncateText(MODE_HINTS[mode], Math.max(12, innerWidth - 20));
-  const modeModelLabel =
-    compact || !modeModel ? "" : ` · ${truncateText(`${modeModel.provider} / ${modeModel.model}`, 36)}`;
 
   const runCommand = (command: string): void => {
     onSubmit(command, { kind: "command", command, raw: command });
@@ -502,29 +511,51 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   return (
     <ThemeProvider theme={props.currentTheme ?? "tokyonight"}>
       <Box flexDirection="column" paddingX={1}>
-        <Box justifyContent="space-between">
-          <Box gap={1}>
+        <Box justifyContent="space-between" width={innerWidth}>
+          <Box gap={1} alignItems="center">
+            <Text bold color={modePalette.primary}>
+              [{mode.toUpperCase()}]
+            </Text>
             <OrchivoxLogo variant="compact" theme={theme} />
             <Text bold color={theme.text}>
-              {truncateText(projectName, narrow ? 18 : 28)}
+              {truncateText(projectName, narrow ? 16 : 24)}
             </Text>
-            {!narrow ? <Text color={theme.muted}>· {truncateText(branch, 18)}</Text> : null}
+            {!narrow && branch ? <Text color={theme.muted}>({truncateText(branch, 16)})</Text> : null}
           </Box>
-          <Box gap={1}>
+          <Box gap={1} alignItems="center">
+            {modeModel ? (
+              <Text color={theme.muted}>
+                {truncateText(modeModel.model, narrow ? 16 : 28)}
+                {props.reasoningEffort && props.reasoningEffort !== "default"
+                  ? ` [${props.reasoningEffort}]`
+                  : ""}
+              </Text>
+            ) : null}
+            {!compact && modeModel ? <Text color={theme.border.passive}>·</Text> : null}
             <Text color={contextColor}>{contextLabel}</Text>
-            {!compact ? <Text color={theme.muted}>·</Text> : null}
-            {!compact ? <Text color={theme.text}>{formatCost(totalCostUsd)}</Text> : null}
+            {!compact ? (
+              <>
+                <Text color={theme.border.passive}>·</Text>
+                <Text color={theme.text}>{formatCost(totalCostUsd)}</Text>
+              </>
+            ) : null}
           </Box>
         </Box>
         <Text color={theme.border.passive}>{divider}</Text>
-        <Box gap={1}>
-          <Text color={modePalette.primary}>●</Text>
-          <Text bold color={modePalette.primary}>{mode.toUpperCase()}</Text>
-          {modeHint ? <Text color={theme.muted}>{modeHint}</Text> : null}
-          {modeModelLabel ? <Text color={theme.muted}>{modeModelLabel}</Text> : null}
-        </Box>
 
-        {props.pendingApproval && props.onApprovalDecision ? (
+        {!isWorkspaceTrusted ? (
+          <WorkspaceTrustPrompt
+            workspacePath={props.workspacePath ?? globalThis.process.cwd()}
+            onTrust={() => {
+              setIsWorkspaceTrusted(true);
+              props.onTrustWorkspace?.();
+            }}
+            onExit={() => {
+              props.onExitWorkspace?.();
+            }}
+            theme={theme}
+          />
+        ) : props.pendingApproval && props.onApprovalDecision ? (
           <ToolApprovalModal
             request={props.pendingApproval}
             onDecision={props.onApprovalDecision}
@@ -702,7 +733,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 resetKey={props.activeSessionId}
                 offsetFromBottom={chatOffsetFromBottom}
                 onOffsetChange={setChatOffsetFromBottom}
-                topOffset={3}
+                topOffset={2}
               />
             </Box>
             {showSidebar ? (

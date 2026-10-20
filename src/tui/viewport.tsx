@@ -555,6 +555,7 @@ export function ScrollableChatViewport({
                   key={`${entry.id}-thinking-${thinkingExpanded ? "open" : "closed"}`}
                   text={entry.thinking}
                   defaultOpen={thinkingExpanded}
+                  live={Boolean(entry.live)}
                   durationMs={
                     entry.thinkingStartedAt !== undefined && entry.thinkingCompletedAt !== undefined
                       ? entry.thinkingCompletedAt - entry.thinkingStartedAt

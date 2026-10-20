@@ -1,6 +1,7 @@
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import packageJson from "../package.json";
 
 console.log("==> Building standalone Orchivox binary...");
 const buildProc = Bun.spawn(["bun", "run", "scripts/build-binary.ts"], {
@@ -45,6 +46,27 @@ function safeInstallBinary(dest: string) {
 
 safeInstallBinary(targetLocalBin);
 safeInstallBinary(targetOrchivoxBin);
+
+// Save source repository metadata so `orchivox update` can locate and rebuild from source:
+const installSourcePath = join(userHome, ".orchivox", "install_source.json");
+try {
+  writeFileSync(
+    installSourcePath,
+    JSON.stringify(
+      {
+        sourceDir: process.cwd(),
+        installedAt: new Date().toISOString(),
+        version: packageJson.version,
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  console.log(`Saved install source metadata to: ${installSourcePath}`);
+} catch {
+  // Best-effort metadata save.
+}
 
 // Clean up stale ~/.bun/bin/orchivox if present so it doesn't shadow the binary
 const bunBin = join(userHome, ".bun", "bin", "orchivox");

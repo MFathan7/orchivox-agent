@@ -96,20 +96,15 @@ export type ProviderProfile = z.infer<typeof ProviderProfileSchema>;
 
 export function inferModelCapabilities(_kind: ProviderKind, model: string): ModelCapabilities {
   const lower = model.toLowerCase();
-  const reasoning =
-    /(^|[^a-z])(o[1-9]|r1|reason|thinking|qwq|magistral|gpt-5|gemini-2\.5|claude|qwen|deepseek|glm|kimi|minimax|nemotron)([^a-z]|$)/.test(
-      lower,
-    );
-  const vision =
-    /(vision|llava|pixtral|minicpm-v|qwen[0-9.]*-vl|gemma3|llama[0-9.]*-vision|claude|gemini|gpt-4o|gpt-4\.1|gpt-5|o[1-9])/.test(
-      lower,
-    );
+  // Generic capability tokens only - no specific model or provider brand names:
+  const reasoning = /(^|[^a-z0-9])(reasoning|thinking|thought|reason)([^a-z0-9]|$)|-r\d+\b/i.test(lower);
+  const vision = /(^|[^a-z0-9])(vision|visual|multimodal)([^a-z0-9]|$)|-vl\b/i.test(lower);
   return {
     tool_calling: true,
     reasoning,
     vision,
     structured_output: false,
-    temperature: !/^(o[1-9]|gpt-5)/.test(lower),
+    temperature: true,
     pdf: false,
     parallel_tool_calls: true,
   };

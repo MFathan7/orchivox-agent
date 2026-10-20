@@ -356,15 +356,8 @@ export async function main(
   }
 
   if (options.command === "tui") {
-    const cwd = globalThis.process.cwd();
-    const trustManager = new WorkspaceTrustManager();
-    if (!options.trust && !trustManager.isTrusted(cwd)) {
-      const trusted = await promptWorkspaceTrust(cwd);
-      if (!trusted) {
-        return { close: async () => undefined };
-      }
-      trustManager.trust(cwd);
-    }
+    // Workspace trust is handled inside the single Orchivox TUI instance
+    // to preserve process.stdin raw mode lifecycle and keyboard protocols.
   }
 
   const runtime = await bootstrap({
@@ -410,19 +403,22 @@ export async function main(
     return { close: async () => undefined };
   }
 
-  return runTuiSession(runtime, print);
+  return runTuiSession(runtime, print, options);
 }
 
 async function runTuiSession(
   runtime: RuntimeHandle,
   print: (text: string) => void,
+  options?: CliOptions,
 ): Promise<{ close: () => Promise<void> }> {
-  // Kitty keyboard protocol (\x1b[>1u) + xterm modifyOtherKeys level 2 (\x1b[>4;2m):
+  // Kitty keyboard protocol (\x1b[>1u, \x1b[=1;1u) + xterm modifyOtherKeys level 2 (\x1b[>4;2m):
   // makes Shift+Enter distinct from Enter across Foot, Kitty, WezTerm, Ptyxis, Ghostty.
-  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[>1u\x1b[>4;2m\x1b[?1000h\x1b[?1006h");
+  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[>1u\x1b[=1;1u\x1b[>4;2m\x1b[?1000h\x1b[?1006h");
 
   const projectName = basename(globalThis.process.cwd());
   const root = globalThis.process.cwd();
+  const trustManager = new WorkspaceTrustManager();
+  let isWorkspaceTrusted = Boolean(options?.trust || trustManager.isTrusted(root));
 
   const state = {
     sessionId: undefined as string | undefined,
@@ -894,13 +890,24 @@ async function runTuiSession(
     modifiedFiles: [...state.modifiedFiles.values()],
     lspStatus: runtime.config.lsp.servers ? "active" : "disabled",
     mcpServers: runtime.mcpServers,
+    isWorkspaceTrusted,
+    workspacePath: root,
+    onTrustWorkspace: () => {
+      isWorkspaceTrusted = true;
+      trustManager.trust(root);
+      rerender();
+    },
+    onExitWorkspace: () => {
+      instance.unmount();
+    },
     onSubmit: (text: string, action: InputAction, attachments?: FileAttachmentRef[]) => {
       void handleInput(text, action, attachments);
     },
   });
 
   const synced = installSynchronizedOutput({ onFrame: (frame) => void relay?.broadcast(frame) });
-  const instance = render(React.createElement(OrchivoxApp, view()));
+  let instance: ReturnType<typeof render>;
+  instance = render(React.createElement(OrchivoxApp, view()));
   const rerender = (): void => {
     instance.rerender(React.createElement(OrchivoxApp, view()));
   };
@@ -1681,7 +1688,7 @@ async function runTuiSession(
     clearInterval(activityTimer);
     unsubscribeCapabilities();
     synced.uninstall();
-    process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[<u\x1b[?1049l");
+    process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[<u\x1b[=0u\x1b[?1049l");
     void runtime.close().then(() => {
       process.exit(0);
     });
@@ -1696,7 +1703,7 @@ async function runTuiSession(
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);
-  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[<u\x1b[?1049l");
+  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[<u\x1b[=0u\x1b[?1049l");
   await relay?.close();
   await runtime.close();
   print("session closed");

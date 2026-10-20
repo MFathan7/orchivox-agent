@@ -1,4 +1,5 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 import packageJson from "../package.json";
@@ -53,10 +54,67 @@ function entrypointKind(executable: string): AppInfo["entrypoint"] {
   return "unknown";
 }
 
+export function findSourceCheckout(cwd = process.cwd()): string | undefined {
+  // 1. Check if cwd or any parent directory contains orchivox-agent package.json
+  let current = cwd;
+  while (true) {
+    const pkgPath = join(current, "package.json");
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+        if (pkg.name === "orchivox-agent") return current;
+      } catch {
+        // ignore
+      }
+    }
+    const parent = dirname(current);
+    if (!parent || parent === current) break;
+    current = parent;
+  }
+
+  // 2. Check ~/.orchivox/install_source.json saved during bun run install:global
+  const sourceRecordPath = join(homedir(), ".orchivox", "install_source.json");
+  if (existsSync(sourceRecordPath)) {
+    try {
+      const data = JSON.parse(readFileSync(sourceRecordPath, "utf8"));
+      if (typeof data.sourceDir === "string" && existsSync(data.sourceDir)) {
+        const pkgPath = join(data.sourceDir, "package.json");
+        if (existsSync(pkgPath)) {
+          const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+          if (pkg.name === "orchivox-agent") return data.sourceDir;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // 3. Check ~/.orchivox/src fallback checkout location
+  const managedSrc = join(homedir(), ".orchivox", "src");
+  if (existsSync(managedSrc)) {
+    const pkgPath = join(managedSrc, "package.json");
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+        if (pkg.name === "orchivox-agent") return managedSrc;
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  return undefined;
+}
+
 export async function getAppInfo(): Promise<AppInfo> {
   const script = realPath(process.argv[1]);
   const executable = script ?? realPath(process.execPath) ?? process.execPath;
-  const root = installRoot(executable);
+  const kind = entrypointKind(executable);
+  let root = installRoot(executable);
+  if (kind === "compiled") {
+    const sourceDir = findSourceCheckout();
+    if (sourceDir) root = sourceDir;
+  }
   const commit = await runGit(root, ["rev-parse", "--short", "HEAD"], {
     allowFailure: true,
   })
@@ -71,7 +129,7 @@ export async function getAppInfo(): Promise<AppInfo> {
     version: packageJson.version,
     commit,
     dirty: status.length > 0,
-    entrypoint: entrypointKind(executable),
+    entrypoint: kind,
     root,
     executable,
     bunVersion: Bun.version,
@@ -119,23 +177,31 @@ async function runCommand(command: string, args: string[], cwd: string): Promise
 
 export async function runUpdate(options: UpdateOptions = {}): Promise<UpdateResult> {
   const info = await getAppInfo();
-  if (info.entrypoint === "compiled") {
+  const root = info.entrypoint === "source" ? info.root : (findSourceCheckout() ?? info.root);
+  const isCompiled = info.entrypoint === "compiled";
+
+  // Check if root is a valid git repository
+  const gitCheck = await runGit(root, ["rev-parse", "--is-inside-work-tree"], { allowFailure: true });
+  if (gitCheck.exitCode !== 0) {
     throw new Error(
-      "this is a compiled binary; rebuild it with `bun run build:binary` after updating the source checkout",
+      "No Orchivox source repository found on this system.\n" +
+      "To enable self-updates, clone Orchivox into your preferred folder or ~/.orchivox/src:\n" +
+      "  git clone https://github.com/MFathan7/orchivox-agent.git ~/.orchivox/src\n" +
+      "  cd ~/.orchivox/src && bun install && bun run install:global",
     );
   }
-  const root = info.root;
+
   const status = await runGit(root, ["status", "--porcelain"], { allowFailure: true });
   if (!options.check && status.stdout.trim().length > 0) {
     throw new Error(
-      "working tree is dirty; commit or stash your changes before running `orchivox update`",
+      `working tree at ${root} is dirty; commit or stash your changes before running \`orchivox update\``,
     );
   }
   const branch = await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"], {
     allowFailure: true,
   }).then((result) => result.stdout.trim());
   if (!branch || branch === "HEAD") {
-    throw new Error("cannot update: the checkout is not on a branch");
+    throw new Error(`cannot update: the checkout at ${root} is not on a branch`);
   }
   await runGit(root, ["fetch", "--prune", "origin"], { allowFailure: false });
   const upstream = await runGit(
@@ -150,9 +216,13 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<UpdateResu
     allowFailure: true,
   }).then((result) => Number.parseInt(result.stdout.trim(), 10) || 0);
 
+  const currentCommit = await runGit(root, ["rev-parse", "--short", "HEAD"], { allowFailure: true })
+    .then((result) => result.stdout.trim())
+    .catch(() => info.commit ?? "unknown");
+
   if (behind === 0) {
     return {
-      output: `already up to date on ${branch} (${info.commit ?? "unknown"})${ahead > 0 ? `, ${ahead} local commit(s) ahead` : ""}`,
+      output: `already up to date on ${branch} (${currentCommit})${ahead > 0 ? `, ${ahead} local commit(s) ahead` : ""}`,
       updated: false,
     };
   }
@@ -163,11 +233,19 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<UpdateResu
     };
   }
 
-  const before = info.commit ?? "unknown";
+  const before = currentCommit;
   await runGit(root, ["pull", "--ff-only"], { allowFailure: false });
-  const install = await runCommand("bun", ["install", "--frozen-lockfile"], root);
-  if (options.binary) {
-    await runCommand("bun", ["run", "build:binary"], root);
+  let installOutput = "";
+  try {
+    installOutput = await runCommand("bun", ["install", "--frozen-lockfile"], root);
+  } catch {
+    installOutput = await runCommand("bun", ["install"], root);
+  }
+
+  let rebuilt = false;
+  if (isCompiled || options.binary) {
+    await runCommand("bun", ["run", "scripts/install-global.ts"], root);
+    rebuilt = true;
   }
   const after = await runGit(root, ["rev-parse", "--short", "HEAD"], {
     allowFailure: true,
@@ -175,8 +253,12 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<UpdateResu
   return {
     output: [
       `updated ${branch}: ${before} -> ${after || "unknown"}`,
-      install,
-      options.binary ? "compiled binary rebuilt" : "source checkout updated",
+      installOutput,
+      rebuilt
+        ? "standalone binary rebuilt and reinstalled to ~/.local/bin/orchivox"
+        : options.binary
+          ? "compiled binary rebuilt"
+          : "source checkout updated",
       "restart Orchivox to use the new version",
     ]
       .filter(Boolean)

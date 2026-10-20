@@ -575,6 +575,19 @@ export function PromptComposer(props: PromptComposerProps) {
   const autocompleteSuppressedRef = React.useRef(false);
 
   React.useEffect(() => {
+    if (process.stdin.isTTY && !process.stdin.isRaw) {
+      try {
+        process.stdin.setRawMode(true);
+      } catch {
+        // Raw mode initialization is best-effort.
+      }
+    }
+    try {
+      process.stdin.resume();
+    } catch {
+      // Stdin resume is best-effort.
+    }
+
     const emitter = internal_eventEmitter as
       | { prependListener?: (event: string, listener: (data: Buffer | string) => void) => void; removeListener?: (event: string, listener: (data: Buffer | string) => void) => void }
       | undefined;
