@@ -47,7 +47,7 @@ export class McpClientManager {
 
   async connect(name: string, config: McpServerConfig): Promise<string[]> {
     if (this.clients.has(name)) throw new Error(`mcp server "${name}" is already connected`);
-    const client = new Client({ name: "orchivox-agent", version: "0.1.0" });
+    const client = new Client({ name: "orchivox-agent", version: "0.2.0" });
     await client.connect(this.buildTransport(name, config));
     this.clients.set(name, client);
 

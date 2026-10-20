@@ -76,7 +76,7 @@ export function registerSpecAndTaskRoutes(app: OpenAPIHono, runner: IAgentRunner
 
   app.doc31("/openapi.json", {
     openapi: "3.1.0",
-    info: { title: "Orchivox Agent Gateway", version: "0.1.0" },
+    info: { title: "Orchivox Agent Gateway", version: "0.2.0" },
   });
 
   app.get("/docs", Scalar({ url: "/openapi.json", theme: "kepler" }));

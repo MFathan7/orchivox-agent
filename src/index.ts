@@ -154,7 +154,8 @@ export function modeToProfile(mode: AgentMode): AgentProfile {
 }
 
 export function reasoningEffortToRequest(level: string): string | undefined {
-  if (level === "default" || level === "off" || level === "none") return undefined;
+  if (level === "default") return undefined;
+  if (level === "off" || level === "none") return "none";
   return level;
 }
 
@@ -416,8 +417,9 @@ async function runTuiSession(
   runtime: RuntimeHandle,
   print: (text: string) => void,
 ): Promise<{ close: () => Promise<void> }> {
-  // xterm modifyOtherKeys level 1: makes Shift+Enter distinct from Enter.
-  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[>4;1m\x1b[?1000h\x1b[?1006h");
+  // Kitty keyboard protocol (\x1b[>1u) + xterm modifyOtherKeys level 2 (\x1b[>4;2m):
+  // makes Shift+Enter distinct from Enter across Foot, Kitty, WezTerm, Ptyxis, Ghostty.
+  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[>1u\x1b[>4;2m\x1b[?1000h\x1b[?1006h");
 
   const projectName = basename(globalThis.process.cwd());
   const root = globalThis.process.cwd();
@@ -1679,7 +1681,7 @@ async function runTuiSession(
     clearInterval(activityTimer);
     unsubscribeCapabilities();
     synced.uninstall();
-    process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[?1049l");
+    process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[<u\x1b[?1049l");
     void runtime.close().then(() => {
       process.exit(0);
     });
@@ -1694,7 +1696,7 @@ async function runTuiSession(
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);
-  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[?1049l");
+  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[<u\x1b[?1049l");
   await relay?.close();
   await runtime.close();
   print("session closed");

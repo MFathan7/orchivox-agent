@@ -101,7 +101,7 @@ export class AlternateScreen {
   enter(): void {
     if (this.entered) return;
     this.entered = true;
-    this.target.write("\u001b[?1049h\u001b[?1000h\u001b[?1006h");
+    this.target.write("\u001b[?1049h\u001b[>1u\u001b[>4;2m\u001b[?1000h\u001b[?1006h");
     this.target.on?.("resize", this.resizeListener);
   }
 
@@ -109,7 +109,7 @@ export class AlternateScreen {
     if (!this.entered) return;
     this.entered = false;
     this.target.removeListener?.("resize", this.resizeListener);
-    this.target.write("\u001b[?1000l\u001b[?1006l\u001b[?1049l");
+    this.target.write("\u001b[?1000l\u001b[?1006l\u001b[>4;0m\u001b[<u\u001b[?1049l");
   }
 
   onChange(listener: (size: ScreenSize) => void): () => void {
@@ -446,9 +446,7 @@ export function ScrollableChatViewport({
           const activity = groupToolCalls(entry.toolCalls);
           const segmented = Boolean(entry.thinkingSegments && entry.thinkingSegments.length > 0);
           const allCalls = entry.toolCalls ?? [];
-          const liveText = entry.live
-            ? entry.text.split("\n").slice(-Math.max(4, height - 4)).join("\n")
-            : entry.text;
+          const liveText = entry.text;
           return (
             <Box key={entry.id} flexDirection="column">
               {entry.live ? (
@@ -552,7 +550,7 @@ export function ScrollableChatViewport({
                     );
                   })}
                 </Box>
-              ) : entry.thinking && !entry.live ? (
+              ) : entry.thinking ? (
                 <ThinkingBlock
                   key={`${entry.id}-thinking-${thinkingExpanded ? "open" : "closed"}`}
                   text={entry.thinking}

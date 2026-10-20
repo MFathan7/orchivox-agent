@@ -265,6 +265,9 @@ export function parseOllamaShow(raw: unknown): RuntimeModelMetadata {
     if (contextWindow !== undefined) break;
   }
   const details = asRecord(record.details);
+  if (contextWindow === undefined && details?.context_length !== undefined) {
+    contextWindow = positive(details.context_length);
+  }
   return {
     contextWindow,
     toolCalling: capabilities.length > 0 ? capabilities.includes("tools") : undefined,
@@ -351,7 +354,8 @@ async function probeOllama(
   const tags = asRecord(
     await fetchJson(`${origin}/api/tags`, { headers, method: "GET" }, OLLAMA_TIMEOUT_MS),
   );
-  const installed = asArray(tags?.models).flatMap((entry) => {
+  const installed: string[] = [];
+  for (const entry of asArray(tags?.models)) {
     const item = asRecord(entry);
     const name =
       typeof item?.model === "string"
@@ -359,8 +363,13 @@ async function probeOllama(
         : typeof item?.name === "string"
           ? item.name
           : undefined;
-    return name ? [name] : [];
-  });
+    if (name) {
+      installed.push(name);
+      const tagMetadata = parseOllamaShow(item);
+      const current = limits.get(name);
+      limits.set(name, current ? mergeRuntimeLimit(current, tagMetadata) : tagMetadata);
+    }
+  }
   const targets = models.length > 0 ? models : installed;
   await Promise.all(
     targets.slice(0, 64).map(async (model) => {

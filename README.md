@@ -15,6 +15,11 @@ Orchivox runs as a full-screen terminal UI, a headless command, an HTTP gateway,
 - [Overview](#overview)
 - [Features](#features)
 - [Requirements](#requirements)
+- [Installation](#installation)
+  - [Linux](#linux)
+  - [macOS](#macos)
+  - [Windows (WSL2 / Native)](#windows-wsl2--native)
+  - [Updating Orchivox](#updating-orchivox)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Running Orchivox](#running-orchivox)
@@ -135,6 +140,124 @@ You can also set a model per mode and a reasoning effort per mode. Model capabil
   - Ollama running locally, or
   - an API key for OpenAI, Anthropic, OpenClaude, or OpenRouter.
 - Optional: language servers such as `typescript-language-server`, `pylsp`, `rust-analyzer`, or `gopls`.
+
+## Installation
+
+Orchivox can be compiled into a single standalone global executable or run directly from source with [Bun](https://bun.sh).
+
+### Linux
+
+1. **Install Bun and Git** (if not already installed):
+   ```bash
+   curl -fsSL https://bun.sh/install | bash
+   # Debian / Ubuntu / Mint:
+   sudo apt update && sudo apt install -y git curl
+   # Arch Linux:
+   sudo pacman -S git curl
+   # Fedora / RHEL:
+   sudo dnf install -y git curl
+   ```
+
+2. **Clone and install dependencies**:
+   ```bash
+   git clone https://github.com/orchivox/orchivox-agent.git
+   cd orchivox-agent
+   bun install
+   ```
+
+3. **Install globally as a standalone binary**:
+   ```bash
+   bun run install:global
+   ```
+   This compiles a native binary into `~/.local/bin/orchivox`. Ensure `~/.local/bin` is in your `PATH`:
+   - **bash** (`~/.bashrc`): `export PATH="$HOME/.local/bin:$PATH"`
+   - **zsh** (`~/.zshrc`): `export PATH="$HOME/.local/bin:$PATH"`
+   - **fish** (`~/.config/fish/config.fish`): `fish_add_path ~/.local/bin`
+
+---
+
+### macOS
+
+1. **Install Bun and Git**:
+   ```bash
+   # Using Homebrew:
+   brew install oven-sh/bun/bun git
+   # Or using the official installer:
+   curl -fsSL https://bun.sh/install | bash
+   ```
+
+2. **Clone and install dependencies**:
+   ```bash
+   git clone https://github.com/orchivox/orchivox-agent.git
+   cd orchivox-agent
+   bun install
+   ```
+
+3. **Install globally as a standalone binary**:
+   ```bash
+   bun run install:global
+   ```
+   Add `~/.local/bin` to your `PATH` in `~/.zshrc` (macOS default shell):
+   ```bash
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+   source ~/.zshrc
+   ```
+
+---
+
+### Windows (WSL2 / Native)
+
+#### Option 1: WSL2 (Recommended)
+Running Orchivox inside **WSL2 (Windows Subsystem for Linux)** provides native terminal emulation, fast Git worktrees, and full POSIX compatibility.
+1. Open PowerShell as Administrator and enable WSL:
+   ```powershell
+   wsl --install
+   ```
+2. Open your Ubuntu terminal inside WSL2 and follow the [Linux](#linux) instructions above.
+
+#### Option 2: Windows Native (PowerShell)
+1. **Install Bun and Git for Windows**:
+   ```powershell
+   powershell -c "irm bun.sh/install.ps1 | iex"
+   winget install --id Git.Git -e --source winget
+   ```
+2. **Clone and install**:
+   ```powershell
+   git clone https://github.com/orchivox/orchivox-agent.git
+   cd orchivox-agent
+   bun install
+   ```
+3. **Build standalone executable**:
+   ```powershell
+   bun run build:binary
+   ```
+   Copy `orchivox.exe` to a directory in your user `PATH` (such as `%USERPROFILE%\.local\bin`).
+
+---
+
+### Updating Orchivox
+
+To update an existing installation to the latest version:
+
+#### Standalone binary update (Recommended)
+From your local checkout:
+```bash
+git pull
+bun install
+bun run install:global
+```
+
+#### Self-update via CLI
+```bash
+orchivox update --check   # Check if upstream commits are available
+orchivox update           # Pull changes and rebuild
+```
+
+Check your installed version and environment anytime:
+```bash
+orchivox --version
+orchivox doctor
+```
 
 ## Quick start
 
@@ -399,7 +522,7 @@ This exposes the agent tools as an MCP server over stdio. Orchivox also acts as 
 | Action | Key or command |
 | --- | --- |
 | Send a prompt | `Enter` |
-| Add a newline | `Shift+Enter` |
+| Add a newline | `Shift+Enter`, `Alt+Enter` / `Option+Enter`, `Ctrl+J`, or `\` + `Enter` |
 | Cycle modes | `Tab` |
 | Open the session manager | `Ctrl+S` or `/sessions` |
 | Open the command palette | `Ctrl+P` |
@@ -519,4 +642,4 @@ Use a model with reliable tool calling. Small local models can stop after one to
 
 ## Status
 
-Orchivox is at version `0.1.0`. It is a working terminal runtime, not a hosted service. The local model path is useful for development and offline tests. For long tasks, use a model with strong tool calling and a context window that matches the repository size.
+Orchivox is at version `0.2.0`. It is a working terminal runtime, not a hosted service. The local model path is useful for development and offline tests. For long tasks, use a model with strong tool calling and a context window that matches the repository size.

@@ -104,20 +104,13 @@ export function normalizeModelId(id: string): string {
     .trim();
 }
 
-export function findCatalogModel(
-  catalog: ModelCatalog | undefined,
-  providerId: string | undefined,
+function searchProviderModels(
+  provider: CatalogProvider,
   modelId: string,
-): CatalogModel | undefined {
-  if (!catalog || !providerId) return undefined;
-  const provider = catalog.providers[providerId];
-  if (!provider) return undefined;
-
+  target: string,
+): { model: CatalogModel; distance: number } | undefined {
   const exact = provider.models[modelId];
-  if (exact) return exact;
-
-  const target = normalizeModelId(modelId);
-  if (!target) return undefined;
+  if (exact) return { model: exact, distance: 0 };
 
   let best: CatalogModel | undefined;
   let bestDistance = Number.POSITIVE_INFINITY;
@@ -126,7 +119,7 @@ export function findCatalogModel(
     for (const candidate of candidates) {
       const normalized = normalizeModelId(candidate);
       if (!normalized) continue;
-      if (normalized === target) return model;
+      if (normalized === target) return { model, distance: 0 };
       if (normalized.startsWith(target) || target.startsWith(normalized)) {
         const distance = Math.abs(normalized.length - target.length);
         if (distance < bestDistance) {
@@ -136,7 +129,40 @@ export function findCatalogModel(
       }
     }
   }
-  return bestDistance <= 24 ? best : undefined;
+  return best && bestDistance <= 24 ? { model: best, distance: bestDistance } : undefined;
+}
+
+export function findCatalogModel(
+  catalog: ModelCatalog | undefined,
+  providerId: string | undefined,
+  modelId: string,
+): CatalogModel | undefined {
+  if (!catalog) return undefined;
+  const target = normalizeModelId(modelId);
+  if (!target) return undefined;
+
+  if (providerId) {
+    const provider = catalog.providers[providerId];
+    if (provider) {
+      const match = searchProviderModels(provider, modelId, target);
+      if (match) return match.model;
+    }
+  }
+
+  // Cross-provider fallback for local, custom, or multi-provider models (e.g. Ollama, vLLM)
+  let bestMatch: CatalogModel | undefined;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (const provider of Object.values(catalog.providers)) {
+    const match = searchProviderModels(provider, modelId, target);
+    if (match) {
+      if (match.distance === 0) return match.model;
+      if (match.distance < bestDist) {
+        bestMatch = match.model;
+        bestDist = match.distance;
+      }
+    }
+  }
+  return bestDist <= 24 ? bestMatch : undefined;
 }
 
 function numberOrUndefined(value: unknown): number | undefined {

@@ -10,6 +10,7 @@ import {
   type TextBlock,
   type TokenPricing,
 } from "../types/schema";
+import { ThinkTagStreamParser } from "./openai-compat";
 import { learnLimitsFromError } from "./limit-cache";
 import type { LLMProvider } from "./router";
 import { iterateSse } from "./sse";
@@ -182,6 +183,7 @@ export class AnthropicCompatProvider implements LLMProvider {
     }
 
     const blocks = new Map<number, { type: string; id: string; name: string; argumentsText: string }>();
+    const thinkParser = new ThinkTagStreamParser();
     let promptTokens = 0;
     let completionTokens = 0;
     let cacheRead = 0;
@@ -243,7 +245,9 @@ export class AnthropicCompatProvider implements LLMProvider {
             const { index, delta } = parsed.data;
             const state = blocks.get(index);
             if (delta.type === "text_delta" && delta.text) {
-              yield { type: "token", text: delta.text };
+              for (const event of thinkParser.process(delta.text)) {
+                yield event;
+              }
             } else if (delta.type === "thinking_delta" && delta.thinking) {
               yield { type: "thinking_token", text: delta.thinking };
             } else if (delta.type === "signature_delta" && delta.signature) {
@@ -315,6 +319,9 @@ export class AnthropicCompatProvider implements LLMProvider {
           default:
             break;
         }
+      }
+      for (const event of thinkParser.flush()) {
+        yield event;
       }
     } catch (error) {
       if (signal?.aborted) {
@@ -392,20 +399,26 @@ export function buildMessagesPayload(
     };
   }
   if (req.reasoning_effort && capabilities.reasoning) {
-    const minBudget = capabilities.reasoning_budget_min ?? 1024;
-    const maxBudget = capabilities.reasoning_budget_max ?? 8192;
     const effort = req.reasoning_effort.toLowerCase();
-    const requested =
-      effort === "high" || effort === "max" || effort === "xhigh"
-        ? maxBudget
-        : effort === "medium"
-          ? Math.min(4096, maxBudget)
-          : Math.min(1024, maxBudget);
-    const headroom = Math.max(minBudget, req.max_tokens - 1024);
-    const budget = Math.max(minBudget, Math.min(requested, maxBudget, headroom));
-    payload.thinking = { type: "enabled", budget_tokens: budget };
-    payload.max_tokens = Math.max(req.max_tokens, budget + 1024);
-    payload.temperature = 1;
+    if (effort === "off" || effort === "none") {
+      payload.thinking = { type: "disabled" };
+    } else if (effort !== "default") {
+      const minBudget = capabilities.reasoning_budget_min ?? 1024;
+      const maxBudget = capabilities.reasoning_budget_max ?? 32768;
+      const requested =
+        effort === "max" || effort === "xhigh"
+          ? maxBudget
+          : effort === "high"
+            ? Math.min(16384, maxBudget)
+            : effort === "medium"
+              ? Math.min(8192, maxBudget)
+              : Math.min(2048, maxBudget);
+      const headroom = Math.max(minBudget, req.max_tokens - 1024);
+      const budget = Math.max(minBudget, Math.min(requested, maxBudget, headroom));
+      payload.thinking = { type: "enabled", budget_tokens: budget };
+      payload.max_tokens = Math.max(req.max_tokens, budget + 1024);
+      payload.temperature = 1;
+    }
   }
   return payload;
 }

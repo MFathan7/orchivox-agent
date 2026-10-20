@@ -1,6 +1,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 
+import packageJson from "../../package.json";
 import { getTheme, type Theme } from "./theme";
 
 export interface OrchivoxLogoProps {
@@ -48,7 +49,7 @@ export function WelcomeBanner({ theme, repoPath, branch }: WelcomeBannerProps): 
         <Text bold color={active.accent}>ORCHIVOX</Text>
         <Text> </Text>
         <Text bold color={active.modes.plan.secondary}>AGENT</Text>
-        <Text color={active.muted} dimColor> v0.1.0</Text>
+        <Text color={active.muted} dimColor> v{packageJson.version}</Text>
       </Box>
       {repoPath ? (
         <Box marginTop={0}>

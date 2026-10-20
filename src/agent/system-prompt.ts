@@ -77,6 +77,13 @@ const TOOL_CALLS = [
   "- Never invent tool output. If you did not call a tool, do not claim you did.",
 ].join("\n");
 
+const REASONING_AND_VERIFICATION = [
+  "# Reasoning and verification",
+  "- Think through the task step-by-step: understand user intent and constraints, inspect files before acting, formulate minimal changes, execute tool calls, and verify results.",
+  "- Evidence before synthesis: all claims and code edits must be grounded in verified file contents or command execution, never speculation.",
+  "- Keep private deliberations in thinking blocks (<think>); deliver clean, objective, structured markdown to the user.",
+].join("\n");
+
 const STYLE = [
   "# Style",
   "- Your first sentence must answer the user's request. Do not start with a greeting, a status update, or a description of what you inspected.",
@@ -128,7 +135,7 @@ export function buildSystemPrompt(options: SystemPromptOptions): string {
   if (options.specialistPrompt?.trim()) {
     sections.push(`# Active agent\n${options.specialistPrompt.trim()}`);
   }
-  sections.push(TOOL_GUIDANCE, TOOL_CALLS, STYLE);
+  sections.push(TOOL_GUIDANCE, TOOL_CALLS, REASONING_AND_VERIFICATION, STYLE);
   if (options.skillsIndex?.trim()) {
     sections.push(options.skillsIndex.trim());
   }
@@ -174,6 +181,7 @@ function compactSystemPrompt(options: SystemPromptOptions): string {
     "You can read, search, and edit files, run commands and tests, use web tools, load skills, and delegate subagents.",
     "When you need the user to choose, call the question tool with 2-8 short options. Never write a multiple-choice question as a plain numbered list.",
     "Read a file before editing it. Verify changes before claiming success. If the task depends on project conventions, read AGENTS.md.",
+    "Think step-by-step, verify evidence with tools before answering, and keep private reasoning in thinking blocks.",
     "Answer the user's question directly. After using tools, summarize and answer. Do not end with a tool log. Do not start with a greeting or describe what you inspected. Reply in the user's language.",
     "Be concise and use Markdown.",
     options.skillsIndex?.trim(),

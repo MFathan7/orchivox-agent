@@ -63,15 +63,50 @@ const RAW_NEWLINE_SEQUENCES = new Set([
   "\x1b\n",
   "\u001b\r",
   "\x1b[13;2u",
+  "[13;2u",
+  "\x1b[13;2;1u",
+  "[13;2;1u",
+  "\x1b[13;2:1u",
+  "[13;2:1u",
   "\x1b[13;2~",
+  "[13;2~",
   "\x1b[13;3u",
+  "[13;3u",
   "\x1b[13;3~",
+  "[13;3~",
   "\x1b[13;5u",
+  "[13;5u",
   "\x1b[13;5~",
+  "[13;5~",
   "\x1b[27;2;13~",
+  "[27;2;13~",
   "\x1b[27;3;13~",
+  "[27;3;13~",
   "\x1b[27;5;13~",
+  "[27;5;13~",
+  "\x1b[10;2u",
+  "[10;2u",
+  "\x1b[10;2~",
+  "[10;2~",
+  "\x1b[27;2;10~",
+  "[27;2;10~",
+  "\x1bOM",
+  "OM",
 ]);
+
+export function isShiftEnterSequence(seq: string): boolean {
+  if (!seq) return false;
+  const normalized = seq.startsWith("\x1b") ? seq.slice(1) : seq;
+  return (
+    RAW_NEWLINE_SEQUENCES.has(seq) ||
+    RAW_NEWLINE_SEQUENCES.has(normalized) ||
+    /^\[13;\d+[u~]$/.test(normalized) ||
+    /^\[13;\d+[:;]\d+[u~]$/.test(normalized) ||
+    /^\[27;\d+;13~$/.test(normalized) ||
+    /^\[10;\d+[u~]$/.test(normalized) ||
+    /^\[27;\d+;10~$/.test(normalized)
+  );
+}
 
 export function imageMimeType(filePath: string): string | undefined {
   const dot = filePath.lastIndexOf(".");
@@ -530,7 +565,7 @@ export function PromptComposer(props: PromptComposerProps) {
   const autocompleteRequestRef = React.useRef(0);
   const [inputScroll, setInputScroll] = React.useState(0);
 
-  const { internal_eventEmitter } = useStdin();
+  const { stdin, internal_eventEmitter } = useStdin();
   const lastRawInputRef = React.useRef<string>("");
   const insertNewlineRef = React.useRef<() => void>(() => {});
   const rawNewlineHandledRef = React.useRef(0);
@@ -545,7 +580,8 @@ export function PromptComposer(props: PromptComposerProps) {
       | undefined;
     const debugInput = process.env.ORCHIVOX_INPUT_DEBUG?.trim() ?? "";
     const onRaw = (data: Buffer | string) => {
-      lastRawInputRef.current = typeof data === "string" ? data : data.toString("utf8");
+      const str = typeof data === "string" ? data : data.toString("utf8");
+      lastRawInputRef.current = str;
       if (debugInput) {
         try {
           const directory = join(homedir(), ".cache", "orchivox");
@@ -558,16 +594,18 @@ export function PromptComposer(props: PromptComposerProps) {
           // Input diagnostics must never block typing.
         }
       }
-      if (RAW_NEWLINE_SEQUENCES.has(lastRawInputRef.current)) {
+      if (isShiftEnterSequence(str) || str === "\x1b\r" || str === "\u001b\r" || str === "\x1b\n") {
         rawNewlineHandledRef.current = Date.now();
         insertNewlineRef.current();
       }
     };
     emitter?.prependListener?.("input", onRaw);
+    stdin?.on?.("data", onRaw);
     return () => {
       emitter?.removeListener?.("input", onRaw);
+      stdin?.off?.("data", onRaw);
     };
-  }, [internal_eventEmitter]);
+  }, [internal_eventEmitter, stdin]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -729,7 +767,6 @@ export function PromptComposer(props: PromptComposerProps) {
 
   useInput((input, key) => {
     if (disabled) return;
-    if (Date.now() - rawNewlineHandledRef.current < 40) return;
 
     const raw = lastRawInputRef.current;
     if (isMouseSequence(raw) || isMouseSequence(input)) return;
@@ -809,19 +846,16 @@ export function PromptComposer(props: PromptComposerProps) {
       (key.return && key.shift) ||
       (key.return && key.meta) ||
       (key.return && key.ctrl) ||
-      (key.ctrl && (input === "j" || sequence === "\n")) ||
+      (key.ctrl && (input === "j" || input === "\n" || sequence === "\n")) ||
+      (key.meta && (input === "\r" || input === "\n" || sequence === "\r")) ||
       sequence === "\n" ||
       sequence === "\u001b\r" ||
+      sequence === "\x1b\r" ||
       sequence === "\x1b\n" ||
-      sequence === "\x1b[13;2u" ||
-      sequence === "\x1b[13;2~" ||
-      sequence === "\x1b[13;3u" ||
-      sequence === "\x1b[13;3~" ||
-      sequence === "\x1b[13;5u" ||
-      sequence === "\x1b[13;5~" ||
-      sequence === "\x1b[27;2;13~" ||
-      sequence === "\x1b[27;3;13~" ||
-      sequence === "\x1b[27;5;13~";
+      sequence === "\x1bOM" ||
+      isShiftEnterSequence(sequence) ||
+      isShiftEnterSequence(raw) ||
+      isShiftEnterSequence(input);
 
     const isBackslashNewline =
       key.return &&
@@ -844,6 +878,7 @@ export function PromptComposer(props: PromptComposerProps) {
     }
 
     if (key.return) {
+      if (Date.now() - rawNewlineHandledRef.current < 250) return;
       void handleFinalSubmit();
       return;
     }
@@ -1062,7 +1097,9 @@ export function PromptComposer(props: PromptComposerProps) {
       input.length > 0 &&
       input >= " " &&
       input !== "\x7f" &&
-      !input.startsWith("\x1b");
+      !input.startsWith("\x1b") &&
+      !isShiftEnterSequence(input) &&
+      !/^\[\d+(?:;\d+)*[~u]$/.test(input);
 
     if (isPrintable) {
       insertPlainOrPasted(input);

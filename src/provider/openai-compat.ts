@@ -44,6 +44,7 @@ const OpenAiChunkSchema = z.object({
             content: z.string().nullish(),
             reasoning_content: z.string().nullish(),
             reasoning: z.string().nullish(),
+            thinking: z.string().nullish(),
             tool_calls: z.array(OpenAiToolCallFragmentSchema).nullish(),
           })
           .nullish(),
@@ -94,6 +95,93 @@ const FINISH_REASONS: Record<string, FinishReason> = {
   function_call: "tool_calls",
   content_filter: "content_filter",
 };
+
+export class ThinkTagStreamParser {
+  private inThink = false;
+  private buffer = "";
+
+  process(chunk: string): Array<{ type: "token" | "thinking_token"; text: string }> {
+    const events: Array<{ type: "token" | "thinking_token"; text: string }> = [];
+    this.buffer += chunk;
+
+    while (this.buffer.length > 0) {
+      if (!this.inThink) {
+        const thinkIndex = this.buffer.toLowerCase().indexOf("<think>");
+        const thinkingIndex = this.buffer.toLowerCase().indexOf("<thinking>");
+        let matchIndex = -1;
+        let tagLen = 0;
+        if (thinkIndex !== -1 && (thinkingIndex === -1 || thinkIndex <= thinkingIndex)) {
+          matchIndex = thinkIndex;
+          tagLen = 7;
+        } else if (thinkingIndex !== -1) {
+          matchIndex = thinkingIndex;
+          tagLen = 10;
+        }
+
+        if (matchIndex === -1) {
+          const partialMatch = /<(?:t(?:h(?:i(?:n(?:k(?:i(?:n(?:g)?)?)?)?)?)?)?)?$/i.exec(this.buffer);
+          if (partialMatch && partialMatch.index !== -1) {
+            const emitText = this.buffer.slice(0, partialMatch.index);
+            if (emitText.length > 0) events.push({ type: "token", text: emitText });
+            this.buffer = this.buffer.slice(partialMatch.index);
+            break;
+          } else {
+            events.push({ type: "token", text: this.buffer });
+            this.buffer = "";
+            break;
+          }
+        } else {
+          const beforeTag = this.buffer.slice(0, matchIndex);
+          if (beforeTag.length > 0) events.push({ type: "token", text: beforeTag });
+          this.inThink = true;
+          this.buffer = this.buffer.slice(matchIndex + tagLen);
+        }
+      } else {
+        const endThinkIndex = this.buffer.toLowerCase().indexOf("</think>");
+        const endThinkingIndex = this.buffer.toLowerCase().indexOf("</thinking>");
+        let matchEndIndex = -1;
+        let endTagLen = 0;
+        if (endThinkIndex !== -1 && (endThinkingIndex === -1 || endThinkIndex <= endThinkingIndex)) {
+          matchEndIndex = endThinkIndex;
+          endTagLen = 8;
+        } else if (endThinkingIndex !== -1) {
+          matchEndIndex = endThinkingIndex;
+          endTagLen = 11;
+        }
+
+        if (matchEndIndex === -1) {
+          const partialEndMatch = /<\/(?:t(?:h(?:i(?:n(?:k(?:i(?:n(?:g)?)?)?)?)?)?)?)?$/i.exec(this.buffer);
+          if (partialEndMatch && partialEndMatch.index !== -1) {
+            const emitText = this.buffer.slice(0, partialEndMatch.index);
+            if (emitText.length > 0) events.push({ type: "thinking_token", text: emitText });
+            this.buffer = this.buffer.slice(partialEndMatch.index);
+            break;
+          } else {
+            events.push({ type: "thinking_token", text: this.buffer });
+            this.buffer = "";
+            break;
+          }
+        } else {
+          const insideText = this.buffer.slice(0, matchEndIndex);
+          if (insideText.length > 0) events.push({ type: "thinking_token", text: insideText });
+          this.inThink = false;
+          this.buffer = this.buffer.slice(matchEndIndex + endTagLen);
+        }
+      }
+    }
+    return events;
+  }
+
+  flush(): Array<{ type: "token" | "thinking_token"; text: string }> {
+    if (this.buffer.length === 0) return [];
+    const event = {
+      type: this.inThink ? ("thinking_token" as const) : ("token" as const),
+      text: this.buffer,
+    };
+    this.buffer = "";
+    return [event];
+  }
+}
 
 export class OpenAICompatProvider implements LLMProvider {
   private readonly baseUrl: string;
@@ -160,6 +248,7 @@ export class OpenAICompatProvider implements LLMProvider {
     }
 
     const drafts = new Map<number, { id: string; name: string; argumentsText: string }>();
+    const thinkParser = new ThinkTagStreamParser();
     let usage: OpenAiUsage;
     let finishReason: FinishReason | undefined;
 
@@ -180,9 +269,13 @@ export class OpenAICompatProvider implements LLMProvider {
         for (const choice of chunk.data.choices) {
           const delta = choice.delta;
           if (delta) {
-            if (delta.content) yield { type: "token", text: delta.content };
-            const reasoning = delta.reasoning_content ?? delta.reasoning;
+            const reasoning = delta.reasoning_content ?? delta.reasoning ?? delta.thinking;
             if (reasoning) yield { type: "thinking_token", text: reasoning };
+            if (delta.content) {
+              for (const event of thinkParser.process(delta.content)) {
+                yield event;
+              }
+            }
             for (const fragment of delta.tool_calls ?? []) {
               const index = fragment.index;
               let draft = drafts.get(index);
@@ -205,6 +298,9 @@ export class OpenAICompatProvider implements LLMProvider {
           }
           if (choice.finish_reason) finishReason = FINISH_REASONS[choice.finish_reason] ?? "stop";
         }
+      }
+      for (const event of thinkParser.flush()) {
+        yield event;
       }
     } catch (error) {
       if (signal?.aborted) {
@@ -259,6 +355,8 @@ export class OpenAICompatProvider implements LLMProvider {
   }
 }
 
+export const buildOpenAiPayload = buildChatPayload;
+
 export function buildChatPayload(
   req: ChatRequest,
   model: string,
@@ -280,9 +378,40 @@ export function buildChatPayload(
     if (req.top_p !== undefined) payload.top_p = req.top_p;
   }
   if (req.stop_sequences.length > 0) payload.stop = req.stop_sequences;
-  if (req.reasoning_effort && capabilities.reasoning) {
-    if (kind === "openrouter") payload.reasoning = { effort: req.reasoning_effort };
-    else payload.reasoning_effort = req.reasoning_effort;
+  if (req.reasoning_effort && (capabilities.reasoning || kind === "ollama")) {
+    const rawEffort = req.reasoning_effort.toLowerCase();
+    const isNone = rawEffort === "off" || rawEffort === "none";
+    const budgetMap: Record<string, number> = {
+      low: 2048,
+      medium: 8192,
+      high: 16384,
+      max: capabilities.reasoning_budget_max ?? 32768,
+    };
+
+    if (kind === "ollama") {
+      if (isNone) {
+        payload.chat_template_kwargs = { enable_thinking: false, thinking: false };
+      } else if (rawEffort !== "default") {
+        const effort = rawEffort === "max" ? "high" : rawEffort;
+        payload.chat_template_kwargs = { enable_thinking: true, thinking: true };
+        payload.reasoning_effort = effort;
+        if (budgetMap[rawEffort]) {
+          payload.reasoning_budget = budgetMap[rawEffort];
+        }
+      }
+    } else if (kind === "openrouter") {
+      if (isNone) {
+        payload.reasoning = { effort: "none" };
+      } else if (rawEffort !== "default") {
+        payload.reasoning = { effort: rawEffort };
+      }
+    } else {
+      if (isNone) {
+        payload.reasoning_effort = "low";
+      } else if (rawEffort !== "default") {
+        payload.reasoning_effort = rawEffort === "max" ? "high" : rawEffort;
+      }
+    }
   }
   if (req.response_format && capabilities.structured_output) {
     payload.response_format = req.response_format;

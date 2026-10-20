@@ -254,7 +254,7 @@ export function ThinkingTimeline({
         const duration =
           segment.completedAt !== undefined
             ? formatThinkingDuration(segment.completedAt - segment.startedAt)
-            : undefined;
+            : formatThinkingDuration(Date.now() - segment.startedAt);
         const summary = thinkingSummary(segment.text, width);
         const lines = segment.text.split("\n").flatMap((line) => wrapText(line, contentWidth));
         if (!expanded) {

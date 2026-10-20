@@ -660,7 +660,7 @@ export class AgentOrchestrator implements IAgentRunner {
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
     let projectNudged = false;
-    const bufferStudyTokens = projectStudy;
+    const bufferStudyTokens = projectStudy || projectFileFollowUp;
 
     const specialistBudget = activeSpecialist?.thinkingBudget ?? 0;
     const capabilityBudget = capabilities.reasoning ? (capabilities.reasoning_budget_max ?? 8192) : 0;
@@ -674,7 +674,7 @@ export class AgentOrchestrator implements IAgentRunner {
 
     const projectStudyFallback = (originalText: string, fallback: string): string => {
       const trimmed = originalText.trim();
-      if (trimmed.length >= 40 && !looksLikeNonAnswer(trimmed, this.projectContext)) return trimmed;
+      if (trimmed.length >= 40 && !looksLikeNonAnswer(trimmed, this.projectContext, { allowPlan: mode === "plan" })) return trimmed;
       return fallback;
     };
 
@@ -733,7 +733,7 @@ export class AgentOrchestrator implements IAgentRunner {
           ? stripThinkTags(text).trim()
           : cleanReasoningAnswer(stripThinkTags(thinking));
       if (candidate.length === 0) return projectStudyFallback(originalText, fallback);
-      if (looksLikeNonAnswer(candidate, this.projectContext)) {
+      if (looksLikeNonAnswer(candidate, this.projectContext, { allowPlan: mode === "plan" })) {
         return projectStudyFallback(originalText, fallback);
       }
       if (
@@ -962,7 +962,7 @@ export class AgentOrchestrator implements IAgentRunner {
           const originalText = textOf(assistantMessage);
           const unknownFiles = projectEvidence ? unknownProjectFiles(originalText, projectEvidence) : [];
           const needsRetry =
-            looksLikeNonAnswer(originalText, this.projectContext) ||
+            looksLikeNonAnswer(originalText, this.projectContext, { allowPlan: mode === "plan" }) ||
             (projectEvidence !== undefined &&
               (unknownFiles.length > 0 || looksLikeMissingFileAnswer(originalText)));
           let finalText = originalText;
@@ -1526,14 +1526,15 @@ export class AgentOrchestrator implements IAgentRunner {
 
 export function stripThinkTags(text: string): string {
   return text
-    .replace(/^\s*<\/think(?:ing)?>\s*/i, "")
-    .replace(/\s*<\/think(?:ing)?>\s*$/i, "");
+    .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "")
+    .replace(/<think(?:ing)?>[\s\S]*$/gi, "")
+    .replace(/<\/think(?:ing)?>/gi, "")
+    .trim();
 }
 
 export function cleanReasoningAnswer(text: string): string {
   return text
-    .replace(/\b(?:Let me|I should|I will|I need to)\b[^.!?]*[.!?]\s*/gi, "")
-    .replace(/\s+/g, " ")
+    .replace(/\b(?:Let me|I should|I will|I need to)\b[^.!?\n]*[.!?]\s*/gi, "")
     .trim();
 }
 

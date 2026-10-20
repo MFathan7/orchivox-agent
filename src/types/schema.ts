@@ -233,7 +233,7 @@ export const DoneEventSchema = z.object({
 export type DoneEvent = z.infer<typeof DoneEventSchema>;
 export type FinishReason = DoneEvent["finish_reason"];
 
-export const ReasoningEffortSchema = z.enum(["off", "low", "medium", "high", "max"]);
+export const ReasoningEffortSchema = z.enum(["default", "off", "none", "low", "medium", "high", "max"]);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 
 export const ApprovalChoiceSchema = z.enum([

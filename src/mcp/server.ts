@@ -22,7 +22,7 @@ export class McpToolServer {
     this.registry = options.registry;
     this.mode = options.mode ?? "build";
     this.server = new Server(
-      { name: options.serverName ?? "orchivox-agent", version: options.version ?? "0.1.0" },
+      { name: options.serverName ?? "orchivox-agent", version: options.version ?? "0.2.0" },
       { capabilities: { tools: {} } },
     );
 

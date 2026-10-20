@@ -139,6 +139,7 @@ const PLAN_PATTERNS = [
 
 export interface NonAnswerOptions {
   requireProjectMention?: boolean;
+  allowPlan?: boolean;
 }
 
 export function looksLikeNonAnswer(
@@ -148,7 +149,9 @@ export function looksLikeNonAnswer(
 ): boolean {
   const trimmed = text.trim();
   if (trimmed.length === 0) return true;
-  if (PLAN_PATTERNS.some((pattern) => pattern.test(trimmed))) return true;
+  if (!options.allowPlan && trimmed.length < 200 && PLAN_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+    return true;
+  }
   const projectMentioned = context ? mentionsProject(trimmed, context) : false;
   if (options.requireProjectMention && context && !projectMentioned) return true;
   const greeting = GREETING_PATTERNS.some((pattern) => pattern.test(trimmed));
