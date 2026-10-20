@@ -575,6 +575,13 @@ export function PromptComposer(props: PromptComposerProps) {
   const autocompleteSuppressedRef = React.useRef(false);
 
   React.useEffect(() => {
+    if (process.stdout.isTTY) {
+      try {
+        process.stdout.write("\x1b[>1u\x1b[>4;2m");
+      } catch {
+        // Best-effort terminal protocol initialization.
+      }
+    }
     if (process.stdin.isTTY && !process.stdin.isRaw) {
       try {
         process.stdin.setRawMode(true);
@@ -591,25 +598,21 @@ export function PromptComposer(props: PromptComposerProps) {
     const emitter = internal_eventEmitter as
       | { prependListener?: (event: string, listener: (data: Buffer | string) => void) => void; removeListener?: (event: string, listener: (data: Buffer | string) => void) => void }
       | undefined;
-    const debugInput = process.env.ORCHIVOX_INPUT_DEBUG?.trim() ?? "";
     const onRaw = (data: Buffer | string) => {
       const str = typeof data === "string" ? data : data.toString("utf8");
       lastRawInputRef.current = str;
-      if (debugInput) {
-        try {
-          const directory = join(homedir(), ".cache", "orchivox");
-          mkdirSync(directory, { recursive: true });
-          appendFileSync(
-            join(directory, "input-debug.log"),
-            `${new Date().toISOString()} term=${process.env.TERM ?? "unknown"} data=${JSON.stringify(lastRawInputRef.current)}\n`,
-          );
-        } catch {
-          // Input diagnostics must never block typing.
-        }
+      try {
+        const directory = join(homedir(), ".cache", "orchivox");
+        mkdirSync(directory, { recursive: true });
+        appendFileSync(
+          join(directory, "input-debug.log"),
+          `${new Date().toISOString()} term=${process.env.TERM ?? "unknown"} data=${JSON.stringify(str)}\n`,
+        );
+      } catch {
+        // Input diagnostics must never block typing.
       }
       if (isShiftEnterSequence(str) || str === "\x1b\r" || str === "\u001b\r" || str === "\x1b\n") {
         rawNewlineHandledRef.current = Date.now();
-        insertNewlineRef.current();
       }
     };
     emitter?.prependListener?.("input", onRaw);
