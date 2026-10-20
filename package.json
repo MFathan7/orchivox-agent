@@ -14,6 +14,7 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "serve": "bun run src/server.ts",
+    "test": "bun test",
     "build:binary": "bun run scripts/build-binary.ts",
     "install:global": "bun run scripts/install-global.ts",
     "check:secrets": "bun run scripts/check-secrets.ts",

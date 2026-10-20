@@ -5,7 +5,7 @@ import { useInput } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
 import { computeLineHash } from "../tools/hashline-edit";
-import { wrapPreservingWhitespace, wrapText } from "./text-wrap";
+import { wrapPreservingWhitespace } from "./text-wrap";
 import type { ThinkingSegmentView } from "./app";
 import { getTheme, type Theme } from "./theme";
 
@@ -233,6 +233,7 @@ export interface ThinkingTimelineProps {
   segments: ThinkingSegmentView[];
   expanded?: boolean;
   live?: boolean;
+  showHeader?: boolean;
   width?: number;
   theme?: Theme;
 }
@@ -241,39 +242,52 @@ export function ThinkingTimeline({
   segments,
   expanded = false,
   live = false,
+  showHeader = true,
   width = 80,
   theme = getTheme("tokyonight"),
 }: ThinkingTimelineProps) {
   const visible = live ? segments.filter((segment) => segment.completedAt !== undefined) : segments;
   if (visible.length === 0) return null;
   const contentWidth = Math.max(8, width - 2);
+  const totalDuration = visible.reduce(
+    (total, segment) => total + Math.max(0, (segment.completedAt ?? Date.now()) - segment.startedAt),
+    0,
+  );
+  const duration = totalDuration > 0 ? formatThinkingDuration(totalDuration) : undefined;
+  const summary = thinkingSummary(visible.map((segment) => segment.text).join("\n"), width);
+  const phaseCount = visible.length > 1 ? `${visible.length} phases` : undefined;
+
+  if (!expanded) {
+    if (!showHeader && !summary) return null;
+    return (
+      <Text color={theme.muted}>
+        <Text color={theme.border.passive}>▎ </Text>
+        {showHeader ? <Text color={theme.badge.running} bold>Thought</Text> : null}
+        {summary ? <Text color={theme.text}>{showHeader ? ": " : ""}{summary}</Text> : null}
+        {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
+        {showHeader && phaseCount ? <Text color={theme.muted}> · {phaseCount}</Text> : null}
+      </Text>
+    );
+  }
 
   return (
     <Box flexDirection="column">
-      {visible.map((segment) => {
-        const duration =
-          segment.completedAt !== undefined
-            ? formatThinkingDuration(segment.completedAt - segment.startedAt)
-            : formatThinkingDuration(Date.now() - segment.startedAt);
-        const summary = thinkingSummary(segment.text, width);
-        const lines = segment.text.split("\n").flatMap((line) => wrapText(line, contentWidth));
-        if (!expanded) {
-          return (
-            <Text key={segment.id} color={theme.muted}>
-              <Text color={theme.border.passive}>▎ </Text>
-              <Text color={theme.badge.running} bold>Thought</Text>
-              {summary ? <Text color={theme.text}>: {summary}</Text> : null}
-              {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
-            </Text>
-          );
-        }
+      {showHeader ? (
+        <Text color={theme.muted}>
+          <Text color={theme.border.passive}>▎ </Text>
+          <Text color={theme.badge.running} bold>Thought</Text>
+          {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
+          {phaseCount ? <Text color={theme.muted}> · {phaseCount}</Text> : null}
+        </Text>
+      ) : null}
+      {visible.map((segment, segmentIndex) => {
+        const lines = segment.text
+          .split("\n")
+          .flatMap((line) => wrapPreservingWhitespace(line, contentWidth));
+        if (lines.length === 0) return null;
         return (
           <Box key={segment.id} flexDirection="column">
-            <Text color={theme.muted}>
-              <Text color={theme.border.passive}>▎ </Text>
-              <Text color={theme.badge.running} bold>Thought</Text>
-              {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
-            </Text>
+            {segmentIndex > 0 ? <Text color={theme.border.passive}> </Text> : null}
             {lines.map((line, index) => (
               <Text key={`${segment.id}-${index}`} color={theme.muted}>
                 <Text color={theme.border.passive}>▎ </Text>
@@ -304,7 +318,9 @@ export function ThinkingBlock({
     { isActive: focused },
   );
   const contentWidth = Math.max(8, width - 2);
-  const lines = text.split("\n").flatMap((line) => wrapText(line, contentWidth));
+  const lines = text
+    .split("\n")
+    .flatMap((line) => wrapPreservingWhitespace(line, contentWidth));
   const summary = thinkingSummary(text, width);
   const duration = durationMs !== undefined ? formatThinkingDuration(durationMs) : undefined;
 

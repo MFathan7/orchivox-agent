@@ -1,10 +1,10 @@
 # Dependencies
 node_modules/
-/docs/
-/tests/
 AGENTS.md
 
 # Build output
+/docs/
+/tests/
 dist/
 build/
 *.tsbuildinfo

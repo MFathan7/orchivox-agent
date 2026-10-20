@@ -9,6 +9,12 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
+import {
+  appendAnswerToken,
+  createAnswerStream,
+  markAnswerBoundary,
+  replaceAnswer,
+} from "./agent/answer-stream";
 import { formatAppInfo, formatDoctor, getAppInfo, runUpdate } from "./app-info";
 import { compactMessages, extractSummary } from "./agent/compaction";
 import { generateSessionTitle, messageText } from "./agent/session-title";
@@ -43,6 +49,7 @@ import {
   type ThinkingSegmentView,
 } from "./tui/app";
 import { buildTranscriptEntries } from "./tui/transcript";
+import { enterTerminal, leaveTerminal } from "./tui/terminal-protocol";
 import type { FileAttachmentRef } from "./tui/composer";
 import type { PendingQuestion } from "./tui/question-modal";
 import type { QuestionAnswer } from "./tools/question";
@@ -411,9 +418,9 @@ async function runTuiSession(
   print: (text: string) => void,
   options?: CliOptions,
 ): Promise<{ close: () => Promise<void> }> {
-  // Kitty keyboard protocol (\x1b[>1u) + xterm modifyOtherKeys level 2 (\x1b[>4;2m):
-  // makes Shift+Enter distinct from Enter across Foot, Kitty, WezTerm, Ptyxis, Ghostty.
-  process.stdout.write("\x1b[?1049h\x1b[H\x1b[2J\x1b[>1u\x1b[>4;2m\x1b[?1000h\x1b[?1006h");
+  // Enter first, then push the keyboard flags. The composer must not push
+  // again, otherwise the terminal keyboard stack is left dirty on exit.
+  enterTerminal();
 
   const projectName = basename(globalThis.process.cwd());
   const root = globalThis.process.cwd();
@@ -1071,6 +1078,7 @@ async function runTuiSession(
         reasoning_effort: reasoningEffortToRequest(state.reasoningEffort),
       });
       let answer = "";
+      const answerStream = createAnswerStream();
       let sawUsage = false;
       let finishReason: string | undefined;
       let firstTokenAt: number | undefined;
@@ -1085,12 +1093,14 @@ async function runTuiSession(
           if (firstTokenAt === undefined) firstTokenAt = now;
           lastTokenAt = now;
           closeThinkingSegment();
-          answer += event.text;
+          appendAnswerToken(answerStream, event.text);
+          answer = answerStream.text;
           liveEntry.text = answer;
           state.streamingText = answer;
           renderLive();
         } else if (event.type === "final_text") {
-          answer = event.text;
+          replaceAnswer(answerStream, event.text);
+          answer = answerStream.text;
           liveEntry.text = answer;
           state.streamingText = answer;
           renderLive(true);
@@ -1108,6 +1118,7 @@ async function runTuiSession(
           renderLive();
         } else if (event.type === "tool_start") {
           closeThinkingSegment();
+          markAnswerBoundary(answerStream);
           liveEntry.toolCalls = [
             ...(liveEntry.toolCalls ?? []),
             {
@@ -1206,6 +1217,7 @@ async function runTuiSession(
           renderLive();
         }
       }
+      answer = answerStream.text;
       const speedStart = Math.max(lastToolEndAt, firstTokenAt ?? lastToolEndAt);
       const streamedMs = (lastTokenAt ?? 0) - speedStart;
       const totalMs = (lastTokenAt ?? Date.now()) - turnStartedAt;
@@ -1688,7 +1700,7 @@ async function runTuiSession(
     clearInterval(activityTimer);
     unsubscribeCapabilities();
     synced.uninstall();
-    process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[<1u\x1b[?1049l");
+    leaveTerminal();
     void runtime.close().then(() => {
       process.exit(0);
     });
@@ -1703,7 +1715,7 @@ async function runTuiSession(
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);
-  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[>4;0m\x1b[<1u\x1b[?1049l");
+  leaveTerminal();
   await relay?.close();
   await runtime.close();
   print("session closed");

@@ -9,8 +9,9 @@ import { activityCalls, activitySummary, groupToolCalls } from "./tool-groups";
 import { formatTokenCount } from "./format";
 import { WelcomeBanner } from "./logo";
 import { estimateMarkdownLines, MarkdownView } from "./markdown";
+import { enterTerminal, leaveTerminal } from "./terminal-protocol";
 import { getTheme, type Theme } from "./theme";
-import { wrapText } from "./text-wrap";
+import { displayWidth, wrapText } from "./text-wrap";
 
 export interface ScreenSize {
   columns: number;
@@ -101,7 +102,7 @@ export class AlternateScreen {
   enter(): void {
     if (this.entered) return;
     this.entered = true;
-    this.target.write("\u001b[?1049h\u001b[>1u\u001b[>4;2m\u001b[?1000h\u001b[?1006h");
+    enterTerminal((chunk) => this.target.write(chunk));
     this.target.on?.("resize", this.resizeListener);
   }
 
@@ -109,7 +110,7 @@ export class AlternateScreen {
     if (!this.entered) return;
     this.entered = false;
     this.target.removeListener?.("resize", this.resizeListener);
-    this.target.write("\u001b[?1000l\u001b[?1006l\u001b[>4;0m\u001b[<u\u001b[?1049l");
+    leaveTerminal((chunk) => this.target.write(chunk));
   }
 
   onChange(listener: (size: ScreenSize) => void): () => void {
@@ -142,7 +143,7 @@ export function countWrappedLines(text: string, width: number): number {
   if (text.length === 0) return 1;
   return text
     .split("\n")
-    .reduce((total, line) => total + Math.max(1, Math.ceil(line.length / safeWidth)), 0);
+    .reduce((total, line) => total + Math.max(1, Math.ceil(displayWidth(line) / safeWidth)), 0);
 }
 
 export function estimateEntryLines(
@@ -152,7 +153,7 @@ export function estimateEntryLines(
   expandedGroups: ReadonlySet<string> = new Set(),
   thinkingExpanded = false,
 ): number {
-  const safeWidth = Math.max(width, 20);
+  const safeWidth = Math.max(1, width);
   if (entry.role === "compaction") {
     const header = 1;
     const footer = entry.compaction?.status === "running" ? 0 : 1;
@@ -171,10 +172,12 @@ export function estimateEntryLines(
     const visibleSegments = entry.live
       ? entry.thinkingSegments.filter((segment) => segment.completedAt !== undefined)
       : entry.thinkingSegments;
-    for (const segment of visibleSegments) {
-      lines += thinkingExpanded
-        ? 1 + countWrappedLines(segment.text, Math.max(1, safeWidth - 2))
-        : 1;
+    if (visibleSegments.length > 0) {
+      const textLines = visibleSegments.reduce(
+        (total, segment) => total + countWrappedLines(segment.text, Math.max(1, safeWidth - 2)),
+        0,
+      );
+      lines += thinkingExpanded ? 1 + textLines : visibleSegments.length;
     }
   } else if (entry.thinking && !entry.live) {
     lines += thinkingExpanded ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2)) : 1;
@@ -213,7 +216,7 @@ export function findActivityRowAt(
   clickRow: number,
   thinkingExpanded = false,
 ): ChatEntryView | undefined {
-  const safeWidth = Math.max(width, 20);
+  const safeWidth = Math.max(1, width);
   const visible = selectWindow(
     entries,
     width,
@@ -232,14 +235,14 @@ export function findActivityRowAt(
         const visibleSegments = entry.live
           ? entry.thinkingSegments.filter((segment) => segment.completedAt !== undefined)
           : entry.thinkingSegments;
-        thinking = visibleSegments.reduce(
-          (total, segment) =>
-            total +
-            (thinkingExpanded
-              ? 1 + countWrappedLines(segment.text, Math.max(1, safeWidth - 2))
-              : 1),
-          0,
-        );
+        if (visibleSegments.length > 0) {
+          const textLines = visibleSegments.reduce(
+            (total, segment) =>
+              total + countWrappedLines(segment.text, Math.max(1, safeWidth - 2)),
+            0,
+          );
+          thinking = thinkingExpanded ? 1 + textLines : visibleSegments.length;
+        }
       } else if (entry.thinking && !entry.live) {
         thinking = thinkingExpanded
           ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2))
@@ -278,6 +281,14 @@ export function selectWindow(
     budget -= cost;
   }
   return selected;
+}
+
+export function transcriptAlignsToBottom(
+  totalLines: number,
+  height: number,
+  offsetFromBottom: number,
+): boolean {
+  return offsetFromBottom <= 0 && totalLines > height;
 }
 
 export function formatProgressBar(done: number, total: number, width = 8): string {
@@ -418,6 +429,7 @@ export function ScrollableChatViewport({
     expandedGroups,
     thinkingExpanded,
   );
+  const pinToBottom = transcriptAlignsToBottom(totalLines, height, effectiveOffset);
 
   React.useEffect(() => {
     setOffsetFromBottom(0);
@@ -428,7 +440,12 @@ export function ScrollableChatViewport({
 
   return (
     <Box flexDirection="column" height={height} overflow="hidden">
-      <Box flexDirection="column" flexGrow={1} overflow="hidden">
+      <Box
+        flexDirection="column"
+        flexGrow={1}
+        overflow="hidden"
+        justifyContent={pinToBottom ? "flex-end" : "flex-start"}
+      >
         {showWelcome ? (
           height >= 12 ? (
             <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />
@@ -521,6 +538,9 @@ export function ScrollableChatViewport({
                     const start = segment.toolIndex;
                     const end = next ? next.toolIndex : allCalls.length;
                     const showSegment = !entry.live || segment.completedAt !== undefined;
+                    const previousVisible = entry.thinkingSegments
+                      ?.slice(0, index)
+                      .some((candidate) => !entry.live || candidate.completedAt !== undefined);
                     return (
                       <Box key={segment.id} flexDirection="column">
                         {showSegment ? (
@@ -528,6 +548,7 @@ export function ScrollableChatViewport({
                             segments={[segment]}
                             expanded={thinkingExpanded}
                             live={entry.live}
+                            showHeader={!previousVisible}
                             width={width}
                             theme={theme}
                           />

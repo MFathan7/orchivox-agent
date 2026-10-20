@@ -1,8 +1,7 @@
 import React from "react";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { Box, Text, useInput, useStdin } from "ink";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import { resolveProjectState } from "../runtime-paths";
 import type { AgentMode } from "../types/schema";
@@ -18,6 +17,7 @@ import { continueList, displayListLine } from "./list-format";
 import { collapsePastedText, expandPastedText, pastedPlaceholderAfter, pastedPlaceholderBefore, type PastedEntry } from "./paste";
 import { getTheme, type Theme } from "./theme";
 import { formatTokenCount } from "./format";
+import { isInputDebugEnabled, writeInputDebug } from "./input-debug";
 import { isMouseSequence } from "./mouse";
 import {
   deleteNextWord,
@@ -575,13 +575,6 @@ export function PromptComposer(props: PromptComposerProps) {
   const autocompleteSuppressedRef = React.useRef(false);
 
   React.useEffect(() => {
-    if (process.stdout.isTTY) {
-      try {
-        process.stdout.write("\x1b[>1u\x1b[>4;2m");
-      } catch {
-        // Best-effort terminal protocol initialization.
-      }
-    }
     if (process.stdin.isTTY && !process.stdin.isRaw) {
       try {
         process.stdin.setRawMode(true);
@@ -598,25 +591,23 @@ export function PromptComposer(props: PromptComposerProps) {
     const emitter = internal_eventEmitter as
       | { prependListener?: (event: string, listener: (data: Buffer | string) => void) => void; removeListener?: (event: string, listener: (data: Buffer | string) => void) => void }
       | undefined;
+    const inputDebug = isInputDebugEnabled();
     const onRaw = (data: Buffer | string) => {
       const str = typeof data === "string" ? data : data.toString("utf8");
       lastRawInputRef.current = str;
-      try {
-        const directory = join(homedir(), ".cache", "orchivox");
-        mkdirSync(directory, { recursive: true });
-        appendFileSync(
-          join(directory, "input-debug.log"),
-          `${new Date().toISOString()} term=${process.env.TERM ?? "unknown"} data=${JSON.stringify(str)}\n`,
-        );
-      } catch {
-        // Input diagnostics must never block typing.
-      }
+      if (inputDebug) writeInputDebug(str);
       if (isShiftEnterSequence(str) || str === "\x1b\r" || str === "\u001b\r" || str === "\x1b\n") {
         rawNewlineHandledRef.current = Date.now();
       }
     };
-    emitter?.prependListener?.("input", onRaw);
-    stdin?.on?.("data", onRaw);
+    // Ink already forwards stdin through internal_eventEmitter. Attaching the
+    // same handler to stdin as well double-logs every key and can race the
+    // order in which the newline flag is set.
+    if (emitter?.prependListener) {
+      emitter.prependListener("input", onRaw);
+    } else {
+      stdin?.on?.("data", onRaw);
+    }
     return () => {
       emitter?.removeListener?.("input", onRaw);
       stdin?.off?.("data", onRaw);
@@ -1131,7 +1122,7 @@ export function PromptComposer(props: PromptComposerProps) {
   const textWidth = Math.max(8, (width ?? 80) - 4 - maxPrefixWidth);
   const visualRows = buildVisualRows(text, textWidth);
   const cursorSpot = locateCursorRow(visualRows, activeLine, activeCol);
-  const maxVisibleRows = Math.max(3, maxRows ?? 8);
+  const maxVisibleRows = Math.max(1, maxRows ?? 8);
 
   React.useLayoutEffect(() => {
     setInputScroll((previous) => {
@@ -1148,7 +1139,9 @@ export function PromptComposer(props: PromptComposerProps) {
   const visibleRows = visualRows.slice(visibleStart, visibleStart + maxVisibleRows);
 
   const popupVisible = autocompleteItems.length > 0 && autocompleteContext !== null;
-  const popupRows = popupVisible ? Math.min(6, autocompleteItems.length) + 4 : 0;
+  const screenRows = process.stdout.rows ?? 24;
+  const popupLimit = Math.max(1, Math.min(6, Math.floor(screenRows / 4)));
+  const popupRows = popupVisible ? Math.min(popupLimit, autocompleteItems.length) + 4 : 0;
   const attachmentRows = attachedFiles.length > 0 ? 1 : 0;
   const effectivePlaceholder =
     (width ?? 80) < 55
@@ -1178,7 +1171,7 @@ export function PromptComposer(props: PromptComposerProps) {
           selectedIndex={autocompleteSelected}
           trigger={autocompleteContext.trigger}
           theme={theme}
-          maxVisible={6}
+          maxVisible={popupLimit}
           width={width}
         />
       ) : null}

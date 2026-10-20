@@ -225,7 +225,9 @@ export function interpretInput(text: string): InputAction {
 export { formatCost } from "./format";
 
 export function computeViewportHeight(rows: number, chromeRows: number, composerRows: number): number {
-  return Math.max(3, rows - chromeRows - composerRows - 1);
+  const available = rows - chromeRows - composerRows;
+  const gap = available > 6 ? 1 : 0;
+  return Math.max(1, available - gap);
 }
 
 export function installSynchronizedOutput(
@@ -476,7 +478,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     task: worker.task,
   }));
 
-  const innerWidth = Math.max(20, terminalSize.columns - 2);
+  const innerWidth = Math.max(1, terminalSize.columns - 2);
   const narrow = innerWidth < 60;
   const compact = innerWidth < 80;
   const statusText = escArmed ? "Press Esc again to stop the current turn" : statusMessage;
@@ -570,7 +572,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <HelpOverlay
             theme={theme}
             width={innerWidth}
-            height={Math.max(10, terminalSize.rows - 8)}
+            height={Math.max(
+              1,
+              Math.min(
+                terminalSize.rows - 2,
+                Math.max(3, terminalSize.rows - 8),
+              ),
+            )}
             onClose={() => setHelpOpen(false)}
           />
         ) : modePickerOpen ? (
@@ -762,7 +770,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             mode={mode}
             theme={theme}
             width={innerWidth}
-            maxRows={Math.max(6, Math.floor(terminalSize.rows / 3))}
+            maxRows={Math.max(
+              1,
+              Math.min(
+                Math.floor(terminalSize.rows / 3),
+                terminalSize.rows - chromeRows - 2,
+              ),
+            )}
             streaming={streaming}
             onLayoutRows={handleComposerRows}
             onModeToggle={() => {
