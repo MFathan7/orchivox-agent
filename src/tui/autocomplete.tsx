@@ -65,7 +65,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/connect", description: "Add, edit, enable, or delete providers" },
   { name: "/mode", args: "<plan|build|ultrawork>", requiresArgs: false, description: "Switch or inspect agent execution mode" },
   { name: "/plan", description: "Switch to plan mode (read-only)" },
-  { name: "/build", description: "Switch to build mode (approval on write)" },
+  { name: "/build", description: "Switch to build mode (workspace autonomy)" },
   { name: "/ultrawork", description: "Switch to autonomous ultrawork mode" },
   { name: "/theme", args: "<name>", requiresArgs: true, description: "Change or inspect the terminal theme" },
   { name: "/reasoning", args: "<default|low|med|high|max>", requiresArgs: false, description: "Set thinking effort" },

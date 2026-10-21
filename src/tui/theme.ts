@@ -40,6 +40,14 @@ export interface Theme {
     number: string;
     type: string;
   };
+  code: {
+    background: string;
+    border: string;
+  };
+  tool: {
+    background: string;
+    border: string;
+  };
 }
 
 export const THEME_ORDER: ThemeName[] = ["tokyonight", "catppuccin", "gruvbox", "monochrome"];
@@ -60,6 +68,8 @@ export const THEMES: Record<ThemeName, Theme> = {
     border: { active: "#7aa2f7", passive: "#3b4261" },
     badge: { running: "#e0af68", ok: "#9ece6a", error: "#f7768e", idle: "#565f89" },
     syntax: { keyword: "#bb9af7", string: "#9ece6a", comment: "#7a86b8", number: "#e0af68", type: "#7dcfff" },
+    code: { background: "#24283b", border: "#3b4261" },
+    tool: { background: "#1f2335", border: "#3b4261" },
   },
   catppuccin: {
     name: "catppuccin",
@@ -76,6 +86,8 @@ export const THEMES: Record<ThemeName, Theme> = {
     border: { active: "#89b4fa", passive: "#45475a" },
     badge: { running: "#f9e2af", ok: "#a6e3a1", error: "#f38ba8", idle: "#6c7086" },
     syntax: { keyword: "#cba6f7", string: "#a6e3a1", comment: "#9399b2", number: "#fab387", type: "#89dceb" },
+    code: { background: "#313244", border: "#45475a" },
+    tool: { background: "#292c3c", border: "#45475a" },
   },
   gruvbox: {
     name: "gruvbox",
@@ -92,6 +104,8 @@ export const THEMES: Record<ThemeName, Theme> = {
     border: { active: "#83a598", passive: "#504945" },
     badge: { running: "#fabd2f", ok: "#b8bb26", error: "#fb4934", idle: "#928374" },
     syntax: { keyword: "#d3869b", string: "#b8bb26", comment: "#a89984", number: "#fabd2f", type: "#8ec07c" },
+    code: { background: "#3c3836", border: "#504945" },
+    tool: { background: "#32302f", border: "#504945" },
   },
   monochrome: {
     name: "monochrome",
@@ -108,6 +122,8 @@ export const THEMES: Record<ThemeName, Theme> = {
     border: { active: "#ffffff", passive: "#4a4a4a" },
     badge: { running: "#d0d0d0", ok: "#e6e6e6", error: "#9a9a9a", idle: "#8a8a8a" },
     syntax: { keyword: "#d0d0d0", string: "#e6e6e6", comment: "#8a8a8a", number: "#c0c0c0", type: "#ffffff" },
+    code: { background: "#1f1f1f", border: "#4a4a4a" },
+    tool: { background: "#181818", border: "#4a4a4a" },
   },
 };
 

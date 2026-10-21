@@ -104,6 +104,35 @@ export function normalizeModelId(id: string): string {
     .trim();
 }
 
+interface NormalizedCatalogEntry {
+  model: CatalogModel;
+  normalized: string;
+}
+
+// Model IDs are normalized once per catalog provider instead of once per
+// lookup. A full models.dev catalog has hundreds of providers, so doing the
+// regex work inside every search makes opening /models take seconds.
+const normalizedProviderCache = new WeakMap<CatalogProvider, NormalizedCatalogEntry[]>();
+// Keyed by the provider map, not the catalog object: refreshModelCatalog
+// replaces catalog.providers in place, so a catalog-keyed cache would go stale.
+const lookupCache = new WeakMap<Record<string, CatalogProvider>, Map<string, CatalogModel | undefined>>();
+
+function normalizedProviderModels(provider: CatalogProvider): NormalizedCatalogEntry[] {
+  const cached = normalizedProviderCache.get(provider);
+  if (cached) return cached;
+
+  const entries: NormalizedCatalogEntry[] = [];
+  for (const [id, model] of Object.entries(provider.models)) {
+    for (const candidate of [id, model.canonicalModelId]) {
+      if (!candidate) continue;
+      const normalized = normalizeModelId(candidate);
+      if (normalized) entries.push({ model, normalized });
+    }
+  }
+  normalizedProviderCache.set(provider, entries);
+  return entries;
+}
+
 function searchProviderModels(
   provider: CatalogProvider,
   modelId: string,
@@ -114,18 +143,13 @@ function searchProviderModels(
 
   let best: CatalogModel | undefined;
   let bestDistance = Number.POSITIVE_INFINITY;
-  for (const [id, model] of Object.entries(provider.models)) {
-    const candidates = [id, model.canonicalModelId].filter((value): value is string => Boolean(value));
-    for (const candidate of candidates) {
-      const normalized = normalizeModelId(candidate);
-      if (!normalized) continue;
-      if (normalized === target) return { model, distance: 0 };
-      if (normalized.startsWith(target) || target.startsWith(normalized)) {
-        const distance = Math.abs(normalized.length - target.length);
-        if (distance < bestDistance) {
-          best = model;
-          bestDistance = distance;
-        }
+  for (const { model, normalized } of normalizedProviderModels(provider)) {
+    if (normalized === target) return { model, distance: 0 };
+    if (normalized.startsWith(target) || target.startsWith(normalized)) {
+      const distance = Math.abs(normalized.length - target.length);
+      if (distance < bestDistance) {
+        best = model;
+        bestDistance = distance;
       }
     }
   }
@@ -141,28 +165,47 @@ export function findCatalogModel(
   const target = normalizeModelId(modelId);
   if (!target) return undefined;
 
+  const providers = catalog.providers;
+  let cache = lookupCache.get(providers);
+  if (!cache) {
+    cache = new Map();
+    lookupCache.set(providers, cache);
+  }
+  const cacheKey = `${providerId ?? ""}\u0000${modelId}`;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
+
+  let result: CatalogModel | undefined;
   if (providerId) {
-    const provider = catalog.providers[providerId];
+    const provider = providers[providerId];
     if (provider) {
       const match = searchProviderModels(provider, modelId, target);
-      if (match) return match.model;
+      if (match) result = match.model;
     }
   }
 
   // Cross-provider fallback for local, custom, or multi-provider models (e.g. Ollama, vLLM)
-  let bestMatch: CatalogModel | undefined;
-  let bestDist = Number.POSITIVE_INFINITY;
-  for (const provider of Object.values(catalog.providers)) {
-    const match = searchProviderModels(provider, modelId, target);
-    if (match) {
-      if (match.distance === 0) return match.model;
-      if (match.distance < bestDist) {
-        bestMatch = match.model;
-        bestDist = match.distance;
+  if (!result) {
+    let bestMatch: CatalogModel | undefined;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const provider of Object.values(providers)) {
+      const match = searchProviderModels(provider, modelId, target);
+      if (match) {
+        if (match.distance === 0) {
+          bestMatch = match.model;
+          bestDist = 0;
+          break;
+        }
+        if (match.distance < bestDist) {
+          bestMatch = match.model;
+          bestDist = match.distance;
+        }
       }
     }
+    result = bestDist <= 24 ? bestMatch : undefined;
   }
-  return bestDist <= 24 ? bestMatch : undefined;
+
+  cache.set(cacheKey, result);
+  return result;
 }
 
 function numberOrUndefined(value: unknown): number | undefined {

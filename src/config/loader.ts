@@ -323,6 +323,13 @@ export const SandboxConfigSchema = z.object({
 });
 export type SandboxConfig = z.infer<typeof SandboxConfigSchema>;
 
+export const PermissionRuleSchema = z.object({
+  action: z.string().min(1),
+  resource: z.string().min(1),
+  effect: z.enum(["allow", "deny", "ask"]),
+});
+export type PermissionRule = z.infer<typeof PermissionRuleSchema>;
+
 export const CompactionConfigSchema = z.object({
   auto: z.boolean().default(true),
   keep_tokens: z.number().int().positive().default(15_000),
@@ -371,6 +378,7 @@ export const AppConfigSchema = z.object({
   providers: z.record(z.string().min(1), ProviderProfileSchema).default({}),
   roles: RolesConfigSchema.default({}),
   modes: ModesConfigSchema.prefault({}),
+  active_mode: z.enum(["plan", "build", "ultrawork"]).default("build"),
   inbound_server: InboundServerConfigSchema.prefault({}),
   lsp: z
     .object({
@@ -383,6 +391,7 @@ export const AppConfigSchema = z.object({
     })
     .prefault({}),
   hooks: HooksConfigSchema.prefault({}),
+  permissions: z.array(PermissionRuleSchema).default([]),
   sandbox: SandboxConfigSchema.prefault({}),
   compaction: CompactionConfigSchema.prefault({}),
   websearch: WebSearchConfigSchema.prefault({}),

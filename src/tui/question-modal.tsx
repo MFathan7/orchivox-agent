@@ -160,12 +160,12 @@ export function QuestionModal({
     <Box
       flexDirection="column"
       borderStyle="round"
-      borderColor={theme.border.active}
+      borderColor={theme.border.passive}
       paddingX={1}
       marginY={1}
     >
       <Box justifyContent="space-between">
-        <Text bold color={theme.accent}>
+        <Text bold color={theme.text}>
           {request.header ?? "QUESTION"}
         </Text>
         <Text color={theme.muted}>Esc cancel</Text>
@@ -177,12 +177,12 @@ export function QuestionModal({
           const checked = toggled.has(index);
           return (
             <Text key={`${option.label}-${index}`}>
-              <Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}</Text>
+              <Text color={active ? theme.text : theme.muted}>{active ? "❯ " : "  "}</Text>
               <Text color={theme.muted}>{`${index + 1}. `}</Text>
               {request.multiple ? (
-                <Text color={active ? theme.accent : theme.muted}>{checked ? "[x] " : "[ ] "}</Text>
+                <Text color={active ? theme.text : theme.muted}>{checked ? "[x] " : "[ ] "}</Text>
               ) : null}
-              <Text bold={active} color={theme.text}>
+              <Text bold={active} color={active ? theme.text : theme.muted}>
                 {labels[index] ?? normalizeQuestionOptionLabel(option.label)}
               </Text>
               {option.description ? <Text color={theme.muted}>  {option.description}</Text> : null}
@@ -191,7 +191,7 @@ export function QuestionModal({
         })}
         {request.allow_custom ? (
           <Text>
-            <Text color={clamped === customIndex ? theme.accent : theme.muted}>
+            <Text color={clamped === customIndex ? theme.text : theme.muted}>
               {clamped === customIndex ? "❯ " : "  "}
             </Text>
             <Text color={theme.muted}>{`${request.options.length + 1}. `}</Text>
@@ -199,14 +199,14 @@ export function QuestionModal({
           </Text>
         ) : null}
       </Box>
-      {notice ? <Text color={theme.badge.running}>{notice}</Text> : null}
+      {notice ? <Text color={theme.text}>{notice}</Text> : null}
       {customMode ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text color={theme.accent} bold>Custom answer:</Text>
+          <Text color={theme.text} bold>Custom answer:</Text>
           <Box>
-            <Text color={theme.accent}>❯ </Text>
-            <Text>{customText}</Text>
-            <Text inverse color={theme.accent}> </Text>
+            <Text color={theme.muted}>❯ </Text>
+            <Text color={theme.text}>{customText}</Text>
+            <Text inverse color={theme.text}> </Text>
           </Box>
           <Text color={theme.muted}>Enter submit · Esc back</Text>
         </Box>

@@ -16,6 +16,7 @@ import { ChoiceModal } from "./choice-modal";
 import { CommandPaletteModal, REASONING_LEVELS, reasoningLevelsFor, type ReasoningEffortLevel } from "./command-palette";
 import { PromptComposer, type FileAttachmentRef } from "./composer";
 import { HelpOverlay } from "./help-overlay";
+import { installKeyNormalizer } from "./key-normalize";
 import { QuestionModal, type PendingQuestion } from "./question-modal";
 import type { QuestionAnswer } from "../tools/question";
 import { OrchivoxLogo } from "./logo";
@@ -59,11 +60,25 @@ export type InputAction =
   | { kind: "command"; command: string; args?: string; raw?: string }
   | { kind: "submit"; text: string; ultrawork: boolean };
 
+export interface ChatToolDiffView {
+  oldText: string;
+  newText: string;
+  oldLabel?: string;
+  newLabel?: string;
+  additions?: number;
+  deletions?: number;
+  action?: "edit" | "create" | "delete" | "move";
+}
+
 export interface ChatToolCallView {
   id?: string;
   name: string;
   label?: string;
   detail?: string;
+  filePath?: string;
+  command?: string;
+  output?: string;
+  diff?: ChatToolDiffView;
   argumentsSummary: string;
   durationMs?: number;
   status?: "running" | "ok" | "error";
@@ -83,6 +98,7 @@ export interface ChatCompactionView {
   afterTokens: number;
   removedMessages: number;
   auto?: boolean;
+  reason?: "auto" | "manual" | "retry" | "output_limit";
   status?: "running" | "done" | "error";
   error?: string;
 }
@@ -195,13 +211,17 @@ const MODE_ORDER: AgentMode[] = ["plan", "build", "ultrawork"];
 
 const MODE_HINTS: Record<AgentMode, string> = {
   plan: "read-only",
-  build: "approval on write",
+  build: "workspace autonomy",
   ultrawork: "autonomous",
 };
 
 const MODE_CHOICES: Array<{ id: AgentMode; label: string; description: string }> = [
   { id: "plan", label: "Plan", description: "Read-only. Inspect and plan, no file changes." },
-  { id: "build", label: "Build", description: "Normal work. File changes ask for approval." },
+  {
+    id: "build",
+    label: "Build",
+    description: "Normal work. Workspace edits and safe commands run automatically.",
+  },
   {
     id: "ultrawork",
     label: "Ultrawork",
@@ -481,12 +501,17 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const innerWidth = Math.max(1, terminalSize.columns - 2);
   const narrow = innerWidth < 60;
   const compact = innerWidth < 80;
+  const tiny = innerWidth < 50;
   const statusText = escArmed ? "Press Esc again to stop the current turn" : statusMessage;
   const statusRows = statusText ? countWrappedLines(statusText, innerWidth) : 0;
   const chromeRows = 2 + statusRows;
   const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
   const chatScrollStep = Math.max(3, Math.floor(viewportHeight / 4));
-  const { stdin } = useStdin();
+  const { stdin, internal_eventEmitter } = useStdin();
+  React.useLayoutEffect(
+    () => installKeyNormalizer(internal_eventEmitter),
+    [internal_eventEmitter],
+  );
   React.useEffect(() => {
     const onData = (data: Buffer): void => {
       const delta = parseMouseWheel(data.toString());
@@ -518,14 +543,14 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             <Text bold color={modePalette.primary}>
               [{mode.toUpperCase()}]
             </Text>
-            <OrchivoxLogo variant="compact" theme={theme} />
+            {!tiny ? <OrchivoxLogo variant="compact" theme={theme} /> : null}
             <Text bold color={theme.text}>
-              {truncateText(projectName, narrow ? 16 : 24)}
+              {truncateText(projectName, tiny ? 12 : narrow ? 16 : 24)}
             </Text>
             {!narrow && branch ? <Text color={theme.muted}>({truncateText(branch, 16)})</Text> : null}
           </Box>
           <Box gap={1} alignItems="center">
-            {modeModel ? (
+            {!tiny && modeModel ? (
               <Text color={theme.muted}>
                 {truncateText(modeModel.model, narrow ? 16 : 28)}
                 {props.reasoningEffort && props.reasoningEffort !== "default"
@@ -533,7 +558,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                   : ""}
               </Text>
             ) : null}
-            {!compact && modeModel ? <Text color={theme.border.passive}>·</Text> : null}
+            {!compact && !tiny && modeModel ? (
+              <Text color={theme.border.passive}>·</Text>
+            ) : null}
             <Text color={contextColor}>{contextLabel}</Text>
             {!compact ? (
               <>
@@ -545,8 +572,14 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         </Box>
         <Text color={theme.border.passive}>{divider}</Text>
 
-        {!isWorkspaceTrusted ? (
-          <WorkspaceTrustPrompt
+        {hasModalOpen ? (
+          <Box
+            flexDirection="column"
+            height={Math.max(1, viewportHeight)}
+            overflow="hidden"
+          >
+            {!isWorkspaceTrusted ? (
+              <WorkspaceTrustPrompt
             workspacePath={props.workspacePath ?? globalThis.process.cwd()}
             onTrust={() => {
               setIsWorkspaceTrusted(true);
@@ -561,6 +594,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <ToolApprovalModal
             request={props.pendingApproval}
             onDecision={props.onApprovalDecision}
+            width={innerWidth}
+            height={viewportHeight}
           />
         ) : props.pendingQuestion && props.onQuestionAnswer ? (
           <QuestionModal
@@ -649,6 +684,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onModeReasoningChange={props.onModeReasoningChange}
             reasoningEffort={props.reasoningEffort}
             onReasoningChange={props.onReasoningEffortChange}
+            height={viewportHeight}
           />
         ) : paletteOpen && props.router ? (
           <CommandPaletteModal
@@ -708,6 +744,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onSessionDeleted={props.onSessionDeleted}
             onRestoreSnapshot={props.onRestoreSnapshot}
             onClose={() => setSessionTab(null)}
+            height={viewportHeight}
           />
         ) : hubOpen ? (
           <AgentHub
@@ -724,6 +761,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             width={innerWidth}
             theme={theme}
           />
+        ) : null}
+          </Box>
         ) : (
           <Box width={innerWidth}>
             <Box width={chatWidth} flexDirection="column">
@@ -765,8 +804,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <Text color={theme.modes.build.primary}>{statusMessage}</Text>
         ) : null}
 
-        {!hasModalOpen ? (
-          <PromptComposer
+        <PromptComposer
             mode={mode}
             theme={theme}
             width={innerWidth}
@@ -778,6 +816,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               ),
             )}
             streaming={streaming}
+            disabled={hasModalOpen}
             onLayoutRows={handleComposerRows}
             onModeToggle={() => {
               const index = MODE_ORDER.indexOf(mode);
@@ -850,7 +889,6 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               }
             }}
           />
-        ) : null}
       </Box>
     </ThemeProvider>
   );

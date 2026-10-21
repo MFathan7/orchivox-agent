@@ -78,6 +78,12 @@ export async function saveRoleSelection(
   await writeDocument(configPath, document);
 }
 
+export async function saveActiveMode(configPath: string, mode: ConfigMode): Promise<void> {
+  const document = await readDocument(configPath);
+  document.set("active_mode", mode);
+  await writeDocument(configPath, document);
+}
+
 export async function saveModeSelection(
   configPath: string,
   mode: ConfigMode,

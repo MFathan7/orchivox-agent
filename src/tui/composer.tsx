@@ -784,6 +784,14 @@ export function PromptComposer(props: PromptComposerProps) {
       return;
     }
 
+    const shiftTab =
+      (key.tab && key.shift) || sequence === "\x1b[Z" || raw === "\x1b[Z" || input === "\x1b[Z";
+    if (shiftTab) {
+      if (autocompleteContext) dismissAutocomplete();
+      onModeToggle?.();
+      return;
+    }
+
     if (autocompleteItems.length > 0 && autocompleteContext) {
       if (key.upArrow) {
         setAutocompleteSelected((prev) => (prev > 0 ? prev - 1 : autocompleteItems.length - 1));
@@ -797,7 +805,7 @@ export function PromptComposer(props: PromptComposerProps) {
         dismissAutocomplete();
         return;
       }
-      if (key.tab || key.return) {
+      if ((key.tab && !key.shift) || key.return) {
         const selected = autocompleteItems[autocompleteSelected];
         if (selected) {
           if (key.return && selected.trigger === "command" && selected.requiresArgs !== true) {
@@ -812,8 +820,9 @@ export function PromptComposer(props: PromptComposerProps) {
       }
     }
 
-    if (key.tab && !autocompleteContext) {
-      onModeToggle?.();
+    if (key.tab && !key.shift) {
+      // Tab only accepts an autocomplete item. Outside the popup it is a no-op;
+      // mode switching lives on Shift+Tab so Tab cannot change state by accident.
       return;
     }
 
@@ -1111,7 +1120,7 @@ export function PromptComposer(props: PromptComposerProps) {
     if (isPrintable) {
       insertPlainOrPasted(input);
     }
-  });
+  }, { isActive: !disabled });
 
   const modeStyle = theme.modes[mode] ?? theme.modes.build;
   const { line: activeLine, col: activeCol, lines } = getLineAndColumn(text, cursorPos);
@@ -1150,11 +1159,13 @@ export function PromptComposer(props: PromptComposerProps) {
         ? "Ask Orchivox, / commands, @ files"
         : placeholder;
   const hintText =
-    (width ?? 80) < 60
-      ? "Enter send · Ctrl+J newline · / commands"
-      : (width ?? 80) < 80
-        ? "Tab mode · / commands · @ files · Enter send · Ctrl+J newline"
-        : "Tab mode · / commands · @ files · $ skills · Enter send · Shift+Enter newline (Ctrl+J)";
+    (width ?? 80) < 50
+      ? "Shift+Tab · Enter send"
+      : (width ?? 80) < 60
+        ? "Enter send · Ctrl+J newline · / commands"
+        : (width ?? 80) < 80
+          ? "Shift+Tab mode · / commands · @ files · Enter send · Ctrl+J newline"
+          : "Shift+Tab mode · / commands · @ files · $ skills · Enter send · Shift+Enter newline (Ctrl+J)";
   const hintRows = wrapText(hintText, Math.max(1, (width ?? 80) - 2)).length;
   const layoutRows =
     popupRows + attachmentRows + Math.min(visualRows.length, maxVisibleRows) + 2 + hintRows;

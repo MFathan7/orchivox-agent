@@ -12,18 +12,23 @@ import { AgentOrchestrator } from "./agent/orchestrator";
 import {
   appendAnswerToken,
   createAnswerStream,
-  markAnswerBoundary,
   replaceAnswer,
+  takeAnswer,
 } from "./agent/answer-stream";
 import { formatAppInfo, formatDoctor, getAppInfo, runUpdate } from "./app-info";
 import { compactMessages, extractSummary } from "./agent/compaction";
 import { generateSessionTitle, messageText } from "./agent/session-title";
 import type { SkillDocument } from "./agent/skills";
-import type { ApprovalDecision, ApprovalRequest } from "./agent/permissions";
+import {
+  GranularPermissionEngine,
+  permissionRulesFromConfig,
+  type ApprovalDecision,
+  type ApprovalRequest,
+} from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
 import { loadConfig, type AppConfig } from "./config/loader";
 import { resolveConfigPaths, type ConfigSource } from "./config/paths";
-import { saveModeReasoning, type ConfigMode } from "./config/writer";
+import { saveActiveMode, saveModeReasoning, type ConfigMode } from "./config/writer";
 import { LSPClient } from "./ide/lsp-client";
 import { RulesLoader } from "./memory/rules-loader";
 import { estimateMessageTokens } from "./memory/hindsight";
@@ -60,7 +65,12 @@ import { WorkspaceTrustManager } from "./security/workspace-trust";
 import { WorkspaceTrustPrompt } from "./tui/trust-modal";
 import type { ReasoningEffortLevel } from "./tui/command-palette";
 import type { SessionModalTab } from "./tui/session-modal";
-import { AgentModeSchema, type AgentMode, type Message } from "./types/schema";
+import {
+  AgentModeSchema,
+  type AgentMode,
+  type CompactionReason,
+  type Message,
+} from "./types/schema";
 
 export interface CliOptions {
   command: "tui" | "serve" | "prompt" | "mcp" | "update" | "doctor";
@@ -257,6 +267,10 @@ export async function bootstrap(
   });
   const lsp = await startLspClient(config, root);
   const lifecycle = buildHashEditLifecycle({ snapshots, lsp });
+  const permissions = new GranularPermissionEngine({
+    repoRoot: root,
+    rules: permissionRulesFromConfig(config.permissions),
+  });
 
   const orchestrator = new AgentOrchestrator({
     router,
@@ -268,6 +282,7 @@ export async function bootstrap(
     lsp,
     hashEditLifecycle: lifecycle,
     repoRoot: root,
+    permissions,
   });
   const plugins = await orchestrator.initialize();
   const mcpClient = new McpClientManager({ registry: orchestrator.registry });
@@ -432,7 +447,7 @@ async function runTuiSession(
     sessionEpoch: 0,
     entries: [] as ChatEntryView[],
     messages: [] as Message[],
-    mode: "build" as AgentMode,
+    mode: runtime.config.active_mode as AgentMode,
     currentTheme: "tokyonight" as ThemeName,
     reasoningEffort: "default" as ReasoningEffortLevel,
     reasoningByMode: {
@@ -481,8 +496,18 @@ async function runTuiSession(
   }
   normalizeAllReasoning();
   const setActiveMode = (next: AgentMode): void => {
+    const changed = state.mode !== next;
     state.mode = next;
     state.reasoningEffort = normalizeReasoningForMode(next, state.reasoningByMode[next]);
+    if (changed) {
+      runtime.config.active_mode = next;
+      void saveActiveMode(runtime.configPath, next).catch((error) => {
+        setNotice(
+          `Could not save mode: ${error instanceof Error ? error.message : String(error)}`,
+          6000,
+        );
+      });
+    }
   };
   const estimateContextTokens = (mode: AgentMode, messages: Message[]): number => {
     const overhead = runtime.orchestrator.estimateContextOverhead(mode);
@@ -522,25 +547,81 @@ async function runTuiSession(
     state.entries = [...state.entries, { id: `entry-${state.counter}`, role, text, ...extra }];
   };
 
-  const pushCompactionEntry = (compaction: {
+  let pendingCompactionEntryId: string | undefined;
+
+  const beginCompaction = (reason: CompactionReason): string => {
+    state.counter += 1;
+    const id = `entry-${state.counter}`;
+    state.entries = [
+      ...state.entries,
+      {
+        id,
+        role: "compaction",
+        text: "",
+        compaction: {
+          beforeTokens: state.contextTokens,
+          afterTokens: state.contextTokens,
+          removedMessages: 0,
+          auto: reason !== "manual",
+          reason,
+          status: "running",
+        },
+      },
+    ];
+    pendingCompactionEntryId = id;
+    return id;
+  };
+
+  const finishCompaction = (compaction: {
     summary?: string;
     beforeTokens: number;
     afterTokens: number;
     removedMessages: number;
     auto?: boolean;
+    reason?: CompactionReason;
     status?: "running" | "done" | "error";
     error?: string;
   }): void => {
+    const id = pendingCompactionEntryId;
+    pendingCompactionEntryId = undefined;
+    if (id) {
+      state.entries = state.entries.map((entry) =>
+        entry.id === id
+          ? {
+              ...entry,
+              text: compaction.summary ?? "",
+              compaction: {
+                beforeTokens: compaction.beforeTokens,
+                afterTokens: compaction.afterTokens,
+                removedMessages: compaction.removedMessages,
+                auto: compaction.auto,
+                reason: compaction.reason,
+                status: compaction.status ?? "done",
+                error: compaction.error,
+              },
+            }
+          : entry,
+      );
+      return;
+    }
     pushEntry("compaction", compaction.summary ?? "", {
       compaction: {
         beforeTokens: compaction.beforeTokens,
         afterTokens: compaction.afterTokens,
         removedMessages: compaction.removedMessages,
         auto: compaction.auto,
+        reason: compaction.reason,
         status: compaction.status ?? "done",
         error: compaction.error,
       },
     });
+  };
+
+  const cancelCompaction = (): void => {
+    const id = pendingCompactionEntryId;
+    pendingCompactionEntryId = undefined;
+    if (!id) return;
+    state.entries = state.entries.filter((entry) => entry.id !== id);
   };
 
   const sessionTitle = (text: string): string => {
@@ -996,6 +1077,10 @@ async function runTuiSession(
           bufferRatio: compactionConfig.buffer_ratio,
           overheadTokens: runtime.orchestrator.estimateContextOverhead(state.mode),
           previousSummary: extractSummary(state.messages),
+          onStart: () => {
+            beginCompaction("auto");
+            rerender();
+          },
         });
         if (compaction.didCompact) {
           state.messages = compaction.messages;
@@ -1009,16 +1094,19 @@ async function runTuiSession(
             removed_messages: compaction.removedMessages,
             auto: true,
           });
-          pushCompactionEntry({
+          finishCompaction({
             summary: compaction.summary,
             beforeTokens: compaction.beforeTokens,
             afterTokens: compaction.afterTokens,
             removedMessages: compaction.removedMessages,
             auto: true,
+            reason: "auto",
           });
           rerender();
         }
       } catch {
+        cancelCompaction();
+        rerender();
         // Compaction is best effort; the turn can still proceed.
       }
     }
@@ -1099,6 +1187,7 @@ async function runTuiSession(
           state.streamingText = answer;
           renderLive();
         } else if (event.type === "final_text") {
+          closeThinkingSegment();
           replaceAnswer(answerStream, event.text);
           answer = answerStream.text;
           liveEntry.text = answer;
@@ -1118,7 +1207,24 @@ async function runTuiSession(
           renderLive();
         } else if (event.type === "tool_start") {
           closeThinkingSegment();
-          markAnswerBoundary(answerStream);
+          const narration = takeAnswer(answerStream);
+          if (narration.trim().length > 0) {
+            const segment = startThinkingSegment();
+            segment.text = narration.trim();
+            const now = Date.now();
+            if (thinkingStartedAt === undefined) thinkingStartedAt = segment.startedAt;
+            thinkingCompletedAt = now;
+            liveEntry.thinkingStartedAt = thinkingStartedAt;
+            liveEntry.thinkingCompletedAt = thinkingCompletedAt;
+            liveEntry.thinking = `${liveEntry.thinking ?? ""}${
+              liveEntry.thinking ? "\n\n" : ""
+            }${segment.text}`;
+            liveEntry.thinkingSegments = thinkingSegments;
+            closeThinkingSegment();
+          }
+          answer = "";
+          liveEntry.text = "";
+          state.streamingText = "";
           liveEntry.toolCalls = [
             ...(liveEntry.toolCalls ?? []),
             {
@@ -1128,6 +1234,10 @@ async function runTuiSession(
               detail: event.file_path
                 ? relative(root, event.file_path) || event.file_path
                 : event.detail,
+              filePath: event.file_path
+                ? relative(root, event.file_path) || event.file_path
+                : undefined,
+              command: event.command,
               argumentsSummary: event.arguments_summary,
               status: "running",
             },
@@ -1137,7 +1247,12 @@ async function runTuiSession(
           lastToolEndAt = Date.now();
           liveEntry.toolCalls = (liveEntry.toolCalls ?? []).map((call) =>
             call.id === event.id
-              ? { ...call, status: event.status, durationMs: event.duration_ms }
+              ? {
+                  ...call,
+                  status: event.status,
+                  durationMs: event.duration_ms,
+                  output: event.output ?? call.output,
+                }
               : call,
           );
           renderLive(true);
@@ -1153,6 +1268,36 @@ async function runTuiSession(
               deletions: event.deletions,
             },
           ];
+          const targetCall = liveEntry.toolCalls?.find((call) => call.id === event.tool_call_id);
+          const action =
+            targetCall?.name === "create_file"
+              ? "create"
+              : targetCall?.name === "delete_file"
+                ? "delete"
+                : targetCall?.name === "move_file"
+                  ? "move"
+                  : event.old_text.length === 0
+                    ? "create"
+                    : "edit";
+          if (event.tool_call_id) {
+            liveEntry.toolCalls = (liveEntry.toolCalls ?? []).map((call) =>
+              call.id === event.tool_call_id
+                ? {
+                    ...call,
+                    filePath: displayPath,
+                    diff: {
+                      oldText: event.old_text,
+                      newText: event.new_text,
+                      oldLabel: `a/${displayPath}`,
+                      newLabel: `b/${displayPath}`,
+                      additions: event.additions,
+                      deletions: event.deletions,
+                      action,
+                    },
+                  }
+                : call,
+            );
+          }
           const existing = state.modifiedFiles.get(event.path);
           state.modifiedFiles.set(event.path, {
             path: displayPath,
@@ -1185,20 +1330,36 @@ async function runTuiSession(
         } else if (event.type === "bg_process_update") {
           pushEntry("system", `[bg_process ${event.processId}] ${event.status}`);
           renderLive(true);
+        } else if (event.type === "compaction_start") {
+          beginCompaction(event.reason);
+          renderLive(true);
         } else if (event.type === "compaction") {
           state.contextTokens = event.after_tokens;
-          pushCompactionEntry({
+          finishCompaction({
             summary: event.summary,
             beforeTokens: event.before_tokens,
             afterTokens: event.after_tokens,
             removedMessages: event.removed_messages,
             auto: event.reason !== "manual",
+            reason: event.reason,
           });
           renderLive(true);
         } else if (event.type === "error") {
-          pushEntry("system", `provider error: ${event.message}`);
-          renderLive(true);
+          const knownLimit =
+            /UnsupportedParamsError|does not support (?:the )?(?:parameter|parameters|param|params)|unsupported (?:parameter|parameters|param|params)|maximum context length|requested\s+\d+\s+output tokens/i.test(
+              event.message,
+            );
+          if (!knownLimit) {
+            pushEntry(
+              "system",
+              event.code === "provider_adjusted"
+                ? event.message
+                : `provider error: ${event.message}`,
+            );
+            renderLive(true);
+          }
         } else if (event.type === "done") {
+          closeThinkingSegment();
           finishReason = event.finish_reason;
         } else if (event.type === "usage") {
           const usedTokens = event.prompt_tokens + event.completion_tokens;
@@ -1241,7 +1402,7 @@ async function runTuiSession(
       if (finishReason === "length") {
         pushEntry(
           "system",
-          "response hit the output token limit; raise Max output in /models or send another message to continue",
+          "response truncated after automatic continuation limit; send another message to continue",
         );
       } else if (finishReason === "turn_limit") {
         pushEntry("system", "agent turn limit reached; send another message to continue");
@@ -1272,6 +1433,7 @@ async function runTuiSession(
       pushEntry("system", `turn failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       activeAbortController = undefined;
+      cancelCompaction();
       state.liveEntry = undefined;
       state.streamingText = "";
       state.busy = false;
@@ -1293,7 +1455,7 @@ async function runTuiSession(
       }
       case "/build": {
         setActiveMode("build");
-        setNotice("Mode: build (approval on write)");
+        setNotice("Mode: build (workspace autonomy)");
         break;
       }
       case "/ultrawork": {
@@ -1549,6 +1711,10 @@ async function runTuiSession(
             overheadTokens: runtime.orchestrator.estimateContextOverhead(state.mode),
             previousSummary: extractSummary(state.messages),
             force: true,
+            onStart: () => {
+              beginCompaction("manual");
+              rerender();
+            },
           });
           if (!result.didCompact) {
             pushEntry(
@@ -1570,16 +1736,18 @@ async function runTuiSession(
                 auto: false,
               });
             }
-            pushCompactionEntry({
+            finishCompaction({
               summary: result.summary,
               beforeTokens: result.beforeTokens,
               afterTokens: result.afterTokens,
               removedMessages: result.removedMessages,
               auto: false,
+              reason: "manual",
             });
             setNotice("Context compacted", 4000);
           }
         } catch (error) {
+          cancelCompaction();
           pushEntry("system", `compact failed: ${error instanceof Error ? error.message : String(error)}`);
           setNotice("Compaction failed", 6000);
         } finally {

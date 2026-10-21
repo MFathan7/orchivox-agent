@@ -1,7 +1,15 @@
 import React from "react";
 import { Box, Text } from "ink";
 
-import { displayWidth, wrapPreservingWhitespace, wrapText } from "./text-wrap";
+import type { RenderRow } from "./rows";
+import {
+  charDisplayWidth,
+  displayWidth,
+  expandTabs,
+  fitDisplayText,
+  wrapPreservingWhitespace,
+  wrapText,
+} from "./text-wrap";
 import { getTheme, type Theme } from "./theme";
 
 export interface MarkdownViewProps {
@@ -22,6 +30,10 @@ export type MarkdownBlock =
   | { kind: "paragraph"; lines: string[] };
 
 export type TokenKind = "keyword" | "string" | "comment" | "number" | "type" | "text";
+
+const PANEL_PAD = " ";
+const PANEL_END = "\u200b";
+const CODE_MARGIN = 2;
 
 export interface HighlightToken {
   kind: TokenKind;
@@ -129,7 +141,7 @@ export function normalizeHtml(content: string): string {
     }
     output.push(inFence ? line : htmlLineToText(line));
   }
-  return output.join("\n");
+  return expandTabs(output.join("\n"));
 }
 
 function listIndent(line: string): number {
@@ -536,6 +548,530 @@ function codeTokenColor(kind: HighlightToken["kind"], theme: Theme): string {
   return theme.text;
 }
 
+type InlineSegmentKind = "text" | "code" | "bold" | "strike" | "italic" | "link" | "url" | "file";
+
+interface InlineSegment {
+  kind: InlineSegmentKind;
+  text: string;
+}
+
+interface InlineStyleOptions {
+  textColor?: string;
+  textBold?: boolean;
+  textItalic?: boolean;
+  textDim?: boolean;
+}
+
+function pushInlineSegment(segments: InlineSegment[], kind: InlineSegmentKind, text: string): void {
+  if (text.length === 0) return;
+  const previous = segments[segments.length - 1];
+  if (previous?.kind === kind) previous.text += text;
+  else segments.push({ kind, text });
+}
+
+function parseInlineSegments(text: string): InlineSegment[] {
+  const segments: InlineSegment[] = [];
+  let cursor = 0;
+
+  while (cursor < text.length) {
+    const rest = text.slice(cursor);
+    const candidates: InlineMatch[] = [];
+
+    const add = (kind: string, pattern: RegExp): void => {
+      pattern.lastIndex = 0;
+      const match = pattern.exec(rest);
+      if (match) candidates.push({ index: match.index, kind, match });
+    };
+
+    add("code", INLINE_CODE);
+    add("bold", INLINE_BOLD);
+    add("strike", INLINE_STRIKE);
+    add("italic", INLINE_ITALIC_STAR);
+    add("italic", INLINE_ITALIC_UNDERSCORE);
+    add("link", INLINE_LINK);
+    add("autolink", INLINE_AUTOLINK);
+
+    FILE_REFERENCE.lastIndex = 0;
+    let fileMatch: RegExpExecArray | null;
+    while ((fileMatch = FILE_REFERENCE.exec(rest)) !== null) {
+      const before = fileMatch.index === 0 ? "" : rest[fileMatch.index - 1];
+      if (before === "" || /[\s("'[]/.test(before)) {
+        candidates.push({ index: fileMatch.index, kind: "file", match: fileMatch });
+        break;
+      }
+    }
+
+    if (candidates.length === 0) {
+      pushInlineSegment(segments, "text", rest);
+      break;
+    }
+
+    candidates.sort((left, right) => left.index - right.index || left.match[0].length - right.match[0].length);
+    const winner = candidates[0];
+    if (winner.index > 0) pushInlineSegment(segments, "text", rest.slice(0, winner.index));
+
+    if (winner.kind === "code") {
+      pushInlineSegment(segments, "code", winner.match[1]);
+    } else if (winner.kind === "bold") {
+      pushInlineSegment(segments, "bold", winner.match[1]);
+    } else if (winner.kind === "strike") {
+      pushInlineSegment(segments, "strike", winner.match[1]);
+    } else if (winner.kind === "italic") {
+      pushInlineSegment(segments, "italic", winner.match[1]);
+    } else if (winner.kind === "link") {
+      const label = winner.match[1];
+      const url = winner.match[2];
+      pushInlineSegment(segments, "link", label);
+      if (label !== url) {
+        pushInlineSegment(segments, "text", " (");
+        pushInlineSegment(segments, "url", url);
+        pushInlineSegment(segments, "text", ")");
+      }
+    } else if (winner.kind === "autolink") {
+      pushInlineSegment(segments, "link", winner.match[1]);
+    } else {
+      const marker = winner.match[2] ? `:${winner.match[2]}` : "";
+      pushInlineSegment(segments, "file", `${winner.match[1]}${marker}`);
+    }
+
+    cursor += winner.index + winner.match[0].length;
+  }
+
+  return segments;
+}
+
+function trimTrailingWhitespace(segments: InlineSegment[]): InlineSegment[] {
+  while (segments.length > 0) {
+    const last = segments[segments.length - 1];
+    last.text = last.text.replace(/\s+$/, "");
+    if (last.text.length > 0) break;
+    segments.pop();
+  }
+  return segments;
+}
+
+function wrapInlineSegments(segments: InlineSegment[], width: number): InlineSegment[][] {
+  const max = Math.max(1, width);
+  const rows: InlineSegment[][] = [];
+  let row: InlineSegment[] = [];
+  let rowWidth = 0;
+
+  const append = (kind: InlineSegmentKind, text: string): void => {
+    pushInlineSegment(row, kind, text);
+    rowWidth += displayWidth(text);
+  };
+  const flush = (): void => {
+    rows.push(trimTrailingWhitespace(row));
+    row = [];
+    rowWidth = 0;
+  };
+
+  for (const segment of segments) {
+    const tokens = segment.text.match(/\s+|\S+/g) ?? [];
+    for (const token of tokens) {
+      const tokenWidth = displayWidth(token);
+      const whitespace = /^\s+$/.test(token);
+      if (rowWidth === 0 && whitespace) continue;
+      if (rowWidth + tokenWidth <= max) {
+        append(segment.kind, token);
+        continue;
+      }
+      if (whitespace) {
+        flush();
+        continue;
+      }
+      if (tokenWidth <= max) {
+        flush();
+        append(segment.kind, token);
+        continue;
+      }
+      for (const char of token) {
+        const charWidth = charDisplayWidth(char);
+        if (rowWidth > 0 && rowWidth + charWidth > max) flush();
+        append(segment.kind, char);
+      }
+    }
+  }
+
+  if (row.length > 0 || rows.length === 0) flush();
+  return rows;
+}
+
+function inlineSegmentNode(
+  segment: InlineSegment,
+  theme: Theme,
+  key: string,
+  style: InlineStyleOptions,
+): React.ReactNode {
+  switch (segment.kind) {
+    case "code":
+      return <Text key={key} color={theme.syntax.string}>{segment.text}</Text>;
+    case "bold":
+      return <Text key={key} bold>{segment.text}</Text>;
+    case "strike":
+      return <Text key={key} strikethrough dimColor>{segment.text}</Text>;
+    case "italic":
+      return <Text key={key} italic>{segment.text}</Text>;
+    case "link":
+      return <Text key={key} color={theme.accent}>{segment.text}</Text>;
+    case "url":
+      return <Text key={key} color={theme.muted}>{segment.text}</Text>;
+    case "file":
+      return <Text key={key} color={theme.modes.plan.primary} bold>{segment.text}</Text>;
+    default:
+      return (
+        <Text
+          key={key}
+          color={style.textColor ?? theme.text}
+          bold={style.textBold}
+          italic={style.textItalic}
+          dimColor={style.textDim}
+        >
+          {segment.text}
+        </Text>
+      );
+  }
+}
+
+function inlineSegmentsNode(
+  segments: InlineSegment[],
+  theme: Theme,
+  keyPrefix: string,
+  style: InlineStyleOptions = {},
+): React.ReactNode {
+  return segments.map((segment, index) =>
+    inlineSegmentNode(segment, theme, `${keyPrefix}-${index}`, style),
+  );
+}
+
+function inlineRows(
+  segments: InlineSegment[],
+  width: number,
+  theme: Theme,
+  keyPrefix: string,
+  style: InlineStyleOptions = {},
+): RenderRow[] {
+  return wrapInlineSegments(segments, width).map((row, index) => ({
+    key: `${keyPrefix}-${index}`,
+    node: (
+      <Text
+        wrap="truncate"
+        color={style.textColor ?? theme.text}
+        bold={style.textBold}
+        italic={style.textItalic}
+        dimColor={style.textDim}
+      >
+        {inlineSegmentsNode(row, theme, `${keyPrefix}-${index}`, style)}
+      </Text>
+    ),
+  }));
+}
+
+function tableRows(
+  block: Extract<MarkdownBlock, { kind: "table" }>,
+  blockIndex: number,
+  theme: Theme,
+  width: number,
+): RenderRow[] {
+  const rows: RenderRow[] = [];
+  const columnCount = Math.max(block.headers.length, ...block.rows.map((row) => row.length), 0);
+  const available = Math.max(12, width - 2);
+  if (available < 30 || columnCount === 0) {
+    for (let rowIndex = 0; rowIndex < block.rows.length; rowIndex += 1) {
+      const row = block.rows[rowIndex];
+      for (let column = 0; column < block.headers.length; column += 1) {
+        const header = block.headers[column] ?? "";
+        const value = row[column] ?? "";
+        const prefix = `${header}: `;
+        const prefixWidth = displayWidth(prefix);
+        const valueRows = wrapInlineSegments(
+          parseInlineSegments(value),
+          Math.max(1, width - prefixWidth),
+        );
+        valueRows.forEach((valueRow, valueIndex) => {
+          rows.push({
+            key: `md-${blockIndex}-table-${rowIndex}-${column}-${valueIndex}`,
+            node: (
+              <Text wrap="truncate" color={theme.text}>
+                <Text bold color={theme.accent}>
+                  {valueIndex === 0 ? prefix : " ".repeat(prefixWidth)}
+                </Text>
+                {inlineSegmentsNode(
+                  valueRow,
+                  theme,
+                  `md-${blockIndex}-table-${rowIndex}-${column}-${valueIndex}`,
+                )}
+              </Text>
+            ),
+          });
+        });
+      }
+    }
+    return rows;
+  }
+
+  const rawWidths = Array.from({ length: columnCount }, (_, column) => {
+    const values = [block.headers[column] ?? "", ...block.rows.map((row) => row[column] ?? "")];
+    return Math.min(
+      28,
+      Math.max(3, ...values.map((value) => displayWidth(inlinePlainText(value).trim()))),
+    );
+  });
+  const separators = Math.max(0, columnCount - 1) * 3;
+  const total = rawWidths.reduce((sum, value) => sum + value, 0) + separators;
+  const scale = total > available ? available / total : 1;
+  const widths = rawWidths.map((value) => Math.max(3, Math.floor(value * scale)));
+
+  const renderRow = (
+    cells: string[],
+    rowIndex: number,
+    header: boolean,
+  ): RenderRow => {
+    const nodes: React.ReactNode[] = [];
+    for (let column = 0; column < columnCount; column += 1) {
+      const cell = cellView(cells[column] ?? "", widths[column]);
+      nodes.push(
+        header ? (
+          <Text key={`cell-${rowIndex}-${column}`} bold color={theme.accent}>
+            {cell.truncated ? cell.text : renderInline(cell.text, theme)}
+            {" ".repeat(Math.max(0, widths[column] - displayWidth(cell.plain)))}
+            {column < columnCount - 1 ? " │ " : ""}
+          </Text>
+        ) : (
+          <Text key={`cell-${rowIndex}-${column}`} color={theme.text}>
+            {cell.truncated ? cell.text : renderInline(cell.text, theme)}
+            {" ".repeat(Math.max(0, widths[column] - displayWidth(cell.plain)))}
+            {column < columnCount - 1 ? " │ " : ""}
+          </Text>
+        ),
+      );
+    }
+    return {
+      key: `md-${blockIndex}-table-row-${rowIndex}`,
+      node: <Text wrap="truncate">{nodes}</Text>,
+    };
+  };
+
+  rows.push(renderRow(block.headers, 0, true));
+  rows.push({
+    key: `md-${blockIndex}-table-separator`,
+    node: (
+      <Text color={theme.border.passive} wrap="truncate">
+        {widths.map((value) => "─".repeat(value)).join("─┼─")}
+      </Text>
+    ),
+  });
+  block.rows.forEach((row, rowIndex) => {
+    rows.push(renderRow(row, rowIndex + 1, false));
+  });
+  return rows;
+}
+
+export function markdownRows(
+  content: string,
+  width: number,
+  theme: Theme,
+): RenderRow[] {
+  const blocks = parseMarkdown(content);
+  const safeWidth = Math.max(12, width);
+  const rows: RenderRow[] = [];
+
+  blocks.forEach((block, blockIndex) => {
+    if (rows.length > 0) {
+      rows.push({
+        key: `md-${blockIndex}-block-gap`,
+        node: <Text> </Text>,
+      });
+    }
+
+    switch (block.kind) {
+      case "heading": {
+        const headingRows = inlineRows(
+          parseInlineSegments(block.text),
+          safeWidth,
+          theme,
+          `md-${blockIndex}-heading`,
+          {
+            textColor: block.level === 1 ? theme.accent : theme.text,
+            textBold: true,
+          },
+        );
+        rows.push(...headingRows);
+        break;
+      }
+      case "paragraph": {
+        block.lines.forEach((line, lineIndex) => {
+          if (line.length === 0) {
+            rows.push({
+              key: `md-${blockIndex}-paragraph-${lineIndex}-blank`,
+              node: <Text> </Text>,
+            });
+            return;
+          }
+          rows.push(
+            ...inlineRows(
+              parseInlineSegments(line),
+              safeWidth,
+              theme,
+              `md-${blockIndex}-paragraph-${lineIndex}`,
+            ),
+          );
+        });
+        break;
+      }
+      case "code": {
+        const showNumbers = safeWidth >= 60;
+        const panelWidth = Math.max(11, safeWidth - CODE_MARGIN * 2 - 1);
+        const margin = " ".repeat(CODE_MARGIN);
+        const leftPad = 2;
+        const gutterWidth = showNumbers ? 7 : 0;
+        const codeWidth = Math.max(8, panelWidth - leftPad - gutterWidth - 1);
+        const background = theme.code.background;
+        const paddingRow = (key: string): RenderRow => ({
+          key,
+          node: (
+            <Text wrap="truncate">
+              {margin}
+              <Text backgroundColor={background}>
+                {PANEL_PAD.repeat(panelWidth)}
+                {PANEL_END}
+              </Text>
+            </Text>
+          ),
+        });
+
+        rows.push(paddingRow(`md-${blockIndex}-code-top`));
+        if (block.language) {
+          const label = fitDisplayText(`  ${block.language}`, panelWidth);
+          rows.push({
+            key: `md-${blockIndex}-code-language`,
+            node: (
+              <Text wrap="truncate">
+                {margin}
+                <Text bold color={theme.syntax.type} backgroundColor={background}>
+                  {label}
+                  {PANEL_PAD.repeat(Math.max(0, panelWidth - displayWidth(label)))}
+                  {PANEL_END}
+                </Text>
+              </Text>
+            ),
+          });
+        }
+        block.lines.forEach((line, lineIndex) => {
+          wrapPreservingWhitespace(line, codeWidth).forEach((chunk, chunkIndex) => {
+            const gutter = showNumbers
+              ? `${chunkIndex === 0 ? String(lineIndex + 1).padStart(4, " ") : "    "} │ `
+              : "";
+            const used = leftPad + displayWidth(gutter) + displayWidth(chunk);
+            rows.push({
+              key: `md-${blockIndex}-code-${lineIndex}-${chunkIndex}`,
+              node: (
+                <Text wrap="truncate">
+                  {margin}
+                  <Text backgroundColor={background}>
+                    {" ".repeat(leftPad)}
+                    {showNumbers ? <Text color={theme.code.border}>{gutter}</Text> : null}
+                    {highlightLine(chunk, block.language).map((token, tokenIndex) => (
+                      <Text
+                        key={`${lineIndex}-${chunkIndex}-${tokenIndex}`}
+                        color={codeTokenColor(token.kind, theme)}
+                      >
+                        {token.text}
+                      </Text>
+                    ))}
+                    {PANEL_PAD.repeat(Math.max(0, panelWidth - used))}
+                    {PANEL_END}
+                  </Text>
+                </Text>
+              ),
+            });
+          });
+        });
+        rows.push(paddingRow(`md-${blockIndex}-code-bottom`));
+        break;
+      }
+      case "hr":
+        rows.push({
+          key: `md-${blockIndex}-hr`,
+          node: (
+            <Text color={theme.border.passive} wrap="truncate">
+              {"─".repeat(Math.max(8, Math.min(safeWidth, 48)))}
+            </Text>
+          ),
+        });
+        break;
+      case "table":
+        rows.push(...tableRows(block, blockIndex, theme, safeWidth));
+        break;
+      case "task":
+      case "bullet":
+      case "numbered": {
+        block.items.forEach((item, itemIndex) => {
+          const checked = block.kind === "task" && "checked" in item ? item.checked : false;
+          const prefix =
+            block.kind === "task"
+              ? `${"  ".repeat(item.indent)}${checked ? "● " : "○ "}`
+              : block.kind === "numbered"
+                ? `${"  ".repeat(item.indent)}${itemIndex + 1}. `
+                : `${"  ".repeat(item.indent)}- `;
+          const prefixWidth = displayWidth(prefix);
+          const itemRows = wrapInlineSegments(
+            parseInlineSegments(item.text),
+            Math.max(1, safeWidth - prefixWidth),
+          );
+          itemRows.forEach((itemRow, rowIndex) => {
+            rows.push({
+              key: `md-${blockIndex}-${block.kind}-${itemIndex}-${rowIndex}`,
+              node: (
+                <Text wrap="truncate" color={theme.text}>
+                  <Text color={theme.accent}>
+                    {rowIndex === 0 ? prefix : " ".repeat(prefixWidth)}
+                  </Text>
+                  {inlineSegmentsNode(
+                    itemRow,
+                    theme,
+                    `md-${blockIndex}-${block.kind}-${itemIndex}-${rowIndex}`,
+                  )}
+                </Text>
+              ),
+            });
+          });
+        });
+        break;
+      }
+      case "quote": {
+        block.lines.forEach((line, lineIndex) => {
+          const quoteRows = wrapInlineSegments(
+            parseInlineSegments(line),
+            Math.max(1, safeWidth - 2),
+          );
+          quoteRows.forEach((quoteRow, rowIndex) => {
+            rows.push({
+              key: `md-${blockIndex}-quote-${lineIndex}-${rowIndex}`,
+              node: (
+                <Text wrap="truncate" color={theme.muted} italic>
+                  <Text color={theme.border.passive}>
+                    {rowIndex === 0 ? "▎ " : "  "}
+                  </Text>
+                  {inlineSegmentsNode(
+                    quoteRow,
+                    theme,
+                    `md-${blockIndex}-quote-${lineIndex}-${rowIndex}`,
+                    { textColor: theme.muted, textItalic: true, textDim: true },
+                  )}
+                </Text>
+              ),
+            });
+          });
+        });
+        break;
+      }
+    }
+  });
+
+  return rows;
+}
+
 const lineEstimateCache = new Map<string, number>();
 
 export function estimateMarkdownLines(content: string, width: number): number {
@@ -550,9 +1086,10 @@ export function estimateMarkdownLines(content: string, width: number): number {
       const text = block.kind === "heading" ? block.text : block.lines.join("\n");
       lines += Math.max(1, wrapText(text, safeWidth).length);
     } else if (block.kind === "code") {
-      lines += 1;
+      const codeWidth = safeWidth >= 60 ? safeWidth - 10 : safeWidth - 3;
+      lines += 2 + (block.language ? 1 : 0);
       for (const line of block.lines) {
-        lines += Math.max(1, wrapPreservingWhitespace(line, Math.max(8, safeWidth - 6)).length);
+        lines += Math.max(1, wrapPreservingWhitespace(line, Math.max(8, codeWidth)).length);
       }
     } else if (block.kind === "bullet" || block.kind === "task" || block.kind === "numbered") {
       for (const item of block.items) {
@@ -569,6 +1106,7 @@ export function estimateMarkdownLines(content: string, width: number): number {
       lines += 1;
     }
   }
+  lines += Math.max(0, blocks.length - 1);
   const result = Math.max(1, lines);
   if (lineEstimateCache.size > 300) lineEstimateCache.clear();
   lineEstimateCache.set(cacheKey, result);
@@ -596,17 +1134,21 @@ export function MarkdownView({
           case "code": {
             const showNumbers = safeWidth >= 60;
             const gutter = showNumbers ? 4 : 0;
-            const codeWidth = Math.max(8, safeWidth - gutter - 2);
+            const codeWidth = Math.max(8, safeWidth - gutter - 4);
             return (
-              <Box key={index} flexDirection="column">
+              <Box key={index} flexDirection="column" paddingX={1}>
+                <Text backgroundColor={theme.code.background}> </Text>
                 {block.language ? (
-                  <Text color={theme.syntax.type} bold>
+                  <Text color={theme.syntax.type} bold backgroundColor={theme.code.background}>
                     {block.language}
                   </Text>
                 ) : null}
                 {block.lines.flatMap((line, lineIndex) =>
                   wrapPreservingWhitespace(line, codeWidth).map((chunk, chunkIndex) => (
-                    <Text key={`${lineIndex}-${chunkIndex}`}>
+                    <Text
+                      key={`${lineIndex}-${chunkIndex}`}
+                      backgroundColor={theme.code.background}
+                    >
                       <Text color={theme.border.passive}>▎ </Text>
                       {showNumbers ? (
                         <Text color={theme.muted}>
@@ -621,6 +1163,7 @@ export function MarkdownView({
                     </Text>
                   )),
                 )}
+                <Text backgroundColor={theme.code.background}> </Text>
               </Box>
             );
           }

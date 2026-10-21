@@ -1,11 +1,15 @@
 <p align="center">
+
   <img src="assets/Orchivox%20Agent.jpeg" alt="Orchivox Agent logo" width="760" />
+
 </p>
 
 <h1 align="center">Orchivox Agent</h1>
 
 <p align="center">
+
   A terminal coding agent that reads your repository, edits files, runs commands, and keeps a session history you can resume.
+
 </p>
 
 Orchivox runs as a full-screen terminal UI, a headless command, an HTTP gateway, or a Model Context Protocol (MCP) server. It works with hosted models and local Ollama models. The same runtime handles planning, file edits, shell commands, web access, Git snapshots, and isolated subagents.
@@ -48,11 +52,13 @@ Orchivox uses Bun for execution, TypeScript for the runtime, React and Ink for t
 
 ### Three working modes
 
-| Mode | What it is for |
-| --- | --- |
-| Plan | Read-only inspection, architecture questions, and implementation plans. File changes are blocked. |
-| Build | Normal repository work. File edits ask for approval before they run. |
-| Ultrawork | Longer autonomous work with a todo list, task board, and subagents. |
+
+| Mode      | What it is for                                                                                    |
+| --------- | ------------------------------------------------------------------------------------------------- |
+| Plan      | Read-only inspection, architecture questions, and implementation plans. File changes are blocked. |
+| Build     | Normal repository work. File edits ask for approval before they run.                              |
+| Ultrawork | Longer autonomous work with a todo list, task board, and subagents.                               |
+
 
 Switch modes with `Tab`, `/plan`, `/build`, `/ultrawork`, or `/mode`.
 
@@ -149,27 +155,26 @@ Orchivox can be compiled into a single standalone global executable or run direc
 
 1. **Install Bun and Git** (if not already installed):
    ```bash
-   curl -fsSL https://bun.sh/install | bash
-   # Debian / Ubuntu / Mint:
-   sudo apt update && sudo apt install -y git curl
-   # Arch Linux:
-   sudo pacman -S git curl
-   # Fedora / RHEL:
-   sudo dnf install -y git curl
+    curl -fsSL https://bun.sh/install | bash
+    # Debian / Ubuntu / Mint:
+    sudo apt update && sudo apt install -y git curl
+    # Arch Linux:
+    sudo pacman -S git curl
+    # Fedora / RHEL:
+    sudo dnf install -y git curl
    ```
-
 2. **Clone and install dependencies**:
    ```bash
-   git clone https://github.com/orchivox/orchivox-agent.git
-   cd orchivox-agent
-   bun install
+    git clone https://https://github.com/MFathan7/orchivox-agent.git
+    cd orchivox-agent
+    bun install
    ```
-
 3. **Install globally as a standalone binary**:
    ```bash
-   bun run install:global
+    bun run install:global
    ```
-   This compiles a native binary into `~/.local/bin/orchivox`. Ensure `~/.local/bin` is in your `PATH`:
+
+    This compiles a native binary into `~/.local/bin/orchivox`. Ensure `~/.local/bin` is in your `PATH`:
    - **bash** (`~/.bashrc`): `export PATH="$HOME/.local/bin:$PATH"`
    - **zsh** (`~/.zshrc`): `export PATH="$HOME/.local/bin:$PATH"`
    - **fish** (`~/.config/fish/config.fish`): `fish_add_path ~/.local/bin`
@@ -180,58 +185,57 @@ Orchivox can be compiled into a single standalone global executable or run direc
 
 1. **Install Bun and Git**:
    ```bash
-   # Using Homebrew:
-   brew install oven-sh/bun/bun git
-   # Or using the official installer:
-   curl -fsSL https://bun.sh/install | bash
+    # Using Homebrew:
+    brew install oven-sh/bun/bun git
+    # Or using the official installer:
+    curl -fsSL https://bun.sh/install | bash
    ```
-
 2. **Clone and install dependencies**:
    ```bash
-   git clone https://github.com/orchivox/orchivox-agent.git
-   cd orchivox-agent
-   bun install
+    git clone https://https://github.com/MFathan7/orchivox-agent.git
+    cd orchivox-agent
+    bun install
    ```
-
 3. **Install globally as a standalone binary**:
    ```bash
-   bun run install:global
+    bun run install:global
    ```
-   Add `~/.local/bin` to your `PATH` in `~/.zshrc` (macOS default shell):
-   ```bash
-   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-   source ~/.zshrc
-   ```
+
+    Add `~/.local/bin` to your `PATH` in `~/.zshrc` (macOS default shell):
 
 ---
 
 ### Windows (WSL2 / Native)
 
 #### Option 1: WSL2 (Recommended)
+
 Running Orchivox inside **WSL2 (Windows Subsystem for Linux)** provides native terminal emulation, fast Git worktrees, and full POSIX compatibility.
+
 1. Open PowerShell as Administrator and enable WSL:
    ```powershell
-   wsl --install
+    wsl --install
    ```
 2. Open your Ubuntu terminal inside WSL2 and follow the [Linux](#linux) instructions above.
 
 #### Option 2: Windows Native (PowerShell)
+
 1. **Install Bun and Git for Windows**:
    ```powershell
-   powershell -c "irm bun.sh/install.ps1 | iex"
-   winget install --id Git.Git -e --source winget
+    powershell -c "irm bun.sh/install.ps1 | iex"
+    winget install --id Git.Git -e --source winget
    ```
 2. **Clone and install**:
    ```powershell
-   git clone https://github.com/orchivox/orchivox-agent.git
-   cd orchivox-agent
-   bun install
+    git clone https://https://github.com/MFathan7/orchivox-agent.git
+    cd orchivox-agent
+    bun install
    ```
 3. **Build standalone executable**:
    ```powershell
-   bun run build:binary
+    bun run build:binary
    ```
-   Copy `orchivox.exe` to a directory in your user `PATH` (such as `%USERPROFILE%\.local\bin`).
+
+    Copy `orchivox.exe` to a directory in your user `PATH` (such as `%USERPROFILE%\.local\bin`).
 
 ---
 
@@ -240,7 +244,9 @@ Running Orchivox inside **WSL2 (Windows Subsystem for Linux)** provides native t
 To update an existing installation to the latest version:
 
 #### Standalone binary update (Recommended)
+
 From your local checkout:
+
 ```bash
 git pull
 bun install
@@ -248,12 +254,14 @@ bun run install:global
 ```
 
 #### Self-update via CLI
+
 ```bash
 orchivox update --check   # Check if upstream commits are available
 orchivox update           # Pull changes and rebuild
 ```
 
 Check your installed version and environment anytime:
+
 ```bash
 orchivox --version
 orchivox doctor
@@ -391,20 +399,22 @@ chmod 600 ~/.orchivox/secrets.yaml
 
 After that, projects without `.agent/config.yaml` use the global config automatically.
 
-| Key | What it controls |
-| --- | --- |
-| `providers` | Provider profiles, base URLs, model lists, capabilities, pricing, and timeouts. |
-| `roles` | The main, fast, and advisor models. |
-| `modes` | Per-mode model and reasoning overrides. |
-| `inbound_server` | Gateway port and API key. |
-| `lsp` | Language server commands and root markers. |
-| `mcp.servers` | MCP servers to connect to. |
-| `hooks` | Commands to run before or after tools, and when a turn stops. |
-| `sandbox` | Filesystem, network, and command permissions. |
-| `compaction` | Automatic context compaction thresholds. |
-| `websearch` | Web search provider and enablement. |
-| `webfetch` | Web fetch enablement. |
-| `prompt` | System prompt style: `auto`, `full`, or `compact`. |
+
+| Key              | What it controls                                                                |
+| ---------------- | ------------------------------------------------------------------------------- |
+| `providers`      | Provider profiles, base URLs, model lists, capabilities, pricing, and timeouts. |
+| `roles`          | The main, fast, and advisor models.                                             |
+| `modes`          | Per-mode model and reasoning overrides.                                         |
+| `inbound_server` | Gateway port and API key.                                                       |
+| `lsp`            | Language server commands and root markers.                                      |
+| `mcp.servers`    | MCP servers to connect to.                                                      |
+| `hooks`          | Commands to run before or after tools, and when a turn stops.                   |
+| `sandbox`        | Filesystem, network, and command permissions.                                   |
+| `compaction`     | Automatic context compaction thresholds.                                        |
+| `websearch`      | Web search provider and enablement.                                             |
+| `webfetch`       | Web fetch enablement.                                                           |
+| `prompt`         | System prompt style: `auto`, `full`, or `compact`.                              |
+
 
 ### Model capabilities
 
@@ -502,7 +512,7 @@ Authorization: Bearer <key>
 or:
 
 ```text
-x-api-key: <key>
+x-api-key: [[ORCA_RICH_MD:5dbcd4820b2819ee5c0d87b24a82fc50:inline-html:%3Ckey%3E]]
 ```
 
 The API key protects `/v1/*`. `/openapi.json` and `/docs` are served without it, so protect them at the proxy if the gateway is exposed.
@@ -519,24 +529,26 @@ This exposes the agent tools as an MCP server over stdio. Orchivox also acts as 
 
 ## TUI basics
 
-| Action | Key or command |
-| --- | --- |
-| Send a prompt | `Enter` |
-| Add a newline | `Shift+Enter`, `Alt+Enter` / `Option+Enter`, `Ctrl+J`, or `\` + `Enter` |
-| Cycle modes | `Tab` |
-| Open the session manager | `Ctrl+S` or `/sessions` |
-| Open the command palette | `Ctrl+P` |
-| Open help | `Ctrl+G` or `/help` |
-| Expand or collapse activity and thinking | `Ctrl+O` |
-| Expand one activity group | Click the `Activity` row |
-| Scroll the transcript | Mouse wheel, `PageUp`, `PageDown` |
-| Stop the current turn | `Esc` twice |
-| Browse and search models | `/models` |
-| Add, edit, or delete providers | `/connect` |
-| Inspect snapshots | `/timeline` |
-| Undo or redo file changes | `/undo`, `/redo` |
-| Split the diff into commits | `/commit` |
-| Show token and cost stats | `/stats` |
+
+| Action                                   | Key or command                                                          |
+| ---------------------------------------- | ----------------------------------------------------------------------- |
+| Send a prompt                            | `Enter`                                                                 |
+| Add a newline                            | `Shift+Enter`, `Alt+Enter` / `Option+Enter`, `Ctrl+J`, or `\` + `Enter` |
+| Cycle modes                              | `Tab`                                                                   |
+| Open the session manager                 | `Ctrl+S` or `/sessions`                                                 |
+| Open the command palette                 | `Ctrl+P`                                                                |
+| Open help                                | `Ctrl+G` or `/help`                                                     |
+| Expand or collapse activity and thinking | `Ctrl+O`                                                                |
+| Expand one activity group                | Click the `Activity` row                                                |
+| Scroll the transcript                    | Mouse wheel, `PageUp`, `PageDown`                                       |
+| Stop the current turn                    | `Esc` twice                                                             |
+| Browse and search models                 | `/models`                                                               |
+| Add, edit, or delete providers           | `/connect`                                                              |
+| Inspect snapshots                        | `/timeline`                                                             |
+| Undo or redo file changes                | `/undo`, `/redo`                                                        |
+| Split the diff into commits              | `/commit`                                                               |
+| Show token and cost stats                | `/stats`                                                                |
+
 
 The current mode, model, context usage, and session cost are shown in the header. The footer under an answer shows the mode, model, and generation speed.
 

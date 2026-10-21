@@ -21,6 +21,28 @@ function thinkingSegmentsFromMetadata(value: unknown): ThinkingSegmentView[] | u
   return segments.length > 0 ? segments : undefined;
 }
 
+function toolDiffFromMetadata(value: unknown): ChatToolCallView["diff"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.oldText !== "string" || typeof record.newText !== "string") return undefined;
+  const action =
+    record.action === "edit" ||
+    record.action === "create" ||
+    record.action === "delete" ||
+    record.action === "move"
+      ? record.action
+      : undefined;
+  return {
+    oldText: record.oldText,
+    newText: record.newText,
+    oldLabel: typeof record.oldLabel === "string" ? record.oldLabel : undefined,
+    newLabel: typeof record.newLabel === "string" ? record.newLabel : undefined,
+    additions: typeof record.additions === "number" ? record.additions : undefined,
+    deletions: typeof record.deletions === "number" ? record.deletions : undefined,
+    action,
+  };
+}
+
 function toolCallsFromMetadata(value: unknown): ChatToolCallView[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const calls = value.flatMap((entry): ChatToolCallView[] => {
@@ -33,6 +55,10 @@ function toolCallsFromMetadata(value: unknown): ChatToolCallView[] | undefined {
         name: record.name,
         label: typeof record.label === "string" ? record.label : record.name,
         detail: typeof record.detail === "string" ? record.detail : undefined,
+        filePath: typeof record.filePath === "string" ? record.filePath : undefined,
+        command: typeof record.command === "string" ? record.command : undefined,
+        output: typeof record.output === "string" ? record.output : undefined,
+        diff: toolDiffFromMetadata(record.diff),
         argumentsSummary:
           typeof record.argumentsSummary === "string" ? record.argumentsSummary : "",
         status:

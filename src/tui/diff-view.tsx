@@ -5,9 +5,13 @@ import { useInput } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
 import { computeLineHash } from "../tools/hashline-edit";
-import { wrapPreservingWhitespace } from "./text-wrap";
+import type { RenderRow } from "./rows";
+import { displayWidth, expandTabs, fitDisplayText, wrapPreservingWhitespace } from "./text-wrap";
 import type { ThinkingSegmentView } from "./app";
 import { getTheme, type Theme } from "./theme";
+
+const PANEL_PAD = " ";
+const PANEL_END = "\u200b";
 
 export interface DiffViewProps {
   oldText: string;
@@ -41,22 +45,12 @@ export interface ThinkingBlockProps {
   theme?: Theme;
 }
 
-function formatThinkingDuration(durationMs: number): string {
+export function formatThinkingDuration(durationMs: number): string {
   if (durationMs < 1000) return `${durationMs}ms`;
   const seconds = durationMs / 1000;
   if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
   const minutes = Math.floor(seconds / 60);
   return `${minutes}m ${Math.round(seconds % 60)}s`;
-}
-
-function thinkingSummary(text: string, width: number): string {
-  const first = text
-    .split("\n")
-    .map((line) => line.replace(/^[#>*\-\s]+/, "").replace(/[*_`]/g, "").trim())
-    .find((line) => line.length > 0);
-  if (!first) return "";
-  const limit = Math.max(20, Math.min(72, width - 18));
-  return first.length > limit ? `${first.slice(0, limit - 3).trimEnd()}...` : first;
 }
 
 interface DisplayLine {
@@ -139,6 +133,138 @@ function unifiedLine(
   return { marker: " ", kind: "context", gutter };
 }
 
+function fitDiffText(text: string, width: number): string {
+  const plain = expandTabs(text);
+  const safeWidth = Math.max(1, width);
+  if (displayWidth(plain) <= safeWidth) {
+    return plain + " ".repeat(safeWidth - displayWidth(plain));
+  }
+  if (safeWidth <= 3) return plain.slice(0, safeWidth);
+  let output = "";
+  let used = 0;
+  for (const char of plain) {
+    const charWidth = displayWidth(char);
+    if (used + charWidth > safeWidth - 3) break;
+    output += char;
+    used += charWidth;
+  }
+  return `${output}...`;
+}
+
+export function diffRows(
+  oldText: string,
+  newText: string,
+  oldLabel: string,
+  newLabel: string,
+  width: number,
+  theme: Theme,
+  unified = false,
+  background?: string,
+): RenderRow[] {
+  const hunks = collectDiffHunks(oldText, newText);
+  const rows: RenderRow[] = [];
+  const sideBySide = !unified && width >= 100;
+  const lineColor = (kind: DisplayLine["kind"]): string =>
+    kind === "add" ? theme.diff.added : kind === "remove" ? theme.diff.removed : theme.muted;
+  const panelRow = (
+    key: string,
+    node: React.ReactNode,
+    plainInput: string,
+  ): RenderRow => {
+    const plain = fitDisplayText(plainInput, width);
+    if (!background) return { key, node };
+    return {
+      key,
+      node: (
+        <Text backgroundColor={background} wrap="truncate">
+          {displayWidth(plainInput) > width ? plain : node}
+          {PANEL_PAD.repeat(Math.max(0, width - displayWidth(plain)))}
+          {PANEL_END}
+        </Text>
+      ),
+    };
+  };
+
+  const headerPlain = fitDisplayText(`${oldLabel} → ${newLabel}`, width);
+  rows.push(
+    panelRow(
+      "diff-header",
+      <Text bold color={theme.text} wrap="truncate">
+        {headerPlain}
+      </Text>,
+      headerPlain,
+    ),
+  );
+
+  hunks.forEach((hunk, hunkIndex) => {
+    rows.push(
+      panelRow(
+        `diff-hunk-${hunkIndex}`,
+        <Text color={theme.muted} wrap="truncate">
+          @@ -{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@
+        </Text>,
+        `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`,
+      ),
+    );
+
+    if (!sideBySide) {
+      hunk.lines.forEach((line, lineIndex) => {
+        const view = unifiedLine(line, width >= 60);
+        const firstPrefix = `${view.marker} ${view.gutter}`;
+        const prefixWidth = displayWidth(`▎ ${firstPrefix} `);
+        const textWidth = Math.max(8, width - prefixWidth);
+        wrapPreservingWhitespace(line.text, textWidth).forEach((chunk, chunkIndex) => {
+          const prefix = chunkIndex === 0 ? firstPrefix : "  ";
+          rows.push(
+            panelRow(
+              `diff-${hunkIndex}-${lineIndex}-${chunkIndex}`,
+              <Text color={lineColor(view.kind)} wrap="truncate">
+                <Text color={theme.border.passive}>▎ </Text>
+                {prefix} {chunk}
+              </Text>,
+              `▎ ${prefix} ${chunk}`,
+            ),
+          );
+        });
+      });
+      return;
+    }
+
+    const columnWidth = Math.max(12, Math.floor((width - 1) / 2));
+    pairDiffLines(hunk.lines).forEach((pair, lineIndex) => {
+      const left = pair.left
+        ? `${String(pair.left.kind === "add" ? "" : (pair.left.oldNumber ?? "")).padStart(4)} ${lineHash(pair.left)} ${
+            pair.left.kind === "remove" ? "-" : " "
+          } ${expandTabs(pair.left.text)}`
+        : "(empty)";
+      const right = pair.right
+        ? `${String(pair.right.kind === "remove" ? "" : (pair.right.newNumber ?? "")).padStart(4)} ${lineHash(pair.right)} ${
+            pair.right.kind === "add" ? "+" : " "
+          } ${expandTabs(pair.right.text)}`
+        : "(empty)";
+      const leftText = fitDiffText(left, columnWidth);
+      const rightText = fitDiffText(right, columnWidth);
+      rows.push(
+        panelRow(
+          `diff-pair-${hunkIndex}-${lineIndex}`,
+          <Text wrap="truncate">
+            <Text color={pair.left ? lineColor(pair.left.kind) : theme.muted}>
+              {leftText}
+            </Text>
+            <Text color={theme.border.passive}>│</Text>
+            <Text color={pair.right ? lineColor(pair.right.kind) : theme.muted}>
+              {rightText}
+            </Text>
+          </Text>,
+          `${leftText}│${rightText}`,
+        ),
+      );
+    });
+  });
+
+  return rows;
+}
+
 export function DiffView({
   oldText,
   newText,
@@ -151,7 +277,6 @@ export function DiffView({
 }: DiffViewProps) {
   const hunks = React.useMemo(() => collectDiffHunks(oldText, newText, context), [oldText, newText, context]);
   const sideBySide = !unified && width >= 100;
-  const textWidth = Math.max(8, width - 10);
 
   const lineColor = (kind: DisplayLine["kind"]): string =>
     kind === "add" ? theme.diff.added : kind === "remove" ? theme.diff.removed : theme.muted;
@@ -159,7 +284,7 @@ export function DiffView({
   return (
     <Box flexDirection="column">
       <Text bold color={theme.text}>
-        {oldLabel} {"→"} {newLabel}
+        {fitDisplayText(`${oldLabel} → ${newLabel}`, width)}
       </Text>
       {hunks.map((hunk, hunkIndex) => (
         <Box key={hunkIndex} flexDirection="column">
@@ -169,37 +294,42 @@ export function DiffView({
           {!sideBySide
             ? hunk.lines.flatMap((line, lineIndex) => {
                 const view = unifiedLine(line, width >= 60);
+                const firstPrefix = `${view.marker} ${view.gutter}`;
+                const textWidth = Math.max(8, width - displayWidth(`▎ ${firstPrefix} `));
                 return wrapPreservingWhitespace(line.text, textWidth).map((chunk, chunkIndex) => (
                   <Text key={`${lineIndex}-${chunkIndex}`} color={lineColor(view.kind)}>
                     <Text color={theme.border.passive}>▎ </Text>
-                    {chunkIndex === 0 ? `${view.marker} ${view.gutter}` : "  "} {chunk}
+                    {chunkIndex === 0 ? firstPrefix : "  "} {chunk}
                   </Text>
                 ));
               })
-            : pairDiffLines(hunk.lines).map((pair, lineIndex) => (
-                <Box key={lineIndex}>
-                  <Box width="50%">
-                    {pair.left ? (
-                      <Text color={lineColor(pair.left.kind)}>
-                        {String(pair.left.kind === "add" ? "" : (pair.left.oldNumber ?? "")).padStart(4)} {lineHash(pair.left)}{" "}
-                        {pair.left.kind === "remove" ? "-" : " "} {pair.left.text}
+            : pairDiffLines(hunk.lines).map((pair, lineIndex) => {
+                const columnWidth = Math.max(12, Math.floor((width - 1) / 2));
+                const left = pair.left
+                  ? `${String(pair.left.kind === "add" ? "" : (pair.left.oldNumber ?? "")).padStart(4)} ${lineHash(pair.left)} ${
+                      pair.left.kind === "remove" ? "-" : " "
+                    } ${expandTabs(pair.left.text)}`
+                  : "(empty)";
+                const right = pair.right
+                  ? `${String(pair.right.kind === "remove" ? "" : (pair.right.newNumber ?? "")).padStart(4)} ${lineHash(pair.right)} ${
+                      pair.right.kind === "add" ? "+" : " "
+                    } ${expandTabs(pair.right.text)}`
+                  : "(empty)";
+                return (
+                  <Box key={lineIndex}>
+                    <Box width="50%">
+                      <Text color={pair.left ? lineColor(pair.left.kind) : theme.muted}>
+                        {fitDiffText(left, columnWidth)}
                       </Text>
-                    ) : (
-                      <Text color={theme.muted}>{"     (empty)"}</Text>
-                    )}
-                  </Box>
-                  <Box width="50%">
-                    {pair.right ? (
-                      <Text color={lineColor(pair.right.kind)}>
-                        {String(pair.right.kind === "remove" ? "" : (pair.right.newNumber ?? "")).padStart(4)} {lineHash(pair.right)}{" "}
-                        {pair.right.kind === "add" ? "+" : " "} {pair.right.text}
+                    </Box>
+                    <Box width="50%">
+                      <Text color={pair.right ? lineColor(pair.right.kind) : theme.muted}>
+                        {fitDiffText(right, columnWidth)}
                       </Text>
-                    ) : (
-                      <Text color={theme.muted}>{"     (empty)"}</Text>
-                    )}
+                    </Box>
                   </Box>
-                </Box>
-              ))}
+                );
+              })}
         </Box>
       ))}
     </Box>
@@ -254,18 +384,16 @@ export function ThinkingTimeline({
     0,
   );
   const duration = totalDuration > 0 ? formatThinkingDuration(totalDuration) : undefined;
-  const summary = thinkingSummary(visible.map((segment) => segment.text).join("\n"), width);
   const phaseCount = visible.length > 1 ? `${visible.length} phases` : undefined;
 
   if (!expanded) {
-    if (!showHeader && !summary) return null;
+    if (!showHeader) return null;
     return (
       <Text color={theme.muted}>
         <Text color={theme.border.passive}>▎ </Text>
-        {showHeader ? <Text color={theme.badge.running} bold>Thought</Text> : null}
-        {summary ? <Text color={theme.text}>{showHeader ? ": " : ""}{summary}</Text> : null}
+        <Text color={theme.badge.running} bold>Thought</Text>
         {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
-        {showHeader && phaseCount ? <Text color={theme.muted}> · {phaseCount}</Text> : null}
+        {phaseCount ? <Text color={theme.muted}> · {phaseCount}</Text> : null}
       </Text>
     );
   }
@@ -321,7 +449,6 @@ export function ThinkingBlock({
   const lines = text
     .split("\n")
     .flatMap((line) => wrapPreservingWhitespace(line, contentWidth));
-  const summary = thinkingSummary(text, width);
   const duration = durationMs !== undefined ? formatThinkingDuration(durationMs) : undefined;
 
   if (live) {
@@ -339,7 +466,6 @@ export function ThinkingBlock({
       <Text color={theme.muted}>
         <Text color={theme.border.passive}>▎ </Text>
         <Text color={theme.badge.running} bold>Thought</Text>
-        {summary ? <Text color={theme.text}>: {summary}</Text> : null}
         {duration ? <Text color={theme.muted}> · {duration}</Text> : null}
       </Text>
     );

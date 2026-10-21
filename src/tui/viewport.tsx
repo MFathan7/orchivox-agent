@@ -1,17 +1,15 @@
 import React from "react";
 import { Box, Text, useInput, useStdin } from "ink";
 
-import { toolDisplay } from "../agent/tool-display";
-import type { ChatEntryView, WriteTarget } from "./app";
-import { DiffView, ThinkingBlock, ThinkingTimeline, ToolCallBadge } from "./diff-view";
+import type { ChatEntryView, ChatToolCallView, WriteTarget } from "./app";
 import { parseMouseClick } from "./mouse";
-import { activityCalls, activitySummary, groupToolCalls } from "./tool-groups";
-import { formatTokenCount } from "./format";
+import { groupToolCalls } from "./tool-groups";
 import { WelcomeBanner } from "./logo";
-import { estimateMarkdownLines, MarkdownView } from "./markdown";
+import { estimateMarkdownLines, markdownRows } from "./markdown";
 import { enterTerminal, leaveTerminal } from "./terminal-protocol";
 import { getTheme, type Theme } from "./theme";
 import { displayWidth, wrapText } from "./text-wrap";
+import { buildTranscriptRows, type TranscriptRow } from "./transcript-lines";
 
 export interface ScreenSize {
   columns: number;
@@ -69,6 +67,7 @@ export interface ScrollableChatViewportProps {
   onOffsetChange?: React.Dispatch<React.SetStateAction<number>>;
   topOffset?: number;
   initiallyExpandedActivity?: boolean;
+  initiallyExpandedThinking?: boolean;
 }
 
 export interface SplitPaneViewportProps extends ScrollableChatViewportProps {
@@ -146,6 +145,35 @@ export function countWrappedLines(text: string, width: number): number {
     .reduce((total, line) => total + Math.max(1, Math.ceil(displayWidth(line) / safeWidth)), 0);
 }
 
+function estimateToolLines(
+  call: ChatToolCallView,
+  width: number,
+  collapsed: boolean,
+): number {
+  let lines = 4;
+  const isCommand = Boolean(call.command) || ["bash", "run_sandbox_script", "bg_start", "bg_logs"].includes(call.name);
+  if (isCommand && call.command) {
+    lines += wrapText(call.command, Math.max(1, width - 4)).length;
+  }
+  if (call.output) {
+    if (collapsed) {
+      lines += 1;
+    } else {
+      const outputLines = call.output.split("\n").length;
+      const visible = Math.min(isCommand ? 24 : 14, outputLines);
+      lines += visible + (outputLines > visible ? 1 : 0);
+    }
+  }
+  if (call.diff) {
+    if (collapsed) {
+      lines += 1;
+    } else {
+      lines += Math.max(2, (call.diff.additions ?? 0) + (call.diff.deletions ?? 0) + 6);
+    }
+  }
+  return lines;
+}
+
 export function estimateEntryLines(
   entry: ChatEntryView,
   width: number,
@@ -177,21 +205,26 @@ export function estimateEntryLines(
         (total, segment) => total + countWrappedLines(segment.text, Math.max(1, safeWidth - 2)),
         0,
       );
-      lines += thinkingExpanded ? 1 + textLines : visibleSegments.length;
+      lines += thinkingExpanded ? 1 + textLines : 1;
     }
   } else if (entry.thinking && !entry.live) {
     lines += thinkingExpanded ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2)) : 1;
   }
-  const activity = groupToolCalls(entry.toolCalls);
-  if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
-    lines += entry.toolCalls?.length ?? 0;
-  } else {
-    if (activity.total > 0) {
-      lines += 1 + (expandedGroups.has(entry.id) ? activity.total : 0);
-    }
-    lines += activity.others.length;
+  if (entry.role === "assistant" && (entry.thinking || (entry.thinkingSegments?.length ?? 0) > 0)) {
+    lines += 1;
   }
-  lines += (entry.files?.length ?? 0) * (collapsed ? 1 : 10);
+  lines += (entry.toolCalls ?? []).reduce(
+    (total, call) => total + estimateToolLines(call, safeWidth, collapsed),
+    0,
+  );
+  const linkedPaths = new Set(
+    (entry.toolCalls ?? [])
+      .filter((call) => call.diff)
+      .map((call) => call.filePath)
+      .filter((path): path is string => Boolean(path)),
+  );
+  const unlinkedFiles = (entry.files ?? []).filter((file) => !linkedPaths.has(file.path));
+  lines += unlinkedFiles.length * (collapsed ? 1 : 10);
   if (entry.live) lines += 1;
   if (entry.diff) lines += collapsed ? 1 : 10;
   if (entry.role === "assistant") lines += 2;
@@ -241,7 +274,7 @@ export function findActivityRowAt(
               total + countWrappedLines(segment.text, Math.max(1, safeWidth - 2)),
             0,
           );
-          thinking = thinkingExpanded ? 1 + textLines : visibleSegments.length;
+          thinking = thinkingExpanded ? 1 + textLines : 1;
         }
       } else if (entry.thinking && !entry.live) {
         thinking = thinkingExpanded
@@ -328,12 +361,13 @@ export function ScrollableChatViewport({
   onOffsetChange,
   topOffset = 0,
   initiallyExpandedActivity = false,
+  initiallyExpandedThinking = false,
 }: ScrollableChatViewportProps): React.ReactElement {
   const [internalOffset, setInternalOffset] = React.useState(0);
   const offsetFromBottom = controlledOffset ?? internalOffset;
   const setOffsetFromBottom = onOffsetChange ?? setInternalOffset;
   const [collapsed, setCollapsed] = React.useState(initiallyCollapsed);
-  const [thinkingExpanded, setThinkingExpanded] = React.useState(false);
+  const [thinkingExpanded, setThinkingExpanded] = React.useState(initiallyExpandedThinking);
   const allEntries = React.useMemo(
     () => (liveEntry ? [...entries, liveEntry] : entries),
     [entries, liveEntry],
@@ -367,12 +401,45 @@ export function ScrollableChatViewport({
   );
 
   const spinner = useSpinner(Boolean(liveEntry));
-  const totalLines = allEntries.reduce(
-    (sum, entry) => sum + estimateEntryLines(entry, width, collapsed, expandedGroups, thinkingExpanded),
-    0,
-  );
-  const maxOffset = Math.max(0, totalLines - height);
-  const effectiveOffset = Math.min(offsetFromBottom, maxOffset);
+  const rows: TranscriptRow[] = buildTranscriptRows(allEntries, {
+    width,
+    theme,
+    collapsed,
+    expandedGroups,
+    thinkingExpanded,
+    spinner,
+    now: Date.now(),
+  });
+  if (!liveEntry && streamingText) {
+    rows.push({
+      key: "streaming-header",
+      node: (
+        <Text color={theme.badge.running} dimColor>
+          ... streaming
+        </Text>
+      ),
+    });
+    rows.push(
+      ...markdownRows(streamingText, width, theme).map((row, index) => ({
+        ...row,
+        key: `streaming-${index}`,
+      })),
+    );
+  }
+
+  let availableHeight = Math.max(1, height);
+  let maxOffset = Math.max(0, rows.length - availableHeight);
+  let effectiveOffset = Math.min(offsetFromBottom, maxOffset);
+  if (effectiveOffset > 0) {
+    availableHeight = Math.max(0, height - 1);
+    maxOffset = Math.max(0, rows.length - availableHeight);
+    effectiveOffset = Math.min(offsetFromBottom, maxOffset);
+  }
+  const showIndicator = effectiveOffset > 0;
+  const start = Math.max(0, rows.length - availableHeight - effectiveOffset);
+  const visibleRows = rows.slice(start, start + availableHeight);
+  const visibleRowsRef = React.useRef(visibleRows);
+  visibleRowsRef.current = visibleRows;
 
   React.useEffect(() => {
     if (offsetFromBottom > maxOffset) setOffsetFromBottom(maxOffset);
@@ -383,23 +450,17 @@ export function ScrollableChatViewport({
     const onData = (data: Buffer): void => {
       const click = parseMouseClick(data.toString());
       if (!click) return;
-      const row = click.y - (topOffset + 1);
-      if (row < 0 || row >= height) return;
-      const target = findActivityRowAt(
-        allEntries,
-        width,
-        height,
-        effectiveOffset,
-        collapsed,
-        expandedGroups,
-        row,
-        thinkingExpanded,
-      );
-      if (!target) return;
+      const clickRow = click.y - (topOffset + 1);
+      if (clickRow < 0 || clickRow >= height) return;
+      const contentRow = clickRow - (showIndicator ? 1 : 0);
+      if (contentRow < 0) return;
+      const target = visibleRowsRef.current[contentRow];
+      const entryId = target?.entryId;
+      if (!entryId || target?.clickable !== "activity") return;
       setExpandedGroups((previous) => {
         const next = new Set(previous);
-        if (next.has(target.id)) next.delete(target.id);
-        else next.add(target.id);
+        if (next.has(entryId)) next.delete(entryId);
+        else next.add(entryId);
         return next;
       });
     };
@@ -407,29 +468,7 @@ export function ScrollableChatViewport({
     return () => {
       stdin.off("data", onData);
     };
-  }, [
-    active,
-    stdin,
-    topOffset,
-    height,
-    width,
-    effectiveOffset,
-    collapsed,
-    expandedGroups,
-    thinkingExpanded,
-    allEntries,
-  ]);
-
-  const visible = selectWindow(
-    allEntries,
-    width,
-    height,
-    effectiveOffset,
-    collapsed,
-    expandedGroups,
-    thinkingExpanded,
-  );
-  const pinToBottom = transcriptAlignsToBottom(totalLines, height, effectiveOffset);
+  }, [active, stdin, topOffset, height, showIndicator]);
 
   React.useEffect(() => {
     setOffsetFromBottom(0);
@@ -440,267 +479,24 @@ export function ScrollableChatViewport({
 
   return (
     <Box flexDirection="column" height={height} overflow="hidden">
-      <Box
-        flexDirection="column"
-        flexGrow={1}
-        overflow="hidden"
-        justifyContent={pinToBottom ? "flex-end" : "flex-start"}
-      >
-        {showWelcome ? (
-          height >= 12 ? (
-            <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />
-          ) : (
-            <Box justifyContent="center">
-              <Text bold color={theme.accent}>ORCHIVOX</Text>
-              <Text color={theme.muted}> · type a prompt to begin</Text>
-            </Box>
-          )
-        ) : null}
-        {visible.map((entry) => {
-          const running = entry.toolCalls?.find((call) => call.status === "running");
-          const elapsed = entry.startedAt ? Math.max(0, Math.floor((Date.now() - entry.startedAt) / 1000)) : 0;
-          const files = entry.live ? (entry.files ?? []).slice(-2) : (entry.files ?? []);
-          const activity = groupToolCalls(entry.toolCalls);
-          const segmented = Boolean(entry.thinkingSegments && entry.thinkingSegments.length > 0);
-          const allCalls = entry.toolCalls ?? [];
-          const liveText = entry.text;
-          return (
-            <Box key={entry.id} flexDirection="column">
-              {entry.live ? (
-                <Box gap={1} marginY={0}>
-                  <Text color={theme.badge.running} bold>{spinner}</Text>
-                  <Text color={theme.text} bold>
-                    {running
-                      ? (running.label ?? toolDisplay(running.name).label)
-                      : entry.text
-                        ? "Answering"
-                        : entry.thinking
-                          ? "Thinking"
-                          : "Working"}
-                  </Text>
-                  {elapsed > 0 ? <Text color={theme.muted}>{elapsed}s</Text> : null}
-                  <Text color={theme.muted}>Esc twice to stop</Text>
-                </Box>
-              ) : null}
-              {entry.role === "compaction" ? (
-                <Box flexDirection="column" marginY={1}>
-                  <Text color={theme.border.passive}>
-                    {dividerLine(entry.compaction?.auto ? "auto compacted" : "compacted", width)}
-                  </Text>
-                  {entry.compaction?.status === "running" ? (
-                    <Text color={theme.badge.running}>compacting...</Text>
-                  ) : entry.text ? (
-                    collapsed ? (
-                      <Text color={theme.muted}>summary hidden (Ctrl+O to expand)</Text>
-                    ) : (
-                      <MarkdownView content={entry.text} width={width} theme={theme} />
-                    )
-                  ) : null}
-                  {entry.compaction?.error ? (
-                    <Text color={theme.badge.error}>{entry.compaction.error}</Text>
-                  ) : null}
-                  {entry.compaction && entry.compaction.status !== "running" ? (
-                    <Text color={theme.border.passive}>
-                      {dividerLine(
-                        `${formatTokenCount(entry.compaction.beforeTokens)} -> ${formatTokenCount(entry.compaction.afterTokens)} tokens · ${entry.compaction.removedMessages} messages removed`,
-                        width,
-                      )}
-                    </Text>
-                  ) : null}
-                </Box>
-              ) : entry.role === "user" ? (
-                <Box flexDirection="column" marginY={1}>
-                  {wrapText(entry.text, Math.max(1, width - 2)).map((line, lineIndex) => (
-                    <Box key={`${entry.id}-line-${lineIndex}`}>
-                      <Text color={theme.accent} bold>
-                        ▌{" "}
-                      </Text>
-                      <Text color={theme.text} bold>
-                        {line || " "}
-                      </Text>
-                    </Box>
-                  ))}
-                </Box>
-              ) : entry.role === "system" ? (
-                <Box marginY={0} flexDirection="column">
-                  {entry.text.split("\n").map((line, lineIndex) => (
-                    <Text key={`${entry.id}-line-${lineIndex}`}>
-                      <Text color={theme.modes.plan.primary}>{lineIndex === 0 ? "ℹ " : "  "}</Text>
-                      <Text color={theme.text}>{line}</Text>
-                    </Text>
-                  ))}
-                </Box>
-              ) : null}
-              {segmented ? (
-                <Box flexDirection="column">
-                  {entry.thinkingSegments?.map((segment, index) => {
-                    const next = entry.thinkingSegments?.[index + 1];
-                    const start = segment.toolIndex;
-                    const end = next ? next.toolIndex : allCalls.length;
-                    const showSegment = !entry.live || segment.completedAt !== undefined;
-                    const previousVisible = entry.thinkingSegments
-                      ?.slice(0, index)
-                      .some((candidate) => !entry.live || candidate.completedAt !== undefined);
-                    return (
-                      <Box key={segment.id} flexDirection="column">
-                        {showSegment ? (
-                          <ThinkingTimeline
-                            segments={[segment]}
-                            expanded={thinkingExpanded}
-                            live={entry.live}
-                            showHeader={!previousVisible}
-                            width={width}
-                            theme={theme}
-                          />
-                        ) : null}
-                        {allCalls.slice(start, end).map((call, callIndex) => (
-                          <Box key={`${segment.id}-tool-${callIndex}`} paddingLeft={2}>
-                            <ToolCallBadge
-                              name={call.name}
-                              label={call.label}
-                              detail={call.detail}
-                              argumentsSummary={collapsed ? "" : call.argumentsSummary}
-                              durationMs={call.durationMs}
-                              status={call.status}
-                              lspStatus={call.lspStatus}
-                              theme={theme}
-                            />
-                          </Box>
-                        ))}
-                      </Box>
-                    );
-                  })}
-                </Box>
-              ) : entry.thinking ? (
-                <ThinkingBlock
-                  key={`${entry.id}-thinking-${thinkingExpanded ? "open" : "closed"}`}
-                  text={entry.thinking}
-                  defaultOpen={thinkingExpanded}
-                  live={Boolean(entry.live)}
-                  durationMs={
-                    entry.thinkingStartedAt !== undefined && entry.thinkingCompletedAt !== undefined
-                      ? entry.thinkingCompletedAt - entry.thinkingStartedAt
-                      : undefined
-                  }
-                  width={width}
-                  theme={theme}
-                />
-              ) : null}
-              {!segmented && activity.total > 0 ? (
-                <Box flexDirection="column">
-                  <Text>
-                    <Text color={theme.muted}>
-                      {expandedGroups.has(entry.id) ? "▾ " : "▸ "}
-                    </Text>
-                    <Text color={theme.text}>Activity: {activitySummary(activity)}</Text>
-                  </Text>
-                  {expandedGroups.has(entry.id)
-                    ? activityCalls(activity).map((call, index) => (
-                        <Box key={`${entry.id}-activity-${index}`} paddingLeft={2}>
-                          <ToolCallBadge
-                            name={call.name}
-                            label={call.label}
-                            detail={call.detail}
-                            argumentsSummary={collapsed ? "" : call.argumentsSummary}
-                            durationMs={call.durationMs}
-                            status={call.status}
-                            lspStatus={call.lspStatus}
-                            theme={theme}
-                          />
-                        </Box>
-                      ))
-                    : null}
-                </Box>
-              ) : null}
-              {!segmented && activity.others.map((call, index) => (
-                <ToolCallBadge
-                  key={`${entry.id}-tool-${index}`}
-                  name={call.name}
-                  label={call.label}
-                  detail={call.detail}
-                  argumentsSummary={collapsed ? "" : call.argumentsSummary}
-                  durationMs={call.durationMs}
-                  status={call.status}
-                  lspStatus={call.lspStatus}
-                  theme={theme}
-                />
-              ))}
-              {files.map((file, index) => (
-                <Box key={`${entry.id}-file-${index}`} flexDirection="column">
-                  <Text color={theme.muted}>
-                    {file.path}
-                    {file.additions !== undefined || file.deletions !== undefined
-                      ? ` (+${file.additions ?? 0} -${file.deletions ?? 0})`
-                      : ""}
-                  </Text>
-                  {collapsed ? (
-                    <Text color={theme.muted}>diff hidden (Ctrl+O to expand)</Text>
-                  ) : (
-                    <DiffView
-                      oldText={file.oldText}
-                      newText={file.newText}
-                      oldLabel={`a/${file.path}`}
-                      newLabel={`b/${file.path}`}
-                      unified
-                      width={width}
-                      theme={theme}
-                    />
-                  )}
-                </Box>
-              ))}
-              {entry.diff ? (
-                collapsed ? (
-                  <Text color={theme.muted}>
-                    diff hidden: {entry.diff.oldLabel ?? "old"} → {entry.diff.newLabel ?? "new"} (Ctrl+O to expand)
-                  </Text>
-                ) : (
-                  <DiffView
-                    oldText={entry.diff.oldText}
-                    newText={entry.diff.newText}
-                    oldLabel={entry.diff.oldLabel}
-                    newLabel={entry.diff.newLabel}
-                    unified={entry.diff.unified ?? false}
-                    width={width}
-                    theme={theme}
-                  />
-                )
-              ) : null}
-              {entry.role === "assistant" && entry.text ? (
-                <Box marginY={1} flexDirection="column">
-                  <MarkdownView content={liveText} width={width} theme={theme} />
-                  {!entry.live &&
-                  (entry.mode || entry.model || entry.tokensPerSecond !== undefined) ? (
-                    <Text color={theme.muted}>
-                      {[
-                        entry.mode?.toUpperCase(),
-                        entry.model,
-                        entry.tokensPerSecond !== undefined && Number.isFinite(entry.tokensPerSecond)
-                          ? `${entry.tokensPerSecond.toFixed(1)} tok/s`
-                          : undefined,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </Text>
-                  ) : null}
-                </Box>
-              ) : null}
-            </Box>
-          );
-        })}
-        {!liveEntry && streamingText ? (
-          <Box flexDirection="column">
-            <Text color={theme.badge.running} dimColor>
-              ... streaming
-            </Text>
-            <MarkdownView content={streamingText} width={width} theme={theme} />
+      {showWelcome ? (
+        height >= 12 ? (
+          <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />
+        ) : (
+          <Box justifyContent="center">
+            <Text bold color={theme.accent}>ORCHIVOX</Text>
+            <Text color={theme.muted}> · type a prompt to begin</Text>
           </Box>
-        ) : null}
-      </Box>
-      {offsetFromBottom > 0 ? (
-        <Text color={theme.badge.running} bold>
+        )
+      ) : null}
+      {showIndicator ? (
+        <Text color={theme.badge.running} bold wrap="truncate">
           {AUTO_SCROLL_PAUSED}
         </Text>
       ) : null}
+      {visibleRows.map((row) => (
+        <React.Fragment key={row.key}>{row.node}</React.Fragment>
+      ))}
     </Box>
   );
 }

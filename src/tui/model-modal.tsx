@@ -29,6 +29,7 @@ import { findMissingModels } from "../provider/model-sync";
 import { refreshRuntimeMetadata } from "../provider/runtime-metadata";
 import type { ProviderReferences, ProviderRouter, ProviderSummary } from "../provider/router";
 import { filterFuzzy } from "./autocomplete";
+import { truncateText } from "./format";
 import { REASONING_LEVELS, reasoningLevelsFor, type ReasoningEffortLevel } from "./command-palette";
 import { isMouseSequence } from "./mouse";
 import {
@@ -298,6 +299,7 @@ export interface ModelConfigModalProps {
   onModeReasoningChange?: (mode: ConfigMode, reasoning: string) => void;
   reasoningEffort?: ReasoningEffortLevel;
   onReasoningChange?: (effort: ReasoningEffortLevel) => void;
+  height?: number;
 }
 
 function profileFromForm(form: ProviderForm, custom = false): ProviderProfile {
@@ -340,7 +342,10 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     onModeReasoningChange,
     reasoningEffort = "default",
     onReasoningChange,
+    height = 24,
   } = props;
+  const compact = (process.stdout.columns ?? 80) < 72 || height < 20;
+  const veryCompact = height < 10;
 
   const [view, setView] = React.useState<ModalView>(
     initialView === "providers" ? "providers" : "models",
@@ -385,7 +390,23 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   const { stdin } = useStdin();
   const [, forceRender] = React.useReducer((value: number) => value + 1, 0);
 
-  const providers = router.listProviders();
+  const providerSnapshot = router.listProviders();
+  const providerSignature = providerSnapshot
+    .map((provider) =>
+      [
+        provider.name,
+        provider.kind,
+        provider.baseUrl,
+        provider.enabled,
+        provider.hasApiKey,
+        provider.models.join(","),
+      ].join("\u0000"),
+    )
+    .join("\u0001");
+  const providers = React.useMemo(
+    () => providerSnapshot,
+    [providerSignature, router],
+  );
   const visibleFormFields: readonly FormField[] =
     formMode === "edit" ? FORM_FIELDS.filter((name) => name !== "models") : FORM_FIELDS;
   const activeFormField: FormField = visibleFormFields[field] ?? visibleFormFields[0] ?? "name";
@@ -422,13 +443,6 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     }
     return result;
   }, [providers, runtimeForProvider]);
-
-  const providerSyncKey = providers
-    .map(
-      (provider) =>
-        `${provider.name}:${provider.enabled}:${provider.hasApiKey}:${provider.baseUrl}:${provider.models.join(",")}`,
-    )
-    .join("|");
 
   const levelOptions = (target: ModelTarget) => {
     if (isModeTarget(target)) return reasoningLevelsFor(router.reasoningOptionsForMode(target));
@@ -580,7 +594,11 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     ).map((entry) => entry.item);
   }, [visibleModels, query]);
 
-  const MODEL_WINDOW = 12;
+  const MODEL_WINDOW = veryCompact
+    ? Math.max(1, height - 4)
+    : compact
+      ? Math.max(3, height - 10)
+      : 12;
   const clampedModelIndex = Math.max(0, Math.min(filteredModels.length - 1, selectedIndex));
   const windowStart = Math.max(
     0,
@@ -625,14 +643,15 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
 
   const clampedProviderIndex = Math.max(0, Math.min(providers.length - 1, providerIndex));
   const selectedProvider = providers[clampedProviderIndex];
+  const providerWindow = compact ? Math.max(1, height - 4) : 10;
   const providerStart = Math.max(
     0,
     Math.min(
-      Math.max(0, providers.length - 10),
-      clampedProviderIndex - Math.floor(Math.min(10, providers.length) / 2),
+      Math.max(0, providers.length - providerWindow),
+      clampedProviderIndex - Math.floor(Math.min(providerWindow, providers.length) / 2),
     ),
   );
-  const providerEnd = Math.min(providers.length, providerStart + 10);
+  const providerEnd = Math.min(providers.length, providerStart + providerWindow);
   const visibleProviders = providers.slice(providerStart, providerEnd);
   const clampedProviderAddIndex = Math.max(
     0,
@@ -641,14 +660,15 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   const managedProfile = manageProvider ? router.getProviderProfile(manageProvider) : undefined;
   const managedModels = managedProfile?.models ?? [];
   const clampedManagedModelIndex = Math.max(0, Math.min(managedModels.length - 1, manageModelIndex));
+  const managedWindow = compact ? Math.max(1, height - 5) : 12;
   const managedStart = Math.max(
     0,
     Math.min(
-      Math.max(0, managedModels.length - 12),
-      clampedManagedModelIndex - Math.floor(Math.min(12, managedModels.length) / 2),
+      Math.max(0, managedModels.length - managedWindow),
+      clampedManagedModelIndex - Math.floor(Math.min(managedWindow, managedModels.length) / 2),
     ),
   );
-  const managedEnd = Math.min(managedModels.length, managedStart + 12);
+  const managedEnd = Math.min(managedModels.length, managedStart + managedWindow);
   const managedVisible = managedModels.slice(managedStart, managedEnd);
 
   React.useEffect(() => {
@@ -657,9 +677,11 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     discoverLocalProviders()
       .then((providers) => {
         if (cancelled) return;
+        // Reset before the state update so the selection effect sees it on the
+        // render that adds the discovered models.
+        didSelectTarget.current = false;
         setDiscovered(providers);
         setDiscovering(false);
-        didSelectTarget.current = false;
       })
       .catch(() => {
         if (cancelled) return;
@@ -669,47 +691,6 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       cancelled = true;
     };
   }, []);
-
-  React.useEffect(() => {
-    if (view !== "providers") return;
-    let cancelled = false;
-    const targets = providers.filter(
-      (provider) => provider.enabled && provider.kind !== "ollama" && provider.hasApiKey,
-    );
-    for (const provider of targets) {
-      const profile = router.getProviderProfile(provider.name);
-      if (!profile) continue;
-      setRemoteSync((previous) => ({
-        ...previous,
-        [provider.name]: { state: "checking" },
-      }));
-      void router
-        .testProvider(profile)
-        .then((models) => {
-          if (cancelled) return;
-          const live = new Set(models);
-          setRemoteSync((previous) => ({
-            ...previous,
-            [provider.name]: {
-              state: "ok",
-              count: models.length,
-              missing: provider.models.filter((model) => !live.has(model)),
-            },
-          }));
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setRemoteSync((previous) => ({
-              ...previous,
-              [provider.name]: { state: "error" },
-            }));
-          }
-        });
-    }
-    return () => {
-      cancelled = true;
-    };
-  }, [providerSyncKey, view, router]);
 
   React.useEffect(() => {
     const handleData = (data: Buffer | string): void => {
@@ -1850,40 +1831,65 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
 
     return (
       <Box flexDirection="column" paddingX={1}>
-        <Box justifyContent="space-between">
-          {renderTabs("models")}
-          <Text color={theme.muted}>Esc close</Text>
-        </Box>
-        <Text>
+        {compact ? (
+          <Text wrap="truncate">
+            <Text bold color={theme.accent}>Models</Text>
+            <Text color={theme.muted}> · Tab providers · Esc close</Text>
+          </Text>
+        ) : (
+          <Box justifyContent="space-between">
+            {renderTabs("models")}
+            <Text color={theme.muted}>Esc close</Text>
+          </Box>
+        )}
+        <Text wrap="truncate">
           <Text color={theme.muted}>Target </Text>
           <Text bold color={theme.text}>{targetRole}</Text>
           <Text color={theme.muted}>
             {" · "}
-            {activeModel ? `${activeModel.provider} / ${activeModel.model}` : "not configured"}
+            {activeModel
+              ? truncateText(
+                  `${activeModel.provider} / ${activeModel.model}`,
+                  Math.max(8, (process.stdout.columns ?? 80) - (compact ? 16 : 24)),
+                )
+              : "not configured"}
             {activeMissing ? " · not installed" : ""}
-            {"  (Ctrl+R cycle)"}
+            {!compact ? "  (Ctrl+R cycle)" : ""}
           </Text>
         </Text>
 
-        <Box justifyContent="space-between">
-          <Text color={theme.muted}>Search</Text>
-          <Text color={theme.muted}>
-            {hasQuery ? `${filteredModels.length} match(es)` : "type to filter"}
-          </Text>
-        </Box>
-        <Box borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
-          <Text color={theme.accent} bold>❯ </Text>
-          {query.length > 0 ? (
-            renderEditableText(query, queryCursor)
-          ) : (
-            <>
-              <Text inverse> </Text>
+        {!compact ? (
+          <Box justifyContent="space-between">
+            <Text color={theme.muted}>Search</Text>
+            <Text color={theme.muted}>
+              {hasQuery ? `${filteredModels.length} match(es)` : "type to filter"}
+            </Text>
+          </Box>
+        ) : null}
+        {compact ? (
+          <Text wrap="truncate">
+            <Text color={theme.accent} bold>❯ </Text>
+            {query.length > 0 ? (
+              renderEditableText(query, queryCursor)
+            ) : (
               <Text color={theme.muted}>Type model or provider</Text>
-            </>
-          )}
-        </Box>
+            )}
+          </Text>
+        ) : (
+          <Box borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
+            <Text color={theme.accent} bold>❯ </Text>
+            {query.length > 0 ? (
+              renderEditableText(query, queryCursor)
+            ) : (
+              <>
+                <Text inverse> </Text>
+                <Text color={theme.muted}>Type model or provider</Text>
+              </>
+            )}
+          </Box>
+        )}
 
-        {filteredModels.length > 0 && (filteredModels.length > MODEL_WINDOW || hasQuery) ? (
+        {!compact && filteredModels.length > 0 && (filteredModels.length > MODEL_WINDOW || hasQuery) ? (
           <Text color={theme.muted}>
             Showing {windowStart + 1}-{windowEnd} of {filteredModels.length}
           </Text>
@@ -1903,6 +1909,24 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
           <Text color={theme.muted}>
             No models yet. Use /connect to add models or enable a provider.
           </Text>
+        ) : veryCompact ? (
+          windowModels.map((entry) => {
+            const index = filteredModels.indexOf(entry);
+            const isSelected = index === clampedModelIndex;
+            return (
+              <Text key={`${entry.provider}-${entry.model}`} wrap="truncate">
+                <Text color={isSelected ? theme.accent : theme.muted}>
+                  {isSelected ? "❯ " : "  "}
+                </Text>
+                <Text bold={isSelected} color={theme.text}>
+                  {entry.displayName}
+                </Text>
+                {entry.displayName !== entry.model ? (
+                  <Text color={theme.muted}> · {entry.model}</Text>
+                ) : null}
+              </Text>
+            );
+          })
         ) : (
           windowGroups.map((group) => (
             <Box key={group.key} flexDirection="column">
@@ -1930,13 +1954,13 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
             </Box>
           ))
         )}
-        {!hasQuery && filteredModels.length > 0 && emptyGroups.length > 0 ? (
+        {!veryCompact && !hasQuery && filteredModels.length > 0 && emptyGroups.length > 0 ? (
           <Text color={theme.muted}>
             No models: {emptyGroups.map((group) => group.label).join(", ")} · manage in Providers
           </Text>
         ) : null}
 
-        {selectedCaps ? (
+        {!veryCompact && selectedCaps ? (
           <Text color={theme.muted}>
             {[
               selectedCaps.tool_calling ? "tools" : "no-tools",
@@ -1956,25 +1980,33 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
               .join(" · ")}
           </Text>
         ) : null}
-        {hiddenNonChatCount > 0 ? (
+        {!compact && hiddenNonChatCount > 0 ? (
           <Text color={theme.muted}>
             Hidden {hiddenNonChatCount} non-chat model(s) · Ctrl+A show all
           </Text>
         ) : null}
-        {derivedNameCount > 0 ? (
+        {!compact && derivedNameCount > 0 ? (
           <Text color={theme.muted}>
             {derivedNameCount} name(s) generated from live model IDs
           </Text>
         ) : null}
-        {disabledCount > 0 ? (
+        {!compact && disabledCount > 0 ? (
           <Text color={theme.muted}>
             {disabledCount} disabled provider(s) · manage in Providers
           </Text>
         ) : null}
         {status ? <Text color={theme.modes.build.primary}>{status}</Text> : null}
         {error ? <Text color={theme.badge.error}>{error}</Text> : null}
-        <Text color={theme.muted}>Type to search · Enter assign · Ctrl+E capabilities</Text>
-        <Text color={theme.muted}>Tab providers · Esc clear/close</Text>
+        <Text color={theme.muted} wrap="truncate">
+          {compact
+            ? veryCompact
+              ? "Enter assign · Esc close"
+              : "Enter assign · Ctrl+E · Esc close"
+            : "Type to search · Enter assign · Ctrl+E capabilities"}
+        </Text>
+        {!compact ? (
+          <Text color={theme.muted}>Tab providers · Esc clear/close</Text>
+        ) : null}
       </Box>
     );
   }
@@ -1986,7 +2018,9 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
           {renderTabs("providers")}
           <Text color={theme.muted}>Esc close</Text>
         </Box>
-        <Text color={theme.muted}>Registered providers, including disabled ones.</Text>
+        {!compact ? (
+          <Text color={theme.muted}>Registered providers, including disabled ones.</Text>
+        ) : null}
         {providers.length > 10 ? (
           <Text color={theme.muted}>
             Showing {providerStart + 1}-{providerEnd} of {providers.length}
@@ -2001,6 +2035,23 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
             const runtime = runtimeForProvider(provider);
             const localMissing = missingLocalModels.get(provider.name) ?? [];
             const sync = remoteSync[provider.name];
+            if (compact) {
+              return (
+                <Text key={provider.name} wrap="truncate">
+                  <Text color={isSelected ? theme.accent : theme.muted}>
+                    {isSelected ? "❯ " : "  "}
+                  </Text>
+                  <Text bold={isSelected} color={theme.text}>{provider.name}</Text>
+                  <Text color={provider.enabled ? theme.modes.build.primary : theme.muted}>
+                    {provider.enabled ? " · on" : " · off"}
+                  </Text>
+                  <Text color={theme.muted}>
+                    {" · "}
+                    {kindLabel(provider.kind)} · {provider.models.length} models
+                  </Text>
+                </Text>
+              );
+            }
             return (
               <Box key={provider.name} flexDirection="column">
                 <Text>
@@ -2049,8 +2100,16 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         )}
         {status ? <Text color={theme.modes.build.primary}>{status}</Text> : null}
         {error ? <Text color={theme.badge.error}>{error}</Text> : null}
-        <Text color={theme.muted}>a add · Enter/e edit · t enable/disable · d delete</Text>
-        <Text color={theme.muted}>m manage models · Tab browse models · Esc close</Text>
+        {compact ? (
+          <Text color={theme.muted} wrap="truncate">
+            a add · Enter edit · Esc close
+          </Text>
+        ) : (
+          <>
+            <Text color={theme.muted}>a add · Enter/e edit · t enable/disable · d delete</Text>
+            <Text color={theme.muted}>m manage models · Tab browse models · Esc close</Text>
+          </>
+        )}
       </Box>
     );
   }

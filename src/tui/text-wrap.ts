@@ -28,14 +28,61 @@ export function displayWidth(text: string): number {
   return width;
 }
 
+const DEFAULT_TAB_SIZE = 4;
+
+function expandTabsInLine(line: string, tabSize: number): string {
+  let column = 0;
+  let output = "";
+  for (const char of line) {
+    const code = char.codePointAt(0) ?? 0;
+    if (char === "\t") {
+      const spaces = tabSize - (column % tabSize);
+      output += " ".repeat(spaces);
+      column += spaces;
+      continue;
+    }
+    if (code < 32 || (code >= 0x7f && code < 0xa0)) continue;
+    output += char;
+    column += charDisplayWidth(char);
+  }
+  return output;
+}
+
+/** Expands tabs and removes terminal control characters without touching newlines. */
+export function expandTabs(text: string, tabSize = DEFAULT_TAB_SIZE): string {
+  return text
+    .split("\n")
+    .map((line) => expandTabsInLine(line, Math.max(1, tabSize)))
+    .join("\n");
+}
+
+/** Truncates plain text to a display width using a short ellipsis. */
+export function fitDisplayText(text: string, width: number, ellipsis = "..."): string {
+  const plain = expandTabs(text);
+  const max = Math.max(1, width);
+  if (displayWidth(plain) <= max) return plain;
+  if (max <= displayWidth(ellipsis)) return plain.slice(0, max);
+  let output = "";
+  let used = 0;
+  const limit = max - displayWidth(ellipsis);
+  for (const char of plain) {
+    const charWidth = charDisplayWidth(char);
+    if (used + charWidth > limit) break;
+    output += char;
+    used += charWidth;
+  }
+  return `${output}${ellipsis}`;
+}
+
 /** Hard-wraps a line at a display width without collapsing whitespace. */
 export function wrapPreservingWhitespace(line: string, width: number): string[] {
   const max = Math.max(1, width);
-  if (line.length === 0) return [""];
+  const expanded = expandTabs(line);
+  if (expanded.length === 0) return [""];
   const rows: string[] = [];
   let current = "";
   let currentWidth = 0;
-  for (const char of line) {
+  for (const char of expanded) {
     const charWidth = charDisplayWidth(char);
     if (current.length > 0 && currentWidth + charWidth > max) {
       rows.push(current);
@@ -57,7 +104,7 @@ export function wrapText(text: string, width: number): string[] {
   const max = Math.max(1, width);
   const lines: string[] = [];
 
-  for (const paragraph of text.split("\n")) {
+  for (const paragraph of expandTabs(text).split("\n")) {
     const words = paragraph.trim().split(/\s+/).filter(Boolean);
     if (words.length === 0) {
       lines.push("");

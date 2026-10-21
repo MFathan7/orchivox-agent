@@ -30,6 +30,7 @@ export interface CompactionOptions {
   overheadTokens?: number;
   maxSummaryTokens?: number;
   signal?: AbortSignal;
+  onStart?: () => void;
 }
 
 const RESERVE_MIN = 16_000;
@@ -154,6 +155,7 @@ export async function compactMessages(messages: Message[], options: CompactionOp
     };
   }
 
+  options.onStart?.();
   const summary = await summarize(
     older,
     options.provider,

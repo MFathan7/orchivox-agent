@@ -191,6 +191,7 @@ export class OpenAICompatProvider implements LLMProvider {
   private readonly pricing: TokenPricing | undefined;
   private readonly kind: ProviderKind;
   private readonly capabilities: ModelCapabilities;
+  private readonly unsupportedParams = new Set<string>();
 
   constructor(options: OpenAICompatProviderOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -206,31 +207,57 @@ export class OpenAICompatProvider implements LLMProvider {
     const model = req.model ?? this.model;
     if (!model) throw new Error("ChatRequest.model is required when the provider has no default model");
 
-    let response: Response;
-    try {
-      response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: this.requestHeaders(),
-        body: JSON.stringify(buildChatPayload(req, model, this.kind, this.capabilities)),
-        signal,
-      });
-    } catch (error) {
-      if (signal?.aborted) {
-        yield { type: "done", finish_reason: "aborted" };
+    const payload = buildChatPayload(req, model, this.kind, this.capabilities);
+    for (const name of this.unsupportedParams) delete payload[name];
+
+    let response: Response | undefined;
+    let failureMessage = "";
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        response = await fetch(`${this.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: this.requestHeaders(),
+          body: JSON.stringify(payload),
+          signal,
+        });
+      } catch (error) {
+        if (signal?.aborted) {
+          yield { type: "done", finish_reason: "aborted" };
+          return;
+        }
+        yield { type: "error", code: "request_failed", message: errorMessage(error), recoverable: true };
+        yield { type: "done", finish_reason: "error" };
         return;
       }
-      yield { type: "error", code: "request_failed", message: errorMessage(error), recoverable: true };
-      yield { type: "done", finish_reason: "error" };
-      return;
+
+      if (response.ok) break;
+      failureMessage = await readErrorBody(response);
+      learnLimitsFromError(this.baseUrl, model, failureMessage);
+      if (attempt >= 2) break;
+
+      let adjusted = false;
+      for (const name of unsupportedParameterNames(failureMessage)) {
+        if (!(name in payload)) continue;
+        delete payload[name];
+        this.unsupportedParams.add(name);
+        if (name.startsWith("reasoning")) this.capabilities.reasoning = false;
+        adjusted = true;
+      }
+      if (!adjusted) {
+        const nextMax = reducedMaxTokens(payload, failureMessage);
+        if (nextMax !== undefined) {
+          setPayloadMaxTokens(payload, nextMax);
+          adjusted = true;
+        }
+      }
+      if (!adjusted) break;
     }
 
-    if (!response.ok) {
-      const message = await readErrorBody(response);
-      learnLimitsFromError(this.baseUrl, model, message);
+    if (!response || !response.ok) {
       yield {
         type: "error",
-        code: `http_${response.status}`,
-        message,
+        code: response ? `http_${response.status}` : "request_failed",
+        message: failureMessage || "provider request failed",
         recoverable: false,
       };
       yield { type: "done", finish_reason: "error" };
@@ -565,4 +592,68 @@ async function readErrorBody(response: Response): Promise<string> {
     .safeParse(parseJson(text));
   if (parsed.success && parsed.data.error?.message) return parsed.data.error.message;
   return text || response.statusText || `HTTP ${response.status}`;
+}
+
+function unsupportedParameterNames(message: string): string[] {
+  const names = new Set<string>();
+  for (const match of message.matchAll(
+    /(?:does not support|unsupported)\s+(?:the\s+)?(?:parameters?|params?)\s*:?\s*\[([^\]]*)\]/gi,
+  )) {
+    for (const name of match[1].matchAll(/["']([a-zA-Z_][a-zA-Z0-9_]*)["']/g)) {
+      names.add(name[1]);
+    }
+  }
+  for (const match of message.matchAll(
+    /unsupported\s+(?:parameter|parameters|param|params)\s*:?\s*["']?([a-zA-Z_][a-zA-Z0-9_]*)/gi,
+  )) {
+    names.add(match[1]);
+  }
+  if (names.size === 0 && /UnsupportedParamsError|does not support/i.test(message)) {
+    for (const name of ["reasoning_effort", "reasoning_budget", "chat_template_kwargs", "reasoning"]) {
+      const pattern = new RegExp(`["']${name}["']|\\b${name}\\b`, "i");
+      if (pattern.test(message)) names.add(name);
+    }
+  }
+  return [...names];
+}
+
+function payloadMaxTokensKey(payload: Record<string, unknown>): string | undefined {
+  if ("max_completion_tokens" in payload) return "max_completion_tokens";
+  if ("max_tokens" in payload) return "max_tokens";
+  return undefined;
+}
+
+function setPayloadMaxTokens(payload: Record<string, unknown>, value: number): void {
+  const key = payloadMaxTokensKey(payload) ?? "max_tokens";
+  payload[key] = Math.max(1, Math.round(value));
+}
+
+function errorNumber(message: string, pattern: RegExp): number | undefined {
+  const match = pattern.exec(message);
+  if (!match) return undefined;
+  const value = Number.parseInt(match[1], 10);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function reducedMaxTokens(
+  payload: Record<string, unknown>,
+  message: string,
+): number | undefined {
+  const key = payloadMaxTokensKey(payload);
+  if (!key) return undefined;
+  const current = Number(payload[key]);
+  if (!Number.isFinite(current) || current <= 1024) return undefined;
+
+  const requested = errorNumber(message, /requested\s+(\d{3,})\s+output tokens/i);
+  const contextLimit = errorNumber(message, /maximum context length is\s+(\d{3,})/i);
+  const prompt = errorNumber(message, /prompt contains at least\s+(\d{3,})\s+input tokens/i);
+  if (!requested && !contextLimit) return undefined;
+
+  const available =
+    contextLimit !== undefined
+      ? contextLimit - (prompt ?? 0) - Math.max(2048, Math.floor(contextLimit * 0.02))
+      : current;
+  const target = Math.min(available, Math.floor((requested ?? current) / 2));
+  const next = Math.max(1024, Math.min(current - 1, target));
+  return next < current ? next : undefined;
 }

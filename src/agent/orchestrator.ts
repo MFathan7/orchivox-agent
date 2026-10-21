@@ -11,7 +11,7 @@ import { structuredPatch } from "diff";
 import { registerAstTools } from "../ide/ast-compress";
 import { registerCodeIntelTools } from "../ide/code-intel";
 import type { LSPClient } from "../ide/lsp-client";
-import { HindsightMemory } from "../memory/hindsight";
+import { HindsightMemory, estimateMessageTokens } from "../memory/hindsight";
 import type { MemoryDatabase } from "../memory/sqlite";
 import type { RulesLoader } from "../memory/rules-loader";
 import type { ProviderRouter } from "../provider/router";
@@ -668,9 +668,18 @@ export class AgentOrchestrator implements IAgentRunner {
     const outputCap = Math.min(capabilities.max_output ?? 32_000, 256_000);
     const defaultOutput = reasoningBudget > 0 ? Math.max(outputCap, reasoningBudget + 2048) : outputCap;
     const requestedMaxTokens = request.max_tokens ?? defaultOutput;
-    const maxTokens = Math.min(requestedMaxTokens, outputCap);
+    const estimatePromptTokens = (): number =>
+      messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overheadTokens;
+    const outputHeadroom = (): number => {
+      const reserve = Math.max(2048, Math.floor(contextWindow * 0.02));
+      return Math.max(1024, contextWindow - estimatePromptTokens() - reserve);
+    };
+    let forcedOutputLimit: number | undefined;
+    let maxTokens = Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
     let compactedRetry = false;
     let outputLimitContinues = 0;
+    let outputLimitCompacted = false;
+    let outputBudgetRetried = false;
 
     const projectStudyFallback = (originalText: string, fallback: string): string => {
       const trimmed = originalText.trim();
@@ -795,9 +804,13 @@ export class AgentOrchestrator implements IAgentRunner {
           bufferRatio: this.compactionConfig.buffer_ratio,
           overheadTokens,
           previousSummary: extractSummary(messages),
+          onStart: () => sink({ type: "compaction_start", reason: "auto" }),
         });
         if (compaction.didCompact) {
           messages = compaction.messages;
+          maxTokens =
+            forcedOutputLimit ??
+            Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
           sink({
             type: "compaction",
             reason: "auto",
@@ -846,6 +859,7 @@ export class AgentOrchestrator implements IAgentRunner {
       const accumulator = new TurnAccumulator();
       let turnError: string | undefined;
       let contextOverflow = false;
+      let errorSunk = false;
       for await (const event of provider.streamChat(chatRequest, signal)) {
         switch (event.type) {
           case "token":
@@ -870,7 +884,10 @@ export class AgentOrchestrator implements IAgentRunner {
           case "error":
             turnError = event.message;
             if (isContextOverflow(event.message)) contextOverflow = true;
-            sink(event);
+            if (!isAutoHandledProviderError(event.message)) {
+              sink(event);
+              errorSunk = true;
+            }
             break;
           case "done":
             finishReason = event.finish_reason;
@@ -880,6 +897,23 @@ export class AgentOrchestrator implements IAgentRunner {
             break;
           default:
             break;
+        }
+      }
+
+      if (turnError && isOutputBudgetError(turnError) && !outputBudgetRetried) {
+        const next = reduceOutputTokensFromError(
+          turnError,
+          maxTokens,
+          estimatePromptTokens(),
+          contextWindow,
+        );
+        if (next !== undefined) {
+          outputBudgetRetried = true;
+          forcedOutputLimit = next;
+          maxTokens = next;
+          turnError = undefined;
+          contextOverflow = false;
+          continue;
         }
       }
 
@@ -894,9 +928,13 @@ export class AgentOrchestrator implements IAgentRunner {
           overheadTokens,
           previousSummary: extractSummary(messages),
           force: true,
+          onStart: () => sink({ type: "compaction_start", reason: "retry" }),
         });
         if (forced.didCompact) {
           messages = forced.messages;
+          maxTokens =
+            forcedOutputLimit ??
+            Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
           sink({
             type: "compaction",
             reason: "retry",
@@ -942,6 +980,39 @@ export class AgentOrchestrator implements IAgentRunner {
         }
         if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES) {
           outputLimitContinues += 1;
+          if (!outputLimitCompacted) {
+            outputLimitCompacted = true;
+            const hasPriorTurn = messages.filter((message) => message.role === "user").length > 1;
+            const compacted = hasPriorTurn
+              ? await compactMessages(messages, {
+                  provider,
+                  contextWindow,
+                  keepTokens: this.compactionConfig.keep_tokens,
+                  bufferTokens: this.compactionConfig.buffer_tokens,
+                  bufferRatio: this.compactionConfig.buffer_ratio,
+                  overheadTokens,
+                  previousSummary: extractSummary(messages),
+                  force: true,
+                  onStart: () => sink({ type: "compaction_start", reason: "output_limit" }),
+                })
+              : undefined;
+            if (compacted?.didCompact) {
+              messages = compacted.messages;
+              maxTokens =
+                forcedOutputLimit ??
+                Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
+              sink({
+                type: "compaction",
+                reason: "output_limit",
+                before_tokens: compacted.beforeTokens,
+                after_tokens: compacted.afterTokens,
+                summary_tokens: compacted.summaryTokens,
+                summary: compacted.summary,
+                removed_messages: compacted.removedMessages,
+                tail_start_message_id: compacted.tailStartMessageId,
+              });
+            }
+          }
           messages.push(
             makeMessage(
               `turn-${turn}-output-limit`,
@@ -1002,6 +1073,16 @@ export class AgentOrchestrator implements IAgentRunner {
         if (bufferStudyTokens && !turnError) {
           sink({ type: "token", text: textOf(finalMessage) });
         }
+        if (turnError && !errorSunk) {
+          sink({
+            type: "error",
+            code: "provider_adjusted",
+            message: isAutoHandledProviderError(turnError)
+              ? "provider request failed after automatic adjustment"
+              : turnError,
+            recoverable: false,
+          });
+        }
         await this.hooks.runOnStop({});
         const finalReason: FinishReason = turnError ? "error" : finishReason;
         sink(usageEvent(totals));
@@ -1020,6 +1101,7 @@ export class AgentOrchestrator implements IAgentRunner {
           name: call.name,
           label: display.label,
           detail: display.detail,
+          command: typeof call.arguments.command === "string" ? call.arguments.command : undefined,
           arguments_summary: summarizeArguments(call.arguments),
           file_path: filePath,
         });
@@ -1033,6 +1115,7 @@ export class AgentOrchestrator implements IAgentRunner {
             status: "error",
             duration_ms: Date.now() - toolStartedAt,
             file_path: filePath,
+            output: "blocked: the active skill does not allow this tool",
           });
           continue;
         }
@@ -1047,6 +1130,7 @@ export class AgentOrchestrator implements IAgentRunner {
             status: "error",
             duration_ms: Date.now() - toolStartedAt,
             file_path: filePath,
+            output: `blocked: ${pre.reason ?? "pre tool use hook"}`,
           });
           continue;
         }
@@ -1100,6 +1184,7 @@ export class AgentOrchestrator implements IAgentRunner {
           status: result.is_error ? "error" : "ok",
           duration_ms: Date.now() - toolStartedAt,
           file_path: filePath,
+          output: toolOutputPreview(call.name, content, result.is_error),
         });
 
         if (captureChange && filePath && beforeText !== undefined) {
@@ -1113,6 +1198,7 @@ export class AgentOrchestrator implements IAgentRunner {
               new_text: afterText.slice(0, MAX_DIFF_CHARS),
               additions: stats.additions,
               deletions: stats.deletions,
+              tool_call_id: call.id,
             });
           }
         }
@@ -1129,6 +1215,7 @@ export class AgentOrchestrator implements IAgentRunner {
               new_text: destinationText.slice(0, MAX_DIFF_CHARS),
               additions: stats.additions,
               deletions: 0,
+              tool_call_id: call.id,
             });
           }
         }
@@ -1687,6 +1774,32 @@ function countLineChanges(before: string, after: string): { additions: number; d
   return { additions, deletions };
 }
 
+const COMMAND_OUTPUT_TOOLS = new Set(["bash", "run_sandbox_script", "bg_start", "bg_logs"]);
+const CONTENT_OUTPUT_TOOLS = new Set([
+  "read_file",
+  "read_skeleton",
+  "diff_view",
+  "grep_search",
+  "glob_files",
+  "json_query",
+  "lsp_hover_type",
+]);
+
+function toolOutputPreview(name: string, content: string, isError: boolean): string | undefined {
+  const command = COMMAND_OUTPUT_TOOLS.has(name);
+  const contentPreview = CONTENT_OUTPUT_TOOLS.has(name);
+  if (!isError && !command && !contentPreview) return undefined;
+  const text = content.replace(/\r\n/g, "\n").trimEnd();
+  if (text.length === 0) return undefined;
+  const lines = text.split("\n");
+  const maxLines = command ? 60 : contentPreview ? 16 : 24;
+  const maxChars = command ? 6000 : contentPreview ? 2400 : 3000;
+  let preview = lines.slice(0, maxLines).join("\n");
+  if (preview.length > maxChars) preview = preview.slice(0, maxChars);
+  if (lines.length > maxLines || text.length > maxChars) preview += "\n… output truncated";
+  return preview;
+}
+
 function summarizeArguments(args: Record<string, unknown>): string {
   const text = JSON.stringify(args);
   return text.length > 120 ? `${text.slice(0, 117)}...` : text;
@@ -1701,6 +1814,47 @@ function isContextOverflow(message: string): boolean {
   return /context length|context_length_exceeded|too many tokens|maximum context|prompt is too long|reduce the length of the messages|request too large/i.test(
     message,
   );
+}
+
+function isOutputBudgetError(message: string): boolean {
+  return /requested\s+\d+\s+output tokens|output tokens?.*(?:too large|exceed)|max_tokens.*(?:too large|exceed)/i.test(
+    message,
+  );
+}
+
+function isUnsupportedParamsError(message: string): boolean {
+  return /UnsupportedParamsError|does not support (?:the )?(?:parameter|parameters|param|params)|unsupported (?:parameter|parameters|param|params)/i.test(
+    message,
+  );
+}
+
+function isAutoHandledProviderError(message: string): boolean {
+  return isOutputBudgetError(message) || isUnsupportedParamsError(message) || isContextOverflow(message);
+}
+
+function errorNumber(message: string, pattern: RegExp): number | undefined {
+  const match = pattern.exec(message);
+  if (!match) return undefined;
+  const value = Number.parseInt(match[1], 10);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function reduceOutputTokensFromError(
+  message: string,
+  current: number,
+  promptTokens: number,
+  contextWindow: number,
+): number | undefined {
+  const contextLimit =
+    errorNumber(message, /maximum context length is\s+(\d{3,})/i) ?? contextWindow;
+  const prompt =
+    errorNumber(message, /prompt contains at least\s+(\d{3,})\s+input tokens/i) ?? promptTokens;
+  const requested = errorNumber(message, /requested\s+(\d{3,})\s+output tokens/i);
+  const reserve = Math.max(2048, Math.floor(contextLimit * 0.02));
+  const available = Math.max(1024, contextLimit - prompt - reserve);
+  const fallback = requested !== undefined ? Math.floor(requested / 2) : Math.floor(current / 2);
+  const next = Math.max(1024, Math.min(current - 1, available, fallback));
+  return next < current ? next : undefined;
 }
 
 function clampReasoningEffort(

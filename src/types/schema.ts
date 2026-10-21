@@ -348,6 +348,7 @@ export const ToolStartEventSchema = z.object({
   name: z.string().min(1),
   label: z.string().optional(),
   detail: z.string().optional(),
+  command: z.string().optional(),
   arguments_summary: z.string().default(""),
   file_path: z.string().optional(),
 });
@@ -360,6 +361,7 @@ export const ToolEndEventSchema = z.object({
   status: z.enum(["ok", "error"]),
   duration_ms: z.number().nonnegative().default(0),
   file_path: z.string().optional(),
+  output: z.string().optional(),
 });
 export type ToolEndEvent = z.infer<typeof ToolEndEventSchema>;
 
@@ -370,6 +372,7 @@ export const FileChangeEventSchema = z.object({
   new_text: z.string(),
   additions: z.number().int().nonnegative().default(0),
   deletions: z.number().int().nonnegative().default(0),
+  tool_call_id: z.string().optional(),
 });
 export type FileChangeEvent = z.infer<typeof FileChangeEventSchema>;
 
@@ -392,9 +395,18 @@ export const PromptPreflightEventSchema = z.object({
 });
 export type PromptPreflightEvent = z.infer<typeof PromptPreflightEventSchema>;
 
+export const CompactionReasonSchema = z.enum(["auto", "manual", "retry", "output_limit"]);
+export type CompactionReason = z.infer<typeof CompactionReasonSchema>;
+
+export const CompactionStartEventSchema = z.object({
+  type: z.literal("compaction_start"),
+  reason: CompactionReasonSchema,
+});
+export type CompactionStartEvent = z.infer<typeof CompactionStartEventSchema>;
+
 export const CompactionEventSchema = z.object({
   type: z.literal("compaction"),
-  reason: z.enum(["auto", "manual", "retry"]),
+  reason: CompactionReasonSchema,
   before_tokens: z.number().int().nonnegative(),
   after_tokens: z.number().int().nonnegative(),
   summary_tokens: z.number().int().nonnegative().default(0),
@@ -422,6 +434,7 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   FileChangeEventSchema,
   SkillActivatedEventSchema,
   PromptPreflightEventSchema,
+  CompactionStartEventSchema,
   CompactionEventSchema,
 ]);
 export type StreamEvent = z.infer<typeof StreamEventSchema>;

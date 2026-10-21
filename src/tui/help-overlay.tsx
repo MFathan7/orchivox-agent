@@ -64,7 +64,7 @@ export const HELP_SECTIONS: HelpSection[] = [
   {
     title: "Panels",
     rows: [
-      { keys: "Tab", description: "Cycle the agent mode" },
+      { keys: "Shift+Tab", description: "Cycle the agent mode" },
       { keys: "Ctrl+P", description: "Open the command palette" },
       { keys: "Ctrl+G", description: "Open this help panel" },
       { keys: "Ctrl+S", description: "Open the session manager" },

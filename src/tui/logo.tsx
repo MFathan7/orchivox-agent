@@ -63,7 +63,7 @@ export function WelcomeBanner({ theme, repoPath, branch }: WelcomeBannerProps): 
           Type a prompt to begin.
         </Text>
         <Box gap={1} marginTop={0}>
-          <Text color={active.accent}>Tab</Text>
+          <Text color={active.accent}>Shift+Tab</Text>
           <Text color={active.muted}>Mode</Text>
           <Text color={active.border.passive}>·</Text>
           <Text color={active.accent}>Ctrl+P</Text>

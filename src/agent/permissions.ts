@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { EventEmitter } from "node:events";
 import { applyPatch } from "diff";
 
@@ -35,6 +35,7 @@ export interface ApprovalRequest {
   diffPreview?: DiffPreviewDetails;
   shellDetails?: ShellRiskDetails;
   reason?: string;
+  alwaysAllowLabel?: string;
 }
 
 export interface ApprovalDecision {
@@ -85,6 +86,185 @@ const MEDIUM_RISK_COMMAND_PATTERNS = [
   /\bchmod\b/i,
   /\bchown\b/i,
 ];
+
+const SHELL_TOOL_NAMES = new Set(["bash", "bg_start"]);
+export const EDIT_TOOL_NAMES = new Set([
+  "hash_edit",
+  "write_file",
+  "create_file",
+  "delete_file",
+  "move_file",
+  "apply_unified_patch",
+]);
+const MULTI_WORD_COMMANDS = new Set([
+  "git",
+  "npm",
+  "bun",
+  "pnpm",
+  "yarn",
+  "docker",
+  "kubectl",
+  "cargo",
+  "go",
+  "pip",
+  "uv",
+  "deno",
+]);
+const SHELL_WRAPPER_COMMANDS = new Set([
+  "sudo",
+  "env",
+  "command",
+  "builtin",
+  "exec",
+  "nohup",
+  "time",
+  "xargs",
+  "sh",
+  "bash",
+  "zsh",
+  "fish",
+  "node",
+  "python",
+  "python3",
+  "bunx",
+  "npx",
+]);
+
+export interface PermissionConfigRule {
+  action: string;
+  resource: string;
+  effect: PermissionAction;
+}
+
+function splitShellSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) {
+      current += char;
+      if (char === "\\" && quote === '"' && index + 1 < command.length) {
+        current += command[index + 1];
+        index += 1;
+        continue;
+      }
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === ";" || char === "|" || char === "&" || char === "\n") {
+      if ((char === "|" || char === "&") && command[index + 1] === char) index += 1;
+      if (current.trim().length > 0) segments.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+
+  if (current.trim().length > 0) segments.push(current.trim());
+  return segments;
+}
+
+function tokenizeShellSegment(segment: string): string[] {
+  return segment.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+}
+
+function unquote(value: string): string {
+  return value.replace(/^["']|["']$/g, "");
+}
+
+function commandSignatureForSegment(segment: string): string | undefined {
+  const tokens = tokenizeShellSegment(segment);
+  let index = 0;
+  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) {
+    index += 1;
+  }
+  if (index >= tokens.length) return undefined;
+
+  const rawName = unquote(tokens[index]);
+  if (!rawName) return undefined;
+  const name = rawName.split("/").pop() ?? rawName;
+  if (SHELL_WRAPPER_COMMANDS.has(name)) return undefined;
+
+  if (MULTI_WORD_COMMANDS.has(name)) {
+    const second = tokens[index + 1] ? unquote(tokens[index + 1]) : "";
+    if (second && !second.startsWith("-") && !/^[<>=]/.test(second)) {
+      return `${name} ${second}`;
+    }
+  }
+  return name;
+}
+
+export function shellCommandSignatures(command: string): string[] | undefined {
+  const segments = splitShellSegments(command);
+  if (segments.length === 0) return undefined;
+  const signatures = segments.map(commandSignatureForSegment);
+  if (signatures.some((signature) => signature === undefined)) return undefined;
+  return signatures as string[];
+}
+
+export function isSimpleShellCommand(command: string): boolean {
+  const segments = splitShellSegments(command);
+  if (segments.length !== 1) return false;
+  const segment = segments[0];
+  if (/[<>`]|\$\(/.test(segment)) return false;
+  return commandSignatureForSegment(segment) !== undefined;
+}
+
+function isInsideWorkspace(repoRoot: string, value: string): boolean {
+  const resolved = resolve(repoRoot, value);
+  const rel = relative(repoRoot, resolved);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function shellPathsOutsideWorkspace(
+  command: string,
+  cwd: string,
+  repoRoot: string,
+): boolean {
+  for (const segment of splitShellSegments(command)) {
+    const tokens = tokenizeShellSegment(segment);
+    for (let index = 0; index < tokens.length; index += 1) {
+      let token = unquote(tokens[index]);
+      if (!token || token === "-" || token.includes("://")) continue;
+      if (token.startsWith("-") && !token.includes("=")) continue;
+      if (token.startsWith("-") && token.includes("=")) {
+        token = token.slice(token.indexOf("=") + 1);
+      }
+      if (token.startsWith("~")) return true;
+      if (!token.startsWith(".") && !token.startsWith("/") && !token.includes("/")) continue;
+      if (!isInsideWorkspace(repoRoot, resolve(cwd, token))) return true;
+    }
+  }
+  return false;
+}
+
+export function permissionRulesFromConfig(
+  rules: readonly PermissionConfigRule[],
+): ToolRulePattern[] {
+  const rulesForAction = (action: string): string[] => {
+    if (action === "shell") return [...SHELL_TOOL_NAMES];
+    if (action === "edit") return [...EDIT_TOOL_NAMES];
+    if (action === "read") return ["read_file"];
+    if (action === "*") return ["*"];
+    return [action];
+  };
+
+  return rules.flatMap((rule) =>
+    rulesForAction(rule.action).map((toolName) => ({
+      raw: `${toolName}(${rule.resource}) -> ${rule.effect}`,
+      toolName,
+      pattern: rule.resource,
+      action: rule.effect,
+    })),
+  );
+}
 
 export function parseToolRule(ruleInput: ToolRulePattern | string): ToolRulePattern {
   if (typeof ruleInput !== "string") {
@@ -356,6 +536,56 @@ export class GranularPermissionEngine extends EventEmitter {
     this.sessionAllowlist.add(`${toolName}:${targetKey}`);
   }
 
+  isSessionAllowedFor(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): boolean {
+    const keys = this.sessionKeysFor(toolName, args);
+    return keys.length > 0 && keys.every((key) => this.isSessionAllowed(toolName, key));
+  }
+
+  allowInSessionFor(toolName: string, args: Record<string, unknown>): void {
+    for (const key of this.sessionKeysFor(toolName, args)) {
+      this.allowInSession(toolName, key);
+    }
+  }
+
+  private sessionKeysFor(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): string[] {
+    if (SHELL_TOOL_NAMES.has(toolName) && typeof args.command === "string") {
+      return shellCommandSignatures(args.command) ?? [];
+    }
+    if (EDIT_TOOL_NAMES.has(toolName) && typeof args.filePath === "string") {
+      const filePath = args.filePath.trim();
+      return isInsideWorkspace(this.repoRoot, resolve(this.repoRoot, filePath))
+        ? ["workspace"]
+        : [filePath];
+    }
+    if (typeof args.filePath === "string") return [args.filePath.trim()];
+    return ["*"];
+  }
+
+  private alwaysAllowLabel(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): string | undefined {
+    if (SHELL_TOOL_NAMES.has(toolName) && typeof args.command === "string") {
+      const signatures = shellCommandSignatures(args.command);
+      if (!signatures || signatures.length === 0) return undefined;
+      return `${signatures.join(" + ")} in this workspace`;
+    }
+    if (EDIT_TOOL_NAMES.has(toolName)) {
+      const filePath = typeof args.filePath === "string" ? args.filePath : undefined;
+      if (filePath && isInsideWorkspace(this.repoRoot, resolve(this.repoRoot, filePath))) {
+        return "edits in this workspace";
+      }
+      return filePath ? `edits to ${filePath}` : "edits";
+    }
+    return "this tool";
+  }
+
   async check(
     tool: { name: string; readOnly: boolean },
     mode: AgentMode,
@@ -370,35 +600,23 @@ export class GranularPermissionEngine extends EventEmitter {
     mode: AgentMode,
     toolCallId = `call-${Date.now()}`,
   ): Promise<{ allowed: boolean; reason?: string; feedback?: string }> {
-    const targetKey = this.extractTargetKey(tool.name, args);
-
-    if (this.isSessionAllowed(tool.name, targetKey)) {
-      return { allowed: true };
-    }
-
-    const matchedRule = this.matchConfigRule(tool.name, targetKey);
-    if (matchedRule) {
-      if (matchedRule.action === "allow") return { allowed: true };
-      if (matchedRule.action === "deny") {
-        return {
-          allowed: false,
-          reason: `Denied by configuration rule: ${matchedRule.raw}`,
-        };
-      }
-    }
+    const cwd = typeof args.cwd === "string" ? args.cwd : this.repoRoot;
+    const shellRisk =
+      SHELL_TOOL_NAMES.has(tool.name) && typeof args.command === "string"
+        ? evaluateShellRisk(args.command, cwd)
+        : undefined;
 
     if (mode === "plan") {
       if (tool.readOnly) {
         return { allowed: true };
       }
       if (tool.name === "bash" && typeof args.command === "string") {
-        const risk = evaluateShellRisk(args.command, this.repoRoot);
-        if (isPlanReadOnlyShellCommand(args.command) && risk.riskLevel === "low") {
+        if (isPlanReadOnlyShellCommand(args.command) && shellRisk?.riskLevel === "low") {
           return { allowed: true };
         }
         return {
           allowed: false,
-          reason: `PLAN mode allows only read-only shell commands. ${risk.warning ?? "Use a safe inspection command or switch to build mode."}`,
+          reason: `PLAN mode allows only read-only shell commands. ${shellRisk?.warning ?? "Use a safe inspection command or switch to build mode."}`,
         };
       }
       return {
@@ -407,24 +625,62 @@ export class GranularPermissionEngine extends EventEmitter {
       };
     }
 
-    let shellRisk: ShellRiskDetails | undefined;
-    if ((tool.name === "bash" || tool.name === "bg_start") && typeof args.command === "string") {
-      const cwd = typeof args.cwd === "string" ? args.cwd : this.repoRoot;
-      shellRisk = evaluateShellRisk(args.command, cwd);
+    if (shellRisk?.riskLevel === "critical") {
+      return {
+        allowed: false,
+        reason: `Fatal command "${shellRisk.command}" automatically denied in ${mode.toUpperCase()} mode: ${shellRisk.warning}`,
+      };
+    }
+
+    const targetKey = this.extractTargetKey(tool.name, args);
+    const matchedRule = this.matchConfigRule(tool.name, targetKey);
+    let forceApproval = false;
+    if (matchedRule) {
+      if (matchedRule.action === "allow") return { allowed: true };
+      if (matchedRule.action === "deny") {
+        return {
+          allowed: false,
+          reason: `Denied by configuration rule: ${matchedRule.raw}`,
+        };
+      }
+      forceApproval = true;
+    }
+
+    const sessionAllowed =
+      this.isSessionAllowedFor(tool.name, args) &&
+      !(
+        SHELL_TOOL_NAMES.has(tool.name) &&
+        typeof args.command === "string" &&
+        shellPathsOutsideWorkspace(args.command, cwd, this.repoRoot)
+      );
+    if (sessionAllowed) {
+      return { allowed: true };
     }
 
     if (mode === "ultrawork") {
-      if (shellRisk?.riskLevel === "critical") {
-        return {
-          allowed: false,
-          reason: `Fatal command "${shellRisk.command}" automatically denied in ULTRAWORK mode: ${shellRisk.warning}`,
-        };
-      }
       return { allowed: true };
     }
 
-    if (tool.readOnly) {
+    if (tool.readOnly && !forceApproval) {
       return { allowed: true };
+    }
+
+    if (!forceApproval) {
+      if (EDIT_TOOL_NAMES.has(tool.name) && typeof args.filePath === "string") {
+        if (isInsideWorkspace(this.repoRoot, resolve(cwd, args.filePath))) {
+          return { allowed: true };
+        }
+      }
+      if (
+        SHELL_TOOL_NAMES.has(tool.name) &&
+        typeof args.command === "string" &&
+        shellRisk &&
+        (shellRisk.riskLevel === "low" || shellRisk.riskLevel === "medium") &&
+        isSimpleShellCommand(args.command) &&
+        !shellPathsOutsideWorkspace(args.command, cwd, this.repoRoot)
+      ) {
+        return { allowed: true };
+      }
     }
 
     const diffPreview = await calculateDiffPreview(tool.name, args, this.repoRoot);
@@ -439,6 +695,7 @@ export class GranularPermissionEngine extends EventEmitter {
       diffPreview,
       shellDetails: shellRisk,
       reason: shellRisk?.warning ?? "This tool requires approval before executing changes.",
+      alwaysAllowLabel: this.alwaysAllowLabel(tool.name, args),
     };
 
     const decision = await this.requestApproval(request);
@@ -454,10 +711,21 @@ export class GranularPermissionEngine extends EventEmitter {
     };
   }
 
-  async requestApproval(request: ApprovalRequest): Promise<ApprovalDecision> {
-    const targetKey = this.extractTargetKey(request.toolName, request.args);
-
-    if (this.isSessionAllowed(request.toolName, targetKey)) {
+  async requestApproval(
+    request: ApprovalRequest,
+    allowSession = true,
+  ): Promise<ApprovalDecision> {
+    const cwd =
+      typeof request.args.cwd === "string" ? request.args.cwd : this.repoRoot;
+    const outsideWorkspace =
+      SHELL_TOOL_NAMES.has(request.toolName) &&
+      typeof request.args.command === "string" &&
+      shellPathsOutsideWorkspace(request.args.command, cwd, this.repoRoot);
+    if (
+      allowSession &&
+      !outsideWorkspace &&
+      this.isSessionAllowedFor(request.toolName, request.args)
+    ) {
       return { approved: true, choice: "always_allow" };
     }
 
@@ -475,7 +743,7 @@ export class GranularPermissionEngine extends EventEmitter {
     }
 
     if (decision.choice === "always_allow") {
-      this.allowInSession(request.toolName, targetKey);
+      this.allowInSessionFor(request.toolName, request.args);
     }
 
     this.emit("approval_resolved", { request, decision });
@@ -493,7 +761,8 @@ export class GranularPermissionEngine extends EventEmitter {
   }
 
   private matchConfigRule(toolName: string, targetKey: string): ToolRulePattern | undefined {
-    for (const rule of this.rules) {
+    for (let index = this.rules.length - 1; index >= 0; index -= 1) {
+      const rule = this.rules[index];
       if (rule.toolName !== "*" && rule.toolName !== toolName) {
         continue;
       }

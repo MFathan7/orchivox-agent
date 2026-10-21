@@ -24,6 +24,7 @@ export interface SessionTimeTravelModalProps {
   onSessionDeleted?: (sessionId: string) => void;
   onRestoreSnapshot?: (result: RestoreResult) => void;
   onClose: () => void;
+  height?: number;
   theme?: Theme;
 }
 
@@ -61,6 +62,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
     onSessionDeleted,
     onRestoreSnapshot,
     onClose,
+    height,
     theme = getTheme("tokyonight"),
   } = props;
 
@@ -72,7 +74,9 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
   const [searchHits, setSearchHits] = React.useState<MessageSearchHit[]>([]);
   const [sessionIndex, setSessionIndex] = React.useState(0);
   const [statusNotice, setStatusNotice] = React.useState<string | undefined>();
-  const { columns } = useTerminalSize();
+  const { columns, rows } = useTerminalSize();
+  const availableHeight = height ?? rows;
+  const compact = columns < 72 || availableHeight < 16;
 
   // Tab 2 state
   const [turnIndex, setTurnIndex] = React.useState(0);
@@ -285,37 +289,64 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
     }
   });
 
+  const listWindow = Math.max(
+    1,
+    Math.min(10, availableHeight - (compact ? 5 : 9)),
+  );
+  const sessionStart = Math.max(
+    0,
+    Math.min(
+      Math.max(0, sessions.length - listWindow),
+      sessionIndex - Math.floor(listWindow / 2),
+    ),
+  );
+  const visibleSessions = sessions.slice(sessionStart, sessionStart + listWindow);
+  const visibleHits = searchHits.slice(0, listWindow);
+
   return (
     <Box
       flexDirection="column"
       borderStyle="round"
       borderColor={theme.border.active}
       paddingX={1}
-      marginY={1}
+      marginY={compact ? 0 : 1}
     >
-      <Box justifyContent="space-between" marginBottom={0}>
-        <Box gap={2}>
-          <Text
-            bold={activeTab === "sessions"}
-            color={activeTab === "sessions" ? theme.accent : theme.muted}
-          >
-            1. Sessions & FTS Search
+      {compact ? (
+        <Box justifyContent="space-between">
+          <Text bold color={theme.accent}>
+            {activeTab === "sessions"
+              ? "Sessions"
+              : activeTab === "fork"
+                ? "Conversation Forking"
+                : "Git Snapshots"}
           </Text>
-          <Text
-            bold={activeTab === "fork"}
-            color={activeTab === "fork" ? theme.modes.build.primary : theme.muted}
-          >
-            2. Conversation Forking
-          </Text>
-          <Text
-            bold={activeTab === "timeline"}
-            color={activeTab === "timeline" ? theme.modes.ultrawork.primary : theme.muted}
-          >
-            3. Git Snapshot Timeline
-          </Text>
+          <Text dimColor>Tab switch · Esc close</Text>
         </Box>
-        <Text dimColor>Esc Close  |  Tab Switch Tab  |  Ctrl+N New Session</Text>
-      </Box>
+      ) : (
+        <Box justifyContent="space-between" marginBottom={0}>
+          <Box gap={2}>
+            <Text
+              bold={activeTab === "sessions"}
+              color={activeTab === "sessions" ? theme.accent : theme.muted}
+            >
+              1. Sessions & FTS Search
+            </Text>
+            <Text
+              bold={activeTab === "fork"}
+              color={activeTab === "fork" ? theme.modes.build.primary : theme.muted}
+            >
+              2. Conversation Forking
+            </Text>
+            <Text
+              bold={activeTab === "timeline"}
+              color={activeTab === "timeline" ? theme.modes.ultrawork.primary : theme.muted}
+            >
+              3. Git Snapshot Timeline
+            </Text>
+          </Box>
+          <Text dimColor>Esc Close  |  Tab Switch Tab  |  Ctrl+N New Session</Text>
+        </Box>
+      )}
 
       {statusNotice ? (
         <Box marginY={0}>
@@ -324,26 +355,39 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
       ) : null}
 
       {activeTab === "sessions" ? (
-        <Box flexDirection="column" marginY={1}>
-          <Box borderStyle="single" borderColor={theme.border.passive} paddingX={1} marginY={0}>
-            <Text color={theme.accent} bold>
-              FTS5 Search:{" "}
+        <Box flexDirection="column" marginY={compact ? 0 : 1}>
+          {compact ? (
+            <Text wrap="truncate">
+              <Text color={theme.accent} bold>
+                Search:{" "}
+              </Text>
+              <Text>{searchQuery}</Text>
+              <Text inverse color={theme.accent}> </Text>
+              {searchQuery.length === 0 ? <Text dimColor> type to filter</Text> : null}
             </Text>
-            <Text>{searchQuery}</Text>
-            <Text inverse color={theme.accent}> </Text>
-            {searchQuery.length === 0 ? (
-              <Text dimColor>Type keyword for instant FTS search across sessions...</Text>
-            ) : null}
-          </Box>
+          ) : (
+            <Box borderStyle="single" borderColor={theme.border.passive} paddingX={1} marginY={0}>
+              <Text color={theme.accent} bold>
+                FTS5 Search:{" "}
+              </Text>
+              <Text>{searchQuery}</Text>
+              <Text inverse color={theme.accent}> </Text>
+              {searchQuery.length === 0 ? (
+                <Text dimColor>Type keyword for instant FTS search across sessions...</Text>
+              ) : null}
+            </Box>
+          )}
 
-          <Box flexDirection="column" marginY={1}>
-            <Text bold color={theme.modes.plan.primary}>
-              {searchHits.length > 0
-                ? `Search Results (${searchHits.length})`
-                : `Session History (${sessions.length})`}
-            </Text>
-            {searchHits.length > 0 ? (
-              searchHits.slice(0, 10).map((hit, idx) => {
+          <Box flexDirection="column" marginY={compact ? 0 : 1}>
+            {!compact ? (
+              <Text bold color={theme.modes.plan.primary}>
+                {searchHits.length > 0
+                  ? `Search Results (${searchHits.length})`
+                  : `Session History (${sessions.length})`}
+              </Text>
+            ) : null}
+            {visibleHits.length > 0 ? (
+              visibleHits.map((hit, idx) => {
                 const isSelected = idx === sessionIndex;
                 const label = `● ${hit.role.toUpperCase()}: ${hit.snippet}`;
                 return (
@@ -354,16 +398,31 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                     wrap="truncate"
                   >
                     {isSelected ? "❯ " : "  "}
-                    {truncateText(label, Math.max(24, columns - 12))}
+                    {truncateText(label, Math.max(16, columns - 8))}
                   </Text>
                 );
               })
             ) : sessions.length === 0 ? (
               <Text dimColor>No conversation sessions found.</Text>
             ) : (
-              sessions.slice(0, 10).map((sess, idx) => {
+              visibleSessions.map((sess, offset) => {
+                const idx = sessionStart + offset;
                 const isSelected = idx === sessionIndex;
                 const isCurrent = sess.id === activeSessionId;
+                if (compact) {
+                  return (
+                    <Text
+                      key={sess.id}
+                      color={isSelected ? theme.accent : undefined}
+                      bold={isSelected}
+                      wrap="truncate"
+                    >
+                      {isSelected ? "❯ " : "  "}
+                      {truncateText(sess.title, Math.max(8, columns - 8))}
+                      {isCurrent ? " (active)" : ""}
+                    </Text>
+                  );
+                }
                 return (
                   <Box key={sess.id} justifyContent="space-between">
                     <Box>
@@ -380,11 +439,13 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             )}
           </Box>
 
-          <Box justifyContent="space-between">
-            <Text dimColor>
-              Enter Resume Session  |  d Delete Session  |  Up/Down Select Session
-            </Text>
-          </Box>
+          <Text dimColor wrap="truncate">
+            {compact
+              ? columns < 50
+                ? "Enter resume · Esc close"
+                : "Enter resume · d delete · Esc close"
+              : "Enter Resume Session  |  d Delete Session  |  Up/Down Select Session"}
+          </Text>
         </Box>
       ) : null}
 
