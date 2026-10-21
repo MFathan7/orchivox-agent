@@ -478,7 +478,7 @@ export function ScrollableChatViewport({
   const showWelcome = !hasChatMessages && !streamingText && !liveEntry;
 
   return (
-    <Box flexDirection="column" height={height} overflow="hidden">
+    <Box flexDirection="column" height={height} overflowY="hidden">
       {showWelcome ? (
         height >= 12 ? (
           <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />

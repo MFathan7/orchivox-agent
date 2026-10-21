@@ -5,13 +5,17 @@ import { useInput } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
 import { computeLineHash } from "../tools/hashline-edit";
+import { panelRowNode } from "./panel";
 import type { RenderRow } from "./rows";
-import { displayWidth, expandTabs, fitDisplayText, wrapPreservingWhitespace } from "./text-wrap";
+import {
+  displayWidth,
+  expandTabs,
+  fitDisplayText,
+  truncateToWidth,
+  wrapPreservingWhitespace,
+} from "./text-wrap";
 import type { ThinkingSegmentView } from "./app";
 import { getTheme, type Theme } from "./theme";
-
-const PANEL_PAD = " ";
-const PANEL_END = "\u200b";
 
 export interface DiffViewProps {
   oldText: string;
@@ -139,16 +143,8 @@ function fitDiffText(text: string, width: number): string {
   if (displayWidth(plain) <= safeWidth) {
     return plain + " ".repeat(safeWidth - displayWidth(plain));
   }
-  if (safeWidth <= 3) return plain.slice(0, safeWidth);
-  let output = "";
-  let used = 0;
-  for (const char of plain) {
-    const charWidth = displayWidth(char);
-    if (used + charWidth > safeWidth - 3) break;
-    output += char;
-    used += charWidth;
-  }
-  return `${output}...`;
+  if (safeWidth <= 3) return truncateToWidth(plain, safeWidth).text;
+  return `${truncateToWidth(plain, safeWidth - 3).text}...`;
 }
 
 export function diffRows(
@@ -171,17 +167,10 @@ export function diffRows(
     node: React.ReactNode,
     plainInput: string,
   ): RenderRow => {
-    const plain = fitDisplayText(plainInput, width);
     if (!background) return { key, node };
     return {
       key,
-      node: (
-        <Text backgroundColor={background} wrap="truncate">
-          {displayWidth(plainInput) > width ? plain : node}
-          {PANEL_PAD.repeat(Math.max(0, width - displayWidth(plain)))}
-          {PANEL_END}
-        </Text>
-      ),
+      node: panelRowNode([{ text: plainInput, node }], { width, background, margin: 0 }),
     };
   };
 

@@ -3,13 +3,15 @@ import { Box, Text } from "ink";
 
 import type { RenderRow } from "./rows";
 import {
-  charDisplayWidth,
   displayWidth,
   expandTabs,
   fitDisplayText,
+  graphemeClusters,
+  truncateToWidth,
   wrapPreservingWhitespace,
   wrapText,
 } from "./text-wrap";
+import { PANEL_END, PANEL_PAD } from "./panel";
 import { getTheme, type Theme } from "./theme";
 
 export interface MarkdownViewProps {
@@ -31,8 +33,6 @@ export type MarkdownBlock =
 
 export type TokenKind = "keyword" | "string" | "comment" | "number" | "type" | "text";
 
-const PANEL_PAD = " ";
-const PANEL_END = "\u200b";
 const CODE_MARGIN = 2;
 
 export interface HighlightToken {
@@ -445,16 +445,8 @@ export function inlinePlainText(text: string): string {
 
 function truncateDisplay(value: string, width: number): string {
   if (displayWidth(value) <= width) return value;
-  if (width <= 3) return value.slice(0, Math.max(0, width));
-  let output = "";
-  let used = 0;
-  for (const char of value) {
-    const charWidth = displayWidth(char);
-    if (used + charWidth > width - 3) break;
-    output += char;
-    used += charWidth;
-  }
-  return `${output}...`;
+  if (width <= 3) return truncateToWidth(value, Math.max(0, width)).text;
+  return `${truncateToWidth(value, width - 3).text}...`;
 }
 
 function cellView(value: string, width: number): { text: string; plain: string; truncated: boolean } {
@@ -685,10 +677,10 @@ function wrapInlineSegments(segments: InlineSegment[], width: number): InlineSeg
         append(segment.kind, token);
         continue;
       }
-      for (const char of token) {
-        const charWidth = charDisplayWidth(char);
-        if (rowWidth > 0 && rowWidth + charWidth > max) flush();
-        append(segment.kind, char);
+      for (const cluster of graphemeClusters(token)) {
+        const clusterWidth = displayWidth(cluster);
+        if (rowWidth > 0 && rowWidth + clusterWidth > max) flush();
+        append(segment.kind, cluster);
       }
     }
   }

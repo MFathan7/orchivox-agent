@@ -6,9 +6,14 @@ import type { ChatEntryView, ChatToolCallView } from "./app";
 import { diffRows, formatThinkingDuration } from "./diff-view";
 import { formatTokenCount } from "./format";
 import { markdownRows } from "./markdown";
+import {
+  panelPaddingRowNode,
+  panelRowNode,
+  type PanelPart,
+} from "./panel";
 import type { RenderRow } from "./rows";
 import { getTheme, type Theme } from "./theme";
-import { displayWidth, expandTabs, fitDisplayText, wrapPreservingWhitespace, wrapText } from "./text-wrap";
+import { displayWidth, fitDisplayText, wrapPreservingWhitespace, wrapText } from "./text-wrap";
 
 export interface TranscriptRow extends RenderRow {
   entryId?: string;
@@ -47,8 +52,6 @@ function statusColor(status: ChatToolCallView["status"], theme: Theme): string {
   return theme.badge.ok;
 }
 
-const PANEL_PAD = " ";
-const PANEL_END = "\u200b";
 const TOOL_MARGIN = 2;
 const COMMAND_TOOL_NAMES = new Set(["bash", "run_sandbox_script", "bg_start", "bg_logs"]);
 const EDIT_TOOL_NAMES = new Set([
@@ -98,85 +101,74 @@ function toolCallRows(
   const deletions = call.diff?.deletions;
   const safeWidth = Math.max(16, width);
   const panelWidth = Math.max(16, safeWidth - TOOL_MARGIN * 2 - 1);
-  const margin = " ".repeat(TOOL_MARGIN);
+  const panelOptions = {
+    width: panelWidth,
+    background: theme.tool.background,
+    margin: TOOL_MARGIN,
+  };
   const innerPad = Math.max(2, indent + 2);
-  const background = theme.tool.background;
+  const statusTint = statusColor(call.status, theme);
 
   const paddingRow = (key: string): TranscriptRow => ({
     key,
-    node: (
-      <Text wrap="truncate">
-        {margin}
-        <Text backgroundColor={background}>
-          {PANEL_PAD.repeat(panelWidth)}
-          {PANEL_END}
-        </Text>
-      </Text>
-    ),
+    node: panelPaddingRowNode(panelOptions),
   });
-  const panelRow = (
-    key: string,
-    plain: string,
-    node: React.ReactNode,
-  ): TranscriptRow => {
-    const normalized = expandTabs(plain);
-    const fitted = fitDisplayText(normalized, panelWidth);
-    const overflow = displayWidth(normalized) > panelWidth;
-    return {
-      key,
-      node: (
-        <Text wrap="truncate">
-          {margin}
-          <Text backgroundColor={background}>
-            {overflow ? fitted : node}
-            {PANEL_PAD.repeat(Math.max(0, panelWidth - displayWidth(fitted)))}
-            {PANEL_END}
-          </Text>
-        </Text>
-      ),
-    };
-  };
+  const panelRow = (key: string, parts: PanelPart[]): TranscriptRow => ({
+    key,
+    node: panelRowNode(parts, panelOptions),
+  });
 
   const icon = call.status === "running" ? spinner ?? "●" : statusIcon(call.status);
+  const suffixParts: PanelPart[] = [];
+  if (additions !== undefined || deletions !== undefined) {
+    suffixParts.push({
+      text: ` +${additions ?? 0}`,
+      node: <Text color={theme.diff.added}> +{additions ?? 0}</Text>,
+      color: theme.diff.added,
+    });
+    suffixParts.push({
+      text: ` -${deletions ?? 0}`,
+      node: <Text color={theme.diff.removed}> -{deletions ?? 0}</Text>,
+      color: theme.diff.removed,
+    });
+  }
+  if (call.durationMs !== undefined) {
+    suffixParts.push({
+      text: ` ${call.durationMs}ms`,
+      node: <Text color={theme.muted}> {call.durationMs}ms</Text>,
+      color: theme.muted,
+    });
+  }
+  if (call.lspStatus) {
+    suffixParts.push({
+      text: ` lsp:${call.lspStatus}`,
+      node: <Text color={theme.badge.running}> lsp:{call.lspStatus}</Text>,
+      color: theme.badge.running,
+    });
+  }
+
   const headerPrefix = `${" ".repeat(innerPad)}${icon} ${label}`;
-  const headerSuffix = `${
-    additions !== undefined || deletions !== undefined
-      ? ` +${additions ?? 0} -${deletions ?? 0}`
-      : ""
-  }${call.durationMs !== undefined ? ` ${call.durationMs}ms` : ""}${
-    call.lspStatus ? ` lsp:${call.lspStatus}` : ""
-  }`;
-  const targetWidth = Math.max(
-    0,
-    panelWidth - displayWidth(headerPrefix) - displayWidth(headerSuffix) - 1,
-  );
+  const suffixWidth = suffixParts.reduce((sum, part) => sum + displayWidth(part.text), 0);
+  const targetWidth = Math.max(0, panelWidth - displayWidth(headerPrefix) - suffixWidth - 1);
   const fittedTarget = target && targetWidth > 3 ? ` ${fitDisplayText(target, targetWidth)}` : "";
-  const headerPlain = `${headerPrefix}${fittedTarget}${headerSuffix}`;
 
   rows.push(paddingRow(`${keyPrefix}-panel-top`));
   rows.push(
-    panelRow(
-      keyPrefix,
-      headerPlain,
-      <Text wrap="truncate">
-        {" ".repeat(innerPad)}
-        <Text color={statusColor(call.status, theme)} bold>
-          {icon}{" "}
-        </Text>
-        <Text bold>{label}</Text>
-        {fittedTarget ? <Text color={theme.text}>{fittedTarget}</Text> : null}
-        {additions !== undefined || deletions !== undefined ? (
-          <Text>
-            <Text color={theme.diff.added}> +{additions ?? 0}</Text>
-            <Text color={theme.diff.removed}> -{deletions ?? 0}</Text>
-          </Text>
-        ) : null}
-        {call.durationMs !== undefined ? (
-          <Text color={theme.muted}> {call.durationMs}ms</Text>
-        ) : null}
-        {call.lspStatus ? <Text color={theme.badge.running}> lsp:{call.lspStatus}</Text> : null}
-      </Text>,
-    ),
+    panelRow(keyPrefix, [
+      { text: " ".repeat(innerPad) },
+      { text: `${icon} `, node: <Text color={statusTint} bold>{icon} </Text>, color: statusTint },
+      { text: label, node: <Text bold>{label}</Text> },
+      ...(fittedTarget
+        ? [
+            {
+              text: fittedTarget,
+              node: <Text color={theme.text}>{fittedTarget}</Text>,
+              color: theme.text,
+            },
+          ]
+        : []),
+      ...suffixParts,
+    ]),
   );
 
   if (isCommand) {
@@ -184,19 +176,17 @@ function toolCallRows(
     if (command.length > 0) {
       wrapPreservingWhitespace(command, Math.max(8, panelWidth - innerPad - 4)).forEach(
         (line, index) => {
-          const plain = `${" ".repeat(innerPad)}${index === 0 ? "$ " : "  "}${line}`;
+          const prompt = index === 0 ? "$ " : "  ";
           rows.push(
-            panelRow(
-              `${keyPrefix}-command-${index}`,
-              plain,
-              <Text color={theme.text} wrap="truncate">
-                {" ".repeat(innerPad)}
-                <Text color={theme.accent} bold>
-                  {index === 0 ? "$ " : "  "}
-                </Text>
-                {line}
-              </Text>,
-            ),
+            panelRow(`${keyPrefix}-command-${index}`, [
+              { text: " ".repeat(innerPad) },
+              {
+                text: prompt,
+                node: <Text color={theme.accent} bold>{prompt}</Text>,
+                color: theme.accent,
+              },
+              { text: line, node: <Text color={theme.text}>{line}</Text>, color: theme.text },
+            ]),
           );
         },
       );
@@ -204,14 +194,13 @@ function toolCallRows(
   }
 
   if (call.output) {
+    const outputTint = call.status === "error" ? theme.diff.removed : theme.muted;
     if (collapsed) {
       const plain = `${" ".repeat(innerPad)}output hidden (Ctrl+O to expand)`;
       rows.push(
-        panelRow(
-          `${keyPrefix}-output-hidden`,
-          plain,
-          <Text color={theme.muted}>{plain}</Text>,
-        ),
+        panelRow(`${keyPrefix}-output-hidden`, [
+          { text: plain, node: <Text color={theme.muted}>{plain}</Text>, color: theme.muted },
+        ]),
       );
     } else {
       const lines = call.output.split("\n");
@@ -219,19 +208,12 @@ function toolCallRows(
       visible.forEach((line, lineIndex) => {
         wrapPreservingWhitespace(line, Math.max(8, panelWidth - innerPad - 2)).forEach(
           (chunk, chunkIndex) => {
-            const plain = `${" ".repeat(innerPad)}${chunk || " "}`;
+            const body = chunk || " ";
             rows.push(
-              panelRow(
-                `${keyPrefix}-output-${lineIndex}-${chunkIndex}`,
-                plain,
-                <Text
-                  color={call.status === "error" ? theme.diff.removed : theme.muted}
-                  wrap="truncate"
-                >
-                  {" ".repeat(innerPad)}
-                  {chunk || " "}
-                </Text>,
-              ),
+              panelRow(`${keyPrefix}-output-${lineIndex}-${chunkIndex}`, [
+                { text: " ".repeat(innerPad) },
+                { text: body, node: <Text color={outputTint}>{body}</Text>, color: outputTint },
+              ]),
             );
           },
         );
@@ -239,11 +221,9 @@ function toolCallRows(
       if (lines.length > visible.length) {
         const plain = `${" ".repeat(innerPad)}… ${lines.length - visible.length} more lines`;
         rows.push(
-          panelRow(
-            `${keyPrefix}-output-more`,
-            plain,
-            <Text color={theme.muted}>{plain}</Text>,
-          ),
+          panelRow(`${keyPrefix}-output-more`, [
+            { text: plain, node: <Text color={theme.muted}>{plain}</Text>, color: theme.muted },
+          ]),
         );
       }
     }
@@ -253,11 +233,9 @@ function toolCallRows(
     if (collapsed) {
       const plain = `${" ".repeat(innerPad)}diff hidden (Ctrl+O to expand)`;
       rows.push(
-        panelRow(
-          `${keyPrefix}-diff-hidden`,
-          plain,
-          <Text color={theme.muted}>{plain}</Text>,
-        ),
+        panelRow(`${keyPrefix}-diff-hidden`, [
+          { text: plain, node: <Text color={theme.muted}>{plain}</Text>, color: theme.muted },
+        ]),
       );
     } else {
       rows.push(
@@ -269,13 +247,13 @@ function toolCallRows(
           panelWidth,
           theme,
           true,
-          background,
+          theme.tool.background,
         ).map((row, index) => ({
           ...row,
           key: `${keyPrefix}-diff-${index}`,
           node: (
             <Text wrap="truncate">
-              {margin}
+              {" ".repeat(TOOL_MARGIN)}
               {row.node}
             </Text>
           ),
