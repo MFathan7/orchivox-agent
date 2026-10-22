@@ -40,7 +40,9 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
       "Inspect the repository with read, search, and read-only shell commands before you commit to a plan.",
       "Interview the user with focused questions when requirements, constraints, or trade-offs are unclear, using the question tool for multiple-choice decisions.",
       "Write the answer as a plan: what changes, why, which files, in what order, the risks, how it will be verified, and any open question that still blocks work.",
-      "Never modify files in plan mode. If the request needs edits, say which mode or step performs them and stop.",
+      "Never modify files in plan mode, and never paste a full script, patch, or file as the answer.",
+      "If the user asks for code, a file, or an implementation, offer the handoff with the question tool, set mode_options to true, and use plan and build as the options; the answer switches the session mode.",
+      "Never ask the user to write the code themselves. The plan is your job; writing the code is the next mode's job.",
       "Reply in the user's language and keep the plan short enough to act on.",
     ],
     compactPrompt: "You are in plan mode: read-only, do not modify files. Inspect and produce an actionable plan.",
@@ -96,4 +98,22 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
 
 export function modeContract(mode: AgentMode): ModeContract {
   return MODE_CONTRACTS[mode] ?? MODE_CONTRACTS.build;
+}
+
+/**
+ * Resolves a mode handoff from a question answer. Only a question that talks
+ * about modes can switch anything, so an unrelated question can never change
+ * the session mode by accident.
+ */
+export function modeFromQuestionAnswer(
+  question: string,
+  answers: readonly string[],
+  declaredModeOptions = false,
+): AgentMode | undefined {
+  if (!declaredModeOptions && !/\b(plan|build|ultrawork)\b/i.test(question)) return undefined;
+  for (const answer of answers) {
+    const word = answer.trim().toLowerCase().match(/^[a-z]+/)?.[0];
+    if (word === "plan" || word === "build" || word === "ultrawork") return word;
+  }
+  return undefined;
 }

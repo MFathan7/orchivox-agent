@@ -146,7 +146,15 @@ export async function compactMessages(messages: Message[], options: CompactionOp
   const systems = messages.filter((message) => message.role === "system" && !isSummaryMessage(message));
   const conversation = messages.filter((message) => message.role !== "system");
   const previousSummary = options.previousSummary ?? extractSummary(messages);
-  const { tail, older } = selectTail(conversation, options.keepTokens ?? DEFAULT_KEEP_TOKENS);
+  const { tail: rawTail, older } = selectTail(conversation, options.keepTokens ?? DEFAULT_KEEP_TOKENS);
+  // The kept tail must not start on a tool result, or the model sees an answer
+  // to a call that the summary removed.
+  const tail = [...rawTail];
+  while (tail.length > 0 && tail[0]?.role === "tool") {
+    const previous = older.pop();
+    if (!previous) break;
+    tail.unshift(previous);
+  }
 
   if (older.length === 0) {
     // Nothing older to summarize. An oversized tool result is still survivable:

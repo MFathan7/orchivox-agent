@@ -351,6 +351,8 @@ export const WebFetchConfigSchema = z.object({
 export type WebFetchConfig = z.infer<typeof WebFetchConfigSchema>;
 
 export const PromptConfigSchema = z.object({
+  // "auto" always uses the full prompt, so every provider gets the same
+  // instructions. "compact" is an explicit opt-in for very small models.
   style: z.enum(["auto", "full", "compact"]).default("auto"),
 });
 export type PromptConfig = z.infer<typeof PromptConfigSchema>;
@@ -400,6 +402,23 @@ export const AppConfigSchema = z.object({
   prompt: PromptConfigSchema.prefault({}),
 });
 export type AppConfig = z.infer<typeof AppConfigSchema>;
+
+/**
+ * Returns the model when every mode pins the same one. Such a pin is really the
+ * session model, so callers can fold it into the main role and let one model
+ * choice cover every mode.
+ */
+export function sharedModeModel(
+  config: Pick<AppConfig, "modes">,
+): { provider: string; model: string } | undefined {
+  const refs = (["plan", "build", "ultrawork"] as const).map((mode) => config.modes[mode]?.model);
+  const first = refs[0];
+  if (!first) return undefined;
+  const shared = refs.every(
+    (ref) => ref !== undefined && ref.provider === first.provider && ref.model === first.model,
+  );
+  return shared ? { provider: first.provider, model: first.model } : undefined;
+}
 
 const ProviderSecretSchema = z.object({
   api_key: z.string().min(1).optional(),

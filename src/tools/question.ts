@@ -13,6 +13,11 @@ export const QuestionRequestSchema = z.object({
   options: z.array(QuestionOptionSchema).min(2).max(8),
   multiple: z.boolean().default(false),
   allow_custom: z.boolean().default(true),
+  /**
+   * The options are agent modes. Answering with plan, build, or ultrawork
+   * switches the session mode, so only set this for a mode handoff.
+   */
+  mode_options: z.boolean().default(false),
 });
 
 export type QuestionRequest = z.infer<typeof QuestionRequestSchema>;
@@ -35,7 +40,7 @@ export function createQuestionTool(
   return {
     name: "question",
     description:
-      "Ask the user a question when a requirement or choice is ambiguous. Provide 2 to 8 options. Set multiple=true to allow more than one answer. The user may type a custom answer. Do not use this for approval of risky actions; the approval flow handles that.",
+      "Ask the user a question when a requirement or choice is ambiguous. Provide 2 to 8 options. Set multiple=true to allow more than one answer. The user may type a custom answer. Set mode_options=true only when the options are agent modes (plan, build, ultrawork); the answer then switches the session mode. Do not use this for approval of risky actions; the approval flow handles that.",
     parameters: QuestionRequestSchema,
     readOnly: true,
     async execute(args) {

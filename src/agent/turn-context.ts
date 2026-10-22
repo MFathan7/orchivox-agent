@@ -5,6 +5,10 @@ import type { AgentMode } from "../types/schema";
 export interface TurnContext {
   mode: AgentMode;
   sessionId?: string;
+  /** Last user text for this turn, used by tools that need the request. */
+  userText?: string;
+  /** Skills the user invoked explicitly with /skill:<name>. */
+  forcedSkills?: string[];
 }
 
 const storage = new AsyncLocalStorage<TurnContext>();

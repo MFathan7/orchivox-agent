@@ -12,6 +12,18 @@ import {
 } from "../types/schema";
 import { ThinkTagStreamParser } from "./openai-compat";
 import { learnLimitsFromError } from "./limit-cache";
+import {
+  DEFAULT_IDLE_TIMEOUT_MS,
+  DEFAULT_PROVIDER_RETRY_POLICY,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  createRequestGuard,
+  isRetryableProviderError,
+  parseRetryAfterMs,
+  providerRetryDelayMs,
+  sleepAbortable,
+  timeoutMessage,
+  type RetryPolicy,
+} from "./retry";
 import type { LLMProvider } from "./router";
 import { iterateSse } from "./sse";
 
@@ -22,6 +34,11 @@ export interface AnthropicCompatProviderOptions {
   model?: string;
   pricing?: TokenPricing;
   capabilities: ModelCapabilities;
+  /** Time allowed for response headers before the request is aborted. */
+  timeoutMs?: number;
+  /** Longest silence allowed while streaming. */
+  idleTimeoutMs?: number;
+  retryPolicy?: RetryPolicy;
 }
 
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -127,6 +144,9 @@ export class AnthropicCompatProvider implements LLMProvider {
   private readonly model: string | undefined;
   private readonly pricing: TokenPricing | undefined;
   private readonly capabilities: ModelCapabilities;
+  private readonly timeoutMs: number;
+  private readonly idleTimeoutMs: number;
+  private readonly retryPolicy: RetryPolicy;
 
   constructor(options: AnthropicCompatProviderOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -135,220 +155,315 @@ export class AnthropicCompatProvider implements LLMProvider {
     this.model = options.model;
     this.pricing = options.pricing;
     this.capabilities = options.capabilities;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.retryPolicy = options.retryPolicy ?? DEFAULT_PROVIDER_RETRY_POLICY;
   }
 
   async *streamChat(req: ChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown> {
     const model = req.model ?? this.model;
     if (!model) throw new Error("ChatRequest.model is required when the provider has no default model");
 
-    let response: Response;
-    try {
-      response = await fetch(`${this.baseUrl}/v1/messages`, {
-        method: "POST",
-        headers: this.requestHeaders(),
-        body: JSON.stringify(buildMessagesPayload(req, model, this.capabilities)),
-        signal,
-      });
-    } catch (error) {
-      if (signal?.aborted) {
-        yield { type: "done", finish_reason: "aborted" };
-        return;
-      }
-      yield { type: "error", code: "request_failed", message: errorMessage(error), recoverable: true };
-      yield { type: "done", finish_reason: "error" };
-      return;
-    }
+    const policy = this.retryPolicy;
+    const guard = createRequestGuard(signal, {
+      timeoutMs: this.timeoutMs,
+      idleTimeoutMs: this.idleTimeoutMs,
+    });
 
-    if (!response.ok) {
-      const message = await readErrorBody(response);
-      learnLimitsFromError(this.baseUrl, model, message);
-      yield {
-        type: "error",
-        code: `http_${response.status}`,
-        message,
-        recoverable: false,
-      };
-      yield { type: "done", finish_reason: "error" };
-      return;
-    }
-    if (!response.body) {
-      yield {
-        type: "error",
-        code: "empty_body",
-        message: "provider returned an empty response body",
-        recoverable: false,
-      };
-      yield { type: "done", finish_reason: "error" };
-      return;
-    }
-
-    const blocks = new Map<number, { type: string; id: string; name: string; argumentsText: string }>();
-    const thinkParser = new ThinkTagStreamParser();
-    let promptTokens = 0;
-    let completionTokens = 0;
-    let cacheRead = 0;
-    let cacheCreation = 0;
-    let usageSeen = false;
-    let stopReason: string | undefined;
+    let response: Response | undefined;
+    let failureMessage = "";
+    let retries = 0;
 
     try {
-      stream: for await (const message of iterateSse(response.body, signal)) {
-        const json = parseJson(message.data);
-        switch (message.event) {
-          case "message_start": {
-            const parsed = AnthropicMessageStartSchema.safeParse(json);
-            if (!parsed.success) {
-              yield invalidEventError(message.event);
-              break;
-            }
-            const usage = parsed.data.message.usage;
-            if (usage) {
-              usageSeen = true;
-              promptTokens = usage.input_tokens ?? 0;
-              cacheRead = usage.cache_read_input_tokens ?? 0;
-              cacheCreation = usage.cache_creation_input_tokens ?? 0;
-            }
-            break;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+          response = await fetch(`${this.baseUrl}/v1/messages`, {
+            method: "POST",
+            headers: this.requestHeaders(),
+            body: JSON.stringify(buildMessagesPayload(req, model, this.capabilities)),
+            signal: guard.signal,
+          });
+        } catch (error) {
+          if (signal?.aborted) {
+            yield { type: "done", finish_reason: "aborted" };
+            return;
           }
-          case "content_block_start": {
-            const parsed = AnthropicContentBlockStartSchema.safeParse(json);
-            if (!parsed.success) {
-              yield invalidEventError(message.event);
-              break;
+          const timedOut = guard.timedOut();
+          const message = timedOut
+            ? timeoutMessage(guard.timeoutKind(), this.timeoutMs)
+            : errorMessage(error);
+          if (policy.enabled && !timedOut && retries < policy.maxRetries && isRetryableProviderError(message)) {
+            retries += 1;
+            const delayMs = providerRetryDelayMs(policy, retries);
+            yield {
+              type: "retry_scheduled",
+              attempt: retries,
+              max_attempts: policy.maxRetries,
+              delay_ms: delayMs,
+              reason: message.slice(0, 200),
+            };
+            try {
+              await sleepAbortable(delayMs, signal);
+            } catch {
+              yield { type: "done", finish_reason: "aborted" };
+              return;
             }
-            const { index, content_block: block } = parsed.data;
-            if (block.type === "tool_use") {
-              const id = block.id ?? `tool_${index}`;
-              blocks.set(index, { type: block.type, id, name: block.name ?? "", argumentsText: "" });
-              yield {
-                type: "tool_call_delta",
-                id,
-                index,
-                name_delta: block.name ?? "",
-                arguments_delta: "",
-              };
-            } else {
-              blocks.set(index, { type: block.type, id: "", name: "", argumentsText: "" });
-              if (block.type === "text" && block.text) yield { type: "token", text: block.text };
-              if (block.type === "thinking" && block.thinking) {
-                yield { type: "thinking_token", text: block.thinking };
-              }
-            }
-            break;
+            continue;
           }
-          case "content_block_delta": {
-            const parsed = AnthropicContentBlockDeltaSchema.safeParse(json);
-            if (!parsed.success) {
-              yield invalidEventError(message.event);
-              break;
-            }
-            const { index, delta } = parsed.data;
-            const state = blocks.get(index);
-            if (delta.type === "text_delta" && delta.text) {
-              for (const event of thinkParser.process(delta.text)) {
-                yield event;
-              }
-            } else if (delta.type === "thinking_delta" && delta.thinking) {
-              yield { type: "thinking_token", text: delta.thinking };
-            } else if (delta.type === "signature_delta" && delta.signature) {
-              yield { type: "thinking_token", text: "", signature: delta.signature };
-            } else if (delta.type === "input_json_delta") {
-              const fragment = delta.partial_json ?? "";
-              if (state) state.argumentsText += fragment;
-              yield {
-                type: "tool_call_delta",
-                id: state?.id ?? `tool_${index}`,
-                index,
-                name_delta: "",
-                arguments_delta: fragment,
-              };
-            }
-            break;
-          }
-          case "content_block_stop": {
-            const parsed = AnthropicContentBlockStopSchema.safeParse(json);
-            if (!parsed.success) {
-              yield invalidEventError(message.event);
-              break;
-            }
-            const state = blocks.get(parsed.data.index);
-            blocks.delete(parsed.data.index);
-            if (state?.type === "tool_use") {
-              const toolArguments = parseToolArguments(state.argumentsText);
-              if (!toolArguments) {
-                yield {
-                  type: "error",
-                  code: "tool_arguments_parse_error",
-                  message: `tool call "${state.name}" sent invalid JSON arguments`,
-                  recoverable: true,
-                };
-              } else {
-                yield { type: "tool_call_ready", id: state.id, name: state.name, arguments: toolArguments };
-              }
-            }
-            break;
-          }
-          case "message_delta": {
-            const parsed = AnthropicMessageDeltaSchema.safeParse(json);
-            if (!parsed.success) {
-              yield invalidEventError(message.event);
-              break;
-            }
-            const reason = parsed.data.delta?.stop_reason;
-            if (reason) stopReason = reason;
-            const output = parsed.data.usage?.output_tokens;
-            if (output != null) {
-              completionTokens = output;
-              usageSeen = true;
-            }
-            break;
-          }
-          case "message_stop":
-            break stream;
-          case "error": {
-            const parsed = AnthropicErrorEventSchema.safeParse(json);
+          yield {
+            type: "error",
+            code: timedOut ? "request_timeout" : "request_failed",
+            message,
+            recoverable: true,
+          };
+          yield { type: "done", finish_reason: "error" };
+          return;
+        }
+
+        if (response.ok) break;
+        failureMessage = await readErrorBody(response);
+        learnLimitsFromError(this.baseUrl, model, failureMessage);
+        const status = response.status;
+        const shouldRetryHeader = response.headers.get("x-should-retry");
+        const retryable =
+          shouldRetryHeader === "false"
+            ? false
+            : shouldRetryHeader === "true" || isRetryableProviderError(failureMessage, status);
+        if (policy.enabled && retries < policy.maxRetries && retryable) {
+          const serverDelay = parseRetryAfterMs(response.headers);
+          if (serverDelay !== undefined && serverDelay > policy.maxRetryAfterMs) {
             yield {
               type: "error",
-              code: parsed.success ? (parsed.data.error?.type ?? "provider_error") : "provider_error",
-              message: (parsed.success ? (parsed.data.error?.message ?? undefined) : undefined) ?? message.data,
+              code: `http_${status}`,
+              message: `provider asked to retry after ${Math.ceil(serverDelay / 1000)}s, above the ${Math.round(
+                policy.maxRetryAfterMs / 1000,
+              )}s limit: ${failureMessage}`,
               recoverable: false,
             };
             yield { type: "done", finish_reason: "error" };
             return;
           }
-          default:
-            break;
+          retries += 1;
+          const delayMs = serverDelay ?? providerRetryDelayMs(policy, retries);
+          yield {
+            type: "retry_scheduled",
+            attempt: retries,
+            max_attempts: policy.maxRetries,
+            delay_ms: delayMs,
+            reason: failureMessage.slice(0, 200),
+          };
+          try {
+            await sleepAbortable(delayMs, signal);
+          } catch {
+            yield { type: "done", finish_reason: "aborted" };
+            return;
+          }
+          continue;
         }
+        break;
       }
-      for (const event of thinkParser.flush()) {
-        yield event;
+
+      if (!response || !response.ok) {
+        yield {
+          type: "error",
+          code: response ? `http_${response.status}` : "request_failed",
+          message: failureMessage || "provider request failed",
+          recoverable: false,
+        };
+        yield { type: "done", finish_reason: "error" };
+        return;
       }
-    } catch (error) {
+      if (!response.body) {
+        yield {
+          type: "error",
+          code: "empty_body",
+          message: "provider returned an empty response body",
+          recoverable: false,
+        };
+        yield { type: "done", finish_reason: "error" };
+        return;
+      }
+
+      guard.startIdle();
+      const body = response.body;
+      const blocks = new Map<number, { type: string; id: string; name: string; argumentsText: string }>();
+      const thinkParser = new ThinkTagStreamParser();
+      let promptTokens = 0;
+      let completionTokens = 0;
+      let cacheRead = 0;
+      let cacheCreation = 0;
+      let usageSeen = false;
+      let stopReason: string | undefined;
+
+      try {
+        stream: for await (const message of iterateSse(body, guard.signal)) {
+          guard.touch();
+          const json = parseJson(message.data);
+          switch (message.event) {
+            case "message_start": {
+              const parsed = AnthropicMessageStartSchema.safeParse(json);
+              if (!parsed.success) {
+                yield invalidEventError(message.event);
+                break;
+              }
+              const usage = parsed.data.message.usage;
+              if (usage) {
+                usageSeen = true;
+                promptTokens = usage.input_tokens ?? 0;
+                cacheRead = usage.cache_read_input_tokens ?? 0;
+                cacheCreation = usage.cache_creation_input_tokens ?? 0;
+              }
+              break;
+            }
+            case "content_block_start": {
+              const parsed = AnthropicContentBlockStartSchema.safeParse(json);
+              if (!parsed.success) {
+                yield invalidEventError(message.event);
+                break;
+              }
+              const { index, content_block: block } = parsed.data;
+              if (block.type === "tool_use") {
+                const id = block.id ?? `tool_${index}`;
+                blocks.set(index, { type: block.type, id, name: block.name ?? "", argumentsText: "" });
+                yield {
+                  type: "tool_call_delta",
+                  id,
+                  index,
+                  name_delta: block.name ?? "",
+                  arguments_delta: "",
+                };
+              } else {
+                blocks.set(index, { type: block.type, id: "", name: "", argumentsText: "" });
+                if (block.type === "text" && block.text) yield { type: "token", text: block.text };
+                if (block.type === "thinking" && block.thinking) {
+                  yield { type: "thinking_token", text: block.thinking };
+                }
+              }
+              break;
+            }
+            case "content_block_delta": {
+              const parsed = AnthropicContentBlockDeltaSchema.safeParse(json);
+              if (!parsed.success) {
+                yield invalidEventError(message.event);
+                break;
+              }
+              const { index, delta } = parsed.data;
+              const state = blocks.get(index);
+              if (delta.type === "text_delta" && delta.text) {
+                for (const event of thinkParser.process(delta.text)) {
+                  yield event;
+                }
+              } else if (delta.type === "thinking_delta" && delta.thinking) {
+                yield { type: "thinking_token", text: delta.thinking };
+              } else if (delta.type === "signature_delta" && delta.signature) {
+                yield { type: "thinking_token", text: "", signature: delta.signature };
+              } else if (delta.type === "input_json_delta") {
+                const fragment = delta.partial_json ?? "";
+                if (state) state.argumentsText += fragment;
+                yield {
+                  type: "tool_call_delta",
+                  id: state?.id ?? `tool_${index}`,
+                  index,
+                  name_delta: "",
+                  arguments_delta: fragment,
+                };
+              }
+              break;
+            }
+            case "content_block_stop": {
+              const parsed = AnthropicContentBlockStopSchema.safeParse(json);
+              if (!parsed.success) {
+                yield invalidEventError(message.event);
+                break;
+              }
+              const state = blocks.get(parsed.data.index);
+              blocks.delete(parsed.data.index);
+              if (state?.type === "tool_use") {
+                const toolArguments = parseToolArguments(state.argumentsText);
+                if (!toolArguments) {
+                  yield {
+                    type: "error",
+                    code: "tool_arguments_parse_error",
+                    message: `tool call "${state.name}" sent invalid JSON arguments`,
+                    recoverable: true,
+                  };
+                } else {
+                  yield { type: "tool_call_ready", id: state.id, name: state.name, arguments: toolArguments };
+                }
+              }
+              break;
+            }
+            case "message_delta": {
+              const parsed = AnthropicMessageDeltaSchema.safeParse(json);
+              if (!parsed.success) {
+                yield invalidEventError(message.event);
+                break;
+              }
+              const reason = parsed.data.delta?.stop_reason;
+              if (reason) stopReason = reason;
+              const output = parsed.data.usage?.output_tokens;
+              if (output != null) {
+                completionTokens = output;
+                usageSeen = true;
+              }
+              break;
+            }
+            case "message_stop":
+              break stream;
+            case "error": {
+              const parsed = AnthropicErrorEventSchema.safeParse(json);
+              yield {
+                type: "error",
+                code: parsed.success ? (parsed.data.error?.type ?? "provider_error") : "provider_error",
+                message: (parsed.success ? (parsed.data.error?.message ?? undefined) : undefined) ?? message.data,
+                recoverable: false,
+              };
+              yield { type: "done", finish_reason: "error" };
+              return;
+            }
+            default:
+              break;
+          }
+        }
+        for (const event of thinkParser.flush()) {
+          yield event;
+        }
+      } catch (error) {
+        if (signal?.aborted) {
+          yield { type: "done", finish_reason: "aborted" };
+          return;
+        }
+        yield {
+          type: "error",
+          code: guard.timedOut() ? "request_timeout" : "stream_failed",
+          message: guard.timedOut()
+            ? timeoutMessage(guard.timeoutKind(), this.idleTimeoutMs)
+            : errorMessage(error),
+          recoverable: true,
+        };
+        yield { type: "done", finish_reason: "error" };
+        return;
+      }
+
       if (signal?.aborted) {
         yield { type: "done", finish_reason: "aborted" };
         return;
       }
-      yield { type: "error", code: "stream_failed", message: errorMessage(error), recoverable: true };
-      yield { type: "done", finish_reason: "error" };
-      return;
-    }
 
-    if (signal?.aborted) {
-      yield { type: "done", finish_reason: "aborted" };
-      return;
+      if (usageSeen) {
+        yield {
+          type: "usage",
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          cost_usd: computeCostUsd(promptTokens, completionTokens, this.pricing),
+          cache_read_input_tokens: cacheRead,
+          cache_creation_input_tokens: cacheCreation,
+        };
+      }
+      yield { type: "done", finish_reason: stopReason ? (STOP_REASONS[stopReason] ?? "stop") : "stop" };
+    } finally {
+      guard.dispose();
     }
-
-    if (usageSeen) {
-      yield {
-        type: "usage",
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        cost_usd: computeCostUsd(promptTokens, completionTokens, this.pricing),
-        cache_read_input_tokens: cacheRead,
-        cache_creation_input_tokens: cacheCreation,
-      };
-    }
-    yield { type: "done", finish_reason: stopReason ? (STOP_REASONS[stopReason] ?? "stop") : "stop" };
   }
 
   async listModels(signal?: AbortSignal): Promise<string[]> {

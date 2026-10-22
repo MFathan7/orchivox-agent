@@ -11,6 +11,18 @@ import {
   type TokenPricing,
 } from "../types/schema";
 import { learnLimitsFromError } from "./limit-cache";
+import {
+  DEFAULT_IDLE_TIMEOUT_MS,
+  DEFAULT_PROVIDER_RETRY_POLICY,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  createRequestGuard,
+  isRetryableProviderError,
+  parseRetryAfterMs,
+  providerRetryDelayMs,
+  sleepAbortable,
+  timeoutMessage,
+  type RetryPolicy,
+} from "./retry";
 import type { LLMProvider } from "./router";
 import { iterateSse } from "./sse";
 
@@ -22,6 +34,11 @@ export interface OpenAICompatProviderOptions {
   pricing?: TokenPricing;
   kind: ProviderKind;
   capabilities: ModelCapabilities;
+  /** Time allowed for response headers before the request is aborted. */
+  timeoutMs?: number;
+  /** Longest silence allowed while streaming. */
+  idleTimeoutMs?: number;
+  retryPolicy?: RetryPolicy;
 }
 
 const OpenAiToolCallFragmentSchema = z.object({
@@ -191,6 +208,9 @@ export class OpenAICompatProvider implements LLMProvider {
   private readonly pricing: TokenPricing | undefined;
   private readonly kind: ProviderKind;
   private readonly capabilities: ModelCapabilities;
+  private readonly timeoutMs: number;
+  private readonly idleTimeoutMs: number;
+  private readonly retryPolicy: RetryPolicy;
   private readonly unsupportedParams = new Set<string>();
 
   constructor(options: OpenAICompatProviderOptions) {
@@ -201,6 +221,9 @@ export class OpenAICompatProvider implements LLMProvider {
     this.pricing = options.pricing;
     this.kind = options.kind;
     this.capabilities = options.capabilities;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.retryPolicy = options.retryPolicy ?? DEFAULT_PROVIDER_RETRY_POLICY;
   }
 
   async *streamChat(req: ChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown> {
@@ -210,157 +233,253 @@ export class OpenAICompatProvider implements LLMProvider {
     const payload = buildChatPayload(req, model, this.kind, this.capabilities);
     for (const name of this.unsupportedParams) delete payload[name];
 
+    const policy = this.retryPolicy;
+    const guard = createRequestGuard(signal, {
+      timeoutMs: this.timeoutMs,
+      idleTimeoutMs: this.idleTimeoutMs,
+    });
+
     let response: Response | undefined;
     let failureMessage = "";
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    let retries = 0;
+    let adjustments = 0;
+
+    try {
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+          response = await fetch(`${this.baseUrl}/chat/completions`, {
+            method: "POST",
+            headers: this.requestHeaders(),
+            body: JSON.stringify(payload),
+            signal: guard.signal,
+          });
+        } catch (error) {
+          if (signal?.aborted) {
+            yield { type: "done", finish_reason: "aborted" };
+            return;
+          }
+          const timedOut = guard.timedOut();
+          const message = timedOut
+            ? timeoutMessage(guard.timeoutKind(), this.timeoutMs)
+            : errorMessage(error);
+          if (policy.enabled && !timedOut && retries < policy.maxRetries && isRetryableProviderError(message)) {
+            retries += 1;
+            const delayMs = providerRetryDelayMs(policy, retries);
+            yield {
+              type: "retry_scheduled",
+              attempt: retries,
+              max_attempts: policy.maxRetries,
+              delay_ms: delayMs,
+              reason: message.slice(0, 200),
+            };
+            try {
+              await sleepAbortable(delayMs, signal);
+            } catch {
+              yield { type: "done", finish_reason: "aborted" };
+              return;
+            }
+            continue;
+          }
+          yield {
+            type: "error",
+            code: timedOut ? "request_timeout" : "request_failed",
+            message,
+            recoverable: true,
+          };
+          yield { type: "done", finish_reason: "error" };
+          return;
+        }
+
+        if (response.ok) break;
+        failureMessage = await readErrorBody(response);
+        learnLimitsFromError(this.baseUrl, model, failureMessage);
+        const status = response.status;
+
+        // Deterministic request-shape fixes first: unsupported parameters and an
+        // output budget that does not fit the window. These never count as
+        // transport retries because the payload actually changed.
+        if (adjustments < 2 && status < 500 && status !== 429) {
+          let adjusted = false;
+          for (const name of unsupportedParameterNames(failureMessage)) {
+            if (!(name in payload)) continue;
+            delete payload[name];
+            this.unsupportedParams.add(name);
+            if (name.startsWith("reasoning")) this.capabilities.reasoning = false;
+            adjusted = true;
+          }
+          if (!adjusted) {
+            const nextMax = reducedMaxTokens(payload, failureMessage);
+            if (nextMax !== undefined) {
+              setPayloadMaxTokens(payload, nextMax);
+              adjusted = true;
+            }
+          }
+          if (adjusted) {
+            adjustments += 1;
+            continue;
+          }
+        }
+
+        const shouldRetryHeader = response.headers.get("x-should-retry");
+        const retryable =
+          shouldRetryHeader === "false"
+            ? false
+            : shouldRetryHeader === "true" || isRetryableProviderError(failureMessage, status);
+        if (policy.enabled && retries < policy.maxRetries && retryable) {
+          const serverDelay = parseRetryAfterMs(response.headers);
+          if (serverDelay !== undefined && serverDelay > policy.maxRetryAfterMs) {
+            yield {
+              type: "error",
+              code: `http_${status}`,
+              message: `provider asked to retry after ${Math.ceil(serverDelay / 1000)}s, above the ${Math.round(
+                policy.maxRetryAfterMs / 1000,
+              )}s limit: ${failureMessage}`,
+              recoverable: false,
+            };
+            yield { type: "done", finish_reason: "error" };
+            return;
+          }
+          retries += 1;
+          const delayMs = serverDelay ?? providerRetryDelayMs(policy, retries);
+          yield {
+            type: "retry_scheduled",
+            attempt: retries,
+            max_attempts: policy.maxRetries,
+            delay_ms: delayMs,
+            reason: failureMessage.slice(0, 200),
+          };
+          try {
+            await sleepAbortable(delayMs, signal);
+          } catch {
+            yield { type: "done", finish_reason: "aborted" };
+            return;
+          }
+          continue;
+        }
+        break;
+      }
+
+      if (!response || !response.ok) {
+        yield {
+          type: "error",
+          code: response ? `http_${response.status}` : "request_failed",
+          message: failureMessage || "provider request failed",
+          recoverable: false,
+        };
+        yield { type: "done", finish_reason: "error" };
+        return;
+      }
+      if (!response.body) {
+        yield {
+          type: "error",
+          code: "empty_body",
+          message: "provider returned an empty response body",
+          recoverable: false,
+        };
+        yield { type: "done", finish_reason: "error" };
+        return;
+      }
+
+      guard.startIdle();
+      const body = response.body;
+      const drafts = new Map<number, { id: string; name: string; argumentsText: string }>();
+      const thinkParser = new ThinkTagStreamParser();
+      let usage: OpenAiUsage;
+      let finishReason: FinishReason | undefined;
+
       try {
-        response = await fetch(`${this.baseUrl}/chat/completions`, {
-          method: "POST",
-          headers: this.requestHeaders(),
-          body: JSON.stringify(payload),
-          signal,
-        });
+        for await (const message of iterateSse(body, guard.signal)) {
+          guard.touch();
+          if (message.data === "[DONE]") break;
+          const chunk = OpenAiChunkSchema.safeParse(parseJson(message.data));
+          if (!chunk.success) {
+            yield {
+              type: "error",
+              code: "invalid_chunk",
+              message: "provider sent a chat completion chunk that could not be parsed",
+              recoverable: true,
+            };
+            continue;
+          }
+          if (chunk.data.usage) usage = chunk.data.usage;
+          for (const choice of chunk.data.choices) {
+            const delta = choice.delta;
+            if (delta) {
+              const reasoning = delta.reasoning_content ?? delta.reasoning ?? delta.thinking;
+              if (reasoning) yield { type: "thinking_token", text: reasoning };
+              if (delta.content) {
+                for (const event of thinkParser.process(delta.content)) {
+                  yield event;
+                }
+              }
+              for (const fragment of delta.tool_calls ?? []) {
+                const index = fragment.index;
+                let draft = drafts.get(index);
+                if (!draft) {
+                  draft = { id: fragment.id ?? `call_${index}`, name: "", argumentsText: "" };
+                  drafts.set(index, draft);
+                }
+                const nameFragment = fragment.function?.name ?? "";
+                const argumentsFragment = fragment.function?.arguments ?? "";
+                draft.name += nameFragment;
+                draft.argumentsText += argumentsFragment;
+                yield {
+                  type: "tool_call_delta",
+                  id: draft.id,
+                  index,
+                  name_delta: nameFragment,
+                  arguments_delta: argumentsFragment,
+                };
+              }
+            }
+            if (choice.finish_reason) finishReason = FINISH_REASONS[choice.finish_reason] ?? "stop";
+          }
+        }
+        for (const event of thinkParser.flush()) {
+          yield event;
+        }
       } catch (error) {
         if (signal?.aborted) {
           yield { type: "done", finish_reason: "aborted" };
           return;
         }
-        yield { type: "error", code: "request_failed", message: errorMessage(error), recoverable: true };
+        yield {
+          type: "error",
+          code: guard.timedOut() ? "request_timeout" : "stream_failed",
+          message: guard.timedOut()
+            ? timeoutMessage(guard.timeoutKind(), this.idleTimeoutMs)
+            : errorMessage(error),
+          recoverable: true,
+        };
         yield { type: "done", finish_reason: "error" };
         return;
       }
 
-      if (response.ok) break;
-      failureMessage = await readErrorBody(response);
-      learnLimitsFromError(this.baseUrl, model, failureMessage);
-      if (attempt >= 2) break;
-
-      let adjusted = false;
-      for (const name of unsupportedParameterNames(failureMessage)) {
-        if (!(name in payload)) continue;
-        delete payload[name];
-        this.unsupportedParams.add(name);
-        if (name.startsWith("reasoning")) this.capabilities.reasoning = false;
-        adjusted = true;
-      }
-      if (!adjusted) {
-        const nextMax = reducedMaxTokens(payload, failureMessage);
-        if (nextMax !== undefined) {
-          setPayloadMaxTokens(payload, nextMax);
-          adjusted = true;
-        }
-      }
-      if (!adjusted) break;
-    }
-
-    if (!response || !response.ok) {
-      yield {
-        type: "error",
-        code: response ? `http_${response.status}` : "request_failed",
-        message: failureMessage || "provider request failed",
-        recoverable: false,
-      };
-      yield { type: "done", finish_reason: "error" };
-      return;
-    }
-    if (!response.body) {
-      yield {
-        type: "error",
-        code: "empty_body",
-        message: "provider returned an empty response body",
-        recoverable: false,
-      };
-      yield { type: "done", finish_reason: "error" };
-      return;
-    }
-
-    const drafts = new Map<number, { id: string; name: string; argumentsText: string }>();
-    const thinkParser = new ThinkTagStreamParser();
-    let usage: OpenAiUsage;
-    let finishReason: FinishReason | undefined;
-
-    try {
-      for await (const message of iterateSse(response.body, signal)) {
-        if (message.data === "[DONE]") break;
-        const chunk = OpenAiChunkSchema.safeParse(parseJson(message.data));
-        if (!chunk.success) {
-          yield {
-            type: "error",
-            code: "invalid_chunk",
-            message: "provider sent a chat completion chunk that could not be parsed",
-            recoverable: true,
-          };
-          continue;
-        }
-        if (chunk.data.usage) usage = chunk.data.usage;
-        for (const choice of chunk.data.choices) {
-          const delta = choice.delta;
-          if (delta) {
-            const reasoning = delta.reasoning_content ?? delta.reasoning ?? delta.thinking;
-            if (reasoning) yield { type: "thinking_token", text: reasoning };
-            if (delta.content) {
-              for (const event of thinkParser.process(delta.content)) {
-                yield event;
-              }
-            }
-            for (const fragment of delta.tool_calls ?? []) {
-              const index = fragment.index;
-              let draft = drafts.get(index);
-              if (!draft) {
-                draft = { id: fragment.id ?? `call_${index}`, name: "", argumentsText: "" };
-                drafts.set(index, draft);
-              }
-              const nameFragment = fragment.function?.name ?? "";
-              const argumentsFragment = fragment.function?.arguments ?? "";
-              draft.name += nameFragment;
-              draft.argumentsText += argumentsFragment;
-              yield {
-                type: "tool_call_delta",
-                id: draft.id,
-                index,
-                name_delta: nameFragment,
-                arguments_delta: argumentsFragment,
-              };
-            }
-          }
-          if (choice.finish_reason) finishReason = FINISH_REASONS[choice.finish_reason] ?? "stop";
-        }
-      }
-      for (const event of thinkParser.flush()) {
-        yield event;
-      }
-    } catch (error) {
       if (signal?.aborted) {
         yield { type: "done", finish_reason: "aborted" };
         return;
       }
-      yield { type: "error", code: "stream_failed", message: errorMessage(error), recoverable: true };
-      yield { type: "done", finish_reason: "error" };
-      return;
-    }
 
-    if (signal?.aborted) {
-      yield { type: "done", finish_reason: "aborted" };
-      return;
-    }
-
-    for (const [index, draft] of [...drafts.entries()].sort(([a], [b]) => a - b)) {
-      const toolArguments = parseToolArguments(draft.argumentsText);
-      if (!toolArguments) {
-        yield {
-          type: "error",
-          code: "tool_arguments_parse_error",
-          message: `tool call "${draft.name || `call_${index}`}" sent invalid JSON arguments`,
-          recoverable: true,
-        };
-        continue;
+      for (const [index, draft] of [...drafts.entries()].sort(([a], [b]) => a - b)) {
+        const toolArguments = parseToolArguments(draft.argumentsText);
+        if (!toolArguments) {
+          yield {
+            type: "error",
+            code: "tool_arguments_parse_error",
+            message: `tool call "${draft.name || `call_${index}`}" sent invalid JSON arguments`,
+            recoverable: true,
+          };
+          continue;
+        }
+        yield { type: "tool_call_ready", id: draft.id, name: draft.name, arguments: toolArguments };
       }
-      yield { type: "tool_call_ready", id: draft.id, name: draft.name, arguments: toolArguments };
-    }
 
-    const usageEvent = buildUsageEvent(usage, this.pricing);
-    if (usageEvent) yield usageEvent;
-    yield { type: "done", finish_reason: finishReason ?? (drafts.size > 0 ? "tool_calls" : "stop") };
+      const usageEvent = buildUsageEvent(usage, this.pricing);
+      if (usageEvent) yield usageEvent;
+      yield { type: "done", finish_reason: finishReason ?? (drafts.size > 0 ? "tool_calls" : "stop") };
+    } finally {
+      guard.dispose();
+    }
   }
 
   async listModels(signal?: AbortSignal): Promise<string[]> {

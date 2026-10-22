@@ -100,6 +100,7 @@ export interface TaskBoardOptions {
 }
 
 const RESULT_EXCERPT = 400;
+const CHAIN_RESULT_LIMIT = 12_000;
 
 export class TaskBoard {
   private readonly tasks = new Map<string, TaskItem>();
@@ -202,8 +203,50 @@ export class TaskBoard {
       }
     }
 
+    this.blockCycles(created);
+
     for (const item of created) this.persist(item);
     return created;
+  }
+
+  /** Blocks tasks that depend on each other in a loop, which would never start. */
+  private blockCycles(created: TaskItem[]): void {
+    const visit = (
+      id: string,
+      path: string[],
+      done: Set<string>,
+      stack: Set<string>,
+    ): string[] | undefined => {
+      if (stack.has(id)) {
+        const start = path.indexOf(id);
+        return [...path.slice(start), id];
+      }
+      if (done.has(id)) return undefined;
+      const task = this.tasks.get(id);
+      if (!task) return undefined;
+      done.add(id);
+      stack.add(id);
+      path.push(id);
+      for (const dependency of task.dependsOn) {
+        const cycle = visit(dependency, path, done, stack);
+        if (cycle) return cycle;
+      }
+      path.pop();
+      stack.delete(id);
+      return undefined;
+    };
+
+    for (const item of created) {
+      const cycle = visit(item.id, [], new Set(), new Set());
+      if (!cycle) continue;
+      for (const id of cycle) {
+        const task = this.tasks.get(id);
+        if (!task || task.state !== "pending") continue;
+        task.state = "blocked";
+        task.error = `dependency cycle: ${cycle.join(" -> ")}`;
+        task.updatedAt = Date.now();
+      }
+    }
   }
 
   list(): TaskItem[] {
@@ -328,6 +371,34 @@ export class TaskBoard {
     }
   }
 
+  /**
+   * Replaces {previous} with the last dependency result and {result:<id>} with a
+   * named dependency result, so a chain of tasks can pass work forward.
+   */
+  private renderTaskText(task: TaskItem): string {
+    let text = task.task;
+    const previousId = task.dependsOn[task.dependsOn.length - 1];
+    if (previousId && text.includes("{previous}")) {
+      text = text.split("{previous}").join(this.dependencyResult(previousId));
+    }
+    for (const dependencyId of task.dependsOn) {
+      const token = `{result:${dependencyId}}`;
+      if (text.includes(token)) {
+        text = text.split(token).join(this.dependencyResult(dependencyId));
+      }
+    }
+    return text;
+  }
+
+  private dependencyResult(taskId: string): string {
+    const dependency = this.tasks.get(taskId);
+    const value = dependency?.result ?? "";
+    if (value.length === 0) return "(no result from " + taskId + ")";
+    return value.length > CHAIN_RESULT_LIMIT
+      ? `${value.slice(0, CHAIN_RESULT_LIMIT)}\n\n[... result truncated to fit the next task]`
+      : value;
+  }
+
   private startTask(task: TaskItem): void {
     task.state = "running";
     task.updatedAt = Date.now();
@@ -338,7 +409,7 @@ export class TaskBoard {
     try {
       handle = this.spawner({
         id: task.id,
-        task: task.task,
+        task: this.renderTaskText(task),
         agent: task.agent,
         mode: task.mode,
         roleModel: task.roleModel,
@@ -395,7 +466,12 @@ export class TaskBoard {
     return {
       name: "task_create",
       description:
-        "Create tasks on the multi-agent board. Each task becomes a subagent worker with its own context, optionally isolated in a git worktree and routed to a model role or provider/model. Include every file path and decision the worker needs. Use depends_on to build a DAG. Tasks start automatically unless auto_start is false.",
+        [
+          "Create tasks on the multi-agent board. Each task becomes a subagent worker with its own context, optionally isolated in a git worktree and routed to a model role or provider/model.",
+          "Use depends_on to build a DAG, and write {previous} or {result:<task-id>} inside a task to hand a dependency result to it, which turns a chain of tasks into a pipeline.",
+          "Chain steps see each other's files only when write_isolation is false, which is the right choice for a pipeline that edits the same files.",
+          "Include every file path and decision the worker needs. Tasks start automatically unless auto_start is false.",
+        ].join(" "),
       parameters: z.object({
         tasks: z
           .array(

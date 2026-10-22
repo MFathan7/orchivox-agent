@@ -189,6 +189,24 @@ export class ProviderRouter {
     this.config.modes[mode] = { ...this.config.modes[mode], model: { provider, model } };
   }
 
+  /** Drops every per-mode model pin so the main model answers in all modes. */
+  clearModeModels(): void {
+    for (const mode of ["plan", "build", "ultrawork"] as AgentMode[]) {
+      const settings = this.config.modes[mode];
+      if (!settings?.model) continue;
+      const { model: _dropped, ...rest } = settings;
+      this.config.modes[mode] = rest;
+    }
+  }
+
+  /** Per-mode pins that override the main model, for the picker hint. */
+  modeModelOverrides(): Array<{ mode: AgentMode; provider: string; model: string }> {
+    return (["plan", "build", "ultrawork"] as AgentMode[]).flatMap((mode) => {
+      const ref = this.config.modes[mode]?.model;
+      return ref ? [{ mode, provider: ref.provider, model: ref.model }] : [];
+    });
+  }
+
   setModeReasoning(mode: AgentMode, reasoning: string): void {
     this.config.modes[mode] = { ...this.config.modes[mode], reasoning };
   }
@@ -384,6 +402,7 @@ function createProvider(
     pricing: profile.pricing,
     kind: profile.kind,
     capabilities,
+    timeoutMs: profile.timeout_ms,
   };
   switch (profile.kind) {
     case "openai":

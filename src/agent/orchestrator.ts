@@ -78,6 +78,7 @@ import {
   type ProjectEvidence,
 } from "./project-evidence";
 import { createQuestionTool, type QuestionHandler } from "../tools/question";
+import { parseTextToolCall } from "./text-tool-call";
 import {
   isDesignQuestion,
   looksLikeInternalDump,
@@ -97,7 +98,8 @@ import {
 import { SubagentManager, type SubagentTaskInput, type SubagentTaskResult, type SubagentWorkerState } from "./subagent";
 import { buildSystemPrompt } from "./system-prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
-import { runWithTurnContext } from "./turn-context";
+import { currentTurnContext, runWithTurnContext } from "./turn-context";
+import { sleepAbortable } from "../provider/retry";
 import { modeContract } from "./modes";
 import { SKILL_ALWAYS_ALLOWED_TOOLS, SkillToolPolicy } from "./skill-policy";
 import { TodoEngine } from "./todo";
@@ -163,6 +165,30 @@ const VERIFY_TOOL_NAMES = new Set(["diagnostics_check"]);
 const VERIFY_COMMAND =
   /\b(?:bun\s+test|bun\s+run\s+(?:typecheck|test|check|lint)|npm\s+(?:test|run)|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|pytest|cargo\s+test|go\s+test|tsc\b|vitest|jest|eslint|biome)\b/i;
 
+/** `/skill:<name> [args]` forces a skill, like the portable skill command. */
+const SKILL_DIRECTIVE = /^\/skill:([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/;
+
+/** Extra attempts when a provider fails before producing any output. */
+const MAX_TURN_RETRIES = 1;
+
+const PLAN_MODE_NUDGE = [
+  "You are in PLAN mode. Return a plan, not an implementation.",
+  "Do not paste a full script, patch, or file, and do not ask the user to write it.",
+  "If the user wants the code, tell them to switch to build mode, then stop.",
+].join(" ");
+
+/** A fenced block with this many lines is an implementation, not a plan. */
+const PLAN_CODE_LINE_LIMIT = 30;
+
+function looksLikeImplementationDump(text: string): boolean {
+  const fences = [...text.matchAll(/```[^\n]*\n([\s\S]*?)```/g)];
+  const codeLines = fences.reduce(
+    (sum, match) => sum + (match[1]?.split("\n").length ?? 0),
+    0,
+  );
+  return codeLines >= PLAN_CODE_LINE_LIMIT;
+}
+
 const VERIFY_NUDGE = [
   "You changed files but did not verify them.",
   "Run diagnostics_check and the tests or checks that cover the change, fix what they report, then give the final summary.",
@@ -214,6 +240,7 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly taskRequests = new Map<string, AgentTaskRequest>();
   private readonly pendingDiagnostics = new Map<string, string>();
   private questionHandler: QuestionHandler | undefined;
+  private requestedModeSwitch: AgentMode | undefined;
 
   constructor(options: AgentOrchestratorOptions) {
     this.router = options.router;
@@ -252,6 +279,21 @@ export class AgentOrchestrator implements IAgentRunner {
       store: options.database,
     });
     this.registerDefaultTools();
+  }
+
+  /**
+   * Asks the running turn to continue in another mode, for example after the
+   * user picks build in a plan-to-build handoff question. The turn switches at
+   * the next tool boundary so the tool gate, not just the next turn, unlocks.
+   */
+  requestModeSwitch(mode: AgentMode): void {
+    this.requestedModeSwitch = mode;
+  }
+
+  private consumeModeSwitch(): AgentMode | undefined {
+    const next = this.requestedModeSwitch;
+    this.requestedModeSwitch = undefined;
+    return next;
   }
 
   setQuestionHandler(handler: QuestionHandler | undefined): void {
@@ -299,7 +341,7 @@ export class AgentOrchestrator implements IAgentRunner {
 
   estimateContextOverhead(mode: AgentMode): number {
     const providerRef = this.router.getModeModel(mode);
-    const compact = this.useCompactPrompt(providerRef?.provider);
+    const compact = this.useCompactPrompt();
     const system = buildSystemPrompt({
       mode,
       repoRoot: this.root,
@@ -451,8 +493,12 @@ export class AgentOrchestrator implements IAgentRunner {
     }
 
     let messages: Message[] = [...request.messages];
-    const contract = modeContract(mode);
+    let contract = modeContract(mode);
     const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
+    // Ids are stored in the session database, so every run needs its own prefix
+    // or a second user turn would reuse turn-0 and collide.
+    const runId = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const persistedIds = new Set<string>();
 
     const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
     if (lastUserIdx !== -1) {
@@ -476,8 +522,36 @@ export class AgentOrchestrator implements IAgentRunner {
     }
 
     const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-    const lastText =
+    let lastText =
       lastUserMsg?.content.map((b) => (b.type === "text" ? b.text : "")).join(" ") ?? "";
+
+    // `/skill:<name> [args]` forces a skill and turns the rest of the line into
+    // the request, so the model follows the skill instead of reading the command.
+    let forcedSkill: SkillDocument | undefined;
+    const skillDirective = SKILL_DIRECTIVE.exec(lastText.trim());
+    if (skillDirective && lastUserMsg) {
+      const document = this.skills.get(skillDirective[1]);
+      if (document) {
+        forcedSkill = document;
+        const args = (skillDirective[2] ?? "").trim();
+        const replacement =
+          args.length > 0 ? args : `Follow the ${document.name} skill for this request.`;
+        const content = lastUserMsg.content.map((block) =>
+          block.type === "text" ? { ...block, text: replacement } : block,
+        );
+        messages = messages.map((message) =>
+          message.id === lastUserMsg.id ? { ...message, content } : message,
+        );
+        lastText = replacement;
+      }
+    }
+
+    const turnContext = currentTurnContext();
+    if (turnContext) {
+      turnContext.userText = lastText;
+      turnContext.forcedSkills = forcedSkill ? [forcedSkill.name] : [];
+    }
+
     if (!activeSpecialist && lastText) {
       const mention = await this.specialistAgents.parseMention(lastText);
       if (mention?.profile) {
@@ -498,8 +572,11 @@ export class AgentOrchestrator implements IAgentRunner {
       : this.router.capabilitiesForMode(mode);
     if (!capabilities.vision) messages = stripImageBlocks(messages);
 
-    const compact = this.useCompactPrompt(providerRef?.provider);
+    const compact = this.useCompactPrompt();
     const mentionedSkills = lastText ? parseSkillMentions(lastText, this.skills) : [];
+    if (forcedSkill && !mentionedSkills.some((entry) => entry.name === forcedSkill?.name)) {
+      mentionedSkills.unshift(forcedSkill);
+    }
     for (const document of mentionedSkills) {
       const newlyActivated = this.activateSkill(sessionId, document.name);
       if (newlyActivated) {
@@ -511,7 +588,9 @@ export class AgentOrchestrator implements IAgentRunner {
         });
       }
     }
-    const namedSkills = compact && lastText ? matchSkillNames(lastText, this.skills) : [];
+    // Name matching is provider-independent on purpose: the same request loads
+    // the same skills whatever model answers it.
+    const namedSkills = lastText ? matchSkillNames(lastText, this.skills) : [];
     const turnSkills = [
       ...new Map(
         [...mentionedSkills, ...namedSkills].map((document) => [document.name, document]),
@@ -729,6 +808,8 @@ export class AgentOrchestrator implements IAgentRunner {
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
     let verifyNudges = 0;
+    let planNudges = 0;
+    let turnRetries = 0;
     let projectNudged = false;
     let editedThisTurn = false;
     let verifiedThisTurn = false;
@@ -837,6 +918,60 @@ export class AgentOrchestrator implements IAgentRunner {
       return candidate;
     };
 
+    // The database keeps every tool call and its result so a resumed session
+    // still has the full conversation. The final text answer is stored by the
+    // client with its own display metadata, so it is not stored twice here.
+    const persistConversationMessage = (message: Message): void => {
+      if (!sessionId) return;
+      const hasToolUse = message.content.some((block) => block.type === "tool_use");
+      if (message.role === "assistant" && !hasToolUse) return;
+      if (message.role !== "assistant" && message.role !== "tool") return;
+      const content = message.content.filter((block) => block.type !== "thinking");
+      try {
+        this.database.saveMessage(sessionId, { ...message, content });
+        persistedIds.add(message.id);
+      } catch {
+        // A deleted session must not break the turn.
+      }
+    };
+
+    // A compaction tail may start at an internal notice that was never stored.
+    // Point it at the first stored message so resume still keeps the tail.
+    const persistableTail = (tailId: string | undefined): string | undefined => {
+      if (!tailId) return undefined;
+      const index = messages.findIndex((message) => message.id === tailId);
+      if (index === -1) return undefined;
+      for (let cursor = index; cursor < messages.length; cursor += 1) {
+        const candidate = messages[cursor];
+        if (candidate && persistedIds.has(candidate.id)) return candidate.id;
+      }
+      return undefined;
+    };
+
+    const applyModeSwitch = (next: AgentMode, turn: number): void => {
+      if (next === mode) return;
+      const from = mode;
+      mode = next;
+      contract = modeContract(mode);
+      tools = this.combineTools(request.tools, mode);
+      if (!capabilities.tool_calling) tools = [];
+      if (activeSpecialist) {
+        tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
+      }
+      messages.push(
+        makeMessage(
+          `turn-${turn}-mode`,
+          "system",
+          [
+            `The user switched this session from ${from.toUpperCase()} to ${mode.toUpperCase()} mode.`,
+            `Write access is ${contract.fullAccess ? "now enabled" : "still restricted"}.`,
+            "Continue the task in the new mode. Do not ask for this switch again.",
+          ].join(" "),
+        ),
+      );
+      sink({ type: "mode_changed", from, to: mode });
+    };
+
     const retryAfterInternalDump = async (originalText: string): Promise<string> => {
       const retrySystem = [
         system,
@@ -878,6 +1013,8 @@ export class AgentOrchestrator implements IAgentRunner {
     };
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
+      const requestedMode = this.consumeModeSwitch();
+      if (requestedMode) applyModeSwitch(requestedMode, turn);
       if (this.compactionConfig.auto) {
         const compaction = await compactMessages(messages, {
           provider,
@@ -905,7 +1042,7 @@ export class AgentOrchestrator implements IAgentRunner {
             summary_tokens: compaction.summaryTokens,
             summary: compaction.summary,
             removed_messages: compaction.removedMessages,
-            tail_start_message_id: compaction.tailStartMessageId,
+            tail_start_message_id: persistableTail(compaction.tailStartMessageId),
           });
         }
       }
@@ -919,7 +1056,7 @@ export class AgentOrchestrator implements IAgentRunner {
       const guardWebTools =
         turn === 0 &&
         !explicitWebIntent &&
-        (projectStudy || projectQuestion || (compact && injectedTurnSkills.length > 0));
+        (projectStudy || projectQuestion || injectedTurnSkills.length > 0);
       const forceNoTools = turn === 0 && (projectIdentity || capabilityQuestion);
       const turnTools = forceNoTools
         ? []
@@ -974,14 +1111,25 @@ export class AgentOrchestrator implements IAgentRunner {
               };
             }
             break;
-          case "error":
+          case "retry_scheduled":
+            sink(event);
+            break;
+          case "error": {
             turnError = event.message;
             if (isContextOverflow(event.message)) contextOverflow = true;
-            if (!isAutoHandledProviderError(event.message)) {
+            // A recovered provider failure restarts the turn only when nothing was
+            // streamed yet, so the transcript never contains a half answer.
+            const canRetryTurn =
+              event.recoverable === true &&
+              !accumulator.hasOutput() &&
+              !contextOverflow &&
+              turnRetries < MAX_TURN_RETRIES;
+            if (!isAutoHandledProviderError(event.message) && !canRetryTurn) {
               sink(event);
               errorSunk = true;
             }
             break;
+          }
           case "done":
             finishReason = event.finish_reason;
             break;
@@ -991,6 +1139,31 @@ export class AgentOrchestrator implements IAgentRunner {
           default:
             break;
         }
+      }
+
+      if (turnError && !contextOverflow && !errorSunk && turnRetries < MAX_TURN_RETRIES) {
+        turnRetries += 1;
+        const delayMs = 500 * turnRetries;
+        sink({
+          type: "retry_scheduled",
+          attempt: turnRetries,
+          max_attempts: MAX_TURN_RETRIES,
+          delay_ms: delayMs,
+          reason: turnError.slice(0, 200),
+        });
+        try {
+          await sleepAbortable(delayMs, signal);
+        } catch {
+          sink({ type: "done", finish_reason: "aborted" });
+          return {
+            message: makeMessage(`turn-${turn}`, "assistant", ""),
+            usage: totals,
+            finish_reason: "aborted",
+          };
+        }
+        turnError = undefined;
+        finishReason = "stop";
+        continue;
       }
 
       if (turnError && isOutputBudgetError(turnError) && !outputBudgetRetried) {
@@ -1048,8 +1221,31 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
 
-      const assistantMessage = accumulator.toMessage(`turn-${turn}`);
+      // A model that prints a tool call as JSON text never reaches the tool
+      // channel. Recover it so the work still runs, then drop the JSON text.
+      if (!turnError && finishReason === "stop" && accumulator.hasTextOutput()) {
+        const recovered = parseTextToolCall(
+          accumulator.textOutput(),
+          turnTools.map((tool) => tool.name),
+        );
+        if (recovered) {
+          accumulator.discardText();
+          accumulator.finishTool({
+            type: "tool_call_ready",
+            id: recovered.id,
+            name: recovered.name,
+            arguments: recovered.arguments,
+          });
+          // The JSON was already streamed; clear it so the client shows the
+          // tool rows and the real answer instead of the raw call text.
+          sink({ type: "final_text", text: "" });
+          finishReason = "tool_calls";
+        }
+      }
+
+      const assistantMessage = accumulator.toMessage(`${runId}-turn-${turn}`);
       messages.push(assistantMessage);
+      persistConversationMessage(assistantMessage);
       const toolUses = assistantMessage.content.filter((block) => block.type === "tool_use");
 
       if (toolUses.length === 0 && !turnError && !accumulator.hasTextOutput()) {
@@ -1088,6 +1284,17 @@ export class AgentOrchestrator implements IAgentRunner {
           messages.push(makeMessage(`turn-${turn}-verify`, "user", VERIFY_NUDGE));
           continue;
         }
+        if (
+          !turnError &&
+          mode === "plan" &&
+          finishReason === "stop" &&
+          planNudges < 1 &&
+          looksLikeImplementationDump(accumulator.textOutput())
+        ) {
+          planNudges += 1;
+          messages.push(makeMessage(`turn-${turn}-plan`, "user", PLAN_MODE_NUDGE));
+          continue;
+        }
         if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES) {
           outputLimitContinues += 1;
           if (!outputLimitCompacted) {
@@ -1122,7 +1329,7 @@ export class AgentOrchestrator implements IAgentRunner {
                 summary_tokens: compacted.summaryTokens,
                 summary: compacted.summary,
                 removed_messages: compacted.removedMessages,
-                tail_start_message_id: compacted.tailStartMessageId,
+                tail_start_message_id: persistableTail(compacted.tailStartMessageId),
               });
             }
           }
@@ -1174,10 +1381,15 @@ export class AgentOrchestrator implements IAgentRunner {
           const cleaned = shouldRetryDump
             ? await retryAfterInternalDump(rawText)
             : sanitizeAssistantText(rawText);
+          // A thinking model can put the whole answer in its reasoning stream.
+          // Prefer that over an error that tells the user nothing.
+          const reasoningAnswer = accumulator.reasoningOutput().trim();
           const finalText =
             cleaned.length > 0
               ? cleaned
-              : "The model returned internal metadata instead of an answer. Please retry.";
+              : reasoningAnswer.length > 0
+                ? sanitizeAssistantText(reasoningAnswer)
+                : "The model returned internal metadata instead of an answer. Please retry.";
           if (finalText !== rawText) {
             finalMessage = makeMessage(assistantMessage.id, "assistant", finalText);
             sink({ type: "final_text", text: finalText });
@@ -1235,7 +1447,9 @@ export class AgentOrchestrator implements IAgentRunner {
         });
 
         if (!skillPolicy.allows(call.name)) {
-          messages.push(toolResultMessage(call, `blocked: the active skill does not allow the ${call.name} tool`, true));
+          const blocked = toolResultMessage(call, `blocked: the active skill does not allow the ${call.name} tool`, true, runId);
+          messages.push(blocked);
+          persistConversationMessage(blocked);
           sink({
             type: "tool_end",
             id: call.id,
@@ -1250,7 +1464,9 @@ export class AgentOrchestrator implements IAgentRunner {
 
         const pre = await this.hooks.runPreToolUse({ toolName: call.name, args: call.arguments, filePath });
         if (pre.allowed === false) {
-          messages.push(toolResultMessage(call, `blocked: ${pre.reason ?? "pre tool use hook"}`, true));
+          const blocked = toolResultMessage(call, `blocked: ${pre.reason ?? "pre tool use hook"}`, true, runId);
+          messages.push(blocked);
+          persistConversationMessage(blocked);
           sink({
             type: "tool_end",
             id: call.id,
@@ -1364,13 +1580,18 @@ export class AgentOrchestrator implements IAgentRunner {
           }
         }
 
-        messages.push(toolResultMessage(call, content, result.is_error));
+        const toolResult = toolResultMessage(call, content, result.is_error, runId);
+        messages.push(toolResult);
+        persistConversationMessage(toolResult);
         if (skillDocument) {
           this.activateSkill(sessionId, skillDocument.name);
           await rebuildSystem();
         }
         if (filePath && mutates && contract.advisor) this.advisor.scheduleReview();
       }
+
+      const switchedMode = this.consumeModeSwitch();
+      if (switchedMode) applyModeSwitch(switchedMode, turn);
 
       if (toolUses.length > 0 && !projectNudged) {
         if (projectStudy) {
@@ -1499,10 +1720,12 @@ export class AgentOrchestrator implements IAgentRunner {
     }
   }
 
-  private useCompactPrompt(providerName: string | undefined): boolean {
-    if (this.promptStyle === "full") return false;
-    if (this.promptStyle === "compact") return true;
-    return providerName ? this.router.providerKind(providerName) === "ollama" : false;
+  /**
+   * The compact prompt is an explicit opt-in. Provider kind never changes the
+   * instructions, so every model gets the same guidance in every mode.
+   */
+  private useCompactPrompt(): boolean {
+    return this.promptStyle === "compact";
   }
 
   private readOnlyToolNames(): ReadonlySet<string> {
@@ -1616,7 +1839,7 @@ export class AgentOrchestrator implements IAgentRunner {
       ? Math.max(outputCap, specialist.thinkingBudget)
       : outputCap;
     const subagentMaxTokens = Math.max(1024, Math.min(requestedMaxTokens, outputCap));
-    const compactPrompt = this.useCompactPrompt(providerName);
+    const compactPrompt = this.useCompactPrompt();
     const subagentSystem = buildSystemPrompt({
       mode: effectiveMode,
       repoRoot: this.root,
@@ -1665,7 +1888,7 @@ export class AgentOrchestrator implements IAgentRunner {
       messages.push(assistantMessage);
       const toolUses = assistantMessage.content.filter((block) => block.type === "tool_use");
       if (toolUses.length === 0) {
-        return { output: accumulator.textOutput(), usage: totals };
+        return this.finishSubagent(input, accumulator.textOutput(), totals);
       }
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
@@ -1676,7 +1899,44 @@ export class AgentOrchestrator implements IAgentRunner {
         );
       }
     }
-    return { output: `subagent stopped after ${this.maxTurns} turns`, usage: totals };
+    return this.finishSubagent(input, `subagent stopped after ${this.maxTurns} turns`, totals);
+  }
+
+  /**
+   * Adds the worktree diff to a finished subagent so the caller can review or
+   * merge it. Without this, isolated work was invisible to the orchestrator.
+   */
+  private async finishSubagent(
+    input: SubagentTaskInput,
+    output: string,
+    usage: Usage,
+  ): Promise<SubagentTaskResult> {
+    if (!input.worktreePath) return { output, usage };
+    const branch = await runGit(input.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"], {
+      allowFailure: true,
+    });
+    const status = await runGit(input.worktreePath, ["status", "--porcelain"], {
+      allowFailure: true,
+    });
+    const filesChanged = status.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 3)
+      .map((line) => line.slice(3).trim());
+    const staged = await runGit(input.worktreePath, ["diff", "--cached", "--", "."], {
+      allowFailure: true,
+    });
+    const unstaged = await runGit(input.worktreePath, ["diff", "--", "."], {
+      allowFailure: true,
+    });
+    const diff = `${staged.stdout}${unstaged.stdout}`.trim();
+    return {
+      output,
+      usage,
+      filesChanged,
+      branch: branch.exitCode === 0 ? branch.stdout.trim() || undefined : undefined,
+      diff: diff.length > 0 ? diff.slice(0, 20_000) : undefined,
+    };
   }
 
   private combineTools(
@@ -1795,6 +2055,11 @@ class TurnAccumulator {
     return stripThinkTags(this.text).trim().length > 0;
   }
 
+  /** Drops streamed text that turned out to be a tool call in disguise. */
+  discardText(): void {
+    this.text = "";
+  }
+
   reasoningOutput(): string {
     return cleanReasoningAnswer(stripThinkTags(this.thinking));
   }
@@ -1837,9 +2102,14 @@ function makeMessage(id: string, role: Message["role"], content: Message["conten
   };
 }
 
-function toolResultMessage(call: ToolCall, content: string, isError: boolean): Message {
+function toolResultMessage(
+  call: ToolCall,
+  content: string,
+  isError: boolean,
+  runId?: string,
+): Message {
   return {
-    id: `tool-${call.id}`,
+    id: runId ? `${runId}-tool-${call.id}` : `tool-${call.id}`,
     role: "tool",
     content: [{ type: "tool_result", tool_use_id: call.id, content, is_error: isError }],
   };

@@ -217,6 +217,23 @@ export const RuleViolationEventSchema = z.object({
 });
 export type RuleViolationEvent = z.infer<typeof RuleViolationEventSchema>;
 
+export const RetryScheduledEventSchema = z.object({
+  type: z.literal("retry_scheduled"),
+  /** 1-based retry number. */
+  attempt: z.number().int().positive(),
+  max_attempts: z.number().int().positive(),
+  delay_ms: z.number().int().nonnegative(),
+  reason: z.string().default(""),
+});
+export type RetryScheduledEvent = z.infer<typeof RetryScheduledEventSchema>;
+
+export const ModeChangedEventSchema = z.object({
+  type: z.literal("mode_changed"),
+  from: z.enum(["plan", "build", "ultrawork"]),
+  to: z.enum(["plan", "build", "ultrawork"]),
+});
+export type ModeChangedEvent = z.infer<typeof ModeChangedEventSchema>;
+
 export const ErrorEventSchema = z.object({
   type: z.literal("error"),
   code: z.string().min(1),
@@ -424,6 +441,8 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   ToolCallReadyEventSchema,
   UsageEventSchema,
   RuleViolationEventSchema,
+  RetryScheduledEventSchema,
+  ModeChangedEventSchema,
   ErrorEventSchema,
   DoneEventSchema,
   ApprovalRequiredEventSchema,
@@ -496,6 +515,7 @@ export const SubagentResultSchema = z.object({
   files_changed: z.array(z.string()).default([]),
   commits: z.array(z.string()).default([]),
   branch: z.string().optional(),
+  worktree_path: z.string().optional(),
   error: z
     .object({
       code: z.string().min(1),

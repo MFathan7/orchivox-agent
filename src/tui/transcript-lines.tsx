@@ -14,7 +14,13 @@ import {
 } from "./panel";
 import type { RenderRow } from "./rows";
 import { getTheme, type Theme } from "./theme";
-import { displayWidth, fitDisplayText, wrapPreservingWhitespace, wrapText } from "./text-wrap";
+import {
+  displayWidth,
+  fitDisplayText,
+  singleLine,
+  wrapPreservingWhitespace,
+  wrapText,
+} from "./text-wrap";
 
 export interface TranscriptRow extends RenderRow {
   entryId?: string;
@@ -98,7 +104,8 @@ function toolCallRows(
     : isEdit
       ? editActionLabel(action)
       : call.label ?? toolDisplay(call.name).label;
-  const target = call.filePath ?? call.detail;
+  // A command can contain newlines; the header must stay one terminal row.
+  const target = singleLine(call.filePath ?? call.detail ?? "");
   const additions = call.diff?.additions;
   const deletions = call.diff?.deletions;
   const safeWidth = Math.max(16, width);
@@ -484,12 +491,20 @@ function assistantRows(
   let liveStatusRendered = false;
   let activeThinkingLive = false;
   const segmented = Boolean(entry.thinkingSegments && entry.thinkingSegments.length > 0);
+  // A model that answers inside its reasoning stream would otherwise show the
+  // same text twice: once as thinking and once as the answer.
+  const flatAnswer = (entry.text ?? "").replace(/\s+/g, " ").trim();
+  const flatThinking = (entry.thinkingSegments ?? [])
+    .map((segment) => segment.text.replace(/\s+/g, " "))
+    .join(" ");
+  const answerCameFromThinking =
+    !entry.live && flatAnswer.length >= 24 && flatThinking.includes(flatAnswer.slice(0, 200));
   if (segmented) {
     const segments = entry.thinkingSegments ?? [];
     segments.forEach((segment, index) => {
       const next = segments[index + 1];
       const visibleSegment = !entry.live || segment.completedAt !== undefined;
-      if (visibleSegment) {
+      if (visibleSegment && !answerCameFromThinking) {
         const duration = Math.max(
           0,
           (segment.completedAt ?? now) - segment.startedAt,

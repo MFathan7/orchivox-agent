@@ -27,6 +27,10 @@ export interface SubagentTaskInput {
 export interface SubagentTaskResult {
   output: string;
   usage?: Usage;
+  /** Unified diff produced inside the worker's worktree, when isolated. */
+  diff?: string;
+  filesChanged?: string[];
+  branch?: string;
 }
 
 export type SubagentExecutor = (input: SubagentTaskInput) => Promise<SubagentTaskResult>;
@@ -50,7 +54,42 @@ export interface SubagentWorkerState {
   updatedAt: number;
 }
 
+export type SubagentBatchMode = "parallel" | "chain";
+
+export interface SubagentSpawnTask {
+  id?: string;
+  agent?: string;
+  task: string;
+  mode?: AgentMode;
+  roleModel?: "main" | "fast" | "advisor";
+  provider?: string;
+  model?: string;
+  outputJsonSchema?: JsonSchemaObject;
+  writeIsolation?: boolean;
+}
+
+export interface SubagentMergeReport {
+  workerId: string;
+  merged: boolean;
+  summary: string;
+}
+
 const WORKER_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+/** Upper bound for one parallel batch, so a single call cannot flood the machine. */
+const MAX_PARALLEL_SUBAGENTS = 8;
+
+/** How much of the previous worker output a chain step receives. */
+const PREVIOUS_RESULT_LIMIT = 12_000;
+
+function interpolatePrevious(task: string, previous: string): string {
+  if (!task.includes("{previous}")) return task;
+  const value =
+    previous.length > PREVIOUS_RESULT_LIMIT
+      ? `${previous.slice(0, PREVIOUS_RESULT_LIMIT)}\n\n[... previous result truncated to fit the chain step]`
+      : previous;
+  return task.split("{previous}").join(value.length > 0 ? value : "(no previous result)");
+}
 const TRANSCRIPT_LIMIT = 500;
 
 export class SubagentManager {
@@ -138,19 +177,83 @@ export class SubagentManager {
     return worker;
   }
 
-  async spawn(
-    tasks: Array<{ id?: string; agent?: string; task: string; mode?: AgentMode; roleModel?: "main" | "fast" | "advisor"; provider?: string; model?: string; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean }>,
-  ): Promise<SubagentResult[]> {
-    const workers = tasks.map((task) => this.spawnOne(task));
-    await Promise.all(tasks.map((_, index) => this.completions.get(workers[index].id)));
-    return workers.map((worker) => {
-      if (worker.result) return worker.result;
-      return SubagentResultSchema.parse({
-        id: worker.id,
-        state: worker.status === "aborted" ? "aborted" : "failed",
-        output: worker.transcript.slice(-10).join("\n"),
-        error: worker.error ?? { code: "no_result", message: "worker finished without a result" },
-      });
+  async spawn(tasks: SubagentSpawnTask[]): Promise<SubagentResult[]> {
+    const batch = await this.spawnBatch(tasks, { mode: "parallel" });
+    return batch.results;
+  }
+
+  /**
+   * Runs a batch of workers. Parallel starts every worker at once; chain runs
+   * them one by one and replaces `{previous}` in later tasks with the previous
+   * worker output. Chain steps share the working tree unless a task asks for
+   * isolation, because a later step depends on the files the earlier one wrote.
+   */
+  async spawnBatch(
+    tasks: SubagentSpawnTask[],
+    options: { mode?: SubagentBatchMode; merge?: boolean } = {},
+  ): Promise<{ results: SubagentResult[]; merged: SubagentMergeReport[] }> {
+    const mode = options.mode ?? "parallel";
+    const results: SubagentResult[] = [];
+
+    if (mode === "chain") {
+      let previous = "";
+      for (const [index, task] of tasks.entries()) {
+        const worker = this.spawnOne({
+          ...task,
+          task: index === 0 ? task.task : interpolatePrevious(task.task, previous),
+          writeIsolation: task.writeIsolation ?? false,
+        });
+        await this.completions.get(worker.id);
+        const result = this.resultOf(worker);
+        results.push(result);
+        previous = result.output;
+        if (result.state !== "completed") break;
+      }
+    } else {
+      if (tasks.length > MAX_PARALLEL_SUBAGENTS) {
+        throw new Error(
+          `too many parallel subagents (${tasks.length}). The limit is ${MAX_PARALLEL_SUBAGENTS}; split the batch or use chain mode.`,
+        );
+      }
+      const workers = tasks.map((task) => this.spawnOne(task));
+      await Promise.all(workers.map((worker) => this.completions.get(worker.id)));
+      results.push(...workers.map((worker) => this.resultOf(worker)));
+    }
+
+    const merged: SubagentMergeReport[] = [];
+    if (options.merge) {
+      for (const result of results) {
+        const worker = this.workers.get(result.id);
+        if (!worker?.worktreePath || result.state !== "completed") continue;
+        try {
+          const outcome = await this.worktrees.mergeAndCleanup(worker.id);
+          merged.push({
+            workerId: worker.id,
+            merged: outcome.success,
+            summary: outcome.success
+              ? outcome.diffSummary
+              : `conflicts: ${outcome.conflicts.join(", ")}`,
+          });
+        } catch (error) {
+          merged.push({
+            workerId: worker.id,
+            merged: false,
+            summary: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+
+    return { results, merged };
+  }
+
+  private resultOf(worker: SubagentWorkerState): SubagentResult {
+    if (worker.result) return worker.result;
+    return SubagentResultSchema.parse({
+      id: worker.id,
+      state: worker.status === "aborted" ? "aborted" : "failed",
+      output: worker.transcript.slice(-10).join("\n"),
+      error: worker.error ?? { code: "no_result", message: "worker finished without a result" },
     });
   }
 
@@ -250,6 +353,10 @@ export class SubagentManager {
         state: worker.status === "completed" ? "completed" : "failed",
         output: result.output,
         usage: worker.usage ?? result.usage,
+        diff: result.diff,
+        files_changed: result.filesChanged ?? [],
+        branch: result.branch,
+        worktree_path: worker.worktreePath,
         error: worker.error,
         started_at: startedAt,
         finished_at: Date.now(),
@@ -277,7 +384,14 @@ export class SubagentManager {
     return {
       name: "spawn_subagents",
       description:
-        "Run independent tasks in parallel, optionally with file-write isolation (a git worktree per worker), a model role or provider/model route, and a JSON output schema. Each worker has its own context, so include every file path and decision it needs. Returns each worker result when all finish.",
+        [
+          "Run tasks in isolated worker contexts.",
+          'mode "parallel" (default) starts every task at once; mode "chain" runs them in order and replaces {previous} in each later task with the earlier worker output.',
+          "Each task can set agent, a model role or provider/model route, a JSON output schema, and write isolation (a git worktree per worker).",
+          "Chain steps share the working tree by default because a later step depends on the files the earlier one wrote; parallel workers are isolated by default.",
+          "Set merge to merge each completed isolated worker back into the current branch afterwards.",
+          "Each worker has its own context, so include every file path and decision it needs.",
+        ].join(" "),
       parameters: z.object({
         tasks: z
           .array(
@@ -289,10 +403,12 @@ export class SubagentManager {
               provider: z.string().min(1).optional(),
               model: z.string().min(1).optional(),
               outputJsonSchema: z.record(z.string(), z.unknown()).optional(),
-              writeIsolation: z.boolean().default(true),
+              writeIsolation: z.boolean().optional(),
             }),
           )
           .min(1),
+        mode: z.enum(["parallel", "chain"]).default("parallel"),
+        merge: z.boolean().default(false),
       }),
       readOnly: false,
       execute: async (args) => {
@@ -307,8 +423,10 @@ export class SubagentManager {
             outputJsonSchema?: JsonSchemaObject;
             writeIsolation?: boolean;
           }>;
+          mode: SubagentBatchMode;
+          merge: boolean;
         };
-        const results = await this.spawn(
+        const batch = await this.spawnBatch(
           request.tasks.map((entry) => ({
             id: entry.id,
             agent: entry.agent,
@@ -319,14 +437,38 @@ export class SubagentManager {
             outputJsonSchema: entry.outputJsonSchema,
             writeIsolation: entry.writeIsolation,
           })),
+          { mode: request.mode, merge: request.merge },
         );
-        return results
-          .map((result) => {
-            const header = `# subagent ${result.id} (${result.state})`;
-            const body = result.error ? `${result.output}\nerror: ${result.error.message}` : result.output;
-            return `${header}\n${body}`;
-          })
-          .join("\n\n");
+
+        const sections = batch.results.map((result) => {
+          const lines = [`# subagent ${result.id} (${result.state})`];
+          lines.push(result.error ? `${result.output}\nerror: ${result.error.message}` : result.output);
+          if (result.files_changed.length > 0) {
+            lines.push(`files: ${result.files_changed.join(", ")}`);
+          }
+          if (result.worktree_path) {
+            lines.push(
+              `worktree: ${result.worktree_path}${result.branch ? ` (branch ${result.branch})` : ""}`,
+            );
+          }
+          if (result.diff) {
+            lines.push(`diff:\n${result.diff.slice(0, 1500)}`);
+          }
+          return lines.join("\n");
+        });
+        const mergeReport =
+          batch.merged.length > 0
+            ? [
+                "# merged",
+                ...batch.merged.map(
+                  (entry) =>
+                    `- ${entry.workerId}: ${entry.merged ? "merged" : "not merged"}${
+                      entry.summary ? ` (${entry.summary})` : ""
+                    }`,
+                ),
+              ].join("\n")
+            : "";
+        return [...sections, mergeReport].filter(Boolean).join("\n\n");
       },
     };
   }

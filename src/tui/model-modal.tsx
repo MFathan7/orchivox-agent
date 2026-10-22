@@ -11,6 +11,7 @@ import {
 } from "../config/loader";
 import {
   appendProviderModel,
+  clearModeModelSelections,
   deleteProviderProfile,
   removeProviderModel,
   replaceProviderModels,
@@ -295,6 +296,8 @@ export interface ModelConfigModalProps {
   onClose: () => void;
   onSaved?: (message: string) => void;
   onRoleChange?: (role: ConfigRole, provider: string, model: string) => void;
+  /** Fired when the session model changes and every mode pin is dropped. */
+  onSessionModelChange?: (provider: string, model: string) => void;
   onModeModelChange?: (mode: ConfigMode, provider: string, model: string) => void;
   onModeReasoningChange?: (mode: ConfigMode, reasoning: string) => void;
   reasoningEffort?: ReasoningEffortLevel;
@@ -338,6 +341,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     onClose,
     onSaved,
     onRoleChange,
+    onSessionModelChange,
     onModeModelChange,
     onModeReasoningChange,
     reasoningEffort = "default",
@@ -835,9 +839,20 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         router.setRole(targetRole, provider, model);
         await saveRoleSelection(configPath, targetRole, provider, model);
         onRoleChange?.(targetRole, provider, model);
+        // The main model is the session model: drop per-mode pins so a model
+        // change applies everywhere instead of staying tied to one mode.
+        if (targetRole === "main") {
+          router.clearModeModels();
+          await clearModeModelSelections(configPath);
+          onSessionModelChange?.(provider, model);
+        }
       }
 
-      setStatus(`${targetRole} now uses ${provider} / ${model}`);
+      setStatus(
+        targetRole === "main"
+          ? `all modes now use ${provider} / ${model}`
+          : `${targetRole} now uses ${provider} / ${model}`,
+      );
       setError(undefined);
       didSelectTarget.current = false;
       setQuery("");
@@ -1816,6 +1831,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     const activeModel = isModeTarget(targetRole)
       ? router.getModeModel(targetRole)
       : router.getRole(targetRole);
+    const modeOverrides = router.modeModelOverrides();
     const activeMissing = activeModel
       ? (missingLocalModels.get(activeModel.provider)?.includes(activeModel.model) ?? false)
       : false;
@@ -1844,7 +1860,9 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         )}
         <Text wrap="truncate">
           <Text color={theme.muted}>Target </Text>
-          <Text bold color={theme.text}>{targetRole}</Text>
+          <Text bold color={theme.text}>
+            {targetRole === "main" ? "session" : targetRole}
+          </Text>
           <Text color={theme.muted}>
             {" · "}
             {activeModel
@@ -1857,6 +1875,17 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
             {!compact ? "  (Ctrl+R cycle)" : ""}
           </Text>
         </Text>
+        {!compact ? (
+          <Text wrap="truncate" color={theme.muted}>
+            {targetRole === "main"
+              ? modeOverrides.length > 0
+                ? `All modes use this model. Overrides: ${modeOverrides
+                    .map((entry) => `${entry.mode} ${entry.model}`)
+                    .join(", ")}`
+                : "All modes use this model."
+              : `Override for ${targetRole} only. Select session to change every mode.`}
+          </Text>
+        ) : null}
 
         {!compact ? (
           <Box justifyContent="space-between">

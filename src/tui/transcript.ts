@@ -120,6 +120,11 @@ export function buildTranscriptEntries(
 
   messages.forEach((message, index) => {
     if (index === (insertIndex === -1 ? 0 : insertIndex)) insertCompaction();
+    // Tool calls and results are shown through the tool_calls metadata on the
+    // answer entry, so their stored rows must not become empty chat bubbles.
+    if (message.role === "tool") return;
+    const hasToolUse = message.content.some((block) => block.type === "tool_use");
+    if (message.role === "assistant" && hasToolUse && messageEntryText(message).trim().length === 0) return;
     const metadata = message.metadata;
     const modeValue = metadata?.mode;
     const mode: AgentMode | undefined =

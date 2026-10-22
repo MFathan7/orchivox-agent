@@ -382,16 +382,29 @@ const PLAN_READ_ONLY_GIT_COMMANDS = new Set([
   "grep",
 ]);
 
-const SHELL_CONTROL_PATTERN = /[><|;&`\n]|\$\(/;
+/** Redirections, command substitution and newlines are never read-only. */
+const SHELL_WRITE_PATTERN = /[><`\n]|\$\(/;
 
 /**
  * Returns true for shell commands that only inspect the workspace or system.
- * Plan mode uses this to allow read-only commands while still blocking writes.
+ * Compound commands are allowed when every segment is read-only, so
+ * `pwd && ls -la` or `ls -la | grep x` work in plan mode while `cat > file`
+ * stays blocked.
  */
 export function isPlanReadOnlyShellCommand(command: string): boolean {
   const trimmed = command.trim();
-  if (!trimmed || SHELL_CONTROL_PATTERN.test(trimmed)) return false;
-  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  if (!trimmed || SHELL_WRITE_PATTERN.test(trimmed)) return false;
+  const segments = trimmed
+    .split(/&&|\|\||;|\|/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+  if (segments.length === 0) return false;
+  return segments.every((segment) => isReadOnlyShellSegment(segment));
+}
+
+function isReadOnlyShellSegment(segment: string): boolean {
+  if (/&/.test(segment)) return false;
+  const tokens = segment.split(/\s+/).filter(Boolean);
   const name = tokens[0];
   if (!name) return false;
 

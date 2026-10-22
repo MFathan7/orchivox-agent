@@ -339,8 +339,10 @@ export class MemoryDatabase implements TaskStore {
     const compaction = this.getCompaction(sessionId);
     if (!compaction) return rows;
     if (!compaction.tail_start_message_id) return [summaryMessage(compaction)];
-    const index = rows.findIndex((message) => message.id === compaction.tail_start_message_id);
+    let index = rows.findIndex((message) => message.id === compaction.tail_start_message_id);
     if (index === -1) return [summaryMessage(compaction)];
+    // Never start the tail on a tool result: its call must stay in the context.
+    while (index > 0 && rows[index]?.role === "tool") index -= 1;
     return [summaryMessage(compaction), ...rows.slice(index)];
   }
 

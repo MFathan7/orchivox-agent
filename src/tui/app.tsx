@@ -678,7 +678,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             secretsPath={secretsPath}
             theme={theme}
             initialView={modelsView}
-            initialTarget={mode}
+            initialTarget="main"
             onClose={() => setModelsOpen(false)}
             onViewChange={setModelsView}
             onSaved={(message) => onStatusMessage?.(message)}

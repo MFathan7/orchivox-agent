@@ -9,6 +9,7 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
+import { modeFromQuestionAnswer } from "./agent/modes";
 import {
   appendAnswerToken,
   createAnswerStream,
@@ -26,9 +27,15 @@ import {
   type ApprovalRequest,
 } from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
-import { loadConfig, type AppConfig } from "./config/loader";
+import { loadConfig, sharedModeModel, type AppConfig } from "./config/loader";
 import { resolveConfigPaths, type ConfigSource } from "./config/paths";
-import { saveActiveMode, saveModeReasoning, type ConfigMode } from "./config/writer";
+import {
+  clearModeModelSelections,
+  saveActiveMode,
+  saveModeReasoning,
+  saveRoleSelection,
+  type ConfigMode,
+} from "./config/writer";
 import { LSPClient } from "./ide/lsp-client";
 import { RulesLoader } from "./memory/rules-loader";
 import { estimateMessageTokens } from "./memory/hindsight";
@@ -258,6 +265,17 @@ export async function bootstrap(
   const catalog = loadModelCatalogSync();
   await primeRuntimeMetadata(config.providers).catch(() => undefined);
   const router = new InterceptingRouter(config, streamRules, catalog);
+  // One model pinned by every mode is the session model. Fold it into the main
+  // role so a later model change applies everywhere instead of one mode.
+  const sharedModel = sharedModeModel(config);
+  if (sharedModel) {
+    router.setRole("main", sharedModel.provider, sharedModel.model);
+    router.clearModeModels();
+    void (async () => {
+      await saveRoleSelection(resolved.configPath, "main", sharedModel.provider, sharedModel.model);
+      await clearModeModelSelections(resolved.configPath);
+    })().catch(() => undefined);
+  }
   void refreshModelCatalog(catalog).then(() => router.refresh()).catch(() => undefined);
   const unsubscribeLearned = subscribeLearnedLimits(() => router.refresh());
   const snapshots = new SnapshotManager({ repoRoot: root, stateDir: statePaths.snapshotsDir });
@@ -694,7 +712,17 @@ async function runTuiSession(
     state.notice = "No config found. Use /connect to add a provider.";
   }
 
+  // A prompt sent while the agent is still working is kept and runs next, so
+  // typing Enter never swallows the user's message.
+  const queuedTurns: Array<{
+    text: string;
+    display?: string;
+    agent?: string;
+    attachments?: FileAttachmentRef[];
+  }> = [];
+
   const resetToWelcome = (): void => {
+    queuedTurns.length = 0;
     state.sessionId = undefined;
     state.sessionEpoch += 1;
     state.entries = [];
@@ -789,6 +817,11 @@ async function runTuiSession(
     onRoleChange: (role: "main" | "fast" | "advisor", provider: string, model: string) => {
       normalizeAllReasoning();
       setNotice(`${role} now uses ${provider} / ${model}`);
+    },
+    onSessionModelChange: (provider: string, model: string) => {
+      normalizeAllReasoning();
+      setNotice(`all modes now use ${provider} / ${model}`, 6000);
+      rerender();
     },
     onModeModelChange: (mode: ConfigMode, provider: string, model: string) => {
       runtime.router.setModeModel(mode, provider, model);
@@ -926,9 +959,26 @@ async function runTuiSession(
     },
     pendingQuestion,
     onQuestionAnswer: (answer: QuestionAnswer) => {
+      const request = pendingQuestion;
       const resolver = questionResolver;
       pendingQuestion = undefined;
       questionResolver = undefined;
+      if (request) {
+        const nextMode = modeFromQuestionAnswer(
+          request.question,
+          [...answer.selected, answer.custom ?? ""],
+          request.mode_options,
+        );
+        if (nextMode) {
+          setActiveMode(nextMode);
+          // The running turn is still on the old profile, so tell it to switch
+          // at its next tool boundary instead of blocking the work it was asked for.
+          runtime.orchestrator.requestModeSwitch(nextMode);
+          // The turn emits mode_changed, which writes the transcript entry; the
+          // notice covers the case where the user aborts before that arrives.
+          setNotice(`mode switched to ${nextMode}`, 4000);
+        }
+      }
       resolver?.(answer);
       rerender();
     },
@@ -1020,9 +1070,12 @@ async function runTuiSession(
     displayUserText?: string,
     targetAgent?: string,
     attachments?: FileAttachmentRef[],
+    options: { userEntryPushed?: boolean } = {},
   ): Promise<void> => {
     if (state.busy) {
-      pushEntry("system", "a turn is already running");
+      pushEntry("user", displayUserText ?? promptText);
+      queuedTurns.push({ text: promptText, display: displayUserText, agent: targetAgent, attachments });
+      setNotice("queued; it runs when this turn ends", 3000);
       rerender();
       return;
     }
@@ -1030,7 +1083,7 @@ async function runTuiSession(
       resetToWelcome();
       setNotice("The active session was deleted. Starting a new session.", 5000);
     }
-    pushEntry("user", displayUserText ?? promptText);
+    if (!options.userEntryPushed) pushEntry("user", displayUserText ?? promptText);
     for (const attachment of attachments ?? []) {
       if (attachment.kind === "image" && attachment.error) {
         pushEntry("system", `image skipped: ${attachment.filePath} (${attachment.error})`);
@@ -1330,6 +1383,17 @@ async function runTuiSession(
         } else if (event.type === "bg_process_update") {
           pushEntry("system", `[bg_process ${event.processId}] ${event.status}`);
           renderLive(true);
+        } else if (event.type === "retry_scheduled") {
+          const seconds = Math.max(1, Math.round(event.delay_ms / 1000));
+          setNotice(
+            `provider retry ${event.attempt}/${event.max_attempts} in ${seconds}s`,
+            event.delay_ms + 3000,
+          );
+          renderLive(true);
+        } else if (event.type === "mode_changed") {
+          setActiveMode(event.to);
+          pushEntry("system", `mode switched to ${event.to}`);
+          renderLive(true);
         } else if (event.type === "compaction_start") {
           beginCompaction(event.reason);
           renderLive(true);
@@ -1438,6 +1502,12 @@ async function runTuiSession(
       state.streamingText = "";
       state.busy = false;
       rerender();
+      const next = queuedTurns.shift();
+      if (next) {
+        void executeTurn(next.text, next.display, next.agent, next.attachments, {
+          userEntryPushed: true,
+        });
+      }
     }
   };
 

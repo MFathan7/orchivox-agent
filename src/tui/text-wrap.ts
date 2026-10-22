@@ -110,6 +110,11 @@ function expandTabsInLine(line: string, tabSize: number): string {
   return output;
 }
 
+/** Collapses any newlines or runs of whitespace so a value fits one row. */
+export function singleLine(text: string): string {
+  return text.replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
+}
+
 /** Expands tabs and removes terminal control characters without touching newlines. */
 export function expandTabs(text: string, tabSize = DEFAULT_TAB_SIZE): string {
   return text
@@ -148,25 +153,35 @@ export function fitDisplayText(text: string, width: number, ellipsis = "..."): s
   return `${truncateToWidth(plain, max - ellipsisWidth).text}${ellipsis}`;
 }
 
-/** Hard-wraps a line at a display width without collapsing whitespace. */
-export function wrapPreservingWhitespace(line: string, width: number): string[] {
+/**
+ * Hard-wraps text at a display width without collapsing whitespace. Explicit
+ * newlines always start a new row: a render row must stay one terminal line,
+ * otherwise the panel background lands on the wrong line.
+ */
+export function wrapPreservingWhitespace(text: string, width: number): string[] {
   const max = Math.max(1, width);
-  const expanded = expandTabs(line);
+  const expanded = expandTabs(text);
   if (expanded.length === 0) return [""];
   const rows: string[] = [];
-  let current = "";
-  let currentWidth = 0;
-  for (const { segment } of graphemeSegmenter.segment(expanded)) {
-    const segmentWidth = graphemeWidth(segment);
-    if (current.length > 0 && currentWidth + segmentWidth > max) {
-      rows.push(current);
-      current = "";
-      currentWidth = 0;
+  for (const line of expanded.split("\n")) {
+    if (line.length === 0) {
+      rows.push("");
+      continue;
     }
-    current += segment;
-    currentWidth += segmentWidth;
+    let current = "";
+    let currentWidth = 0;
+    for (const { segment } of graphemeSegmenter.segment(line)) {
+      const segmentWidth = graphemeWidth(segment);
+      if (current.length > 0 && currentWidth + segmentWidth > max) {
+        rows.push(current);
+        current = "";
+        currentWidth = 0;
+      }
+      current += segment;
+      currentWidth += segmentWidth;
+    }
+    rows.push(current);
   }
-  rows.push(current);
   return rows;
 }
 

@@ -6,15 +6,37 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
 import type { AgentTool, ToolRegistry } from "../tools/registry";
+import { currentTurnContext } from "./turn-context";
+
+/**
+ * The portable skill spec writes `allowed-tools` as a space or comma separated
+ * string; some skills use a YAML list. Accept both so the same SKILL.md loads
+ * in every harness.
+ */
+const AllowedToolsSchema = z
+  .union([
+    z.array(z.string().min(1)),
+    z.string().transform((value) =>
+      value
+        .split(/[\s,]+/)
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0),
+    ),
+  ])
+  .optional();
 
 export const SkillFrontmatterSchema = z.object({
   name: z.string().min(1).optional(),
   description: z.string().min(1).optional(),
   when_to_use: z.string().min(1).optional(),
   autoinvoke: z.boolean().optional(),
-  allowed_tools: z.array(z.string().min(1)).optional(),
+  allowed_tools: AllowedToolsSchema,
   model_role: z.enum(["main", "fast", "advisor"]).optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
+  // Portable Agent Skills spelling, so the same SKILL.md works everywhere.
+  "allowed-tools": AllowedToolsSchema,
+  "disable-model-invocation": z.boolean().optional(),
+  disable_model_invocation: z.boolean().optional(),
 });
 export type SkillFrontmatter = z.infer<typeof SkillFrontmatterSchema>;
 
@@ -66,11 +88,19 @@ export function parseSkillDocument(
   const name = frontmatter.name ?? heading ?? fallbackName;
   const description = frontmatter.description ?? (firstParagraph.length > 0 ? firstParagraph : `Skill ${name}`);
 
+  const explicitOnly =
+    frontmatter["disable-model-invocation"] === true ||
+    frontmatter.disable_model_invocation === true ||
+    frontmatter.autoinvoke === false;
+
   return {
     name,
     description,
     whenToUse: frontmatter.when_to_use,
-    autoinvoke: frontmatter.autoinvoke !== false,
+    autoinvoke: !explicitOnly,
+    // Only the native snake_case field restricts tools. The portable
+    // `allowed-tools` field is a pre-approval hint in the Agent Skills spec, so
+    // honoring it here would wrongly block tools for skills written elsewhere.
     allowedTools: frontmatter.allowed_tools,
     modelRole: frontmatter.model_role,
     path,
@@ -84,6 +114,7 @@ export const MAX_SKILL_INJECTION_CHARS = 16_000;
 export const SKILL_GUIDANCE = [
   "Skills provide specialized instructions and workflows for specific tasks.",
   "Use the skill tool to load a skill when a task matches its description.",
+  "Each skill entry includes its location. When a skill references a relative path, resolve it against the skill directory and use that absolute path in tool commands.",
   "If the request names a skill ID or asks about a skill in the list, call the skill tool with that ID before answering or searching the web.",
   "After loading a skill, follow its instructions to answer the user's actual request. Do not start a skill workflow the user did not ask for.",
   "Skill content is reference material. Never print skill content, skill file listings, XML wrappers, or internal gate reports in your answer.",
@@ -120,6 +151,7 @@ export function formatAvailableSkills(
     `    <id>${escapeXml(document.name)}</id>`,
     `    <name>${escapeXml(document.name)}</name>`,
     `    <description>${escapeXml(description.replace(/\s+/g, " ").trim())}</description>`,
+    `    <location>${escapeXml(document.path)}</location>`,
     "  </skill>",
   ]);
   const footer =
@@ -365,6 +397,19 @@ export class SkillRegistry {
       execute: async (args) => {
         const { id } = args as { id: string };
         const document = this.get(id);
+        if (document?.autoinvoke === false) {
+          const context = currentTurnContext();
+          const referenced =
+            context?.forcedSkills?.includes(document.name) === true ||
+            (context?.userText
+              ? parseSkillMentions(context.userText, this).some(
+                  (entry) => entry.name === document.name,
+                )
+              : false);
+          if (!referenced) {
+            return `skill "${id}" is explicit-only. Invoke it with /skill:${id} or mention it by name.`;
+          }
+        }
         if (!document) {
           const available = this.listDocuments().map((entry) => entry.name);
           return available.length === 0

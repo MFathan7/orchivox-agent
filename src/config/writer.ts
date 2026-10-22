@@ -1,6 +1,6 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { isSeq, parseDocument, type Document } from "yaml";
+import { isMap, isSeq, parseDocument, type Document } from "yaml";
 
 import type { ModelCapabilitiesPatch, ProviderProfile } from "./loader";
 
@@ -81,6 +81,20 @@ export async function saveRoleSelection(
 export async function saveActiveMode(configPath: string, mode: ConfigMode): Promise<void> {
   const document = await readDocument(configPath);
   document.set("active_mode", mode);
+  await writeDocument(configPath, document);
+}
+
+/** Removes every per-mode model pin so all modes fall back to the main model. */
+export async function clearModeModelSelections(
+  configPath: string,
+  modes: readonly ConfigMode[] = ["plan", "build", "ultrawork"],
+): Promise<void> {
+  const document = await readDocument(configPath);
+  for (const mode of modes) {
+    // A config without a modes map, or without that mode, has no pin to clear.
+    const node = document.getIn(["modes", mode], true);
+    if (isMap(node)) node.delete("model");
+  }
   await writeDocument(configPath, document);
 }
 

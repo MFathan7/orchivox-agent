@@ -171,6 +171,9 @@ export function QuestionModal({
         <Text color={theme.muted}>Esc cancel</Text>
       </Box>
       <Text color={theme.text}>{request.question}</Text>
+      {request.mode_options ? (
+        <Text color={theme.muted}>Answering switches the session mode.</Text>
+      ) : null}
       <Box flexDirection="column" marginTop={1}>
         {request.options.map((option, index) => {
           const active = index === clamped;

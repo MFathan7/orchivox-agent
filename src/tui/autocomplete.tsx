@@ -56,19 +56,18 @@ function truncateText(text: string, max: number): string {
 
 export const BUILTIN_SLASH_COMMANDS: Array<{
   name: string;
-  args?: string;
   requiresArgs?: boolean;
   description: string;
 }> = [
   { name: "/help", description: "Open the command reference panel" },
   { name: "/models", description: "Type to search models and assign roles" },
   { name: "/connect", description: "Add, edit, enable, or delete providers" },
-  { name: "/mode", args: "<plan|build|ultrawork>", requiresArgs: false, description: "Switch or inspect agent execution mode" },
+  { name: "/mode", requiresArgs: false, description: "Switch or inspect agent execution mode" },
   { name: "/plan", description: "Switch to plan mode (read-only)" },
   { name: "/build", description: "Switch to build mode (workspace autonomy)" },
   { name: "/ultrawork", description: "Switch to autonomous ultrawork mode" },
-  { name: "/theme", args: "<name>", requiresArgs: true, description: "Change or inspect the terminal theme" },
-  { name: "/reasoning", args: "<default|low|med|high|max>", requiresArgs: false, description: "Set thinking effort" },
+  { name: "/theme", requiresArgs: true, description: "Change or inspect the terminal theme" },
+  { name: "/reasoning", requiresArgs: false, description: "Set thinking effort" },
   { name: "/palette", description: "Search actions and settings" },
   { name: "/sessions", description: "Open session manager and past conversation search" },
   { name: "/fork", description: "Fork active conversation from a specific turn" },
@@ -296,10 +295,9 @@ export async function fetchSlashCommands(repoRoot?: string): Promise<Autocomplet
     trigger: "command",
     label: command.name,
     insertText: `${command.name} `,
-    detail: command.args,
     description: command.description,
     kind: "command",
-    requiresArgs: command.requiresArgs ?? command.args !== undefined,
+    requiresArgs: command.requiresArgs ?? false,
   }));
 
   const root = repoRoot ?? globalThis.process.cwd();
@@ -649,22 +647,23 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
               </Text>
             );
           }
+          const commandLabelWidth = 26;
+          const commandLabel = item.detail
+            ? `${item.label} ${item.detail}`
+            : item.label;
           return (
             <Box key={item.id}>
-              <Box width={24}>
+              <Box width={commandLabelWidth}>
                 <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
                   {isSelected ? "❯ " : "  "}
-                  {item.label}
+                  {truncateText(commandLabel, commandLabelWidth - 2)}
                 </Text>
               </Box>
-              {item.detail ? (
-                <Box width={26}>
-                  <Text color={theme.muted}>{truncateText(item.detail, 25)}</Text>
-                </Box>
-              ) : null}
               {item.description ? (
                 <Box flexGrow={1}>
-                  <Text dimColor>{truncateText(item.description, Math.max(10, popupWidth - 54))}</Text>
+                  <Text dimColor>
+                    {truncateText(item.description, Math.max(10, popupWidth - commandLabelWidth - 4))}
+                  </Text>
                 </Box>
               ) : null}
             </Box>
