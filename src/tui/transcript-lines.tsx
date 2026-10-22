@@ -5,6 +5,7 @@ import { toolDisplay } from "../agent/tool-display";
 import type { ChatEntryView, ChatToolCallView } from "./app";
 import { diffRows, formatThinkingDuration } from "./diff-view";
 import { formatTokenCount } from "./format";
+import { hashlinePanelParts, parseHashlineOutput } from "./hashline-format";
 import { markdownRows } from "./markdown";
 import {
   panelPaddingRowNode,
@@ -54,6 +55,7 @@ function statusColor(status: ChatToolCallView["status"], theme: Theme): string {
 
 const TOOL_MARGIN = 2;
 const COMMAND_TOOL_NAMES = new Set(["bash", "run_sandbox_script", "bg_start", "bg_logs"]);
+const HASHLINE_TOOL_NAMES = new Set(["read_file", "grep_search"]);
 const EDIT_TOOL_NAMES = new Set([
   "hash_edit",
   "write_file",
@@ -205,19 +207,38 @@ function toolCallRows(
     } else {
       const lines = call.output.split("\n");
       const visible = lines.slice(0, isCommand ? 24 : 14);
-      visible.forEach((line, lineIndex) => {
-        wrapPreservingWhitespace(line, Math.max(8, panelWidth - innerPad - 2)).forEach(
-          (chunk, chunkIndex) => {
-            const body = chunk || " ";
-            rows.push(
-              panelRow(`${keyPrefix}-output-${lineIndex}-${chunkIndex}`, [
-                { text: " ".repeat(innerPad) },
-                { text: body, node: <Text color={outputTint}>{body}</Text>, color: outputTint },
-              ]),
-            );
+      const anchored = HASHLINE_TOOL_NAMES.has(call.name)
+        ? parseHashlineOutput(visible.join("\n"))
+        : undefined;
+      if (anchored) {
+        hashlinePanelParts(anchored.lines, { panelWidth, innerPad, theme }).forEach(
+          (parts, index) => {
+            rows.push(panelRow(`${keyPrefix}-output-anchored-${index}`, parts));
           },
         );
-      });
+        if (anchored.notice) {
+          const plain = `${" ".repeat(innerPad)}${anchored.notice}`;
+          rows.push(
+            panelRow(`${keyPrefix}-output-notice`, [
+              { text: plain, node: <Text color={theme.muted}>{plain}</Text>, color: theme.muted },
+            ]),
+          );
+        }
+      } else {
+        visible.forEach((line, lineIndex) => {
+          wrapPreservingWhitespace(line, Math.max(8, panelWidth - innerPad - 2)).forEach(
+            (chunk, chunkIndex) => {
+              const body = chunk || " ";
+              rows.push(
+                panelRow(`${keyPrefix}-output-${lineIndex}-${chunkIndex}`, [
+                  { text: " ".repeat(innerPad) },
+                  { text: body, node: <Text color={outputTint}>{body}</Text>, color: outputTint },
+                ]),
+              );
+            },
+          );
+        });
+      }
       if (lines.length > visible.length) {
         const plain = `${" ".repeat(innerPad)}… ${lines.length - visible.length} more lines`;
         rows.push(

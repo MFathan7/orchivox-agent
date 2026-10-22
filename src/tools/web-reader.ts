@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { truncateHead } from "./output-budget";
 import type { AgentTool, ToolRegistry } from "./registry";
 
 export type WebSearchProvider = "tavily" | "brave" | "exa" | "duckduckgo";
@@ -49,7 +50,6 @@ const DEFAULT_ENDPOINTS = {
 };
 
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; Orchivox/1.0; +https://github.com/orchivox)";
-const MAX_FETCH_CHARS = 200_000;
 const DEFAULT_FETCH_TIMEOUT_SECONDS = 30;
 const MAX_FETCH_TIMEOUT_SECONDS = 120;
 const DEFAULT_SEARCH_RESULTS = 8;
@@ -469,8 +469,7 @@ export function htmlToText(html: string): string {
 }
 
 function truncate(text: string): string {
-  if (text.length <= MAX_FETCH_CHARS) return text;
-  return `${text.slice(0, MAX_FETCH_CHARS)}\n\n... truncated after ${MAX_FETCH_CHARS} characters`;
+  return truncateHead(text, { maxLines: Number.MAX_SAFE_INTEGER }).text;
 }
 
 function formatFetchOutput(

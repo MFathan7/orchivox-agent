@@ -4,6 +4,7 @@ import { applyPatch } from "diff";
 
 import type { AgentMode, ToolCall } from "../types/schema";
 import { readText, splitLines } from "../tools/hashline-edit";
+import { modeContract } from "./modes";
 
 export type PermissionAction = "allow" | "ask" | "deny";
 
@@ -264,6 +265,21 @@ export function permissionRulesFromConfig(
       action: rule.effect,
     })),
   );
+}
+
+/** Matches a shell command against a rule pattern where "*" crosses any character. */
+export function matchCommandPattern(pattern: string, command: string): boolean {
+  const trimmed = pattern.trim();
+  if (trimmed === "" || trimmed === "*") return true;
+  const escaped = trimmed
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  try {
+    return new RegExp(`^${escaped}$`, "s").test(command.trim());
+  } catch {
+    return false;
+  }
 }
 
 export function parseToolRule(ruleInput: ToolRulePattern | string): ToolRulePattern {
@@ -657,7 +673,9 @@ export class GranularPermissionEngine extends EventEmitter {
       return { allowed: true };
     }
 
-    if (mode === "ultrawork") {
+    if (modeContract(mode).fullAccess && !forceApproval) {
+      // Build and ultrawork run without approval prompts. Configuration deny
+      // rules and the critical shell guard above still apply.
       return { allowed: true };
     }
 
@@ -761,9 +779,16 @@ export class GranularPermissionEngine extends EventEmitter {
   }
 
   private matchConfigRule(toolName: string, targetKey: string): ToolRulePattern | undefined {
+    const shellTarget = SHELL_TOOL_NAMES.has(toolName) || toolName === "bg_start";
     for (let index = this.rules.length - 1; index >= 0; index -= 1) {
       const rule = this.rules[index];
       if (rule.toolName !== "*" && rule.toolName !== toolName) {
+        continue;
+      }
+      if (shellTarget) {
+        // Shell targets are commands, not paths: a path glob would refuse to
+        // let "*" cross a slash, so "rm *" could never match "rm src/foo.ts".
+        if (matchCommandPattern(rule.pattern, targetKey)) return rule;
         continue;
       }
       try {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { DEFAULT_MAX_BYTES, spillToolOutput, truncateTail } from "./output-budget";
 import type { AgentTool } from "./registry";
 
 export interface CommandCheck {
@@ -95,11 +96,18 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
 
     if (timeoutSignal.aborted) {
       throw new Error(
-        `command timed out after ${timeoutMs}ms and was killed\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
+        `command timed out after ${timeoutMs}ms and was killed\n${
+          truncateTail(`--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`).text
+        }`,
       );
     }
 
-    return `exit ${exitCode}\n--- stdout ---\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`;
+    const full = `exit ${exitCode}\n--- stdout ---\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`;
+    if (Buffer.byteLength(full, "utf8") <= DEFAULT_MAX_BYTES) return full;
+    const logPath = await spillToolOutput(full, "bash");
+    return truncateTail(full, {
+      detail: logPath ? `Full output: ${logPath}` : "",
+    }).text;
   }
 }
 

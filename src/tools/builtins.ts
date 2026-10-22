@@ -2,6 +2,7 @@ import { createTwoFilesPatch } from "diff";
 import { z } from "zod";
 
 import { formatLine, readText, splitLines } from "./hashline-edit";
+import { truncateHead, DEFAULT_MAX_BYTES } from "./output-budget";
 import type { AgentTool } from "./registry";
 
 interface IgnoreRule {
@@ -86,7 +87,7 @@ export function createGlobFilesTool(): AgentTool<typeof GlobFilesArgsSchema> {
     async execute(args) {
       const files = await collectFiles(args.basePath, args.pattern, args.maxResults);
       if (files.length === 0) return `no files matched "${args.pattern}"`;
-      return files.join("\n");
+      return truncateHead(files.join("\n")).text;
     },
   };
 }
@@ -131,7 +132,9 @@ export function createGrepSearchTool(): AgentTool<typeof GrepSearchArgsSchema> {
       if (matches.length === 0) return `no matches for /${args.pattern}/`;
       const shown = matches.slice(0, args.maxResults);
       const truncated = matches.length - shown.length;
-      return shown.join("\n") + (truncated > 0 ? `\n... ${truncated} more match(es) truncated` : "");
+      const header = truncated > 0 ? `... ${truncated} more match(es) truncated` : "";
+      const budget = truncateHead(shown.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER });
+      return [budget.text, header].filter(Boolean).join("\n");
     },
   };
 }
@@ -162,7 +165,9 @@ export function createDiffViewTool(): AgentTool<typeof DiffViewArgsSchema> {
         undefined,
         { context: args.contextLines },
       );
-      return patch.trim() === "" ? "no differences" : patch;
+      return patch.trim() === ""
+        ? "no differences"
+        : truncateHead(patch, { maxLines: Number.MAX_SAFE_INTEGER, maxBytes: DEFAULT_MAX_BYTES }).text;
     },
   };
 }
@@ -194,7 +199,9 @@ export function createJsonQueryTool(): AgentTool<typeof JsonQueryArgsSchema> {
         throw new Error(`invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
       }
       const result = evaluateJsonQuery(data, parseJsonQuery(args.query));
-      return JSON.stringify(result ?? null, null, 2);
+      return truncateHead(JSON.stringify(result ?? null, null, 2), {
+        maxLines: Number.MAX_SAFE_INTEGER,
+      }).text;
     },
   };
 }

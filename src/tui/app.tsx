@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text, render, useInput, useStdin } from "ink";
 
 import type { AgentMode, Message } from "../types/schema";
+import { modeContract } from "../agent/modes";
 import type { SubagentWorkerState } from "../agent/subagent";
 import type { SkillDocument } from "../agent/skills";
 import type { TaskItem } from "../agent/task-board";
@@ -392,6 +393,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const terminalSize = useTerminalSize();
   const theme = getTheme(props.currentTheme ?? "tokyonight");
   const modePalette = theme.modes[mode] ?? theme.modes.build;
+  const modeInfo = modeContract(mode);
   const reasoningOptions = props.router
     ? props.router.reasoningOptionsForMode(mode)
     : REASONING_LEVELS.map((level) => level.id);
@@ -541,8 +543,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         <Box justifyContent="space-between" width={innerWidth}>
           <Box gap={1} alignItems="center">
             <Text bold color={modePalette.primary}>
-              [{mode.toUpperCase()}]
+              [{modeInfo.label}]
             </Text>
+            {!compact ? <Text color={theme.muted}>{modeInfo.hint}</Text> : null}
             {!tiny ? <OrchivoxLogo variant="compact" theme={theme} /> : null}
             <Text bold color={theme.text}>
               {truncateText(projectName, tiny ? 12 : narrow ? 16 : 24)}

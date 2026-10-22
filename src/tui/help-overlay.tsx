@@ -40,6 +40,7 @@ export const HELP_SECTIONS: HelpSection[] = [
       { keys: "/doctor", description: "Show terminal and config diagnostics" },
       { keys: "/update", description: "Check for a newer Orchivox commit" },
       { keys: "/plugins", description: "List active plugins" },
+      { keys: "/reload", description: "Re-read skills, commands, agents, and rules" },
       { keys: "/collab", description: "Start a live sharing relay" },
       { keys: "/clear", description: "Clear the transcript" },
       { keys: "/exit", description: "Close Orchivox" },

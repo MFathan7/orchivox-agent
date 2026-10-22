@@ -98,9 +98,20 @@ import { SubagentManager, type SubagentTaskInput, type SubagentTaskResult, type 
 import { buildSystemPrompt } from "./system-prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
 import { runWithTurnContext } from "./turn-context";
+import { modeContract } from "./modes";
 import { SKILL_ALWAYS_ALLOWED_TOOLS, SkillToolPolicy } from "./skill-policy";
 import { TodoEngine } from "./todo";
 import { runGit } from "../vcs/git";
+
+export interface ReloadReport {
+  skills: number;
+  commands: number;
+  agents: number;
+  /** Whether project rules (AGENTS.md) were found. */
+  rules: boolean;
+  /** Whether the project summary could be rebuilt. */
+  projectContext: boolean;
+}
 
 export interface AgentOrchestratorOptions {
   router: ProviderRouter;
@@ -137,6 +148,25 @@ const PROFILE_MODES: Record<AgentProfile, AgentMode> = {
   "orchivox-plan": "plan",
   "orchivox-ultrawork": "ultrawork",
 };
+
+const MUTATING_TOOL_NAMES = new Set([
+  "hash_edit",
+  "write_file",
+  "create_file",
+  "delete_file",
+  "move_file",
+  "apply_unified_patch",
+]);
+
+const VERIFY_TOOL_NAMES = new Set(["diagnostics_check"]);
+
+const VERIFY_COMMAND =
+  /\b(?:bun\s+test|bun\s+run\s+(?:typecheck|test|check|lint)|npm\s+(?:test|run)|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|pytest|cargo\s+test|go\s+test|tsc\b|vitest|jest|eslint|biome)\b/i;
+
+const VERIFY_NUDGE = [
+  "You changed files but did not verify them.",
+  "Run diagnostics_check and the tests or checks that cover the change, fix what they report, then give the final summary.",
+].join(" ");
 
 const SUBAGENT_BLOCKED_TOOLS = new Set([
   "spawn_subagents",
@@ -196,7 +226,7 @@ export class AgentOrchestrator implements IAgentRunner {
     this.maxTurns = options.maxTurns ?? 40;
     this.contextTokenBudget = options.contextTokenBudget ?? 200_000;
     this.compactionConfig =
-      options.config?.compaction ?? { auto: true, keep_tokens: 15_000, buffer_ratio: 0.1 };
+      options.config?.compaction ?? { auto: true, keep_tokens: 20_000, reserve_tokens: 16_384 };
     this.webSearchConfig = options.config?.websearch ?? { enabled: true, provider: "random" };
     this.webFetchConfig = options.config?.webfetch ?? { enabled: true };
     this.promptStyle = options.config?.prompt?.style ?? "auto";
@@ -229,7 +259,7 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 
   async initialize(): Promise<PluginLoadReport> {
-    await this.customCommands.ensureDefaults();
+    await this.customCommands.loadCommands({ reset: true });
     await this.specialistAgents.ensureDefaults();
     await this.skills.load(true);
     this.globalRules = await this.rules.getGlobalRules();
@@ -237,6 +267,34 @@ export class AgentOrchestrator implements IAgentRunner {
     const branch = await runGit(this.root, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true });
     this.branch = branch.exitCode === 0 ? branch.stdout.trim() || undefined : undefined;
     return this.hooks.loadUserPlugins(this.registry);
+  }
+
+  /**
+   * Re-reads the files that shape a turn: skills, commands, agents, project
+   * rules, and the project summary. Plugins are registered at startup and need
+   * a restart because their modules are cached and their tools are already
+   * registered.
+   */
+  async reload(): Promise<ReloadReport> {
+    const [skills, commands, agents] = await Promise.all([
+      this.skills.load(true),
+      this.customCommands.loadCommands({ reset: true }),
+      this.specialistAgents.loadAgents(),
+    ]);
+    // The rules loader remembers which files it already injected, so a reload
+    // has to forget them before it reads AGENTS.md again.
+    this.rules.reset();
+    this.globalRules = await this.rules.getGlobalRules();
+    this.projectContext = await loadProjectContext(this.root);
+    const branch = await runGit(this.root, ["rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true });
+    this.branch = branch.exitCode === 0 ? branch.stdout.trim() || undefined : undefined;
+    return {
+      skills: skills.length,
+      commands: commands.size,
+      agents: agents.size,
+      rules: this.globalRules.trim().length > 0,
+      projectContext: this.projectContext !== undefined,
+    };
   }
 
   estimateContextOverhead(mode: AgentMode): number {
@@ -393,6 +451,7 @@ export class AgentOrchestrator implements IAgentRunner {
     }
 
     let messages: Message[] = [...request.messages];
+    const contract = modeContract(mode);
     const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
 
     const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
@@ -596,7 +655,17 @@ export class AgentOrchestrator implements IAgentRunner {
       .filter(Boolean)
       .join("\n\n");
 
-    const contextWindow = capabilities.max_input ?? capabilities.context_window ?? this.contextTokenBudget;
+    const contextWindowBase = capabilities.max_input ?? capabilities.context_window ?? this.contextTokenBudget;
+    let contextWindow = contextWindowBase;
+    const refreshContextWindow = (): number => {
+      if (!providerRef?.provider) return contextWindow;
+      try {
+        const fresh = this.router.capabilitiesFor(providerRef.provider, providerRef.model);
+        return fresh.max_input ?? fresh.context_window ?? contextWindow;
+      } catch {
+        return contextWindow;
+      }
+    };
     const loadedSkillDocs = this.activeSkillDocuments(sessionId);
     await this.reloadSkillsAfterCompaction(sessionId, messages, loadedSkillDocs);
     const promptBase = {
@@ -659,7 +728,11 @@ export class AgentOrchestrator implements IAgentRunner {
     const totals = zeroUsage();
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
+    let verifyNudges = 0;
     let projectNudged = false;
+    let editedThisTurn = false;
+    let verifiedThisTurn = false;
+    let measuredContext: { messageCount: number; promptTokens: number } | undefined;
     const bufferStudyTokens = projectStudy || projectFileFollowUp;
 
     const specialistBudget = activeSpecialist?.thinkingBudget ?? 0;
@@ -668,8 +741,18 @@ export class AgentOrchestrator implements IAgentRunner {
     const outputCap = Math.min(capabilities.max_output ?? 32_000, 256_000);
     const defaultOutput = reasoningBudget > 0 ? Math.max(outputCap, reasoningBudget + 2048) : outputCap;
     const requestedMaxTokens = request.max_tokens ?? defaultOutput;
-    const estimatePromptTokens = (): number =>
-      messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overheadTokens;
+    const estimatePromptTokens = (): number => {
+      const estimated =
+        messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overheadTokens;
+      if (!measuredContext || measuredContext.messageCount > messages.length) return estimated;
+      let trailingTokens = 0;
+      for (let index = measuredContext.messageCount; index < messages.length; index += 1) {
+        trailingTokens += estimateMessageTokens(messages[index]);
+      }
+      return measuredContext.promptTokens + trailingTokens;
+    };
+    const measuredPromptTokens = (): number | undefined =>
+      measuredContext ? estimatePromptTokens() : undefined;
     const outputHeadroom = (): number => {
       const reserve = Math.max(2048, Math.floor(contextWindow * 0.02));
       return Math.max(1024, contextWindow - estimatePromptTokens() - reserve);
@@ -800,13 +883,16 @@ export class AgentOrchestrator implements IAgentRunner {
           provider,
           contextWindow,
           keepTokens: this.compactionConfig.keep_tokens,
+          reserveTokens: this.compactionConfig.reserve_tokens,
           bufferTokens: this.compactionConfig.buffer_tokens,
           bufferRatio: this.compactionConfig.buffer_ratio,
           overheadTokens,
+          contextTokens: measuredPromptTokens(),
           previousSummary: extractSummary(messages),
           onStart: () => sink({ type: "compaction_start", reason: "auto" }),
         });
         if (compaction.didCompact) {
+          measuredContext = undefined;
           messages = compaction.messages;
           maxTokens =
             forcedOutputLimit ??
@@ -842,6 +928,7 @@ export class AgentOrchestrator implements IAgentRunner {
               ? tools.filter((tool) => tool.name !== "web_search" && tool.name !== "web_fetch")
               : tools,
           );
+      const requestMessageCount = messages.length;
       const chatRequest = ChatRequestSchema.parse({
         system,
         messages,
@@ -880,6 +967,12 @@ export class AgentOrchestrator implements IAgentRunner {
             break;
           case "usage":
             accumulateUsage(totals, event);
+            if (event.prompt_tokens > 0) {
+              measuredContext = {
+                messageCount: requestMessageCount,
+                promptTokens: event.prompt_tokens,
+              };
+            }
             break;
           case "error":
             turnError = event.message;
@@ -917,21 +1010,25 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
 
-      if (contextOverflow && !compactedRetry && !accumulator.hasOutput()) {
+      if (contextOverflow && !compactedRetry) {
         compactedRetry = true;
+        contextWindow = refreshContextWindow();
         const forced = await compactMessages(messages, {
           provider,
           contextWindow,
           keepTokens: this.compactionConfig.keep_tokens,
+          reserveTokens: this.compactionConfig.reserve_tokens,
           bufferTokens: this.compactionConfig.buffer_tokens,
           bufferRatio: this.compactionConfig.buffer_ratio,
           overheadTokens,
+          contextTokens: measuredPromptTokens(),
           previousSummary: extractSummary(messages),
           force: true,
           onStart: () => sink({ type: "compaction_start", reason: "retry" }),
         });
         if (forced.didCompact) {
           messages = forced.messages;
+          measuredContext = undefined;
           maxTokens =
             forcedOutputLimit ??
             Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
@@ -945,6 +1042,8 @@ export class AgentOrchestrator implements IAgentRunner {
             removed_messages: forced.removedMessages,
             tail_start_message_id: forced.tailStartMessageId,
           });
+          turnError = undefined;
+          contextOverflow = false;
           continue;
         }
       }
@@ -961,22 +1060,33 @@ export class AgentOrchestrator implements IAgentRunner {
       }
 
       if (toolUses.length === 0 || turnError) {
-        if (!turnError && mode === "ultrawork") {
+        if (!turnError && contract.enforceTodos) {
           const enforcement = this.todos.checkPendingTodos();
           if (enforcement.hasPending) {
             messages.push(makeMessage(`turn-${turn}-todo`, "user", enforcement.continuationPrompt));
             continue;
           }
-          if (finishReason === "stop" && ultraworkNudges < 2) {
-            ultraworkNudges += 1;
-            const nudge = [
-              "Continue in ULTRAWORK mode.",
-              "Verify the result with tools, finish any remaining work, and update the todo list.",
-              "If everything is complete, reply with a short final summary.",
-            ].join(" ");
-            messages.push(makeMessage(`turn-${turn}-ultrawork`, "user", nudge));
-            continue;
-          }
+        }
+        if (!turnError && finishReason === "stop" && ultraworkNudges < contract.nudges) {
+          ultraworkNudges += 1;
+          const nudge = [
+            "You are not finished yet.",
+            "Verify the result with tools, finish any remaining work, and update the todo list.",
+            "If everything is complete, reply with a short final summary.",
+          ].join(" ");
+          messages.push(makeMessage(`turn-${turn}-continue`, "user", nudge));
+          continue;
+        }
+        if (
+          !turnError &&
+          contract.verifyEdits &&
+          editedThisTurn &&
+          !verifiedThisTurn &&
+          verifyNudges < 1
+        ) {
+          verifyNudges += 1;
+          messages.push(makeMessage(`turn-${turn}-verify`, "user", VERIFY_NUDGE));
+          continue;
         }
         if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES) {
           outputLimitContinues += 1;
@@ -988,9 +1098,11 @@ export class AgentOrchestrator implements IAgentRunner {
                   provider,
                   contextWindow,
                   keepTokens: this.compactionConfig.keep_tokens,
+                  reserveTokens: this.compactionConfig.reserve_tokens,
                   bufferTokens: this.compactionConfig.buffer_tokens,
                   bufferRatio: this.compactionConfig.buffer_ratio,
                   overheadTokens,
+                  contextTokens: measuredPromptTokens(),
                   previousSummary: extractSummary(messages),
                   force: true,
                   onStart: () => sink({ type: "compaction_start", reason: "output_limit" }),
@@ -998,6 +1110,7 @@ export class AgentOrchestrator implements IAgentRunner {
               : undefined;
             if (compacted?.didCompact) {
               messages = compacted.messages;
+              measuredContext = undefined;
               maxTokens =
                 forcedOutputLimit ??
                 Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
@@ -1074,12 +1187,18 @@ export class AgentOrchestrator implements IAgentRunner {
           sink({ type: "token", text: textOf(finalMessage) });
         }
         if (turnError && !errorSunk) {
+          const overflowFailure = contextOverflow && compactedRetry;
           sink({
             type: "error",
-            code: "provider_adjusted",
-            message: isAutoHandledProviderError(turnError)
-              ? "provider request failed after automatic adjustment"
-              : turnError,
+            code: overflowFailure ? "context_overflow" : "provider_adjusted",
+            message: overflowFailure
+              ? [
+                  "Context overflow recovery failed after one compact-and-retry attempt.",
+                  "Start a new session, reduce the request size, or switch to a model with a larger context window.",
+                ].join(" ")
+              : isAutoHandledProviderError(turnError)
+                ? "provider request failed after automatic adjustment"
+                : turnError,
             recoverable: false,
           });
         }
@@ -1093,6 +1212,15 @@ export class AgentOrchestrator implements IAgentRunner {
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         const filePath = extractFilePath(call.arguments);
+        if (MUTATING_TOOL_NAMES.has(call.name)) editedThisTurn = true;
+        if (
+          VERIFY_TOOL_NAMES.has(call.name) ||
+          (call.name === "bash" &&
+            typeof call.arguments.command === "string" &&
+            VERIFY_COMMAND.test(call.arguments.command))
+        ) {
+          verifiedThisTurn = true;
+        }
         const toolStartedAt = Date.now();
         const display = toolDisplay(call.name, call.arguments);
         sink({
@@ -1241,7 +1369,7 @@ export class AgentOrchestrator implements IAgentRunner {
           this.activateSkill(sessionId, skillDocument.name);
           await rebuildSystem();
         }
-        if (filePath && mutates && mode !== "plan") this.advisor.scheduleReview();
+        if (filePath && mutates && contract.advisor) this.advisor.scheduleReview();
       }
 
       if (toolUses.length > 0 && !projectNudged) {
@@ -1810,8 +1938,8 @@ function firstLine(text: string): string {
   return line.length > 120 ? `${line.slice(0, 117)}...` : line;
 }
 
-function isContextOverflow(message: string): boolean {
-  return /context length|context_length_exceeded|too many tokens|maximum context|prompt is too long|reduce the length of the messages|request too large/i.test(
+export function isContextOverflow(message: string): boolean {
+  return /context length|context_length_exceeded|too many tokens|maximum context|prompt is too long|reduce the length of the messages|request too large|input length|input token count|maximum number of tokens|tokens? exceed|exceed(?:s|ed)? the (?:model'?s )?(?:maximum|limit)|exceeds? the context|over the context limit/i.test(
     message,
   );
 }

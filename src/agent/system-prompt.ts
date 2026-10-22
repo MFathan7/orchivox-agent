@@ -1,27 +1,11 @@
 import type { AgentMode } from "../types/schema";
+import { modeContract } from "./modes";
 
+/** Full per-mode prompt section, read from the mode contract. */
 export const MODE_PROMPTS: Record<AgentMode, string> = {
-  plan: [
-    "You are in PLAN mode, acting as the lead architect.",
-    "Interview the user with focused architecture questions when requirements are unclear,",
-    "using the question tool for multiple-choice decisions,",
-    "then produce a detailed implementation plan.",
-    "Read-only means no file changes. You can still inspect the environment, read files,",
-    "search the web, and run safe read-only commands.",
-  ].join(" "),
-  build: [
-    "You are in BUILD mode.",
-    "Implement the requested changes completely, verify them with the available tools,",
-    "and only stop once the work is done and verified.",
-    "For multi-step work, keep a todo list with todo_write and mark items complete as you go.",
-  ].join(" "),
-  ultrawork: [
-    "You are in ULTRAWORK mode.",
-    "Track the work with todo_write and keep making progress with tools",
-    "until every todo item is completed.",
-    "For independent work, create tasks with task_create (ready tasks start automatically)",
-    "and inspect progress with task_list.",
-  ].join(" "),
+  plan: modeContract("plan").prompt.join(" "),
+  build: modeContract("build").prompt.join(" "),
+  ultrawork: modeContract("ultrawork").prompt.join(" "),
 };
 
 const TASK_PROMPTS = {
@@ -167,11 +151,7 @@ function compactSystemPrompt(options: SystemPromptOptions): string {
   const { date, time, timezone } = timeParts(options);
   const modeLine = options.task
     ? TASK_PROMPTS[options.task]
-    : options.mode === "plan"
-      ? "You are in plan mode: read-only, do not modify files. Inspect and plan."
-      : options.mode === "ultrawork"
-        ? "You are in ultrawork mode: keep working until the task is complete."
-        : "You are in build mode: make the requested changes and verify them.";
+    : modeContract(options.mode).compactPrompt;
   return [
     "You are Orchivox, a helpful agent in the user's terminal. You can answer general questions and write code.",
     `Environment: ${options.repoRoot} (branch ${options.branch ?? "unknown"}). Date: ${date}. Local time: ${time} (${timezone}).`,

@@ -5,7 +5,9 @@ import { ChatRequestSchema, type Message, type ToolDefinition } from "../types/s
 export { COMPACT_LABEL };
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
-const DEFAULT_KEEP_TOKENS = 15_000;
+const DEFAULT_KEEP_TOKENS = 20_000;
+const DEFAULT_RESERVE_TOKENS = 16_384;
+const TRIM_KEEP_CHARS = 2_000;
 
 const SUMMARY_SYSTEM = [
   "You compress conversation history for a coding agent.",
@@ -28,20 +30,19 @@ export interface CompactionOptions {
   force?: boolean;
   previousSummary?: string;
   overheadTokens?: number;
+  /** Measured prompt tokens from the provider, when one is known. */
+  contextTokens?: number;
   maxSummaryTokens?: number;
   signal?: AbortSignal;
   onStart?: () => void;
 }
 
-const RESERVE_MIN = 16_000;
 
 export function compactionReserve(window: number, options: { bufferTokens?: number; bufferRatio?: number; reserveTokens?: number; outputLimit?: number } = {}): number {
   if (options.reserveTokens !== undefined) return options.reserveTokens;
   if (options.bufferTokens !== undefined) return options.bufferTokens;
   if (options.bufferRatio !== undefined) return Math.floor(window * options.bufferRatio);
-  const baseline = Math.max(Math.floor(window * 0.1), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0);
-  const outputFloor = Math.min(options.outputLimit ?? 0, Math.floor(window * 0.5));
-  return Math.max(baseline, outputFloor);
+  return Math.min(DEFAULT_RESERVE_TOKENS, Math.max(1024, Math.floor(window * 0.5)));
 }
 
 export interface CompactionResult {
@@ -88,10 +89,12 @@ function selectTail(conversation: Message[], keepTokens: number): { tail: Messag
 }
 
 /**
- * Picks where the retained recent conversation starts, mirroring opencode:
- * drop the oldest messages until the rest fit the keep budget, snap to a user
- * message so a turn stays together, and when everything fits keep only the
- * latest exchange so manual compaction still has an older part to summarize.
+ * Picks where the retained recent conversation starts: drop the oldest
+ * messages until the rest fit the keep budget, prefer a user-message boundary
+ * so a turn stays together, and when everything fits keep only the latest
+ * exchange so manual compaction still has an older part to summarize. A single
+ * turn that is larger than the budget is split instead of kept whole, which is
+ * what an oversized tool result looks like.
  */
 function recentStart(conversation: Message[], keepTokens: number): number {
   let kept = 0;
@@ -125,7 +128,8 @@ export async function compactMessages(messages: Message[], options: CompactionOp
   const contextWindow = options.inputLimit ?? options.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   const buffer = compactionReserve(contextWindow, options);
   const overhead = options.overheadTokens ?? 0;
-  const beforeTokens = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overhead;
+  const estimatedTokens = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overhead;
+  const beforeTokens = options.contextTokens ?? estimatedTokens;
   const trigger = Math.max(1024, contextWindow - buffer);
 
   if (!options.force && beforeTokens <= trigger) {
@@ -145,6 +149,21 @@ export async function compactMessages(messages: Message[], options: CompactionOp
   const { tail, older } = selectTail(conversation, options.keepTokens ?? DEFAULT_KEEP_TOKENS);
 
   if (older.length === 0) {
+    // Nothing older to summarize. An oversized tool result is still survivable:
+    // trim it down so the retry can fit, and report a compaction.
+    const trimmed = trimTailToBudget(messages, trigger, overhead);
+    const afterTokens =
+      trimmed.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overhead;
+    if (afterTokens < beforeTokens) {
+      return {
+        messages: trimmed,
+        didCompact: true,
+        beforeTokens,
+        afterTokens,
+        summaryTokens: 0,
+        removedMessages: 0,
+      };
+    }
     return {
       messages,
       didCompact: false,
@@ -169,7 +188,11 @@ export async function compactMessages(messages: Message[], options: CompactionOp
     content: [{ type: "text", text: `${COMPACT_LABEL}\n${summary}` }],
     created_at: Date.now(),
   };
-  const nextMessages = [...systems, summaryMessage, ...tail];
+  const nextMessages = trimTailToBudget(
+    [...systems, summaryMessage, ...tail],
+    Math.max(1024, contextWindow - buffer),
+    overhead,
+  );
   const afterTokens = nextMessages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overhead;
 
   return {
@@ -182,6 +205,44 @@ export async function compactMessages(messages: Message[], options: CompactionOp
     tailStartMessageId: tail[0]?.id,
     removedMessages: older.length,
   };
+}
+
+/**
+ * Trims tool results that survived the cut so the compacted prompt always fits.
+ * Without this, one oversized result keeps the request above the window and the
+ * turn dies even though compaction “succeeded”.
+ */
+function trimTailToBudget(messages: Message[], budget: number, overhead: number): Message[] {
+  const total = (value: Message[]): number =>
+    value.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overhead;
+  const tokens = total(messages);
+  if (tokens <= budget) return messages;
+
+  const needChars = Math.ceil((tokens - budget) * 4 * 1.2);
+  let freed = 0;
+  return messages.map((message) => {
+    if (freed >= needChars) return message;
+    let changed = false;
+    const content = message.content.map((block) => {
+      if (block.type !== "tool_result" || freed >= needChars) return block;
+      const text =
+        typeof block.content === "string"
+          ? block.content
+          : block.content.map((item) => item.text).join("\n");
+      const keep = TRIM_KEEP_CHARS;
+      if (text.length <= keep * 2) return block;
+      const removed = text.length - keep * 2;
+      freed += removed;
+      changed = true;
+      const head = text.slice(0, keep);
+      const tail = text.slice(-keep);
+      return {
+        ...block,
+        content: `${head}\n\n[... ${removed} characters trimmed to fit the context window. Read the file again with offset or limit, or narrow the command, if the detail is needed.]\n\n${tail}`,
+      };
+    });
+    return changed ? { ...message, content } : message;
+  });
 }
 
 async function summarize(

@@ -332,7 +332,8 @@ export type PermissionRule = z.infer<typeof PermissionRuleSchema>;
 
 export const CompactionConfigSchema = z.object({
   auto: z.boolean().default(true),
-  keep_tokens: z.number().int().positive().default(15_000),
+  keep_tokens: z.number().int().positive().default(20_000),
+  reserve_tokens: z.number().int().positive().default(16_384),
   buffer_ratio: z.number().min(0).max(0.9).optional(),
   buffer_tokens: z.number().int().positive().optional(),
 });

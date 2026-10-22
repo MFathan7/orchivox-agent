@@ -5,6 +5,7 @@ import { applyPatch } from "diff";
 import { z } from "zod";
 
 import type { AgentTool } from "./registry";
+import { truncateHead } from "./output-budget";
 
 export interface HashlineLifecycle {
   onBeforeModify?: (filePath: string) => Promise<void> | void;
@@ -139,7 +140,8 @@ export function createReadFileTool(): AgentTool<typeof ReadFileArgsSchema> {
       const lines = splitLines(await readText(args.filePath));
       const slice = lines.slice(args.offset - 1, args.offset - 1 + args.limit);
       if (slice.length === 0) return `no lines to show: the file has ${lines.length} line(s)`;
-      return slice.map((line, index) => formatLine(args.offset + index, line)).join("\n");
+      const output = slice.map((line, index) => formatLine(args.offset + index, line)).join("\n");
+      return truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER }).text;
     },
   };
 }

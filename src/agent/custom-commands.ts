@@ -153,7 +153,9 @@ export class CustomCommandEngine {
     }
   }
 
-  async loadCommands(): Promise<Map<string, CustomCommand>> {
+  async loadCommands(options: { reset?: boolean } = {}): Promise<Map<string, CustomCommand>> {
+    // A reload starts from disk: commands deleted since the last load must go away.
+    if (options.reset) this.cachedCommands = new Map();
     await this.ensureDefaults();
     const map = new Map(this.cachedCommands);
 

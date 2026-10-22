@@ -1,4 +1,5 @@
 import type { AgentMode } from "../types/schema";
+import { modeContract } from "./modes";
 
 export const PLAN_TOOL_NAMES: ReadonlySet<string> = new Set([
   "read_file",
@@ -40,13 +41,21 @@ export const BUILD_TOOL_NAMES: ReadonlySet<string> = new Set([
   "bg_logs",
   "bg_list",
   "bg_stop",
+  "spawn_subagents",
+  "task_create",
+  "task_list",
+  "task_wait",
+  "task_dispatch",
+  "task_cancel",
+  "task_merge",
 ]);
 
 export function filterToolsForMode<T extends { name: string }>(
   tools: readonly T[],
   mode: AgentMode,
 ): T[] {
-  if (mode === "ultrawork") return [...tools];
-  const allowed = mode === "plan" ? PLAN_TOOL_NAMES : BUILD_TOOL_NAMES;
+  const policy = modeContract(mode).toolPolicy;
+  if (policy === "all") return [...tools];
+  const allowed = policy === "read-only" ? PLAN_TOOL_NAMES : BUILD_TOOL_NAMES;
   return tools.filter((tool) => allowed.has(tool.name));
 }

@@ -9,7 +9,7 @@ export function normalizePastedText(text: string): string {
 
 /**
  * Collapses multi-line or long pasted text into a placeholder, mirroring
- * opencode: 3 or more lines, or more than 150 characters.
+ * A paste: 3 or more lines, or more than 150 characters.
  */
 export function collapsePastedText(text: string): PastedEntry | null {
   const normalized = normalizePastedText(text);

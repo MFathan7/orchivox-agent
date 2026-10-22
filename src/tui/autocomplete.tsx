@@ -87,6 +87,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/doctor", description: "Show entrypoint, config, and terminal diagnostics" },
   { name: "/update", description: "Check for a newer Orchivox commit" },
   { name: "/plugins", description: "List loaded and active agent plugins" },
+  { name: "/reload", description: "Re-read skills, commands, agents, and project rules" },
   { name: "/collab", description: "Start live terminal sharing relay session" },
   { name: "/clear", description: "Clear chat screen" },
   { name: "/exit", description: "Exit Orchivox" },

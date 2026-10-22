@@ -1805,6 +1805,24 @@ async function runTuiSession(
         rerender();
         break;
       }
+      case "/reload": {
+        if (state.busy) {
+          setNotice("Cancel the running turn before reloading.", 8000);
+          break;
+        }
+        const report = await runtime.orchestrator.reload();
+        pushEntry(
+          "system",
+          [
+            `reloaded ${report.skills} skills, ${report.commands} commands, ${report.agents} agents`,
+            report.rules ? "project rules on" : "no project rules",
+            report.projectContext ? "project summary rebuilt" : "project summary unavailable",
+          ].join(" · "),
+        );
+        setNotice("Reloaded skills, commands, agents, and rules");
+        rerender();
+        break;
+      }
       case "/clear": {
         state.entries = [];
         state.notice = undefined;
@@ -1844,7 +1862,9 @@ async function runTuiSession(
           pushEntry("system", `custom command execution failed: ${error instanceof Error ? error.message : String(error)}`);
           break;
         }
-        pushEntry("system", `unknown command: ${command}. Type /help for assistance.`);
+        // Not a builtin and not a custom command: send the line as a normal
+        // message instead of rejecting it.
+        await executeTurn(raw, undefined, undefined);
       }
     }
     rerender();
