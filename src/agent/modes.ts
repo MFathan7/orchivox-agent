@@ -41,18 +41,17 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     hint: "read-only architect",
     prompt: [
       "You are in PLAN mode, acting as the lead architect.",
-      "Your job is a plan that someone else can execute, not the implementation.",
-      "Inspect the repository with read, search, and read-only shell commands before you commit to a plan.",
-      "Interview the user with focused questions when requirements, constraints, or trade-offs are unclear, using the question tool for multiple-choice decisions.",
-      "Write the answer as a plan: what changes, why, which files, in what order, the risks, how it will be verified, and any open question that still blocks work.",
-      "Never modify files in plan mode, and never paste a full script, patch, or file as the answer.",
-      "If the user asks for code, a file, or an implementation, offer the handoff with the question tool, set mode_options to true, and use plan and build as the options; the answer switches the session mode.",
-      "Never ask the user to write the code themselves. The plan is your job; writing the code is the next mode's job.",
+      "Your job is the plan, not the implementation.",
+      "Inspect the workspace with read, search, and read-only shell commands before you commit to a plan.",
+      "Discuss the plan with the user directly in the conversation: what changes, why, which files, in what order, the risks, and how it will be verified.",
+      "Never modify files, and never paste a full script, patch, or complete implementation.",
+      "You remain in plan mode until the user switches modes. If the user asks you to implement, tell them they need to switch to build mode. Do not implement it yourself.",
+      "Ask a question only when a requirement is genuinely unclear. Do not end every plan with a menu of options.",
       "Reply in the user's language and keep the plan short enough to act on.",
     ],
     compactPrompt: "You are in plan mode: read-only, do not modify files. Inspect and produce an actionable plan.",
     finalReminder:
-      "Current mode: PLAN. Read-only. Do not write or edit files. Do not paste a full script or a complete implementation. Answer with a plan. If the user wants code, tell them to switch to build mode and stop.",
+      "Current mode: PLAN. Discuss the plan in the conversation. Do not edit files, do not implement, and do not paste a full script. If the user asks for implementation, tell them to switch to build mode.",
     toolPolicy: "read-only",
     fullAccess: false,
     enforceTodos: false,
@@ -66,6 +65,8 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     hint: "implement and verify",
     prompt: [
       "You are in BUILD mode.",
+      "Implement the request now. Do not reply with a plan instead of doing the work.",
+      "If the user approved a plan, execute that plan.",
       "Implement the requested change completely, then prove it works.",
       "Read a file before editing it and keep the diff focused on the request.",
       "For work with three or more steps, keep a todo list with todo_write and mark items complete as you go.",
@@ -74,7 +75,7 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     ],
     compactPrompt: "You are in build mode: make the requested change, verify it, then stop.",
     finalReminder:
-      "Current mode: BUILD. Make the requested change with tools, verify it, then stop. Keep the answer short and report what changed.",
+      "Current mode: BUILD. Implement the request now with tools, verify it, then report what changed. Do not answer with a plan instead of doing the work.",
     toolPolicy: "build",
     fullAccess: true,
     enforceTodos: false,
@@ -121,10 +122,11 @@ export function modeFromQuestionAnswer(
   answers: readonly string[],
   declaredModeOptions = false,
 ): AgentMode | undefined {
-  if (!declaredModeOptions && !/\b(plan|build|ultrawork)\b/i.test(question)) return undefined;
+  const aboutModes = /\b(plan|build|ultrawork|mode|switch|change)\b/i.test(question);
+  if (!declaredModeOptions && !aboutModes) return undefined;
   for (const answer of answers) {
-    const word = answer.trim().toLowerCase().match(/^[a-z]+/)?.[0];
-    if (word === "plan" || word === "build" || word === "ultrawork") return word;
+    const match = answer.match(/\b(plan|build|ultrawork)\b/i);
+    if (match) return match[1].toLowerCase() as AgentMode;
   }
   return undefined;
 }

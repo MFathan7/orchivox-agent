@@ -488,7 +488,6 @@ function assistantRows(
   };
 
   const beforeThinking = rows.length;
-  let liveStatusRendered = false;
   let activeThinkingLive = false;
   const segmented = Boolean(entry.thinkingSegments && entry.thinkingSegments.length > 0);
   // A model that answers inside its reasoning stream would otherwise show the
@@ -553,7 +552,6 @@ function assistantRows(
               options.spinner,
             ),
           );
-          liveStatusRendered = true;
           activeThinkingLive = true;
         }
       }
@@ -601,7 +599,6 @@ function assistantRows(
             options.spinner,
           ),
         );
-        liveStatusRendered = true;
         activeThinkingLive = true;
       }
     } else if (options.thinkingExpanded) {
@@ -703,33 +700,6 @@ function assistantRows(
           theme,
           entry.diff.unified ?? false,
         ).map((row, index) => ({ ...row, key: `${entry.id}-diff-${index}` })),
-      );
-    }
-  }
-
-  if (entry.live && !liveStatusRendered) {
-    const hasRunningTool = allCalls.some((call) => call.status === "running");
-    if (entry.text) {
-      rows.push(
-        liveStatusRow(
-          "Answering",
-          entry.startedAt,
-          now,
-          theme,
-          `${entry.id}-answering`,
-          options.spinner,
-        ),
-      );
-    } else if (!hasRunningTool) {
-      rows.push(
-        liveStatusRow(
-          "Working",
-          entry.startedAt,
-          now,
-          theme,
-          `${entry.id}-working`,
-          options.spinner,
-        ),
       );
     }
   }

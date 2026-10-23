@@ -31,6 +31,7 @@ export class SnapshotManager {
 
   async captureSnapshot(label: string): Promise<string> {
     const tree = await this.writeTree();
+    if (!tree) return "snap-unavailable";
     const history = await this.readHistory();
     if (history.cursor < history.entries.length - 1) {
       history.entries = history.entries.slice(0, history.cursor + 1);
@@ -96,7 +97,13 @@ export class SnapshotManager {
     return { snapshotId: target.id, restoredFiles };
   }
 
-  private async writeTree(): Promise<string> {
+  private async writeTree(): Promise<string | undefined> {
+    // A plain folder is a valid workspace. Without git there is no snapshot to
+    // take, and that must not block creating or editing files there.
+    const inside = await runGit(this.root, ["rev-parse", "--is-inside-work-tree"]).catch(
+      () => undefined,
+    );
+    if (!inside || inside.stdout.trim() !== "true") return undefined;
     await mkdir(this.indexDir, { recursive: true });
     const env = { GIT_INDEX_FILE: `${this.indexDir}/index` };
     await runGit(this.root, ["add", "-A"], { env });
@@ -106,6 +113,7 @@ export class SnapshotManager {
 
   private async restore(targetTree: string): Promise<string[]> {
     const currentTree = await this.writeTree();
+    if (!currentTree) return [];
     const env = { GIT_INDEX_FILE: `${this.indexDir}/index` };
     const [changed, added] = await Promise.all([
       runGit(this.root, ["diff", "--name-only", targetTree, currentTree]),

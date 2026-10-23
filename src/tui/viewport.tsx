@@ -332,7 +332,7 @@ export function formatProgressBar(done: number, total: number, width = 8): strin
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-function useSpinner(active: boolean): string {
+export function useSpinner(active: boolean): string {
   const [frame, setFrame] = React.useState(0);
   React.useEffect(() => {
     if (!active) {

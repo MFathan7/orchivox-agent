@@ -171,24 +171,6 @@ const SKILL_DIRECTIVE = /^\/skill:([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/;
 /** Extra attempts when a provider fails before producing any output. */
 const MAX_TURN_RETRIES = 1;
 
-const PLAN_MODE_NUDGE = [
-  "You are in PLAN mode. Return a plan, not an implementation.",
-  "Do not paste a full script, patch, or file, and do not ask the user to write it.",
-  "If the user wants the code, tell them to switch to build mode, then stop.",
-].join(" ");
-
-/** A fenced block with this many lines is an implementation, not a plan. */
-const PLAN_CODE_LINE_LIMIT = 30;
-
-function looksLikeImplementationDump(text: string): boolean {
-  const fences = [...text.matchAll(/```[^\n]*\n([\s\S]*?)```/g)];
-  const codeLines = fences.reduce(
-    (sum, match) => sum + (match[1]?.split("\n").length ?? 0),
-    0,
-  );
-  return codeLines >= PLAN_CODE_LINE_LIMIT;
-}
-
 const VERIFY_NUDGE = [
   "You changed files but did not verify them.",
   "Run diagnostics_check and the tests or checks that cover the change, fix what they report, then give the final summary.",
@@ -808,7 +790,6 @@ export class AgentOrchestrator implements IAgentRunner {
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
     let verifyNudges = 0;
-    let planNudges = 0;
     let turnRetries = 0;
     let projectNudged = false;
     let editedThisTurn = false;
@@ -1282,17 +1263,6 @@ export class AgentOrchestrator implements IAgentRunner {
         ) {
           verifyNudges += 1;
           messages.push(makeMessage(`turn-${turn}-verify`, "user", VERIFY_NUDGE));
-          continue;
-        }
-        if (
-          !turnError &&
-          mode === "plan" &&
-          finishReason === "stop" &&
-          planNudges < 1 &&
-          looksLikeImplementationDump(accumulator.textOutput())
-        ) {
-          planNudges += 1;
-          messages.push(makeMessage(`turn-${turn}-plan`, "user", PLAN_MODE_NUDGE));
           continue;
         }
         if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES) {

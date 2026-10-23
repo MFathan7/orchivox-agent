@@ -39,6 +39,7 @@ import {
   ScrollableChatViewport,
   WorkspaceSidebar,
   countWrappedLines,
+  useSpinner,
   useTerminalSize,
   type SidebarFile,
   type SidebarSubagent,
@@ -454,6 +455,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     hubOpen ||
     modePickerOpen ||
     reasoningPickerOpen;
+  // The turn status belongs next to the composer, not between the thinking
+  // block and the answer.
+  const statusSpinner = useSpinner(streaming && !hasModalOpen);
 
   useInput((input, key) => {
     if (isMouseSequence(input)) return;
@@ -805,6 +809,16 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <Text color={theme.badge.running}>Press Esc again to stop the current turn</Text>
         ) : statusMessage ? (
           <Text color={theme.modes.build.primary}>{statusMessage}</Text>
+        ) : streaming && !hasModalOpen ? (
+          <Text>
+            <Text color={theme.badge.running} bold>
+              {statusSpinner}{" "}
+            </Text>
+            <Text color={theme.text} bold>
+              {streamingText ? "Answering" : "Thinking"}
+            </Text>
+            <Text color={theme.muted}> · Esc twice to stop</Text>
+          </Text>
         ) : null}
 
         <PromptComposer
