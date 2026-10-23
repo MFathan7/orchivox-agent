@@ -8,6 +8,11 @@ export const MODE_PROMPTS: Record<AgentMode, string> = {
   ultrawork: modeContract("ultrawork").prompt.join(" "),
 };
 
+const TASK_REMINDERS = {
+  study: "Current task: study the project and report what exists. Do not write code or a patch.",
+  review: "Current task: answer the question about the existing code. Do not rewrite files unless asked.",
+} as const;
+
 const TASK_PROMPTS = {
   study: [
     "You are in PROJECT STUDY mode.",
@@ -129,6 +134,9 @@ export function buildSystemPrompt(options: SystemPromptOptions): string {
   if (options.extra?.trim()) {
     sections.push(options.extra.trim());
   }
+  sections.push(
+    options.task ? TASK_REMINDERS[options.task] : modeContract(options.mode).finalReminder,
+  );
   return sections.filter(Boolean).join("\n\n");
 }
 
@@ -162,6 +170,7 @@ function compactSystemPrompt(options: SystemPromptOptions): string {
     "When you need the user to choose, call the question tool with 2-8 short options. Never write a multiple-choice question as a plain numbered list.",
     "Read a file before editing it. Verify changes before claiming success. If the task depends on project conventions, read AGENTS.md.",
     "Think step-by-step, verify evidence with tools before answering, and keep private reasoning in thinking blocks.",
+    options.task ? TASK_REMINDERS[options.task] : modeContract(options.mode).finalReminder,
     "Answer the user's question directly. After using tools, summarize and answer. Do not end with a tool log. Do not start with a greeting or describe what you inspected. Reply in the user's language.",
     "Be concise and use Markdown.",
     options.skillsIndex?.trim(),

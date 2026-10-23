@@ -1,6 +1,7 @@
 import { resolveModelCapabilities, type AppConfig, type ModeSettings, type ModelCapabilities, type ModelCapabilitiesPatch, type ProviderProfile } from "../config/loader";
 import type { AgentMode, ChatRequest, StreamEvent } from "../types/schema";
 import { AnthropicCompatProvider } from "./anthropic-compat";
+import { OllamaNativeProvider } from "./ollama-native";
 import {
   catalogProviderForBaseUrl,
   catalogProviderForKind,
@@ -405,9 +406,12 @@ function createProvider(
     timeoutMs: profile.timeout_ms,
   };
   switch (profile.kind) {
+    case "ollama":
+      // The native endpoint is required for options.num_ctx: the OpenAI
+      // compatible one silently cuts long prompts at the server default.
+      return new OllamaNativeProvider(options);
     case "openai":
     case "openrouter":
-    case "ollama":
       return new OpenAICompatProvider(options);
     case "anthropic":
     case "openclaude":

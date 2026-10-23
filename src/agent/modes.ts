@@ -14,6 +14,11 @@ export interface ModeContract {
   prompt: readonly string[];
   /** Compact variant used when the provider only gets a small prompt. */
   compactPrompt: string;
+  /**
+   * Last line of the system prompt. Small models follow the end of the prompt
+   * best, so the mode rule is repeated after the long sections like skills.
+   */
+  finalReminder: string;
   /** Tool surface: read-only, build (edits plus delegation), or everything. */
   toolPolicy: "read-only" | "build" | "all";
   /** Mutating tools run without an approval prompt. */
@@ -46,6 +51,8 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
       "Reply in the user's language and keep the plan short enough to act on.",
     ],
     compactPrompt: "You are in plan mode: read-only, do not modify files. Inspect and produce an actionable plan.",
+    finalReminder:
+      "Current mode: PLAN. Read-only. Do not write or edit files. Do not paste a full script or a complete implementation. Answer with a plan. If the user wants code, tell them to switch to build mode and stop.",
     toolPolicy: "read-only",
     fullAccess: false,
     enforceTodos: false,
@@ -66,6 +73,8 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
       "Stop when the request is done and verified. Do not keep working on unrelated improvements.",
     ],
     compactPrompt: "You are in build mode: make the requested change, verify it, then stop.",
+    finalReminder:
+      "Current mode: BUILD. Make the requested change with tools, verify it, then stop. Keep the answer short and report what changed.",
     toolPolicy: "build",
     fullAccess: true,
     enforceTodos: false,
@@ -86,6 +95,8 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
       "Reply with a short final summary that names the changes and the checks that passed.",
     ],
     compactPrompt: "You are in ultrawork mode: keep working and verifying until every todo item is complete.",
+    finalReminder:
+      "Current mode: ULTRAWORK. Keep working autonomously with tools until the task is complete and verified. Do not stop for a status update.",
     toolPolicy: "all",
     fullAccess: true,
     enforceTodos: true,

@@ -137,7 +137,9 @@ export function formatAvailableSkills(
   }
 
   const limit = options.limit ?? (options.compact ? 12 : 1000);
-  const descriptionLimit = options.descriptionLimit ?? (options.compact ? 80 : 0);
+  // Full descriptions reached several hundred characters each. The index only
+  // needs enough to pick a skill; the skill tool returns the full document.
+  const descriptionLimit = options.descriptionLimit ?? (options.compact ? 80 : 140);
   const available = autoDocuments.slice(0, limit).map((document) => {
     const description =
       descriptionLimit > 0 && document.description.length > descriptionLimit
