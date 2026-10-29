@@ -1,0 +1,73 @@
+# Dependencies
+node_modules/
+AGENTS*.md
+DESIGN*.md
+PLAN*.md
+
+# Build and release output
+!/docs/
+/docs/*
+!/docs/releasing.md
+dist/
+build/
+artifacts/
+/release/
+*.tsbuildinfo
+*.tgz
+*.tar.gz
+/out-tsc/
+
+# Private test suite stays local
+/tests/
+
+# Compiled binary (bun build --compile)
+orchivox
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets.yaml
+secrets.json
+credentials.json
+.netrc
+.npmrc
+.token
+*.token
+
+# Runtime state
+.orchivox/
+.agent/
+.agent/memory.db
+.agent/memory.db-shm
+.agent/memory.db-wal
+.agent/secrets.yaml
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+bun-debug.log*
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Editor and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local agent tooling state
+.commandcode/

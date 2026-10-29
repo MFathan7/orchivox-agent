@@ -1,0 +1,79 @@
+{
+  "name": "orchivox",
+  "version": "0.3.0",
+  "description": "Personal AI coding agent runtime: IDE-grade code editing, isolated Git worktree subagents, time-traveling stream rules, and a dual-direction OpenAPI and OpenClaude gateway.",
+  "type": "module",
+  "license": "MIT",
+  "author": "MFathan7",
+  "homepage": "https://github.com/MFathan7/orchivox-agent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MFathan7/orchivox-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MFathan7/orchivox-agent/issues"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "cli",
+    "terminal",
+    "bun",
+    "typescript",
+    "mcp"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "orchivox": "bin/launcher.mjs",
+    "orchvox": "bin/launcher.mjs"
+  },
+  "files": [
+    "bin/launcher.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "serve": "bun run src/index.ts serve",
+    "test": "bun test",
+    "build:binary": "bun run scripts/build-binary.ts",
+    "build:launcher": "bun run scripts/build-launcher.ts",
+    "build:release": "bun run scripts/build-release.ts",
+    "release:key": "bun run scripts/release-key.ts",
+    "prepack": "bun run build:launcher",
+    "prepublishOnly": "bun run typecheck && bun run check:secrets",
+    "pack:check": "npm pack --dry-run",
+    "test:installer": "bun test tests/installer",
+    "install:global": "bun run scripts/install-global.ts",
+    "check:secrets": "bun run scripts/check-secrets.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@hono/zod-openapi": "^1.6.3",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@scalar/hono-api-reference": "^0.12.13",
+    "@types/bun": "^1.4.3",
+    "@types/react": "^18.3.31",
+    "@types/yauzl": "^3.4.0",
+    "chalk": "^6.0.1",
+    "diff": "^9.0.0",
+    "exceljs": "^4.4.0",
+    "get-east-asian-width": "^1.7.0",
+    "hono": "^4.13.13",
+    "ink": "^5.2.1",
+    "mammoth": "^1.13.0",
+    "react": "^18.3.1",
+    "typescript": "^5.9.3",
+    "unpdf": "^2.0.0",
+    "yaml": "^2.9.1",
+    "yauzl": "^3.4.0",
+    "zod": "^4.6.7",
+    "zod-to-json-schema": "^3.25.2"
+  }
+}

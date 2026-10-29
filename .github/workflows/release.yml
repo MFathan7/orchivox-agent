@@ -1,0 +1,217 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the v prefix, for example 0.3.0"
+        required: true
+        type: string
+      dry_run:
+        description: "Build and sign without creating a GitHub Release"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          VERSION="$(printf '%s' "$VERSION" | tr -d '[:space:]')"
+          VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then
+            echo "missing release version" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release version: $VERSION"
+
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run build:launcher
+      - run: git diff --exit-code -- bin/launcher.mjs
+      - run: bun run pack:check
+      - run: bun run check:secrets
+
+  build:
+    name: build assets
+    needs: [prepare, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: build release assets
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          ARGS=(--version "$VERSION")
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            ARGS+=(--tag "${{ github.ref_name }}")
+          fi
+          bun run scripts/build-release.ts "${ARGS[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release/v${{ needs.prepare.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: smoke ${{ matrix.id }}
+    needs: [prepare, build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            os: ubuntu-latest
+            asset: orchivox-linux-x64.gz
+          - id: linux-arm64
+            os: ubuntu-24.04-arm
+            asset: orchivox-linux-arm64.gz
+          - id: darwin-x64
+            os: macos-15-intel
+            asset: orchivox-darwin-x64.gz
+          - id: darwin-arm64
+            os: macos-14
+            asset: orchivox-darwin-arm64.gz
+          - id: windows-x64
+            os: windows-latest
+            asset: orchivox-windows-x64.exe.gz
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release/v${{ needs.prepare.outputs.version }}
+      - name: run version check
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cd "dist/release/v$VERSION"
+          gunzip -c "${{ matrix.asset }}" > /tmp/orchivox
+          chmod +x /tmp/orchivox
+          /tmp/orchivox --version
+      - name: run version check
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          Set-Location "dist/release/v$env:VERSION"
+          $source = [System.IO.File]::OpenRead((Join-Path $PWD "${{ matrix.asset }}"))
+          $target = [System.IO.File]::Create((Join-Path $PWD "orchivox.exe"))
+          $gzip = [System.IO.Compression.GZipStream]::new(
+            $source,
+            [System.IO.Compression.CompressionMode]::Decompress
+          )
+          $gzip.CopyTo($target)
+          $gzip.Dispose()
+          $target.Dispose()
+          $source.Dispose()
+          .\orchivox.exe --version
+
+  release:
+    name: publish release
+    needs: [prepare, build, smoke]
+    if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release/v${{ needs.prepare.outputs.version }}
+      - name: sign manifest and checksums
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ORCHIVOX_RELEASE_SIGNING_KEY: ${{ secrets.ORCHIVOX_RELEASE_SIGNING_KEY }}
+        run: |
+          bun run scripts/build-release.ts \
+            --version "$VERSION" \
+            --manifest-only \
+            --require-signature \
+            --signing-key "$ORCHIVOX_RELEASE_SIGNING_KEY"
+      - name: create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          TAG="v$VERSION"
+          DIR="dist/release/v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DIR"/* --clobber
+          else
+            gh release create "$TAG" "$DIR"/* \
+              --title "Orchivox $VERSION" \
+              --generate-notes
+          fi
+          echo "https://github.com/${{ github.repository }}/releases/tag/$TAG"
+      - name: publish npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if npm view "orchivox@$VERSION" version >/dev/null 2>&1; then
+            echo "orchivox@$VERSION is already published"
+            exit 0
+          fi
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is not configured" >&2
+            exit 1
+          fi
+          bun run build:launcher
+          npm publish --provenance --access public --ignore-scripts
