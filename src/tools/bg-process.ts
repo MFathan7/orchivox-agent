@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { ensureRuntimeTempDir } from "../runtime-temp";
 import type { AgentTool, ToolRegistry } from "./registry";
 import { workspaceRoot } from "./workspace";
 
@@ -87,7 +88,12 @@ export class BackgroundProcessManager {
     }
 
     const cwd = options.cwd ?? workspaceRoot(this.defaultCwd);
-    const env = { ...globalThis.process.env, ...options.env };
+    const tempDir = await ensureRuntimeTempDir().catch(() => undefined);
+    const env = {
+      ...globalThis.process.env,
+      ...(tempDir ? { TMPDIR: tempDir } : {}),
+      ...options.env,
+    };
 
     let resolveReady: ((ready: boolean) => void) | undefined;
     let readyPromise: Promise<boolean> | undefined;

@@ -52,6 +52,11 @@ import { loadModelCatalogSync, refreshModelCatalog, type ModelCatalog } from "./
 import { primeRuntimeMetadata } from "./provider/runtime-metadata";
 import { ProviderRouter, type LLMProvider } from "./provider/router";
 import { ensureProjectState, resolveProjectState, type ProjectStatePaths } from "./runtime-paths";
+import {
+  cleanupLegacyTempArtifacts,
+  cleanupRuntimeTempDir,
+  cleanupStaleRuntimeTempDirs,
+} from "./runtime-temp";
 import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
 import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
 import { runGit } from "./vcs/git";
@@ -268,6 +273,8 @@ export async function bootstrap(
   options: { repoRoot?: string; configPath?: string; secretsPath?: string } = {},
 ): Promise<RuntimeHandle> {
   const root = options.repoRoot ?? globalThis.process.cwd();
+  await cleanupStaleRuntimeTempDirs().catch(() => 0);
+  await cleanupLegacyTempArtifacts().catch(() => 0);
   const resolved = await resolveConfigPaths({
     cwd: root,
     configFlag: options.configPath,
@@ -346,6 +353,7 @@ export async function bootstrap(
       await mcpClient.close();
       await lsp?.dispose();
       database.close();
+      await cleanupRuntimeTempDir();
     },
   };
 }

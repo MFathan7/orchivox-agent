@@ -1,6 +1,8 @@
+import { join } from "node:path";
 import { z } from "zod";
 
 import { currentTurnContext } from "../agent/turn-context";
+import { ensureRuntimeTempDir } from "../runtime-temp";
 import { DEFAULT_MAX_BYTES, spillToolOutput, truncateTail } from "./output-budget";
 import type { AgentTool } from "./registry";
 
@@ -41,6 +43,7 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
 
   private readonly defaultDir: string;
   private readonly baseEnv: Record<string, string>;
+  private readonly inheritedTmpDir: string | undefined;
   private readonly defaultTimeoutMs: number;
   private readonly interceptor: CommandInterceptor | undefined;
   /** One persistent shell per workspace, so parallel workers keep separate cwd and env. */
@@ -49,6 +52,7 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
   constructor(options: PersistentShellToolOptions = {}) {
     this.defaultDir = options.cwd ?? process.cwd();
     this.baseEnv = { ...collectEnv(), ...options.env };
+    this.inheritedTmpDir = globalThis.process.env.TMPDIR;
     this.defaultTimeoutMs = options.timeoutMs ?? 60_000;
     this.interceptor = options.interceptor;
   }
@@ -85,7 +89,13 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
   }
 
   private async runBash(command: string, timeoutMs: number, state: ShellState): Promise<string> {
-    const metaPath = `${globalThis.process.env.TMPDIR ?? "/tmp"}/orchivox-shell-${crypto.randomUUID()}.meta`;
+    const tempDir = await ensureRuntimeTempDir().catch(
+      () => this.inheritedTmpDir ?? "/tmp",
+    );
+    if (state.env.TMPDIR === undefined || state.env.TMPDIR === this.inheritedTmpDir) {
+      state.env.TMPDIR = tempDir;
+    }
+    const metaPath = join(tempDir, `orchivox-shell-${crypto.randomUUID()}.meta`);
     const script = [
       `cd ${shellQuote(state.dir)} || exit 97`,
       command,
@@ -154,16 +164,21 @@ interface ShellMeta {
 
 async function readAndClearMeta(metaPath: string): Promise<ShellMeta | undefined> {
   const file = Bun.file(metaPath);
-  if (!(await file.exists())) return undefined;
-  const raw = await file.text();
-  await file.delete();
-  const parts = raw.split("\0");
-  if (parts.length < 2) return undefined;
-  const env: Record<string, string> = {};
-  for (const entry of parts.slice(2)) {
-    if (!entry) continue;
-    const separator = entry.indexOf("=");
-    if (separator > 0) env[entry.slice(0, separator)] = entry.slice(separator + 1);
+  try {
+    if (!(await file.exists())) return undefined;
+    const raw = await file.text();
+    const parts = raw.split("\0");
+    if (parts.length < 2) return undefined;
+    const env: Record<string, string> = {};
+    for (const entry of parts.slice(2)) {
+      if (!entry) continue;
+      const separator = entry.indexOf("=");
+      if (separator > 0) env[entry.slice(0, separator)] = entry.slice(separator + 1);
+    }
+    return { pwd: parts[1], env };
+  } catch {
+    return undefined;
+  } finally {
+    await file.delete().catch(() => undefined);
   }
-  return { pwd: parts[1], env };
 }

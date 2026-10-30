@@ -1,6 +1,8 @@
-import { mkdir } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { z } from "zod";
 
+import { ensureRuntimeTempDir } from "../runtime-temp";
 import type { AgentTool, ToolRegistry } from "./registry";
 
 export interface SandboxBridgeOptions {
@@ -33,6 +35,10 @@ async function runSandboxScript(
 ): Promise<string> {
   const token = `${crypto.randomUUID()}${crypto.randomUUID()}`;
   let callCounter = 0;
+  const tempDir = await ensureRuntimeTempDir().catch(
+    () => globalThis.process.env.TMPDIR?.trim() || "/tmp",
+  );
+  const workDir = await mkdtemp(join(tempDir, "sandbox-"));
 
   const rpc = Bun.serve({
     hostname: "127.0.0.1",
@@ -65,17 +71,15 @@ async function runSandboxScript(
   });
 
   const rpcUrl = `http://127.0.0.1:${rpc.port}/rpc`;
-  const workDir = `${globalThis.process.env.TMPDIR ?? "/tmp"}/orchivox-sandbox-${crypto.randomUUID()}`;
-  await mkdir(workDir, { recursive: true });
-  const extension = request.language === "typescript" ? "ts" : "py";
-  const scriptPath = `${workDir}/main.${extension}`;
-  const wrapper =
-    request.language === "typescript"
-      ? buildTypeScriptWrapper(request.code, rpcUrl, token)
-      : buildPythonWrapper(request.code, rpcUrl, token);
-  await Bun.write(scriptPath, wrapper);
-
   try {
+    const extension = request.language === "typescript" ? "ts" : "py";
+    const scriptPath = `${workDir}/main.${extension}`;
+    const wrapper =
+      request.language === "typescript"
+        ? buildTypeScriptWrapper(request.code, rpcUrl, token)
+        : buildPythonWrapper(request.code, rpcUrl, token);
+    await Bun.write(scriptPath, wrapper);
+
     const command =
       request.language === "typescript"
         ? ["bun", scriptPath]
@@ -85,7 +89,7 @@ async function runSandboxScript(
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: collectEnv(),
+      env: { ...collectEnv(), TMPDIR: tempDir },
     });
     const timeoutMs = request.timeoutMs ?? options.timeoutMs ?? 30_000;
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -101,6 +105,7 @@ async function runSandboxScript(
     return `exit ${exitCode}\n--- stdout ---\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`;
   } finally {
     rpc.stop(true);
+    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 

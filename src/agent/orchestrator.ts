@@ -726,17 +726,7 @@ export class AgentOrchestrator implements IAgentRunner {
       mentionedSkills: mentionedSkills.map((document) => document.name),
       namedSkills: namedSkills.map((document) => document.name),
     });
-    const planPath = join(this.root, ".agent", "plan.md");
-    const hasPlan = mode !== "plan" && (await Bun.file(planPath).exists());
-    const planHint = hasPlan
-      ? [
-          "# Approved plan",
-          "A plan file exists at .agent/plan.md. If the user asks to implement it, read it once at the start of the turn and follow it.",
-          "Do not repeat research, API probes, or verification already recorded in that file.",
-          "For additional exploration, delegate to read-only subagents with spawn_subagents.",
-        ].join(" ")
-      : "";
-    const extraHints = [skillHint, planHint].filter(Boolean).join("\n\n");
+    const extraHints = skillHint;
 
     const contextWindowBase = effectiveContextWindow(capabilities) ?? this.contextTokenBudget;
     let contextWindow = contextWindowBase;

@@ -55,7 +55,7 @@ const TOOL_GUIDANCE = [
   "- Prefer hash_edit or apply_unified_patch for focused edits. Do not reformat unrelated code.",
   "- Use todo_write for multi-step tasks. Work one todo item per step and mark it complete before starting the next.",
   "- Verify changes with diagnostics_check, tests, or a build before claiming success.",
-  "- When the user approved a plan in .agent/plan.md, read it once, put its order in todo_write, and implement it one item at a time. Do not repeat the research it already records.",
+  "- When the user references a plan file, read it once, put its order in todo_write, and implement it one item at a time. Do not look for plan files the user did not mention.",
   "- Do not claim a tool succeeded unless you saw its result. If a tool fails, report the error and adapt.",
   "- Ask the user only when blocked. Otherwise make a reasonable assumption and state it.",
   "- When you need the user to choose between technical paths, call the question tool with 2-8 short options. Never write a multiple-choice question as a plain numbered list. Do not use it for mode switches, execution handoffs, or approval of risky actions; the user controls modes and the approval flow handles risk. A loaded skill may require its own choices, so ask those with the question tool before implementing.",

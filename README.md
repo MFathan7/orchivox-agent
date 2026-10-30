@@ -66,7 +66,7 @@ The system prompt and terminal UI are English. Replies follow the language of th
 
 Use `/study` for a structured report about the current project. It reads project evidence from disk and asks for a report without editing files. Use `/review <file>` to review one file, or `/review <question>` to answer a code question from project evidence. These are explicit commands; a normal sentence that mentions study or review does not trigger them.
 
-Plan mode can delegate read-only exploration to subagents and writes the plan to `.agent/plan.md` with the `write_plan` tool. The chat answer stays short and points to the file.
+Plan mode can delegate read-only exploration to subagents. It discusses the plan in chat and writes a plan file only when you ask, as a `PLAN*.md` file in the active project directory. Build mode does not read or create plan files automatically.
 
 ### Editing with repository context
 
@@ -88,7 +88,7 @@ Large tasks can be split across subagents. Each worker can run in its own Git wo
 
 Within a single turn, independent read-only tool calls also run concurrently, up to four at a time, and keep their original result order. Edits, shell commands, and interactive tools stay sequential.
 
-When the user approved a plan, build reads `.agent/plan.md` once and implements it instead of repeating the research it records. Larger exploration can go to read-only subagents so the main context stays small.
+When you reference a plan file in a build request, build reads it once and implements it instead of repeating the research it records. Larger exploration can go to read-only subagents so the main context stays small.
 
 Use `/hub` to inspect workers and `/tasks` to open the task board. The agent can also create tasks directly when running in Ultrawork mode.
 
@@ -100,6 +100,10 @@ Sessions and messages are stored outside the project, under `$XDG_DATA_HOME/orch
 - `/fork` branches a conversation from a selected turn.
 - `/compact` compresses old context, and automatic compaction runs when the context window is nearly full.
 - The answer footer shows the mode, model, and generation speed.
+
+### Temporary files
+
+Commands run with `TMPDIR` pointing at a managed directory under the Orchivox cache, for example `~/.cache/orchivox/tmp/run-<pid>-<id>`. Orchivox removes that directory when the runtime closes and removes stale `run-*` directories at startup. Files created by a command that hardcodes `/tmp` are outside this cleanup and are left alone.
 
 ### Provider flexibility
 
