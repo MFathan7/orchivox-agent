@@ -153,9 +153,11 @@ jobs:
   release:
     name: publish release
     needs: [prepare, build, smoke]
-    if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
+    if: ${{ github.repository == 'MFathan7/orchivox-agent' && (github.event_name == 'push' || github.event.inputs.dry_run != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment:
+      name: release
     permissions:
       contents: write
       id-token: write

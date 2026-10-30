@@ -527,6 +527,11 @@ async function watchRelease(
   }
 
   console.log(dim(`  run ${run.databaseId}`));
+  console.log(
+    dim(
+      `  approve the release environment if the run is waiting: https://github.com/${repoSlug()}/actions/runs/${run.databaseId}`,
+    ),
+  );
   const watch = exec("gh", ["run", "watch", String(run.databaseId), "--exit-status"], {
     allowFailure: true,
   });
@@ -591,11 +596,14 @@ async function watchRelease(
   return false;
 }
 
-function releaseUrl(tag: string): string {
+function repoSlug(): string {
   const remote = git(["remote", "get-url", "origin"], true).stdout.trim();
   const match = /github\.com[:/](.+?)(?:\.git)?$/.exec(remote);
-  const repo = match ? match[1] : "MFathan7/orchivox-agent";
-  return `https://github.com/${repo}/releases/tag/${tag}`;
+  return match ? match[1] : "MFathan7/orchivox-agent";
+}
+
+function releaseUrl(tag: string): string {
+  return `https://github.com/${repoSlug()}/releases/tag/${tag}`;
 }
 
 async function main(): Promise<void> {

@@ -8,11 +8,19 @@ launcher. Read it before creating a tag.
 - Bun 1.4.4 or newer.
 - GitHub CLI authenticated for the repository.
 - Permission to create GitHub Releases.
-- The `ORCHIVOX_RELEASE_SIGNING_KEY` repository secret.
-- The `NPM_TOKEN` repository secret with permission to publish the `orchivox`
-  package. The token must bypass 2FA, otherwise the workflow stops with
-  `EOTP` because no authenticator is available on the runner. Use a granular
-  token with "bypass 2FA" enabled, or an automation token.
+- The `ORCHIVOX_RELEASE_SIGNING_KEY` environment secret on the `release`
+  environment.
+- The `NPM_TOKEN` environment secret on the `release` environment with
+  permission to publish the `orchivox` package. The token must bypass 2FA,
+  otherwise the workflow stops with `EOTP` because no authenticator is
+  available on the runner. Use a granular token with "bypass 2FA" enabled, or
+  an automation token.
+- Reviewer access to the `release` environment. The publish job pauses until a
+  reviewer approves the deployment.
+
+Keep both secrets on the environment, not on the repository. Repository
+secrets are available to any job in the repository, while environment secrets
+are released only after an approval.
 
 ## Signing key
 
@@ -33,11 +41,11 @@ release-public-key.pem                   local public key, ignored by Git
 It also prints the public key fingerprint. Keep the private key offline and
 never commit it.
 
-Add the private key to GitHub Actions:
+Add the private key to the `release` environment:
 
 ```bash
 base64 < ~/.config/orchivox/release-private.pem | tr -d '\n' \
-  | gh secret set ORCHIVOX_RELEASE_SIGNING_KEY
+  | gh secret set ORCHIVOX_RELEASE_SIGNING_KEY --env release
 ```
 
 Copy the public key into `src/installer/release-public-key.ts` and commit that
@@ -52,6 +60,31 @@ bun run release:key public --private ~/.config/orchivox/release-private.pem \
 ```
 
 Then update the constant in `src/installer/release-public-key.ts`.
+
+## Release protection
+
+The publish job is guarded by three controls:
+
+- The job only runs when `github.repository` is `MFathan7/orchivox-agent`.
+- It targets the `release` environment, which requires approval from
+  `MFathan7` before the job starts.
+- The `v*` tag ruleset blocks tag creation, updates, and deletion unless
+  `MFathan7` bypasses it.
+
+To approve a release, open the workflow run, choose `Review deployments`,
+select `release`, and approve. The job then continues with the environment
+secrets. `prevent_self_review` is off, so the owner can approve their own
+deployment.
+
+Store `NPM_TOKEN` as an environment secret:
+
+```bash
+gh secret set NPM_TOKEN --env release
+```
+
+Never store it as a repository secret. A repository secret is visible to any
+job in the repository, including jobs started from a branch in the same
+repository.
 
 ## Version
 
@@ -146,6 +179,14 @@ The script refuses to reuse an existing tag or npm version. If the npm step
 fails, it offers to publish locally and rerun the failed job when a terminal is
 available. `--dry-run` is safe to run at any time.
 
+After the tag push, the publish job waits for approval on the `release`
+environment. Approve it from the workflow run page, or with:
+
+```bash
+gh run list --workflow=release.yml
+gh run view <run-id> --web
+```
+
 ## Release flow
 
 The manual flow remains available:
@@ -170,6 +211,9 @@ The `release` workflow then:
 6. Creates or updates the GitHub Release.
 7. Uploads binaries, `SHA256SUMS`, `latest.json`, and `latest.json.sig`.
 8. Publishes the launcher package to npm with provenance.
+
+The publish job waits for approval on the `release` environment before it can
+read the signing key or the npm token.
 
 The npm step is skipped when the version is already on the registry, and it
 re-checks the registry before failing, so a publish from another machine does
