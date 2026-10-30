@@ -103,7 +103,52 @@ bun run build:release --version 0.3.0 --manifest-only \
   --require-signature
 ```
 
+## Guided release
+
+Run the cross-platform wizard from the repository root:
+
+```bash
+bun run release
+```
+
+It works on macOS, Linux, and Windows. The script:
+
+1. Asks which branch to release from.
+2. Asks for the commit message.
+3. Offers patch, minor, major, or a manual version.
+4. Updates `package.json` and the README version line.
+5. Rebuilds `bin/launcher.mjs`.
+6. Runs typecheck, tests when present, the secret scan, and the pack check.
+7. Commits, pushes the branch, creates the tag, and pushes it.
+8. Watches the release workflow and reports the npm version.
+
+Non-interactive runs:
+
+```bash
+bun run release -- --bump minor -m "Add session export"
+bun run release -- --version 0.4.0 -m "Release 0.4.0" --yes
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--branch <name>` | Branch to release from, default current |
+| `--create-branch` | Create the branch when it does not exist |
+| `--allow-non-main` | Permit a tag from a branch other than `main` |
+| `-m, --message <text>` | Commit message |
+| `--version <x.y.z>` | Exact version |
+| `--bump <kind>` | `patch`, `minor`, or `major` |
+| `-y, --yes` | Accept defaults and skip confirmation |
+| `--dry-run` | Print the plan without changing anything |
+| `--no-checks` | Skip local checks |
+| `--no-watch` | Do not wait for the release workflow |
+
+The script refuses to reuse an existing tag or npm version. If the npm step
+fails, it offers to publish locally and rerun the failed job when a terminal is
+available. `--dry-run` is safe to run at any time.
+
 ## Release flow
+
+The manual flow remains available:
 
 1. Run `bun run typecheck` and `bun test`.
 2. Bump `package.json` version.

@@ -41,6 +41,7 @@
     "build:binary": "bun run scripts/build-binary.ts",
     "build:launcher": "bun run scripts/build-launcher.ts",
     "build:release": "bun run scripts/build-release.ts",
+    "release": "bun run scripts/release.ts",
     "release:key": "bun run scripts/release-key.ts",
     "prepack": "bun run build:launcher",
     "prepublishOnly": "bun run typecheck && bun run check:secrets",

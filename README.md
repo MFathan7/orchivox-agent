@@ -675,6 +675,15 @@ type checker, launcher build, package contents, and tracked secrets.
 
 The project runs TypeScript directly through Bun. There is no separate transpile step for local development.
 
+Cut a release with the guided script:
+
+```bash
+bun run release
+```
+
+It handles the version bump, launcher rebuild, checks, commit, push, tag, and
+waits for the GitHub and npm release. Run `bun run release -- --help` for flags.
+
 ## Project layout
 
 ```text
