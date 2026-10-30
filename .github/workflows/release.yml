@@ -205,13 +205,35 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          if npm view "orchivox@$VERSION" version >/dev/null 2>&1; then
-            echo "orchivox@$VERSION is already published"
-            exit 0
-          fi
+          published() {
+            npm view "orchivox@$VERSION" version >/dev/null 2>&1
+          }
+
+          # The registry can lag behind a publish from another machine, so give
+          # it a few seconds before assuming the version is missing.
+          for attempt in 1 2 3 4 5; do
+            if published; then
+              echo "orchivox@$VERSION is already published"
+              exit 0
+            fi
+            sleep 3
+          done
+
           if [ -z "$NODE_AUTH_TOKEN" ]; then
             echo "NPM_TOKEN is not configured" >&2
             exit 1
           fi
+
           bun run build:launcher
-          npm publish --provenance --access public --ignore-scripts
+          if ! npm publish --provenance --access public --ignore-scripts; then
+            # A 2FA challenge or a propagation race can fail after the upload
+            # landed. Confirm with the registry before failing the job.
+            for attempt in 1 2 3 4 5; do
+              if published; then
+                echo "orchivox@$VERSION was published despite the error above"
+                exit 0
+              fi
+              sleep 3
+            done
+            exit 1
+          fi

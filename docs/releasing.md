@@ -10,7 +10,9 @@ launcher. Read it before creating a tag.
 - Permission to create GitHub Releases.
 - The `ORCHIVOX_RELEASE_SIGNING_KEY` repository secret.
 - The `NPM_TOKEN` repository secret with permission to publish the `orchivox`
-  package.
+  package. The token must bypass 2FA, otherwise the workflow stops with
+  `EOTP` because no authenticator is available on the runner. Use a granular
+  token with "bypass 2FA" enabled, or an automation token.
 
 ## Signing key
 
@@ -123,6 +125,10 @@ The `release` workflow then:
 6. Creates or updates the GitHub Release.
 7. Uploads binaries, `SHA256SUMS`, `latest.json`, and `latest.json.sig`.
 8. Publishes the launcher package to npm with provenance.
+
+The npm step is skipped when the version is already on the registry, and it
+re-checks the registry before failing, so a publish from another machine does
+not leave the run red.
 
 Manual dispatch is available for a dry run:
 
