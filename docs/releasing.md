@@ -182,3 +182,9 @@ downloaded.
 - Asset missing: check the build matrix and the artifact path.
 - Wrong checksum: regenerate `latest.json` and `SHA256SUMS` with
   `--manifest-only`, then upload again.
+- `ReleaseAsset.name already exists`: the workflow creates the release as a
+  draft and uploads one asset at a time. Rerun the job, or dispatch
+  `release.yml` for the same version.
+- npm `EOTP`: the `NPM_TOKEN` secret needs bypass 2FA.
+- npm `E404` during publish: the token is missing or invalid. A placeholder
+  value shows up unmasked in the job log; real secrets are printed as `***`.
