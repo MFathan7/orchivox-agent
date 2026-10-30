@@ -100,7 +100,7 @@ import { buildSystemPrompt } from "./system-prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
 import { currentTurnContext, runWithTurnContext } from "./turn-context";
 import { sleepAbortable } from "../provider/retry";
-import { modeContract } from "./modes";
+import { modeContract, modeTransitionReminder } from "./modes";
 import { SKILL_ALWAYS_ALLOWED_TOOLS, SkillToolPolicy } from "./skill-policy";
 import { TodoEngine } from "./todo";
 import { runGit } from "../vcs/git";
@@ -810,6 +810,10 @@ export class AgentOrchestrator implements IAgentRunner {
     let studyRetried = false;
     let editedThisTurn = false;
     let verifiedThisTurn = false;
+    let wrotePlanThisTurn = false;
+    let implementationNudges = 0;
+    const editedFiles = new Set<string>();
+    const planReference = /\bPLAN[A-Za-z0-9._-]*\.md\b/i.test(lastText);
     // Measured context is everything the last request used: the prompt it sent
     // plus the completion it produced, reasoning included. The assistant message
     // covered by that completion is the last message before the trailing count.
@@ -903,11 +907,7 @@ export class AgentOrchestrator implements IAgentRunner {
         makeMessage(
           `turn-${turn}-mode`,
           "system",
-          [
-            `The user switched this session from ${from.toUpperCase()} to ${mode.toUpperCase()} mode.`,
-            `Write access is ${contract.fullAccess ? "now enabled" : "still restricted"}.`,
-            "Continue the task in the new mode. Do not ask for this switch again.",
-          ].join(" "),
+          modeTransitionReminder(from, mode),
         ),
       );
       sink({ type: "mode_changed", from, to: mode });
@@ -988,7 +988,19 @@ export class AgentOrchestrator implements IAgentRunner {
             type: "context_pruned",
             tokens: pruned.prunedTokens,
             results: pruned.prunedResults,
+            message_ids: pruned.prunedMessageIds,
           });
+          if (sessionId) {
+            for (const id of pruned.prunedMessageIds) {
+              const message = messages.find((entry) => entry.id === id);
+              if (!message) continue;
+              try {
+                this.database.replaceMessageContent(id, message.content);
+              } catch {
+                // A read-only or stub database must not break the turn.
+              }
+            }
+          }
         }
       }
       const measuredBeforeCompaction = measuredPromptTokens();
@@ -1433,6 +1445,28 @@ export class AgentOrchestrator implements IAgentRunner {
           messages.push(makeMessage(`turn-${turn}-continue`, "user", nudge));
           continue;
         }
+        if (!turnError && mode === "build" && planReference && implementationNudges < 1) {
+          const implementationFiles = [...editedFiles].filter((path) => !isPlanFilePath(path));
+          const wroteOnlyPlan =
+            (editedFiles.size > 0 || wrotePlanThisTurn) && implementationFiles.length === 0;
+          if (wroteOnlyPlan) {
+            implementationNudges += 1;
+            messages.push(
+              makeMessage(
+                `turn-${turn}-implement`,
+                "user",
+                [
+                  "You wrote or updated a plan file, but no implementation files changed.",
+                  "Writing or updating a plan is not implementation.",
+                  "Read the plan, edit the code files it describes with the edit tools, and verify the result.",
+                  "If the plan is already implemented, say so and show the evidence.",
+                  "Do not claim completion without file changes.",
+                ].join(" "),
+              ),
+            );
+            continue;
+          }
+        }
         if (
           !turnError &&
           contract.verifyEdits &&
@@ -1579,7 +1613,10 @@ export class AgentOrchestrator implements IAgentRunner {
         const startedAt = Date.now();
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         const filePath = extractFilePath(call.arguments);
-        if (MUTATING_TOOL_NAMES.has(call.name)) editedThisTurn = true;
+        if (MUTATING_TOOL_NAMES.has(call.name)) {
+          editedThisTurn = true;
+          if (filePath) editedFiles.add(filePath);
+        }
         if (
           VERIFY_TOOL_NAMES.has(call.name) ||
           (call.name === "bash" &&
@@ -1657,6 +1694,7 @@ export class AgentOrchestrator implements IAgentRunner {
         }
 
         const result = await this.registry.run(call, mode);
+        if (call.name === "write_plan" && !result.is_error) wrotePlanThisTurn = true;
         let content = typeof result.content === "string" ? result.content : JSON.stringify(result.content);
         let skillDocument: SkillDocument | undefined;
         if (call.name === "skill" && !result.is_error) {
@@ -2290,6 +2328,13 @@ function parseArguments(text: string): Record<string, unknown> {
 function extractFilePath(args: Record<string, unknown>): string | undefined {
   const candidate = args.filePath ?? args.path ?? args.sourcePath;
   return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+function isPlanFilePath(path: string): boolean {
+  return (
+    /(^|[\\/])PLAN[A-Za-z0-9._-]*\.md$/i.test(path) ||
+    /(^|[\\/])\.agent[\\/]plan\.md$/i.test(path)
+  );
 }
 
 export function stripImageBlocks(messages: Message[]): Message[] {

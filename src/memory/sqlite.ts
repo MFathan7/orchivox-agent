@@ -334,6 +334,16 @@ export class MemoryDatabase implements TaskStore {
     this.db.query("UPDATE sessions SET updated_at = ? WHERE id = ?").run(createdAt, sessionId);
   }
 
+  replaceMessageContent(id: string, content: Message["content"]): void {
+    const plain = stripInlineImages(content);
+    this.db
+      .query("UPDATE messages SET content_json = ? WHERE id = ?")
+      .run(JSON.stringify(plain), id);
+    this.db
+      .query("UPDATE messages_fts SET content = ? WHERE message_id = ?")
+      .run(plainText(plain), id);
+  }
+
   loadMessages(sessionId: string): Message[] {
     const rows = this.loadFullMessages(sessionId);
     const compaction = this.getCompaction(sessionId);

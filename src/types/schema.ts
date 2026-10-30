@@ -433,6 +433,7 @@ export const ContextPrunedEventSchema = z.object({
   type: z.literal("context_pruned"),
   tokens: z.number().int().nonnegative(),
   results: z.number().int().nonnegative(),
+  message_ids: z.array(z.string()).default([]),
 });
 export type ContextPrunedEvent = z.infer<typeof ContextPrunedEventSchema>;
 

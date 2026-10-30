@@ -141,6 +141,10 @@ export function buildTranscriptEntries(
       typeof metadata?.turn_tokens === "number" && Number.isFinite(metadata.turn_tokens)
         ? metadata.turn_tokens
         : undefined;
+    const filesChanged =
+      typeof metadata?.files_changed === "number" && Number.isFinite(metadata.files_changed)
+        ? metadata.files_changed
+        : undefined;
     const thinkingSegments = thinkingSegmentsFromMetadata(metadata?.thinking_segments);
     const toolCalls = toolCallsFromMetadata(metadata?.tool_calls);
     entries.push({
@@ -155,8 +159,12 @@ export function buildTranscriptEntries(
         : {}),
       ...(toolCalls ? { toolCalls } : {}),
       ...(message.role === "assistant" &&
-      (mode || model || tokensPerSecond !== undefined || turnTokens !== undefined)
-        ? { mode, model, tokensPerSecond, turnTokens }
+      (mode ||
+        model ||
+        tokensPerSecond !== undefined ||
+        turnTokens !== undefined ||
+        filesChanged !== undefined)
+        ? { mode, model, tokensPerSecond, turnTokens, filesChanged }
         : {}),
     });
   });

@@ -73,6 +73,7 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
       "Implement the request now. Do not reply with a plan instead of doing the work.",
       "If an active skill tells you to ask the user a question before working, call the question tool first. That instruction wins over the default to implement immediately.",
       "If the user references a plan file, read it once and follow it. Do not look for plan files the user did not mention.",
+      "A plan file is not implementation. When the user asks to implement a plan, change the code files it describes with the edit tools, then verify. Do not claim completion when no files changed.",
       "Write the implementation order with todo_write, then start editing. Do not run another discovery pass first.",
       "Work one todo item per step: mark it in progress, make the smallest complete change, verify it, then mark it complete. Do not plan the whole implementation in one reasoning pass.",
       "For codebase or web exploration that is not already in the plan, use read-only subagents with spawn_subagents so the main context stays small.",
@@ -118,6 +119,15 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
 
 export function modeContract(mode: AgentMode): ModeContract {
   return MODE_CONTRACTS[mode] ?? MODE_CONTRACTS.build;
+}
+
+export function modeTransitionReminder(from: AgentMode, to: AgentMode): string {
+  return [
+    `The user switched this session from ${from.toUpperCase()} to ${to.toUpperCase()} mode.`,
+    `The previous ${from.toUpperCase()} mode instructions no longer apply.`,
+    `Continue in ${to.toUpperCase()} mode.`,
+    "Do not tell the user to switch modes, press Tab, or run /build; the switch already happened.",
+  ].join(" ");
 }
 
 /**

@@ -225,6 +225,7 @@ export interface PruneResult {
   messages: Message[];
   prunedTokens: number;
   prunedResults: number;
+  prunedMessageIds: string[];
 }
 
 export const PRUNED_TOOL_RESULT =
@@ -257,10 +258,10 @@ export function pruneToolOutput(
       break;
     }
   }
-  if (boundary <= 0) return { messages, prunedTokens: 0, prunedResults: 0 };
+  if (boundary <= 0) return { messages, prunedTokens: 0, prunedResults: 0, prunedMessageIds: [] };
 
   let protectedTokens = 0;
-  const targets: Array<{ messageIndex: number; blockIndex: number; tokens: number }> = [];
+  const targets: Array<{ messageIndex: number; blockIndex: number; messageId: string; tokens: number }> = [];
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (index >= boundary) continue;
     const message = messages[index];
@@ -268,28 +269,57 @@ export function pruneToolOutput(
     for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex -= 1) {
       const block = message.content[blockIndex];
       if (block.type !== "tool_result") continue;
-      const tokens = estimateTextTokens(toolResultText(block.content));
+      const text = toolResultText(block.content);
+      if (text.startsWith("[context pruned:")) continue;
+      const tokens = estimateTextTokens(text);
       if (protectedTokens + tokens <= protectTokens) {
         protectedTokens += tokens;
         continue;
       }
-      targets.push({ messageIndex: index, blockIndex, tokens });
+      targets.push({ messageIndex: index, blockIndex, messageId: message.id, tokens });
     }
   }
 
   const total = targets.reduce((sum, target) => sum + target.tokens, 0);
-  if (total < minTokens) return { messages, prunedTokens: 0, prunedResults: 0 };
+  if (total < minTokens) return { messages, prunedTokens: 0, prunedResults: 0, prunedMessageIds: [] };
 
   const next = messages.map((message) => ({ ...message, content: [...message.content] }));
   let prunedTokens = 0;
+  const prunedMessageIds = new Set<string>();
   for (const target of targets) {
     const message = next[target.messageIndex];
     const block = message?.content[target.blockIndex];
     if (block?.type !== "tool_result") continue;
     message.content[target.blockIndex] = { ...block, content: PRUNED_TOOL_RESULT };
     prunedTokens += target.tokens;
+    prunedMessageIds.add(target.messageId);
   }
-  return { messages: next, prunedTokens, prunedResults: targets.length };
+  return {
+    messages: next,
+    prunedTokens,
+    prunedResults: targets.length,
+    prunedMessageIds: [...prunedMessageIds].sort(),
+  };
+}
+
+export function markPrunedToolResults(
+  messages: Message[],
+  messageIds: readonly string[],
+): Message[] {
+  const ids = new Set(messageIds);
+  if (ids.size === 0) return messages;
+  return messages.map((message) =>
+    ids.has(message.id)
+      ? {
+          ...message,
+          content: message.content.map((block) =>
+            block.type === "tool_result"
+              ? { ...block, content: PRUNED_TOOL_RESULT }
+              : block,
+          ),
+        }
+      : message,
+  );
 }
 
 export async function compactMessages(messages: Message[], options: CompactionOptions): Promise<CompactionResult> {

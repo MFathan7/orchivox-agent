@@ -11,7 +11,7 @@ export const QuestionOptionSchema = z.object({
 export const QuestionRequestSchema = z.object({
   question: z.string().min(1),
   header: z.string().optional(),
-  options: z.array(QuestionOptionSchema).min(1).max(8),
+  options: z.array(QuestionOptionSchema).max(8).default([]),
   multiple: z.boolean().default(false),
   allow_custom: z.boolean().default(true),
   /**
@@ -63,7 +63,7 @@ export const QuestionArgumentsSchema = z
 export type QuestionArguments = z.infer<typeof QuestionArgumentsSchema>;
 
 export const QUESTION_UNSHOWN =
-  "The question could not be shown in this client. Continue without an answer: make a reasonable assumption and state it, or ask the user directly in your reply.";
+  "Ask the user the question directly in your reply, in natural prose. Do not mention this fallback. Do not turn the options into a numbered list.";
 
 function parseOptionsField(value: unknown): unknown[] {
   if (Array.isArray(value)) return value;
@@ -117,7 +117,8 @@ export function normalizeQuestionArguments(
     if (options.length === 8) break;
   }
   const text = question.trim();
-  if (text.length === 0 || options.length === 0) return undefined;
+  if (text.length === 0) return undefined;
+  if (options.length === 0 && !args.allow_custom) return undefined;
   const header =
     args.header && args.header.trim().length > 0 && args.header.trim() !== text
       ? args.header.trim()
@@ -125,7 +126,7 @@ export function normalizeQuestionArguments(
   return {
     question: text,
     ...(header ? { header } : {}),
-    options: options.length >= 2 ? options : [...options, { label: "OK" }],
+    options: options.length === 1 ? [...options, { label: "OK" }] : options,
     multiple: args.multiple,
     allow_custom: args.allow_custom,
     mode_options: args.mode_options,
@@ -150,7 +151,7 @@ export function createQuestionTool(
   return {
     name: "question",
     description:
-      "Ask the user a question when a requirement or choice is ambiguous. Provide 2 to 8 options, each with a label and optional description. Set multiple=true to allow more than one answer. The user may type a custom answer. Set mode_options=true only when the options are agent modes (plan, build, ultrawork); the answer then switches the session mode. Do not use mode_options to ask whether to start implementation or hand off to another mode, because the user controls mode switches. Do not use this for approval of risky actions; the approval flow handles that.",
+      "Ask the user a question when a requirement or choice is ambiguous. For a choice, provide 2 to 8 options, each with a label and optional description. For an open question, omit options and the user can type a free-form answer. Set multiple=true to allow more than one answer. The user may type a custom answer. Set mode_options=true only when the options are agent modes (plan, build, ultrawork); the answer then switches the session mode. Do not use mode_options to ask whether to start implementation or hand off to another mode, because the user controls mode switches. Do not use this for approval of risky actions; the approval flow handles that.",
     parameters: QuestionArgumentsSchema,
     readOnly: true,
     async execute(args) {

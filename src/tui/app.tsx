@@ -131,6 +131,7 @@ export interface ChatEntryView {
   model?: string;
   tokensPerSecond?: number;
   turnTokens?: number;
+  filesChanged?: number;
   diff?: { oldText: string; newText: string; oldLabel?: string; newLabel?: string; unified?: boolean };
   compaction?: ChatCompactionView;
 }

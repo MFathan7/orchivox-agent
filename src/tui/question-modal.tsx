@@ -27,7 +27,9 @@ export function QuestionModal({
 }: QuestionModalProps): React.ReactElement {
   const [selected, setSelected] = React.useState(0);
   const [toggled, setToggled] = React.useState<Set<number>>(new Set());
-  const [customMode, setCustomMode] = React.useState(false);
+  const [customMode, setCustomMode] = React.useState(
+    request.options.length === 0 && request.allow_custom,
+  );
   const [customText, setCustomText] = React.useState("");
   const [notice, setNotice] = React.useState("");
 

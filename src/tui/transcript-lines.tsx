@@ -676,7 +676,7 @@ function assistantRows(
     );
     if (
       !entry.live &&
-      (entry.mode || entry.model || entry.tokensPerSecond !== undefined || entry.turnTokens !== undefined)
+      (entry.mode || entry.model || entry.tokensPerSecond !== undefined || entry.turnTokens !== undefined || entry.filesChanged !== undefined)
     ) {
       rows.push({
         key: `${entry.id}-meta`,
@@ -687,6 +687,9 @@ function assistantRows(
               entry.model,
               entry.tokensPerSecond !== undefined && Number.isFinite(entry.tokensPerSecond)
                 ? `${entry.tokensPerSecond.toFixed(1)} tok/s`
+                : undefined,
+              entry.filesChanged !== undefined
+                ? `${entry.filesChanged} file${entry.filesChanged === 1 ? "" : "s"} changed`
                 : undefined,
               entry.turnTokens !== undefined
                 ? `turn ${formatTokenCount(entry.turnTokens)} tokens`

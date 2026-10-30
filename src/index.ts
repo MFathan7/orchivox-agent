@@ -10,7 +10,7 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
-import { modeFromQuestionAnswer } from "./agent/modes";
+import { modeFromQuestionAnswer, modeTransitionReminder } from "./agent/modes";
 import { buildReviewCommand, buildStudyCommand } from "./agent/task-commands";
 import { currentTurnContext } from "./agent/turn-context";
 import { appendErrorLog } from "./agent/error-log";
@@ -21,7 +21,7 @@ import {
   takeAnswer,
 } from "./agent/answer-stream";
 import { formatAppInfo, formatDoctor, getAppInfo, runUpdate } from "./app-info";
-import { compactMessages, extractSummary } from "./agent/compaction";
+import { compactMessages, extractSummary, markPrunedToolResults } from "./agent/compaction";
 import { generateSessionTitle, isPlaceholderTitle, messageText } from "./agent/session-title";
 import type { SkillDocument } from "./agent/skills";
 import {
@@ -1173,6 +1173,9 @@ async function runTuiSession(
         pushEntry("system", `image skipped: ${attachment.filePath} (${attachment.error})`);
       }
     }
+    const previousSessionMode = state.sessionId
+      ? runtime.database.getSession(state.sessionId)?.mode
+      : undefined;
     const sessionId = ensureSession(displayUserText ?? promptText);
     const saveSystemLine = (text: string, metadata: Record<string, unknown> = {}): void => {
       try {
@@ -1267,7 +1270,14 @@ async function runTuiSession(
       const request = AgentRunRequestSchema.parse({
         profile: modeToProfile(turnMode),
         messages: state.messages,
-        system: options.systemContext,
+        system: [
+          previousSessionMode && previousSessionMode !== state.mode
+            ? modeTransitionReminder(previousSessionMode, state.mode)
+            : "",
+          options.systemContext ?? "",
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
         task: options.task,
         metadata: {
           ...(targetAgent ? { agent: targetAgent } : {}),
@@ -1287,6 +1297,7 @@ async function runTuiSession(
       let completionTokens = 0;
       let lastUsage: { prompt_tokens: number; completion_tokens: number; total_tokens?: number } | undefined;
       let sawErrorEvent = false;
+      const turnFiles = new Set<string>();
       for await (const event of runtime.orchestrator.runStream(request, activeAbortController.signal)) {
         if (event.type === "token") {
           const now = Date.now();
@@ -1417,6 +1428,7 @@ async function runTuiSession(
             additions: (existing?.additions ?? 0) + event.additions,
             deletions: (existing?.deletions ?? 0) + event.deletions,
           });
+          turnFiles.add(event.path);
           renderLive(true);
         } else if (event.type === "prompt_preflight") {
           state.activeSkills = event.active_skills;
@@ -1455,6 +1467,9 @@ async function runTuiSession(
           pushEntry("system", `mode switched to ${event.to}`);
           renderLive(true);
         } else if (event.type === "context_pruned") {
+          if (event.message_ids.length > 0) {
+            state.messages = markPrunedToolResults(state.messages, event.message_ids);
+          }
           setNotice(
             `context pruned: ${formatTokenCount(event.tokens)} tokens from ${event.results} old tool result${event.results === 1 ? "" : "s"}`,
             6000,
@@ -1574,6 +1589,7 @@ async function runTuiSession(
         model: turnModel,
         tokensPerSecond,
         turnTokens: state.turnTotalTokens,
+        filesChanged: turnFiles.size,
       };
       if (failedWithoutAnswer) {
         // Keep the reasoning available for inspection, but never save an empty
@@ -1641,6 +1657,7 @@ async function runTuiSession(
             turn_tokens: state.turnTotalTokens,
             thinking_segments: thinkingSegments.map((segment) => ({ ...segment })),
             tool_calls: liveEntry.toolCalls ?? [],
+            files_changed: turnFiles.size,
           },
         };
         state.messages = [...state.messages, assistantMsg];
