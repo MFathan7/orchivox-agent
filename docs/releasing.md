@@ -76,6 +76,11 @@ select `release`, and approve. The job then continues with the environment
 secrets. `prevent_self_review` is off, so the owner can approve their own
 deployment.
 
+`main` is also protected: force pushes and deletions are blocked, including for
+admins. Direct pushes stay allowed so the guided release can commit and push
+without opening a pull request. The `test` workflow still runs on every push,
+and the release workflow repeats the checks before publishing.
+
 Store `NPM_TOKEN` as an environment secret:
 
 ```bash
