@@ -191,12 +191,39 @@ jobs:
         run: |
           TAG="v$VERSION"
           DIR="dist/release/v$VERSION"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$DIR"/* --clobber
-          else
-            gh release create "$TAG" "$DIR"/* \
+
+          # Create as a draft so the latest release pointer never moves to a
+          # release with missing assets.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
               --title "Orchivox $VERSION" \
-              --generate-notes
+              --generate-notes \
+              --draft
+          fi
+
+          # Upload one asset at a time. gh uploads assets in parallel when
+          # given several files, which can race with its own retries and fail
+          # with "ReleaseAsset.name already exists".
+          for file in "$DIR"/*; do
+            name="$(basename "$file")"
+            uploaded=false
+            for attempt in 1 2 3 4 5; do
+              gh release delete-asset "$TAG" "$name" --yes >/dev/null 2>&1 || true
+              if gh release upload "$TAG" "$file"; then
+                uploaded=true
+                break
+              fi
+              echo "upload of $name failed (attempt $attempt)" >&2
+              sleep 5
+            done
+            if [ "$uploaded" != true ]; then
+              echo "could not upload $name" >&2
+              exit 1
+            fi
+          done
+
+          if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "true" ]; then
+            gh release edit "$TAG" --draft=false --latest
           fi
           echo "https://github.com/${{ github.repository }}/releases/tag/$TAG"
       - name: publish npm
