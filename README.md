@@ -780,4 +780,4 @@ The optional character limit `reasoning.max_silent_chars` defaults to `0`, which
 
 ## Status
 
-Orchivox is at version `0.3.0`. It is a working terminal runtime, not a hosted service. The local model path is useful for development and offline tests. For long tasks, use a model with strong tool calling and a context window that matches the repository size.
+Orchivox is at version `0.3.1`. It is a working terminal runtime, not a hosted service. The local model path is useful for development and offline tests. For long tasks, use a model with strong tool calling and a context window that matches the repository size.
