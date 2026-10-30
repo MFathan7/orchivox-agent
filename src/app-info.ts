@@ -76,60 +76,56 @@ function entrypointKind(executable: string): AppInfo["entrypoint"] {
   return "unknown";
 }
 
-export function findSourceCheckout(cwd = process.cwd()): string | undefined {
-  // 1. Check if cwd or any parent directory contains orchivox-agent package.json
+const SOURCE_PACKAGE_NAMES = new Set(["orchivox", "orchivox-agent"]);
+
+function isSourceCheckout(dir: string): boolean {
+  const pkgPath = join(dir, "package.json");
+  if (!existsSync(pkgPath)) return false;
+  if (!existsSync(join(dir, "scripts", "install-global.ts"))) return false;
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { name?: unknown };
+    return typeof pkg.name === "string" && SOURCE_PACKAGE_NAMES.has(pkg.name);
+  } catch {
+    return false;
+  }
+}
+
+export function findSourceCheckout(
+  cwd = process.cwd(),
+  home = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
   let current = cwd;
   while (true) {
-    const pkgPath = join(current, "package.json");
-    if (existsSync(pkgPath)) {
-      try {
-        const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-        if (pkg.name === "orchivox-agent") return current;
-      } catch {
-        // ignore
-      }
-    }
+    if (isSourceCheckout(current)) return current;
     const parent = dirname(current);
     if (!parent || parent === current) break;
     current = parent;
   }
 
-  // 2. Check install_source.json saved during bun run install:global
   const sourceRecordPaths = [
-    join(homedir(), ".orchivox", "install_source.json"),
-    process.env.ORCHIVOX_INSTALL_DIR
-      ? join(process.env.ORCHIVOX_INSTALL_DIR, "install_source.json")
+    join(home, ".orchivox", "install_source.json"),
+    env.ORCHIVOX_INSTALL_DIR
+      ? join(env.ORCHIVOX_INSTALL_DIR, "install_source.json")
       : undefined,
   ].filter((value): value is string => Boolean(value));
+
   for (const sourceRecordPath of sourceRecordPaths) {
     if (!existsSync(sourceRecordPath)) continue;
     try {
-      const data = JSON.parse(readFileSync(sourceRecordPath, "utf8"));
-      if (typeof data.sourceDir === "string" && existsSync(data.sourceDir)) {
-        const pkgPath = join(data.sourceDir, "package.json");
-        if (existsSync(pkgPath)) {
-          const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-          if (pkg.name === "orchivox-agent") return data.sourceDir;
-        }
+      const data = JSON.parse(readFileSync(sourceRecordPath, "utf8")) as {
+        sourceDir?: unknown;
+      };
+      if (typeof data.sourceDir === "string" && isSourceCheckout(data.sourceDir)) {
+        return data.sourceDir;
       }
     } catch {
       // ignore
     }
   }
 
-  // 3. Check ~/.orchivox/src fallback checkout location
-  const managedSrc = join(homedir(), ".orchivox", "src");
-  if (existsSync(managedSrc)) {
-    const pkgPath = join(managedSrc, "package.json");
-    if (existsSync(pkgPath)) {
-      try {
-        const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-        if (pkg.name === "orchivox-agent") return managedSrc;
-      } catch {
-        // ignore
-      }
-    }
-  }
+  const managedSrc = join(home, ".orchivox", "src");
+  if (isSourceCheckout(managedSrc)) return managedSrc;
 
   return undefined;
 }
@@ -215,6 +211,17 @@ async function runCommand(command: string, args: string[], cwd: string): Promise
     );
   }
   return stdout.trim();
+}
+
+function readPackageVersion(dir: string): string | undefined {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as {
+      version?: unknown;
+    };
+    return typeof pkg.version === "string" ? pkg.version : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function runUpdate(options: UpdateOptions = {}): Promise<UpdateResult> {
@@ -427,7 +434,15 @@ async function runSourceUpdate(
     .then((result) => result.stdout.trim())
     .catch(() => info.commit ?? "unknown");
 
-  if (behind === 0) {
+  const sourceVersion = readPackageVersion(root);
+  const runningVersion = packageJson.version;
+  const staleBinary =
+    info.entrypoint === "compiled" &&
+    typeof sourceVersion === "string" &&
+    sourceVersion !== runningVersion;
+  const available = behind > 0 || staleBinary;
+
+  if (!available) {
     const output = `already up to date on ${branch} (${currentCommit})${ahead > 0 ? `, ${ahead} local commit(s) ahead` : ""}`;
     return {
       output: options.json
@@ -437,10 +452,31 @@ async function runSourceUpdate(
     };
   }
   if (options.check) {
-    const output = `${behind} commit(s) available on ${upstream}${ahead > 0 ? `, ${ahead} local commit(s) ahead` : ""}. Run \`orchivox update\` to apply them.`;
+    const reasons: string[] = [];
+    if (behind > 0) reasons.push(`${behind} commit(s) available on ${upstream}`);
+    if (staleBinary) {
+      reasons.push(
+        `installed binary is ${runningVersion} while the checkout is ${sourceVersion}`,
+      );
+    }
+    const output = `${reasons.join("; ")}${ahead > 0 ? `, ${ahead} local commit(s) ahead` : ""}. Run \`orchivox update\` to apply.`;
     return {
       output: options.json
-        ? JSON.stringify({ method: "source", branch, upstream, behind, ahead, updated: false }, null, 2)
+        ? JSON.stringify(
+            {
+              method: "source",
+              branch,
+              upstream,
+              behind,
+              ahead,
+              sourceVersion,
+              runningVersion,
+              staleBinary,
+              updated: false,
+            },
+            null,
+            2,
+          )
         : output,
       updated: false,
     };
@@ -451,7 +487,9 @@ async function runSourceUpdate(
       throw new Error("source update requires --yes in non-interactive mode");
     }
     const approved = await promptYesNo(
-      `Update source checkout at ${root}?`,
+      behind > 0
+        ? `Update source checkout at ${root}?`
+        : `Rebuild the installed binary from ${root}?`,
       false,
     );
     if (!approved) {
@@ -460,7 +498,9 @@ async function runSourceUpdate(
   }
 
   const before = currentCommit;
-  await runGit(root, ["pull", "--ff-only"], { allowFailure: false });
+  if (behind > 0) {
+    await runGit(root, ["pull", "--ff-only"], { allowFailure: false });
+  }
   let installOutput = "";
   try {
     installOutput = await runCommand("bun", ["install", "--frozen-lockfile"], root);
@@ -469,7 +509,7 @@ async function runSourceUpdate(
   }
 
   let rebuilt = false;
-  if (info.entrypoint === "compiled" || options.binary) {
+  if (info.entrypoint === "compiled" || options.binary || staleBinary) {
     await runCommand("bun", ["run", "scripts/install-global.ts"], root);
     rebuilt = true;
   }
@@ -480,7 +520,7 @@ async function runSourceUpdate(
   if (options.json) {
     return {
       output: JSON.stringify(
-        { method: "source", branch, from: before, to: after, rebuilt, updated: true },
+        { method: "source", branch, from: before, to: after, rebuilt, staleBinary, updated: true },
         null,
         2,
       ),
@@ -489,7 +529,9 @@ async function runSourceUpdate(
   }
   return {
     output: [
-      `updated ${branch}: ${before} -> ${after || "unknown"}`,
+      behind > 0
+        ? `updated ${branch}: ${before} -> ${after || "unknown"}`
+        : `source checkout already at ${branch} (${currentCommit})`,
       installOutput,
       rebuilt
         ? "standalone binary rebuilt and reinstalled to ~/.local/bin/orchivox"
