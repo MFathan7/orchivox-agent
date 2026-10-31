@@ -1,6 +1,6 @@
 {
   "name": "orchivox",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Personal AI coding agent runtime: IDE-grade code editing, isolated Git worktree subagents, time-traveling stream rules, and a dual-direction OpenAPI and OpenClaude gateway.",
   "type": "module",
   "license": "MIT",
