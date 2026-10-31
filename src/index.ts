@@ -21,7 +21,8 @@ import {
   takeAnswer,
 } from "./agent/answer-stream";
 import { formatAppInfo, formatDoctor, getAppInfo, runUpdate } from "./app-info";
-import { compactMessages, extractSummary, markPrunedToolResults } from "./agent/compaction";
+import { compactMessages, estimateRequestBytes, extractSummary, markPrunedToolResults } from "./agent/compaction";
+import { shouldWarnLargeSession } from "./agent/session-warning";
 import { generateSessionTitle, isPlaceholderTitle, messageText } from "./agent/session-title";
 import type { SkillDocument } from "./agent/skills";
 import {
@@ -70,6 +71,7 @@ import {
   type ThinkingSegmentView,
 } from "./tui/app";
 import { buildTranscriptEntries } from "./tui/transcript";
+import { finalizeToolCalls } from "./tui/tool-state";
 import { enterTerminal, leaveTerminal, setTerminalTitle } from "./tui/terminal-protocol";
 import type { FileAttachmentRef } from "./tui/composer";
 import type { PendingQuestion } from "./tui/question-modal";
@@ -536,6 +538,7 @@ async function runTuiSession(
     paletteOpen: false,
     sessionTab: null as SessionModalTab | null,
     hubOpen: false,
+    report: undefined as { title: string; text: string } | undefined,
     notice: undefined as string | undefined,
   };
   const resetUsageDetails = (): void => {
@@ -621,7 +624,11 @@ async function runTuiSession(
 
   let pendingCompactionEntryId: string | undefined;
 
-  const beginCompaction = (reason: CompactionReason): string => {
+  const beginCompaction = (
+    reason: CompactionReason,
+    attempt?: number,
+    maxAttempts?: number,
+  ): string => {
     state.counter += 1;
     const id = `entry-${state.counter}`;
     state.entries = [
@@ -637,6 +644,8 @@ async function runTuiSession(
           auto: reason !== "manual",
           reason,
           status: "running",
+          attempt,
+          maxAttempts,
         },
       },
     ];
@@ -653,6 +662,8 @@ async function runTuiSession(
     reason?: CompactionReason;
     status?: "running" | "done" | "error";
     error?: string;
+    attempt?: number;
+    maxAttempts?: number;
   }): void => {
     const id = pendingCompactionEntryId;
     pendingCompactionEntryId = undefined;
@@ -670,6 +681,8 @@ async function runTuiSession(
                 reason: compaction.reason,
                 status: compaction.status ?? "done",
                 error: compaction.error,
+                attempt: compaction.attempt,
+                maxAttempts: compaction.maxAttempts,
               },
             }
           : entry,
@@ -685,6 +698,8 @@ async function runTuiSession(
         reason: compaction.reason,
         status: compaction.status ?? "done",
         error: compaction.error,
+        attempt: compaction.attempt,
+        maxAttempts: compaction.maxAttempts,
       },
     });
   };
@@ -774,6 +789,33 @@ async function runTuiSession(
     rerender();
   };
 
+  const warnedLargeSessions = new Set<string>();
+  const warnLargeSession = (
+    sessionId: string,
+    totalTokens: number | undefined,
+    messages: Message[],
+  ): void => {
+    if (warnedLargeSessions.has(sessionId)) return;
+    const historyBytes = estimateRequestBytes({ messages });
+    const warn = shouldWarnLargeSession({
+      totalTokens,
+      historyBytes,
+      warnTokens: runtime.config.limits?.session_warn_tokens,
+      warnBytes: runtime.config.limits?.session_warn_bytes,
+    });
+    if (!warn) return;
+    warnedLargeSessions.add(sessionId);
+    const size = [
+      formatTokenCount(totalTokens ?? 0),
+      `${Math.round(historyBytes / 1024)} KB of history`,
+    ].join(" tokens, ");
+    pushEntry(
+      "system",
+      `This session is large (${size}). Run /compact or /new before continuing.`,
+    );
+    setNotice("Large session: run /compact or /new before continuing.", 12_000);
+  };
+
   if (!runtime.configExists) {
     state.notice = "No config found. Use /connect to add a provider.";
   }
@@ -806,6 +848,7 @@ async function runTuiSession(
     resetUsageDetails();
     state.modifiedFiles.clear();
     state.counter = 0;
+    state.report = undefined;
     state.busy = false;
   };
 
@@ -839,6 +882,11 @@ async function runTuiSession(
     helpOpen: state.helpOpen,
     onHelpOpenChange: (open: boolean) => {
       state.helpOpen = open;
+      rerender();
+    },
+    report: state.report,
+    onReportClose: () => {
+      state.report = undefined;
       rerender();
     },
     modelsOpen: state.modelsOpen,
@@ -962,6 +1010,7 @@ async function runTuiSession(
       if (sess) setActiveMode(sess.mode);
       setTerminalTitle(sess?.title ?? `Orchivox - ${projectName}`);
       state.contextTokens = estimateContextTokens(state.mode, state.messages);
+      warnLargeSession(sessionId, sess?.totalTokens, msgs);
       state.totalTokens = sess?.totalTokens ?? 0;
       state.totalCostUsd = sess?.totalCostUsd ?? 0;
       state.totalPromptTokens = 0;
@@ -993,6 +1042,7 @@ async function runTuiSession(
       const history = runtime.database.loadFullMessages(forked.id);
       state.messages = msgs;
       state.contextTokens = estimateContextTokens(state.mode, state.messages);
+      warnLargeSession(forked.id, forked.totalTokens, msgs);
       state.activeSkills = runtime.database.listSessionSkills(forked.id).map((skill) => skill.name);
       state.entries = buildTranscriptEntries(history, runtime.database.getCompaction(forked.id));
       state.counter = state.entries.length;
@@ -1476,7 +1526,7 @@ async function runTuiSession(
           );
           renderLive();
         } else if (event.type === "compaction_start") {
-          beginCompaction(event.reason);
+          beginCompaction(event.reason, event.attempt, event.max_attempts);
           renderLive(true);
         } else if (event.type === "compaction") {
           state.contextTokens = event.after_tokens;
@@ -1487,14 +1537,34 @@ async function runTuiSession(
             removedMessages: event.removed_messages,
             auto: event.reason !== "manual",
             reason: event.reason,
+            attempt: event.attempt,
+            maxAttempts: event.max_attempts,
+            status: event.status,
+            error: event.error,
           });
           renderLive(true);
         } else if (event.type === "error") {
+          const actionable = event.code === "context_overflow";
           const knownLimit =
             /UnsupportedParamsError|does not support (?:the )?(?:parameter|parameters|param|params)|unsupported (?:parameter|parameters|param|params)|maximum context length|requested\s+\d+\s+output tokens/i.test(
               event.message,
             );
-          if (!knownLimit) {
+          if (actionable) {
+            pushEntry("system", event.message);
+            saveSystemLine(event.message, { event: "error", code: event.code });
+            sawErrorEvent = true;
+            state.lastOutcome = `error: ${event.code}`;
+            await appendErrorLog({
+              at: Date.now(),
+              session_id: sessionId,
+              mode: turnMode,
+              model: turnModel,
+              finish_reason: "error",
+              message: event.message,
+              turn_tokens: state.turnTotalTokens,
+            });
+            renderLive(true);
+          } else if (!knownLimit) {
             const display =
               event.code === "provider_adjusted" || event.code === "reasoning_stall"
                 ? event.message
@@ -1578,12 +1648,13 @@ async function runTuiSession(
         finishReason === "aborted" || Boolean(activeAbortController?.signal.aborted);
       const failedWithoutAnswer =
         answer.trim().length === 0 && (aborted || finishReason === "error");
+      const finalToolCalls = finalizeToolCalls(liveEntry.toolCalls);
       const entryMeta = {
         thinking: liveEntry.thinking,
         thinkingSegments: thinkingSegments.map((segment) => ({ ...segment })),
         thinkingStartedAt,
         thinkingCompletedAt,
-        toolCalls: liveEntry.toolCalls,
+        toolCalls: finalToolCalls,
         files: liveEntry.files,
         mode: turnMode,
         model: turnModel,
@@ -1656,7 +1727,7 @@ async function runTuiSession(
             estimated_prompt_tokens: estimatedPromptTokens,
             turn_tokens: state.turnTotalTokens,
             thinking_segments: thinkingSegments.map((segment) => ({ ...segment })),
-            tool_calls: liveEntry.toolCalls ?? [],
+            tool_calls: finalToolCalls,
             files_changed: turnFiles.size,
           },
         };
@@ -1676,6 +1747,14 @@ async function runTuiSession(
       cancelCompaction();
       state.liveEntry = undefined;
       state.streamingText = "";
+      if (state.sessionId === sessionId) {
+        try {
+          state.messages = runtime.database.loadMessages(sessionId);
+          state.contextTokens = estimateContextTokens(state.mode, state.messages);
+        } catch {
+          // A deleted session must not break the turn.
+        }
+      }
       state.busy = false;
       rerender();
       const next = queuedTurns.shift();
@@ -1874,41 +1953,44 @@ async function runTuiSession(
         const modeModel = runtime.router.getModeModel(state.mode);
         const capabilities = runtime.router.capabilitiesForMode(state.mode);
         const contextWindow = capabilities.context_window;
-        pushEntry("system", [
-          "Session Statistics:",
-          `  Active Session ID : ${state.sessionId ?? "(draft)"}`,
-          `  Messages in Memory: ${state.messages.length} messages`,
-          `  Total Token Usage : ${formatTokenCount(state.totalTokens, false)} tokens`,
-          `    Input tokens    : ${formatTokenCount(state.totalPromptTokens, false)}`,
-          `    Output tokens   : ${formatTokenCount(state.totalCompletionTokens, false)}`,
-          `  Last Prompt Tokens : ${formatTokenCount(state.lastPromptTokens, false)} provider / ${formatTokenCount(state.lastEstimatedPromptTokens, false)} estimated`,
-          `  Last Completion    : ${formatTokenCount(state.lastCompletionTokens, false)}`,
-          `  Last Request Total : ${formatTokenCount(state.lastTotalTokens, false)}`,
-          `  Last Turn Outcome  : ${state.lastOutcome ?? "unknown"}`,
-          `  Estimated Cost    : ${formatCost(state.totalCostUsd)}`,
-          `  Active Agent Mode : ${state.mode}`,
-          `  Mode Model        : ${modeModel ? `${modeModel.provider} / ${modeModel.model}` : "not configured"}`,
-          `  Context (used)    : ${formatContextUsage(state.contextTokens, contextWindow)}`,
-          `  Local Estimate    : ${formatTokenCount(state.lastEstimatedPromptTokens, false)} tokens`,
-          `  Turn Usage        : ${formatTurnUsage({
-            promptTokens: state.turnPromptTokens,
-            completionTokens: state.turnCompletionTokens,
-            totalTokens: state.turnTotalTokens,
-          })}`,
-          `  Context Window    : ${formatContextWindow(contextWindow)} (${capabilities.limit_sources?.context ?? capabilities.source ?? "default"})`,
-          `  Input Limit       : ${capabilities.max_input ? `${formatContextWindow(capabilities.max_input)} (${capabilities.limit_sources?.input ?? "default"})` : "follows context"}`,
-          `  Output Limit      : ${formatContextWindow(capabilities.max_output)} (${capabilities.limit_sources?.output ?? "default"})`,
-          `  Reasoning Level   : ${state.reasoningEffort} (${state.mode})`,
-          `  Visual Theme      : ${state.currentTheme}`,
-          `  Connected MCP     : ${runtime.mcpServers.length > 0 ? runtime.mcpServers.join(", ") : "none"}`,
-          `  Loaded Plugins    : ${runtime.plugins.loaded.length > 0 ? runtime.plugins.loaded.join(", ") : "none"}`,
-          `  Skills Installed  : ${skillCount}`,
-          `  Session Skills    : ${state.activeSkills.length > 0 ? state.activeSkills.join(", ") : "none"}`,
-          `  Task Board        : ${taskSummary.completed}/${taskSummary.total} completed, ${taskSummary.running} running, ${taskSummary.blocked} blocked`,
-          `  Git Branch        : ${branch}`,
-          `  VCS Snapshots     : ${snapshotCount} snapshots recorded`,
-          `  Saved Sessions    : ${sessionCount} total sessions in database`,
-        ].join("\n"));
+        state.report = {
+          title: "Session statistics",
+          text: [
+            "Session Statistics:",
+            `  Active Session ID : ${state.sessionId ?? "(draft)"}`,
+            `  Messages in Memory: ${state.messages.length} messages`,
+            `  Total Token Usage : ${formatTokenCount(state.totalTokens, false)} tokens`,
+            `    Input tokens    : ${formatTokenCount(state.totalPromptTokens, false)}`,
+            `    Output tokens   : ${formatTokenCount(state.totalCompletionTokens, false)}`,
+            `  Last Prompt Tokens : ${formatTokenCount(state.lastPromptTokens, false)} provider / ${formatTokenCount(state.lastEstimatedPromptTokens, false)} estimated`,
+            `  Last Completion    : ${formatTokenCount(state.lastCompletionTokens, false)}`,
+            `  Last Request Total : ${formatTokenCount(state.lastTotalTokens, false)}`,
+            `  Last Turn Outcome  : ${state.lastOutcome ?? "unknown"}`,
+            `  Estimated Cost    : ${formatCost(state.totalCostUsd)}`,
+            `  Active Agent Mode : ${state.mode}`,
+            `  Mode Model        : ${modeModel ? `${modeModel.provider} / ${modeModel.model}` : "not configured"}`,
+            `  Context (used)    : ${formatContextUsage(state.contextTokens, contextWindow)}`,
+            `  Local Estimate    : ${formatTokenCount(state.lastEstimatedPromptTokens, false)} tokens`,
+            `  Turn Usage        : ${formatTurnUsage({
+              promptTokens: state.turnPromptTokens,
+              completionTokens: state.turnCompletionTokens,
+              totalTokens: state.turnTotalTokens,
+            })}`,
+            `  Context Window    : ${formatContextWindow(contextWindow)} (${capabilities.limit_sources?.context ?? capabilities.source ?? "default"})`,
+            `  Input Limit       : ${capabilities.max_input ? `${formatContextWindow(capabilities.max_input)} (${capabilities.limit_sources?.input ?? "default"})` : "follows context"}`,
+            `  Output Limit      : ${formatContextWindow(capabilities.max_output)} (${capabilities.limit_sources?.output ?? "default"})`,
+            `  Reasoning Level   : ${state.reasoningEffort} (${state.mode})`,
+            `  Visual Theme      : ${state.currentTheme}`,
+            `  Connected MCP     : ${runtime.mcpServers.length > 0 ? runtime.mcpServers.join(", ") : "none"}`,
+            `  Loaded Plugins    : ${runtime.plugins.loaded.length > 0 ? runtime.plugins.loaded.join(", ") : "none"}`,
+            `  Skills Installed  : ${skillCount}`,
+            `  Session Skills    : ${state.activeSkills.length > 0 ? state.activeSkills.join(", ") : "none"}`,
+            `  Task Board        : ${taskSummary.completed}/${taskSummary.total} completed, ${taskSummary.running} running, ${taskSummary.blocked} blocked`,
+            `  Git Branch        : ${branch}`,
+            `  VCS Snapshots     : ${snapshotCount} snapshots recorded`,
+            `  Saved Sessions    : ${sessionCount} total sessions in database`,
+          ].join("\n"),
+        };
         rerender();
         break;
       }
@@ -2074,6 +2156,7 @@ async function runTuiSession(
         state.liveEntry = undefined;
         state.activeSkills = [];
         state.modifiedFiles.clear();
+        state.report = undefined;
         state.totalTokens = 0;
         state.contextTokens = 0;
         state.totalPromptTokens = 0;
@@ -2105,6 +2188,7 @@ async function runTuiSession(
       }
       case "/clear": {
         state.entries = [];
+        state.report = undefined;
         state.notice = undefined;
         break;
       }

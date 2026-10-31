@@ -3,6 +3,8 @@
 This document covers the release pipeline for versioned binaries and the npm
 launcher. Read it before creating a tag.
 
+For the short operational checklist, see [`RELEASING.md`](../RELEASING.md).
+
 ## Prerequisites
 
 - Bun 1.4.4 or newer.

@@ -55,6 +55,7 @@ const TOOL_GUIDANCE = [
   "- Prefer hash_edit or apply_unified_patch for focused edits. Do not reformat unrelated code.",
   "- Use todo_write for multi-step tasks. Work one todo item per step and mark it complete before starting the next.",
   "- Verify changes with diagnostics_check, tests, or a build before claiming success.",
+  "- Plan files are PLAN*.md at the project root by default. When the user names a path, use it exactly. Never create a plan in .agent or a hidden folder unless the user asks for that path.",
   "- When the user references a plan file, read it once, put its order in todo_write, and implement it one item at a time. Do not look for plan files the user did not mention.",
   "- Do not claim a tool succeeded unless you saw its result. If a tool fails, report the error and adapt.",
   "- Ask the user only when blocked. Otherwise make a reasonable assumption and state it.",

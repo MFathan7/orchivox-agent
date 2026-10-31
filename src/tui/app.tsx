@@ -18,6 +18,7 @@ import { CommandPaletteModal, REASONING_LEVELS, reasoningLevelsFor, type Reasoni
 import { PromptComposer, type FileAttachmentRef } from "./composer";
 import { HelpOverlay } from "./help-overlay";
 import { installKeyNormalizer } from "./key-normalize";
+import { ReportModal } from "./report-modal";
 import { QuestionModal, type PendingQuestion } from "./question-modal";
 import type { QuestionAnswer } from "../tools/question";
 import { ModelConfigModal } from "./model-modal";
@@ -101,9 +102,11 @@ export interface ChatCompactionView {
   afterTokens: number;
   removedMessages: number;
   auto?: boolean;
-  reason?: "auto" | "manual" | "retry" | "output_limit";
+  reason?: "auto" | "manual" | "retry" | "output_limit" | "request_size";
   status?: "running" | "done" | "error";
   error?: string;
+  attempt?: number;
+  maxAttempts?: number;
 }
 
 export interface ThinkingSegmentView {
@@ -183,6 +186,8 @@ export interface OrchivoxAppProps {
   onStatusMessage?: (message: string) => void;
   helpOpen?: boolean;
   onHelpOpenChange?: (open: boolean) => void;
+  report?: { title: string; text: string };
+  onReportClose?: () => void;
   modelsOpen?: boolean;
   modelsView?: "models" | "providers";
   onModelsOpenChange?: (open: boolean) => void;
@@ -475,11 +480,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     onModeChange(next);
   };
 
+  const reportOpen = Boolean(props.report);
   const hasModalOpen =
     !isWorkspaceTrusted ||
     Boolean(props.pendingApproval) ||
     Boolean(props.pendingQuestion) ||
     helpOpen ||
+    reportOpen ||
     modelsOpen ||
     skillsOpen ||
     paletteOpen ||
@@ -661,6 +668,15 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               ),
             )}
             onClose={() => setHelpOpen(false)}
+          />
+        ) : props.report ? (
+          <ReportModal
+            title={props.report.title}
+            text={props.report.text}
+            width={innerWidth}
+            height={viewportHeight}
+            theme={theme}
+            onClose={() => props.onReportClose?.()}
           />
         ) : modePickerOpen ? (
           <ChoiceModal

@@ -66,7 +66,7 @@ The system prompt and terminal UI are English. Replies follow the language of th
 
 Use `/study` for a structured report about the current project. It reads project evidence from disk and asks for a report without editing files. Use `/review <file>` to review one file, or `/review <question>` to answer a code question from project evidence. These are explicit commands; a normal sentence that mentions study or review does not trigger them.
 
-Plan mode can delegate read-only exploration to subagents. It discusses the plan in chat and writes a plan file only when you ask, as a `PLAN*.md` file in the active project directory. Build mode does not read or create plan files automatically.
+Plan mode can delegate read-only exploration to subagents. It discusses the plan in chat and writes a plan file only when you ask. It uses the path you name, or `PLAN.md` at the project root when you do not name one. It never creates `.agent` on its own. Build mode does not read or create plan files automatically.
 
 ### Editing with repository context
 
@@ -401,7 +401,7 @@ After that, every project without its own `.agent/config.yaml` uses the global f
 | `webfetch`       | Web fetch enablement and the converted-text cap (`max_chars`, default `24000`). |
 | `prompt`         | System prompt style: `auto`, `full`, or `compact`.                              |
 | `reasoning`      | Optional runaway reasoning character limit, and provider silence limit. Streaming reasoning counts as progress. |
-| `limits`         | Optional session warning and per-turn token budget.                              |
+| `limits`         | Optional session warning, per-turn token budget, request byte guard, and large-session warning. |
 | `skills`         | Optional per-skill body guard. `0` means no cap.                                 |
 | `documents`      | Document read limits: characters, pages, file size, preview, cache spill, images. |
 
@@ -441,13 +441,26 @@ less. Catalog output limits above 64,000 tokens are clamped unless
 `model_capabilities` sets `max_output` explicitly.
 
 Compaction runs before every provider request and can run mid-turn between tool
-steps. Context use is the prompt the provider measured plus the completion it
-produced, so thinking and tool calls count, and the trailing estimate starts
-after that reply. The default buffer is 15% of the window with a 16,000 token
-minimum on windows of 32,000 or more, plus a 2% safety margin. The summary is
-paired with the most recent 15,000 tokens (`compaction.keep_tokens`). Set
-`compaction.reserved` or `compaction.reserve_tokens` to pin the reserve, or use
+steps. Before each request, Orchivox also estimates the serialized request body
+and compacts when it exceeds `limits.max_request_bytes` (800,000 bytes by
+default; set `0` to disable). Context use is the prompt the provider measured
+plus the completion it produced, so thinking and tool calls count, and the
+trailing estimate starts after that reply. The default buffer is 15% of the
+window with a 16,000 token minimum on windows of 32,000 or more, plus a 2%
+safety margin. The summary is paired with the most recent 15,000 tokens
+(`compaction.keep_tokens`). Set `compaction.reserved` or
+`compaction.reserve_tokens` to pin the reserve, or use
 `compaction.buffer_ratio` and `compaction.buffer_tokens` for a different split.
+When you resume a session, Orchivox warns once if the session total or history
+exceeds `limits.session_warn_tokens` or `limits.session_warn_bytes`. Set either
+to `0` to disable that warning.
+
+If a provider still rejects the request as too large, for example with
+`413 Request Entity Too Large`, Orchivox compacts and retries with up to four
+shrinking steps: 85%, 70%, 50%, and 35% of the rejected size. If the summary is
+still too large, it clips or removes tool output, then falls back to text-only
+messages and finally the summary plus the newest user turn. If every step fails,
+the turn stops with a message that points to `/compact` or `/new`.
 After compaction the same turn continues with the summary in place. Set
 `compaction.precompute: true` to write the next summary in the background once
 the measured context reaches 85% of the budget and at least 64,000 tokens. The
@@ -462,11 +475,12 @@ amount that must be freed before anything changes.
 The system prompt lists available skills with their descriptions and locations,
 but does not include their bodies. The `skill` tool loads the body, base
 directory, and file sample into the conversation when the model calls it. A
-loaded body is normal conversation content, so compaction can summarize it. The
-summary keeps loaded skill IDs and paths, and the reload message lists those
-IDs and paths again so the tool can restore any body the model still needs. The
-tool returns the body again on every call. Skill bodies have no default
-character cap; the model context
+loaded body stays in the session history, so later turns use it without calling
+the tool again. The tool still returns the body on every explicit call. The
+runtime asks the model to reload only after compaction or when the body is no
+longer present. The summary keeps loaded skill IDs and paths, and the reload
+message lists those IDs and paths again so the tool can restore any body the
+model still needs. Skill bodies have no default character cap; the model context
 window is the limit. Set `skills.max_body_chars` to a positive value for an
 optional guard, or leave it at `0` for no cap. A mention with `@skill` or
 `/skill:<name>` adds a short hint to load that skill through the tool; the body
@@ -628,7 +642,7 @@ This exposes the agent tools as an MCP server over stdio. Orchivox also acts as 
 | Inspect snapshots                        | `/timeline`                                                             |
 | Undo or redo file changes                | `/undo`, `/redo`                                                        |
 | Split the diff into commits              | `/commit`                                                               |
-| Show token and cost stats                | `/stats`                                                                |
+| Open session statistics (Esc closes)     | `/stats`                                                                |
 
 
 The current mode, model, context usage, and session cost are shown in the header. The window title follows the active session title, so a new chat switches from `Orchivox - <project>` to the first message. The footer under an answer shows the mode, model, and generation speed. During a turn, the live line shows the current step, what is running, elapsed time, and finished tool count, for example `Step 3 · Running command · 2s · 2 tools`. The step number counts provider requests inside the current user turn and is hidden on step 1.
@@ -683,6 +697,10 @@ bun run release
 
 It handles the version bump, launcher rebuild, checks, commit, push, tag, and
 waits for the GitHub and npm release. Run `bun run release -- --help` for flags.
+
+For the step-by-step publishing checklist, see [`RELEASING.md`](RELEASING.md).
+The detailed reference, including signing and rollback, is in
+[`docs/releasing.md`](docs/releasing.md).
 
 ## Project layout
 

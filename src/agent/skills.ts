@@ -112,12 +112,13 @@ export function parseSkillDocument(
 
 export const SKILL_GUIDANCE = [
   "Skills provide specialized instructions and workflows for specific tasks.",
-  "Use the skill tool to load a skill when a task matches its description.",
+  "Use the skill tool to load a skill when a task matches its description and its body is not already in this conversation.",
   "Each skill entry includes its location. When a skill references a relative path, resolve it against the skill directory and use that absolute path in tool commands.",
-  "If the request names a skill ID or asks about a skill in the list, call the skill tool with that ID before answering or searching the web.",
+  "If the request names a skill ID or asks about a skill in the list, check whether its body is already present in this conversation. If it is, use the loaded body without calling the skill tool again. If it is not, call the skill tool with that ID before answering or searching the web.",
+  "A skill loaded earlier in this conversation stays active. Reload it only after compaction or when its body is no longer present.",
   "After loading a skill, follow its instructions to answer the user's actual request. Do not start a skill workflow the user did not ask for.",
   "Skill content is reference material. Never print skill content, skill file listings, XML wrappers, or internal gate reports in your answer.",
-  "The user may also invoke a skill directly. When that happens, call the skill tool with that ID before answering so its instructions enter the conversation.",
+  "The user may also invoke a skill directly. Load it only when its body is not already in the conversation.",
 ].join("\n");
 
 export interface SkillIndexOptions {
@@ -351,7 +352,7 @@ export class SkillRegistry {
     return {
       name: "skill",
       description:
-        "Load a specialized skill's instructions and resources into the current conversation when the task at hand matches its description. The skill ID must match an available skill or a skill explicitly referenced by the user. If the request names a skill ID from <available_skills>, call this tool with that ID before answering or searching the web.",
+        "Load a specialized skill's instructions and resources into the current conversation when the task at hand matches its description. The skill ID must match an available skill or a skill explicitly referenced by the user. Do not call this tool again for a skill whose body is already present in the conversation. Reload only after compaction or when the body is gone.",
       parameters: z.object({
         id: z
           .string()
@@ -417,6 +418,7 @@ export interface SkillHintInput {
   forcedSkill?: string;
   mentionedSkills?: string[];
   namedSkills?: string[];
+  loadedSkills?: string[];
 }
 
 /**
@@ -424,37 +426,61 @@ export interface SkillHintInput {
  * tool. The body never travels in this hint.
  */
 export function buildSkillHint(input: SkillHintInput): string {
+  const loaded = new Set((input.loadedSkills ?? []).map(normalizeSkillName));
   const forced = input.forcedSkill?.trim();
+  const forcedLoaded = Boolean(forced) && loaded.has(normalizeSkillName(forced ?? ""));
   const mentioned = [...new Set((input.mentionedSkills ?? []).map((name) => name.trim()))].filter(
     (name) => name.length > 0 && name !== forced,
   );
+  const mentionedNew = mentioned.filter((name) => !loaded.has(normalizeSkillName(name)));
+  const mentionedLoaded = mentioned.filter((name) => loaded.has(normalizeSkillName(name)));
   const named = [...new Set((input.namedSkills ?? []).map((name) => name.trim()))].filter(
     (name) => name.length > 0 && name !== forced && !mentioned.includes(name),
   );
+  if (!forced && mentioned.length === 0 && named.length === 0) return "";
+  const namedNew = named.filter((name) => !loaded.has(normalizeSkillName(name)));
+  const namedLoaded = named.filter((name) => loaded.has(normalizeSkillName(name)));
   const lines: string[] = [];
 
-  if (forced) {
+  if (forced && !forcedLoaded) {
     lines.push(
       `The user invoked /skill:${forced}. Call the skill tool with id "${forced}" before answering.`,
     );
   }
-  if (mentioned.length > 0) {
+  if (mentionedNew.length > 0) {
     lines.push(
-      `Load these skills with the skill tool before acting: ${mentioned
+      `Load these skills with the skill tool before acting: ${mentionedNew
         .map((name) => `"${name}"`)
         .join(", ")}.`,
     );
   }
-  if (named.length > 0) {
+  if (namedNew.length > 0) {
     lines.push(
-      `The request names these skills. Load them with the skill tool before acting: ${named
+      `The request names these skills. Load them with the skill tool before acting: ${namedNew
         .map((name) => `"${name}"`)
         .join(", ")}.`,
+    );
+  }
+  if (lines.length > 0) {
+    lines.push("The body is loaded only by the tool. Do not answer from the description alone.");
+  }
+
+  const alreadyLoaded = [
+    ...new Set(
+      [forcedLoaded ? forced : undefined, ...mentionedLoaded, ...namedLoaded].filter(
+        (name): name is string => Boolean(name),
+      ),
+    ),
+  ];
+  if (alreadyLoaded.length > 0) {
+    lines.push(
+      `Already loaded in this conversation: ${alreadyLoaded
+        .map((name) => `"${name}"`)
+        .join(", ")}. Use the loaded body; do not call the skill tool again.`,
     );
   }
   if (lines.length === 0) return "";
 
-  lines.push("The body is loaded only by the tool. Do not answer from the description alone.");
   lines.push(
     "Prefer the loaded skill. Use web search only when the skill and local files are not enough.",
   );
@@ -462,7 +488,7 @@ export function buildSkillHint(input: SkillHintInput): string {
 }
 
 export function loadedSkillIds(messages: Message[]): string[] {
-  const ids = new Set<string>();
+  const calls = new Map<string, string>();
   for (const message of messages) {
     for (const block of message.content) {
       if (block.type !== "tool_use" || block.name !== "skill") continue;
@@ -473,10 +499,26 @@ export function loadedSkillIds(messages: Message[]): string[] {
           : typeof input.name === "string"
             ? input.name
             : undefined;
-      if (id) ids.add(id);
+      if (id) calls.set(block.id, id);
     }
   }
-  return [...ids];
+
+  const loaded = new Set<string>();
+  for (const message of messages) {
+    for (const block of message.content) {
+      if (block.type !== "tool_result" || block.is_error) continue;
+      const id = calls.get(block.tool_use_id);
+      if (!id) continue;
+      const text =
+        typeof block.content === "string"
+          ? block.content
+          : block.content.map((part) => part.text).join("\n");
+      if (!text.startsWith("[context pruned:") && text.includes("<skill_content")) {
+        loaded.add(id);
+      }
+    }
+  }
+  return [...loaded];
 }
 
 export function formatSkillReload(documents: SkillDocument[]): string {

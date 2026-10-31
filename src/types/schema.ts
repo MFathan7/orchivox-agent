@@ -420,12 +420,20 @@ export const PromptPreflightEventSchema = z.object({
 });
 export type PromptPreflightEvent = z.infer<typeof PromptPreflightEventSchema>;
 
-export const CompactionReasonSchema = z.enum(["auto", "manual", "retry", "output_limit"]);
+export const CompactionReasonSchema = z.enum([
+  "auto",
+  "manual",
+  "retry",
+  "output_limit",
+  "request_size",
+]);
 export type CompactionReason = z.infer<typeof CompactionReasonSchema>;
 
 export const CompactionStartEventSchema = z.object({
   type: z.literal("compaction_start"),
   reason: CompactionReasonSchema,
+  attempt: z.number().int().positive().optional(),
+  max_attempts: z.number().int().positive().optional(),
 });
 export type CompactionStartEvent = z.infer<typeof CompactionStartEventSchema>;
 
@@ -446,6 +454,10 @@ export const CompactionEventSchema = z.object({
   summary: z.string().optional(),
   removed_messages: z.number().int().nonnegative().default(0),
   tail_start_message_id: z.string().optional(),
+  attempt: z.number().int().positive().optional(),
+  max_attempts: z.number().int().positive().optional(),
+  status: z.enum(["done", "error"]).optional(),
+  error: z.string().optional(),
 });
 export type CompactionEvent = z.infer<typeof CompactionEventSchema>;
 

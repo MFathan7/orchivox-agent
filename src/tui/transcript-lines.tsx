@@ -343,14 +343,22 @@ function compactionRows(
   collapsed: boolean,
   theme: Theme,
 ): TranscriptRow[] {
+  const attemptLabel =
+    entry.compaction?.attempt !== undefined && entry.compaction?.maxAttempts !== undefined
+      ? ` ${entry.compaction.attempt}/${entry.compaction.maxAttempts}`
+      : "";
   const label =
     entry.compaction?.status === "running"
-      ? "compacting"
+      ? `compacting${attemptLabel}`
       : entry.compaction?.reason === "output_limit"
         ? "output limit compacted"
-        : entry.compaction?.auto
-          ? "auto compacted"
-          : "compacted";
+        : entry.compaction?.reason === "request_size"
+          ? "request size compacted"
+          : entry.compaction?.reason === "retry"
+            ? `overflow compacted${attemptLabel}`
+            : entry.compaction?.auto
+              ? "auto compacted"
+              : "compacted";
   const rows: TranscriptRow[] = [
     {
       key: `${entry.id}-divider`,

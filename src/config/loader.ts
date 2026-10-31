@@ -386,6 +386,11 @@ export const LimitsConfigSchema = z.object({
   session_tokens: z.number().int().positive().optional(),
   // Stop a turn after this many tokens across its internal steps.
   turn_tokens: z.number().int().positive().optional(),
+  // Compact before a request body grows past this many bytes. 0 disables it.
+  max_request_bytes: z.number().int().nonnegative().default(800_000),
+  // Warn when resuming a session above either size. 0 disables the check.
+  session_warn_tokens: z.number().int().nonnegative().default(20_000_000),
+  session_warn_bytes: z.number().int().nonnegative().default(800_000),
 });
 export type LimitsConfig = z.infer<typeof LimitsConfigSchema>;
 

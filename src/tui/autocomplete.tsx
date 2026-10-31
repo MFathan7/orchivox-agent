@@ -92,6 +92,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/collab", description: "Start live terminal sharing relay session" },
   { name: "/clear", description: "Clear chat screen" },
   { name: "/exit", description: "Exit Orchivox" },
+  { name: "/quit", description: "Exit Orchivox (alias of /exit)" },
 ];
 
 const IGNORED_SCAN_DIRS = new Set([
@@ -508,7 +509,8 @@ export async function queryAutocomplete(
     sourceItems = await fetchSkills(repoRoot);
   }
 
-  const ranked = filterFuzzy(context.query, sourceItems, (item) => item.label, 20);
+  const limit = context.trigger === "command" ? Math.max(1, sourceItems.length) : 20;
+  const ranked = filterFuzzy(context.query, sourceItems, (item) => item.label, limit);
   const items = ranked.map(({ item, score }) => ({ ...item, score }));
   return { context, items };
 }

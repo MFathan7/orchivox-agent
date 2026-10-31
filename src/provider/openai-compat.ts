@@ -11,6 +11,7 @@ import {
   type TokenPricing,
 } from "../types/schema";
 import { learnLimitsFromError } from "./limit-cache";
+import { providerHttpCode } from "./errors";
 import {
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_PROVIDER_RETRY_POLICY,
@@ -330,7 +331,7 @@ export class OpenAICompatProvider implements LLMProvider {
           if (serverDelay !== undefined && serverDelay > policy.maxRetryAfterMs) {
             yield {
               type: "error",
-              code: `http_${status}`,
+              code: providerHttpCode(status),
               message: `provider asked to retry after ${Math.ceil(serverDelay / 1000)}s, above the ${Math.round(
                 policy.maxRetryAfterMs / 1000,
               )}s limit: ${failureMessage}`,
@@ -362,7 +363,7 @@ export class OpenAICompatProvider implements LLMProvider {
       if (!response || !response.ok) {
         yield {
           type: "error",
-          code: response ? `http_${response.status}` : "request_failed",
+          code: response ? providerHttpCode(response.status) : "request_failed",
           message: failureMessage || "provider request failed",
           recoverable: false,
         };

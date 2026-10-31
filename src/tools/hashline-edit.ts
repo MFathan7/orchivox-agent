@@ -4,8 +4,10 @@ import { dirname, resolve } from "node:path";
 import { applyPatch } from "diff";
 import { z } from "zod";
 
+import { currentTurnContext } from "../agent/turn-context";
 import type { AgentTool } from "./registry";
 import { truncateHead } from "./output-budget";
+import { redirectPlanPath } from "./plan-path";
 
 export interface HashlineLifecycle {
   onBeforeModify?: (filePath: string) => Promise<void> | void;
@@ -267,32 +269,50 @@ export const CreateFileArgsSchema = z.object({
 });
 export type CreateFileArgs = z.infer<typeof CreateFileArgsSchema>;
 
-export function createCreateFileTool(lifecycle: HashlineLifecycle = {}): AgentTool<typeof CreateFileArgsSchema> {
+export interface CreateFileToolOptions {
+  repoRoot?: string;
+}
+
+export function createCreateFileTool(
+  lifecycle: HashlineLifecycle = {},
+  options: CreateFileToolOptions = {},
+): AgentTool<typeof CreateFileArgsSchema> {
   return {
     name: "create_file",
     description:
-      "Create a new file with specified content. Creates any missing parent directories. Fails if the file exists unless overwrite is true.",
+      "Create a new file with specified content. Creates any missing parent directories. Fails if the file exists unless overwrite is true. Plan files named PLAN*.md default to PLAN.md at the project root unless the user names another path.",
     parameters: CreateFileArgsSchema,
     readOnly: false,
     async execute(args) {
-      const file = Bun.file(args.filePath);
+      const turnContext = currentTurnContext();
+      const root = turnContext?.workspaceRoot ?? options.repoRoot ?? globalThis.process.cwd();
+      const redirect = redirectPlanPath({
+        path: args.filePath,
+        userText: turnContext?.userText,
+        root,
+      });
+      const filePath = redirect.path;
+      const file = Bun.file(filePath);
       const exists = await file.exists();
       if (exists && !args.overwrite) {
         throw new EditRejectedError(
-          `file already exists: ${args.filePath}. Set overwrite: true if you intend to replace it.`,
+          `file already exists: ${filePath}. Set overwrite: true if you intend to replace it.`,
         );
       }
 
-      await lifecycle.onBeforeModify?.(args.filePath);
-      const parentDir = dirname(args.filePath);
+      await lifecycle.onBeforeModify?.(filePath);
+      const parentDir = dirname(filePath);
       if (!existsSync(parentDir)) {
         await mkdir(parentDir, { recursive: true });
       }
 
-      await Bun.write(args.filePath, args.content);
-      await lifecycle.onAfterModify?.(args.filePath, args.content);
+      await Bun.write(filePath, args.content);
+      await lifecycle.onAfterModify?.(filePath, args.content);
       const lineCount = splitLines(args.content).length;
-      return `created ${args.filePath} with ${lineCount} line(s)`;
+      const redirectNote = redirect.redirectedFrom
+        ? ` (redirected from ${redirect.redirectedFrom}; the user did not request that path)`
+        : "";
+      return `created ${filePath} with ${lineCount} line(s)${redirectNote}`;
     },
   };
 }

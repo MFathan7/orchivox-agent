@@ -2,10 +2,11 @@ import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 
-import { currentMode } from "../agent/turn-context";
+import { currentMode, currentTurnContext } from "../agent/turn-context";
+import { DEFAULT_PLAN_FILE, userRequestedPlanPath } from "./plan-path";
 import type { AgentTool } from "./registry";
 
-export const PLAN_FILE_RELATIVE_PATH = "PLAN.md";
+export const PLAN_FILE_RELATIVE_PATH = DEFAULT_PLAN_FILE;
 
 const PLAN_FILE_NAME = /^PLAN[A-Za-z0-9._-]*\.md$/i;
 
@@ -64,6 +65,8 @@ async function resolvePlanTarget(repoRoot: string, requested?: string): Promise<
 /**
  * Plan mode is read-only except for a plan file in the active project. The
  * model must only call this tool when the user explicitly asks to save a plan.
+ * The user's path wins. Without a named path, the default is PLAN.md at the
+ * project root.
  */
 export function createWritePlanTool(options: {
   repoRoot: string;
@@ -74,7 +77,7 @@ export function createWritePlanTool(options: {
   return {
     name: "write_plan",
     description:
-      "Write a plan file in the active project. Use only when the user explicitly asks to save a plan. The path must be a PLAN*.md file inside the project, such as PLAN.md or PLAN1.md. Set append=true to add a section.",
+      "Write a plan file in the active project. Use only when the user explicitly asks to save a plan. By default write PLAN.md at the project root. When the user names a path, use it exactly. The path must be a PLAN*.md file inside the project, such as PLAN.md, PLAN1.md, or docs/PLAN9.md. Set append=true to add a section.",
     parameters: z.object({
       content: z.string().min(1),
       append: z.boolean().default(false),
@@ -86,7 +89,24 @@ export function createWritePlanTool(options: {
         return `write_plan is only available in plan mode.`;
       }
       const request = args as { content: string; append: boolean; path?: string };
-      const target = await resolvePlanTarget(options.repoRoot, request.path ?? defaultPath);
+      const root = currentTurnContext()?.workspaceRoot ?? options.repoRoot;
+      const requested = request.path?.trim();
+      let targetPath = defaultPath;
+      let fallbackNote = "";
+
+      if (requested) {
+        const validated = await resolvePlanTarget(root, requested);
+        if (typeof validated === "string") {
+          return `plan write rejected: ${validated}`;
+        }
+        if (userRequestedPlanPath(currentTurnContext()?.userText, validated.relativePath)) {
+          targetPath = validated.relativePath;
+        } else if (validated.relativePath !== defaultPath) {
+          fallbackNote = ` (used ${defaultPath} because the user did not request ${validated.relativePath})`;
+        }
+      }
+
+      const target = await resolvePlanTarget(root, targetPath);
       if (typeof target === "string") {
         return `plan write rejected: ${target}`;
       }
@@ -101,7 +121,7 @@ export function createWritePlanTool(options: {
       } else {
         await writeFile(target.absolutePath, request.content, "utf8");
       }
-      return `wrote ${request.content.length} characters to ${target.relativePath}${request.append ? " (appended)" : ""}`;
+      return `wrote ${request.content.length} characters to ${target.relativePath}${request.append ? " (appended)" : ""}${fallbackNote}`;
     },
   };
 }

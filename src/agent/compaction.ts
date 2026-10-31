@@ -1,4 +1,5 @@
 import { COMPACT_LABEL, estimateMessageTokens } from "../memory/hindsight";
+import { isContextOverflowError } from "../provider/errors";
 import type { LLMProvider } from "../provider/router";
 import { ChatRequestSchema, type Message, type TextBlock, type ToolDefinition } from "../types/schema";
 import { estimateTokenCost } from "./token-estimate";
@@ -12,12 +13,18 @@ const RESERVE_SHARE = 0.15;
 const RESERVE_MIN = 16_000;
 const TRIM_KEEP_CHARS = 2_000;
 
+/** Request-size shares tried after a provider rejects the payload as too large. */
+export const OVERFLOW_SHRINK_STEPS = [0.85, 0.7, 0.5, 0.35] as const;
+
+/** Transcript reduction levels used when compaction itself cannot shrink enough. */
+export const OVERFLOW_TRANSCRIPT_LEVELS = [0, 1, 2, 3, 4] as const;
+
 const SUMMARY_SYSTEM = [
   "You compress conversation history for a coding agent.",
   "Produce a compact Markdown summary that lets another agent continue the work.",
   "Use these sections: ## Objective, ## Requirements, ## Decisions, ## Completed, ## Active, ## Active Skills, ## Blockers, ## Next Move, ## Relevant Files.",
   "Keep decisions, conventions, exact file paths, and active todo items with their status.",
-  "Keep loaded skill IDs and their absolute paths in the Active Skills section. Never copy full skill bodies into the summary.",
+  "Keep loaded skill IDs and their absolute paths in the Active Skills section. Never copy full skill bodies into the summary. Note that compacted skill bodies can be reloaded with the skill tool when needed.",
   "Drop chit-chat, tool noise, and stale intermediate output.",
   "If a previous summary is provided, merge it with the new conversation and keep it current.",
 ].join(" ");
@@ -101,6 +108,27 @@ export function estimateTextTokens(text: string): number {
 export function estimateToolsTokens(tools: ToolDefinition[]): number {
   if (tools.length === 0) return 0;
   return estimateTextTokens(JSON.stringify(tools));
+}
+
+/**
+ * Estimates the serialized request body size. The literal payload differs per
+ * provider adapter, but the message content, system prompt, and tool schemas
+ * dominate it. A 5% margin covers the adapter's small JSON envelope.
+ */
+export function estimateRequestBytes(input: {
+  system?: string;
+  messages: Message[];
+  tools?: ToolDefinition[];
+}): number {
+  const body = JSON.stringify({
+    system: input.system ?? "",
+    messages: input.messages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    })),
+    tools: input.tools ?? [],
+  });
+  return Math.ceil(Buffer.byteLength(body, "utf8") * 1.05);
 }
 
 export function extractSummary(messages: Message[]): string | undefined {
@@ -322,6 +350,80 @@ export function markPrunedToolResults(
   );
 }
 
+function clipToolResult(content: string | TextBlock[], maxChars: number): string {
+  const text = typeof content === "string" ? content : content.map((block) => block.text).join("\n");
+  if (text.length <= maxChars * 2) return text;
+  const head = text.slice(0, maxChars);
+  const tail = text.slice(-maxChars);
+  const removed = text.length - head.length - tail.length;
+  return `${head}\n\n[tool output clipped to fit the request size. ${removed} characters removed. Re-run the command or read the file again if the detail is needed.]\n\n${tail}`;
+}
+
+function textOnlyMessage(message: Message): Message | undefined {
+  if (message.role !== "user" && message.role !== "assistant") return undefined;
+  const content = message.content.filter((block) => block.type === "text");
+  if (content.length === 0) return undefined;
+  return { ...message, content };
+}
+
+/**
+ * Reduces a transcript for an emergency retry after the provider rejects the
+ * payload as too large. Levels preserve call/result pairing until the text-only
+ * levels, where every tool interaction is removed together.
+ */
+export function reduceTranscriptForOverflow(
+  messages: Message[],
+  level: number,
+  clipChars = 2_000,
+): Message[] {
+  const normalized = Math.max(0, Math.min(4, Math.floor(level)));
+  if (normalized === 0) return messages;
+
+  if (normalized === 1) {
+    return messages.map((message) => ({
+      ...message,
+      content: message.content.map((block) =>
+        block.type === "tool_result"
+          ? { ...block, content: clipToolResult(block.content, Math.max(200, clipChars)) }
+          : block,
+      ),
+    }));
+  }
+
+  if (normalized === 2) {
+    return messages.map((message) => ({
+      ...message,
+      content: message.content.map((block) =>
+        block.type === "tool_result" ? { ...block, content: PRUNED_TOOL_RESULT } : block,
+      ),
+    }));
+  }
+
+  const systems = messages.filter((message) => message.role === "system");
+
+  if (normalized === 3) {
+    const textMessages = messages.flatMap((message) => {
+      const reduced = textOnlyMessage(message);
+      return reduced ? [reduced] : [];
+    });
+    return [...systems, ...textMessages];
+  }
+
+  let lastUser = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      lastUser = index;
+      break;
+    }
+  }
+  const tail = (lastUser >= 0 ? messages.slice(lastUser) : []).flatMap((message) => {
+    const reduced = textOnlyMessage(message);
+    return reduced ? [reduced] : [];
+  });
+  const reduced = [...systems, ...tail];
+  return reduced.length > 0 ? reduced : messages.slice(-1);
+}
+
 export async function compactMessages(messages: Message[], options: CompactionOptions): Promise<CompactionResult> {
   const contextWindow = options.inputLimit ?? options.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   const buffer = compactionReserve(contextWindow, options);
@@ -459,31 +561,38 @@ async function summarize(
   maxTokens: number,
   signal?: AbortSignal,
 ): Promise<string> {
-  const transcript = older.map(formatMessageForSummary).join("\n");
-  const prompt = [
-    previousSummary ? `Previous summary:\n${previousSummary}` : "",
-    `Conversation to merge:\n${truncate(transcript, 60_000)}`,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const levels = [0, 1, 2, 3];
+  for (const level of levels) {
+    const reduced = reduceTranscriptForOverflow(older, level);
+    const transcript = reduced.map(formatMessageForSummary).join("\n");
+    const prompt = [
+      previousSummary ? `Previous summary:\n${previousSummary}` : "",
+      `Conversation to merge:\n${truncate(transcript, 60_000)}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
 
-  const request = ChatRequestSchema.parse({
-    system: SUMMARY_SYSTEM,
-    messages: [{ id: "compaction-request", role: "user", content: [{ type: "text", text: prompt }] }],
-    max_tokens: maxTokens,
-    temperature: 0.2,
-  });
+    const request = ChatRequestSchema.parse({
+      system: SUMMARY_SYSTEM,
+      messages: [{ id: "compaction-request", role: "user", content: [{ type: "text", text: prompt }] }],
+      max_tokens: maxTokens,
+      temperature: 0.2,
+    });
 
-  try {
-    let text = "";
-    let streamError: string | undefined;
-    for await (const event of provider.streamChat(request, signal)) {
-      if (event.type === "token") text += event.text;
-      else if (event.type === "error") streamError = event.message;
+    try {
+      let text = "";
+      let streamError: string | undefined;
+      for await (const event of provider.streamChat(request, signal)) {
+        if (event.type === "token") text += event.text;
+        else if (event.type === "error") streamError = event.message;
+      }
+      if (!streamError && text.trim().length > 0) return text.trim();
+      if (streamError && !isContextOverflowError(streamError)) break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!isContextOverflowError(message)) break;
     }
-    if (!streamError && text.trim().length > 0) return text.trim();
-  } catch {
-    // Fall through to the deterministic summary.
+    if (signal?.aborted) break;
   }
   return fallbackSummary(older);
 }
@@ -537,6 +646,9 @@ function fallbackSummary(older: Message[]): string {
     "",
     "## Active Skills",
     skills.size > 0 ? [...skills].sort().join(", ") : "none recorded",
+    ...(skills.size > 0
+      ? ["Bodies were compacted; reload with the skill tool if needed."]
+      : []),
     "",
     "## Relevant Files",
     files.size > 0 ? [...files].sort().map((file) => `- ${file}`).join("\n") : "none recorded",

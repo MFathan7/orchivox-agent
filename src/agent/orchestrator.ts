@@ -65,9 +65,12 @@ import {
   computeInputBudget,
   estimateTextTokens,
   estimateToolsTokens,
+  estimateRequestBytes,
   extractSummary,
   precomputeCompaction,
   pruneToolOutput,
+  reduceTranscriptForOverflow,
+  OVERFLOW_SHRINK_STEPS,
   type PrecomputedCompaction,
 } from "./compaction";
 import { appendUsageLog, usageLogEnabled } from "./usage-log";
@@ -90,6 +93,7 @@ import { toolDisplay } from "./tool-display";
 import {
   buildSkillHint,
   formatSkillReload,
+  loadedSkillIds,
   matchSkillNames,
   parseSkillMentions,
   SkillRegistry,
@@ -100,6 +104,11 @@ import { buildSystemPrompt } from "./system-prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
 import { currentTurnContext, runWithTurnContext } from "./turn-context";
 import { sleepAbortable } from "../provider/retry";
+import {
+  isContextOverflowError,
+  isOutputBudgetError,
+  isUnsupportedParamsError,
+} from "../provider/errors";
 import { modeContract, modeTransitionReminder } from "./modes";
 import { SKILL_ALWAYS_ALLOWED_TOOLS, SkillToolPolicy } from "./skill-policy";
 import { TodoEngine } from "./todo";
@@ -311,6 +320,7 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly maxSilentReasoningChars: number;
   private readonly maxSilentReasoningSeconds: number;
   private readonly maxTurnTokens: number | undefined;
+  private readonly maxRequestBytes: number;
   private readonly skillMaxBodyChars: number;
   private branch: string | undefined;
   private globalRules = "";
@@ -346,6 +356,7 @@ export class AgentOrchestrator implements IAgentRunner {
     this.maxSilentReasoningChars = options.config?.reasoning?.max_silent_chars ?? 0;
     this.maxSilentReasoningSeconds = options.config?.reasoning?.max_silent_seconds ?? 180;
     this.maxTurnTokens = options.config?.limits?.turn_tokens;
+    this.maxRequestBytes = options.config?.limits?.max_request_bytes ?? 800_000;
     this.skillMaxBodyChars = options.config?.skills?.max_body_chars ?? 0;
     this.permissions = options.permissions ?? new GranularPermissionEngine({ repoRoot: this.root });
     this.questionHandler = options.onQuestion;
@@ -551,7 +562,7 @@ export class AgentOrchestrator implements IAgentRunner {
       }),
     );
     this.registry.register(createHashEditTool(lifecycle));
-    this.registry.register(createCreateFileTool(lifecycle));
+    this.registry.register(createCreateFileTool(lifecycle, { repoRoot: this.root }));
     this.registry.register(createDeleteFileTool(lifecycle));
     this.registry.register(createMoveFileTool(lifecycle));
     this.registry.register(createApplyUnifiedPatchTool(lifecycle));
@@ -705,6 +716,7 @@ export class AgentOrchestrator implements IAgentRunner {
     // Name matching is provider-independent on purpose: the same request loads
     // the same skills whatever model answers it.
     const namedSkills = lastText ? matchSkillNames(lastText, this.skills) : [];
+    const loadedSkills = loadedSkillIds(messages);
     const turnSkills = [
       ...new Map(
         [...mentionedSkills, ...namedSkills].map((document) => [document.name, document]),
@@ -725,6 +737,7 @@ export class AgentOrchestrator implements IAgentRunner {
       forcedSkill: forcedSkill?.name,
       mentionedSkills: mentionedSkills.map((document) => document.name),
       namedSkills: namedSkills.map((document) => document.name),
+      loadedSkills,
     });
     const extraHints = skillHint;
 
@@ -858,7 +871,16 @@ export class AgentOrchestrator implements IAgentRunner {
     };
     let forcedOutputLimit: number | undefined;
     let maxTokens = Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
-    let compactedRetry = false;
+    let overflowAttempts = 0;
+    let compactionFailure: string | undefined;
+    const keepTokensForAttempt = (): number => {
+      if (overflowAttempts <= 0) return this.compactionConfig.keep_tokens;
+      const step =
+        OVERFLOW_SHRINK_STEPS[
+          Math.min(overflowAttempts - 1, OVERFLOW_SHRINK_STEPS.length - 1)
+        ];
+      return Math.max(1_000, Math.floor(this.compactionConfig.keep_tokens * step));
+    };
     let outputLimitContinues = 0;
     let outputLimitCompacted = false;
     let outputBudgetRetried = false;
@@ -1004,6 +1026,10 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
       const measuredBeforeCompaction = measuredPromptTokens();
+      const turnTools = skillPolicy.filter(tools);
+      const requestBytes = estimateRequestBytes({ system, messages, tools: turnTools });
+      const requestSizeOverLimit =
+        this.maxRequestBytes > 0 && requestBytes > this.maxRequestBytes;
       const precomputeThreshold = Math.max(
         PRECOMPUTE_MIN_TOKENS,
         Math.floor(inputBudget * PRECOMPUTE_SHARE),
@@ -1049,16 +1075,21 @@ export class AgentOrchestrator implements IAgentRunner {
         const compaction = await compactMessages(messages, {
           provider,
           contextWindow,
-          keepTokens: this.compactionConfig.keep_tokens,
+          keepTokens: keepTokensForAttempt(),
           reserveTokens: this.compactionConfig.reserve_tokens,
           bufferTokens: this.compactionConfig.buffer_tokens,
           bufferRatio: this.compactionConfig.buffer_ratio,
           overheadTokens,
           contextTokens: measuredBeforeCompaction,
           inputBudget,
+          force: requestSizeOverLimit || undefined,
           previousSummary: extractSummary(messages),
           precomputed: this.precomputedCompactions.get(precomputeKey),
-          onStart: () => sink({ type: "compaction_start", reason: "auto" }),
+          onStart: () =>
+            sink({
+              type: "compaction_start",
+              reason: requestSizeOverLimit ? "request_size" : "auto",
+            }),
         });
         if (compaction.didCompact) {
           this.precomputedCompactions.delete(precomputeKey);
@@ -1071,7 +1102,7 @@ export class AgentOrchestrator implements IAgentRunner {
             Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
           sink({
             type: "compaction",
-            reason: "auto",
+            reason: requestSizeOverLimit ? "request_size" : "auto",
             before_tokens: compaction.beforeTokens,
             after_tokens: compaction.afterTokens,
             summary_tokens: compaction.summaryTokens,
@@ -1105,7 +1136,7 @@ export class AgentOrchestrator implements IAgentRunner {
         messages.push(makeMessage(`turn-${turn}-advisor`, "system", advisorNote));
       }
 
-      const turnTools = skillPolicy.filter(tools);
+      const requestBytesEstimate = estimateRequestBytes({ system, messages, tools: turnTools });
       const requestMessageCount = messages.length;
       const forceActionRequest = forceAction;
       forceAction = false;
@@ -1129,6 +1160,7 @@ export class AgentOrchestrator implements IAgentRunner {
       const requestEstimate = estimatePromptTokens();
       const accumulator = new TurnAccumulator();
       let turnError: string | undefined;
+      let turnErrorCode: string | undefined;
       let contextOverflow = false;
       let errorSunk = false;
       let silentReasoningChars = 0;
@@ -1202,7 +1234,8 @@ export class AgentOrchestrator implements IAgentRunner {
             break;
           case "error": {
             turnError = event.message;
-            if (isContextOverflow(event.message)) contextOverflow = true;
+            turnErrorCode = event.code;
+            if (isContextOverflow(event.message, event.code)) contextOverflow = true;
             // A recovered provider failure restarts the turn only when nothing was
             // streamed yet, so the transcript never contains a half answer.
             const canRetryTurn =
@@ -1296,6 +1329,7 @@ export class AgentOrchestrator implements IAgentRunner {
           });
           finishReason = "stop";
           turnError = undefined;
+          turnErrorCode = undefined;
           continue;
         }
         sink({
@@ -1337,6 +1371,7 @@ export class AgentOrchestrator implements IAgentRunner {
           };
         }
         turnError = undefined;
+        turnErrorCode = undefined;
         finishReason = "stop";
         continue;
       }
@@ -1353,33 +1388,92 @@ export class AgentOrchestrator implements IAgentRunner {
           forcedOutputLimit = next;
           maxTokens = next;
           turnError = undefined;
+          turnErrorCode = undefined;
           contextOverflow = false;
           continue;
         }
       }
 
-      if (contextOverflow && !compactedRetry) {
-        compactedRetry = true;
+      if (contextOverflow && overflowAttempts < OVERFLOW_SHRINK_STEPS.length) {
+        overflowAttempts += 1;
         contextWindow = refreshContextWindow();
-        const forced = await compactMessages(messages, {
-          provider,
-          contextWindow,
-          keepTokens: this.compactionConfig.keep_tokens,
-          reserveTokens: this.compactionConfig.reserve_tokens,
-          bufferTokens: this.compactionConfig.buffer_tokens,
-          bufferRatio: this.compactionConfig.buffer_ratio,
-          overheadTokens,
-          contextTokens: measuredPromptTokens(),
-          previousSummary: extractSummary(messages),
-          precomputed: this.precomputedCompactions.get(precomputeKey),
-          force: true,
-          onStart: () => sink({ type: "compaction_start", reason: "retry" }),
+        const keepTokens = keepTokensForAttempt();
+        sink({
+          type: "compaction_start",
+          reason: "retry",
+          attempt: overflowAttempts,
+          max_attempts: OVERFLOW_SHRINK_STEPS.length,
         });
-        if (forced.didCompact) {
-          this.precomputedCompactions.delete(precomputeKey);
-          precomputeEpoch += 1;
-          messages = forced.messages;
-          this.appendSkillReload(sessionId, messages, Date.now());
+        try {
+          const forced = await compactMessages(messages, {
+            provider,
+            contextWindow,
+            keepTokens,
+            reserveTokens: this.compactionConfig.reserve_tokens,
+            bufferTokens: this.compactionConfig.buffer_tokens,
+            bufferRatio: this.compactionConfig.buffer_ratio,
+            overheadTokens,
+            contextTokens: measuredPromptTokens(),
+            previousSummary: extractSummary(messages),
+            precomputed: this.precomputedCompactions.get(precomputeKey),
+            force: true,
+          });
+          if (forced.didCompact) {
+            this.precomputedCompactions.delete(precomputeKey);
+            precomputeEpoch += 1;
+            messages = forced.messages;
+            this.appendSkillReload(sessionId, messages, Date.now());
+            measuredContext = undefined;
+            maxTokens =
+              forcedOutputLimit ??
+              Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
+            sink({
+              type: "compaction",
+              reason: "retry",
+              before_tokens: forced.beforeTokens,
+              after_tokens: forced.afterTokens,
+              summary_tokens: forced.summaryTokens,
+              summary: forced.summary,
+              removed_messages: forced.removedMessages,
+              tail_start_message_id: forced.tailStartMessageId,
+              attempt: overflowAttempts,
+              max_attempts: OVERFLOW_SHRINK_STEPS.length,
+            });
+            turnError = undefined;
+            turnErrorCode = undefined;
+            contextOverflow = false;
+            continue;
+          }
+        } catch (error) {
+          compactionFailure = error instanceof Error ? error.message : String(error);
+          turnError = `request too large and compaction failed: ${compactionFailure}`;
+          turnErrorCode = "compaction_failed";
+          const tokens = measuredPromptTokens() ?? estimatePromptTokens();
+          sink({
+            type: "compaction",
+            reason: "retry",
+            before_tokens: tokens,
+            after_tokens: tokens,
+            summary_tokens: 0,
+            removed_messages: 0,
+            attempt: overflowAttempts,
+            max_attempts: OVERFLOW_SHRINK_STEPS.length,
+            status: "error",
+            error: compactionFailure,
+          });
+        }
+
+        // If the summary did not remove anything, fall back to a transcript
+        // reduction level. Levels 1-2 keep call/result pairing; levels 3-4
+        // become text-only so a single oversized turn cannot keep the request
+        // above the provider's body limit forever.
+        const beforeBytes = estimateRequestBytes({ system, messages, tools: turnTools });
+        const reduced = reduceTranscriptForOverflow(messages, overflowAttempts);
+        const afterBytes = estimateRequestBytes({ system, messages: reduced, tools: turnTools });
+        if (afterBytes < beforeBytes) {
+          const beforeTokens = estimatePromptTokens();
+          const removedMessages = messages.length - reduced.length;
+          messages = reduced;
           measuredContext = undefined;
           maxTokens =
             forcedOutputLimit ??
@@ -1387,14 +1481,16 @@ export class AgentOrchestrator implements IAgentRunner {
           sink({
             type: "compaction",
             reason: "retry",
-            before_tokens: forced.beforeTokens,
-            after_tokens: forced.afterTokens,
-            summary_tokens: forced.summaryTokens,
-            summary: forced.summary,
-            removed_messages: forced.removedMessages,
-            tail_start_message_id: forced.tailStartMessageId,
+            before_tokens: beforeTokens,
+            after_tokens: estimatePromptTokens(),
+            summary_tokens: 0,
+            removed_messages: removedMessages,
+            attempt: overflowAttempts,
+            max_attempts: OVERFLOW_SHRINK_STEPS.length,
+            status: "done",
           });
           turnError = undefined;
+          turnErrorCode = undefined;
           contextOverflow = false;
           continue;
         }
@@ -1585,16 +1681,21 @@ export class AgentOrchestrator implements IAgentRunner {
           }
         }
         if (turnError && !errorSunk) {
-          const overflowFailure = contextOverflow && compactedRetry;
+          const overflowFailure = contextOverflow && overflowAttempts > 0;
           sink({
             type: "error",
             code: overflowFailure ? "context_overflow" : "provider_adjusted",
             message: overflowFailure
-              ? [
-                  "Context overflow recovery failed after one compact-and-retry attempt.",
-                  "Start a new session, reduce the request size, or switch to a model with a larger context window.",
-                ].join(" ")
-              : isAutoHandledProviderError(turnError)
+              ? compactionFailure
+                ? [
+                    `Request too large; compaction failed after ${overflowAttempts} shrink attempt(s): ${compactionFailure}`,
+                    "Run /compact to summarize this session, or /new to start fresh.",
+                  ].join(" ")
+                : [
+                    `Provider rejected the request as too large after ${overflowAttempts} shrink attempt(s).`,
+                    "Run /compact to summarize this session, or /new to start fresh.",
+                  ].join(" ")
+              : isAutoHandledProviderError(turnError, turnErrorCode)
                 ? "provider request failed after automatic adjustment"
                 : turnError,
             recoverable: false,
@@ -2331,10 +2432,7 @@ function extractFilePath(args: Record<string, unknown>): string | undefined {
 }
 
 function isPlanFilePath(path: string): boolean {
-  return (
-    /(^|[\\/])PLAN[A-Za-z0-9._-]*\.md$/i.test(path) ||
-    /(^|[\\/])\.agent[\\/]plan\.md$/i.test(path)
-  );
+  return /(^|[\\/])PLAN[A-Za-z0-9._-]*\.md$/i.test(path);
 }
 
 export function stripImageBlocks(messages: Message[]): Message[] {
@@ -2413,26 +2511,16 @@ function firstLine(text: string): string {
   return line.length > 120 ? `${line.slice(0, 117)}...` : line;
 }
 
-export function isContextOverflow(message: string): boolean {
-  return /context length|context_length_exceeded|too many tokens|maximum context|prompt is too long|reduce the length of the messages|request too large|input length|input token count|maximum number of tokens|tokens? exceed|exceed(?:s|ed)? the (?:model'?s )?(?:maximum|limit)|exceeds? the context|over the context limit/i.test(
-    message,
-  );
+export function isContextOverflow(message: string, code?: string): boolean {
+  return isContextOverflowError(message, code);
 }
 
-function isOutputBudgetError(message: string): boolean {
-  return /requested\s+\d+\s+output tokens|output tokens?.*(?:too large|exceed)|max_tokens.*(?:too large|exceed)/i.test(
-    message,
+function isAutoHandledProviderError(message: string, code?: string): boolean {
+  return (
+    isOutputBudgetError(message) ||
+    isUnsupportedParamsError(message) ||
+    isContextOverflowError(message, code)
   );
-}
-
-function isUnsupportedParamsError(message: string): boolean {
-  return /UnsupportedParamsError|does not support (?:the )?(?:parameter|parameters|param|params)|unsupported (?:parameter|parameters|param|params)/i.test(
-    message,
-  );
-}
-
-function isAutoHandledProviderError(message: string): boolean {
-  return isOutputBudgetError(message) || isUnsupportedParamsError(message) || isContextOverflow(message);
 }
 
 function errorNumber(message: string, pattern: RegExp): number | undefined {
