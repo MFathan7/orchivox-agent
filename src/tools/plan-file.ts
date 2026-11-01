@@ -3,6 +3,7 @@ import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 
 import { currentMode, currentTurnContext } from "../agent/turn-context";
+import { planDirectory } from "./plan-directory";
 import { DEFAULT_PLAN_FILE, userRequestedPlanPath } from "./plan-path";
 import type { AgentTool } from "./registry";
 
@@ -36,28 +37,27 @@ async function nearestExistingPath(path: string): Promise<string | undefined> {
   }
 }
 
-async function resolvePlanTarget(repoRoot: string, requested?: string): Promise<PlanTarget | string> {
+async function resolvePlanTarget(directory: string, requested?: string): Promise<PlanTarget | string> {
   const raw = (requested ?? PLAN_FILE_RELATIVE_PATH).trim();
   if (raw.length === 0) return "plan path cannot be empty";
-  if (isAbsolute(raw)) return "plan path must be relative to the active project";
   if (!raw.toLowerCase().endsWith(".md")) return "plan file must end with .md";
   if (!PLAN_FILE_NAME.test(basename(raw))) return "plan file name must match PLAN*.md";
 
-  const root = resolve(repoRoot);
-  const absolutePath = resolve(root, raw);
+  const root = resolve(directory);
+  const absolutePath = isAbsolute(raw) ? resolve(raw) : resolve(root, raw);
   const relativePath = relative(root, absolutePath);
   if (!insideRoot(root, absolutePath)) {
-    return "plan path must stay inside the active project";
+    return "plan path must stay inside the plan directory";
   }
 
   const realRoot = await realpath(root).catch(() => root);
   const existingParent = await nearestExistingPath(dirname(absolutePath));
   if (existingParent && !insideRoot(realRoot, existingParent)) {
-    return "plan path must stay inside the active project";
+    return "plan path must stay inside the plan directory";
   }
   const existingTarget = await realpath(absolutePath).catch(() => undefined);
   if (existingTarget && !insideRoot(realRoot, existingTarget)) {
-    return "plan path must stay inside the active project";
+    return "plan path must stay inside the plan directory";
   }
   return { relativePath, absolutePath };
 }
@@ -71,13 +71,14 @@ async function resolvePlanTarget(repoRoot: string, requested?: string): Promise<
 export function createWritePlanTool(options: {
   repoRoot: string;
   relativePath?: string;
+  directory?: string;
 }): AgentTool {
   const defaultPath = options.relativePath ?? PLAN_FILE_RELATIVE_PATH;
 
   return {
     name: "write_plan",
     description:
-      "Write a plan file in the active project. Use only when the user explicitly asks to save a plan. By default write PLAN.md at the project root. When the user names a path, use it exactly. The path must be a PLAN*.md file inside the project, such as PLAN.md, PLAN1.md, or docs/PLAN9.md. Set append=true to add a section.",
+      "Write a plan file in the global Orchivox plan directory. Use only when the user explicitly asks to save a plan. By default write PLAN.md. When the user names a path, use it exactly. The path must be a PLAN*.md file inside the plan directory, such as PLAN.md or PLAN9.md. Set append=true to add a section.",
     parameters: z.object({
       content: z.string().min(1),
       append: z.boolean().default(false),
@@ -89,7 +90,8 @@ export function createWritePlanTool(options: {
         return `write_plan is only available in plan mode.`;
       }
       const request = args as { content: string; append: boolean; path?: string };
-      const root = currentTurnContext()?.workspaceRoot ?? options.repoRoot;
+      const root = options.directory ?? planDirectory();
+      await mkdir(root, { recursive: true });
       const requested = request.path?.trim();
       let targetPath = defaultPath;
       let fallbackNote = "";

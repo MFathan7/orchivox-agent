@@ -123,6 +123,9 @@ export function buildTranscriptEntries(
     // Tool calls and results are shown through the tool_calls metadata on the
     // answer entry, so their stored rows must not become empty chat bubbles.
     if (message.role === "tool") return;
+    // Instruction updates and plan reminders are context for the model, not user chat.
+    if (message.metadata?.instruction !== undefined) return;
+    if (message.metadata?.planReminder !== undefined) return;
     const hasToolUse = message.content.some((block) => block.type === "tool_use");
     if (message.role === "assistant" && hasToolUse && messageEntryText(message).trim().length === 0) return;
     const metadata = message.metadata;

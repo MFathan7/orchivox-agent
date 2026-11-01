@@ -437,6 +437,8 @@ export function splitLineAtCursor(line: string, col: number): { before: string; 
 
 export interface VisualRow {
   lineIndex: number;
+  /** Global offset where the logical line starts. */
+  lineStart: number;
   text: string;
   start: number;
   end: number;
@@ -478,12 +480,20 @@ export function wrapLineSegments(
 export function buildVisualRows(text: string, width: number): VisualRow[] {
   const lines = text.split("\n");
   const rows: VisualRow[] = [];
+  let lineStart = 0;
   lines.forEach((line, lineIndex) => {
     for (const segment of wrapLineSegments(line, width)) {
-      rows.push({ lineIndex, text: segment.text, start: segment.start, end: segment.end });
+      rows.push({
+        lineIndex,
+        lineStart,
+        text: segment.text,
+        start: segment.start,
+        end: segment.end,
+      });
     }
+    lineStart += line.length + 1;
   });
-  return rows.length > 0 ? rows : [{ lineIndex: 0, text: "", start: 0, end: 0 }];
+  return rows.length > 0 ? rows : [{ lineIndex: 0, lineStart: 0, text: "", start: 0, end: 0 }];
 }
 
 export function offsetAtVisualPosition(
@@ -494,7 +504,7 @@ export function offsetAtVisualPosition(
   if (rows.length === 0) return 0;
   const row = rows[Math.max(0, Math.min(rows.length - 1, rowIndex))];
   let width = 0;
-  let offset = row.start;
+  let offset = row.lineStart + row.start;
   for (const char of row.text) {
     if (width + displayWidth(char) > visualCol) break;
     width += displayWidth(char);

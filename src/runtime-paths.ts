@@ -17,10 +17,15 @@ export interface ProjectStatePaths {
   legacySnapshotsDir: string;
 }
 
-export function resolveProjectState(root = process.cwd()): ProjectStatePaths {
+export function projectKey(root = process.cwd()): string {
   const canonical = resolve(root).replace(/[\\/]+$/, "");
   const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 12);
   const name = basename(canonical).replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 48) || "project";
+  return `${name}-${hash}`;
+}
+
+export function resolveProjectState(root = process.cwd()): ProjectStatePaths {
+  const canonical = resolve(root).replace(/[\\/]+$/, "");
   const stateHome =
     process.env.ORCHIVOX_STATE_HOME?.trim() ||
     join(
@@ -28,7 +33,7 @@ export function resolveProjectState(root = process.cwd()): ProjectStatePaths {
       "orchivox",
       "projects",
     );
-  const dataDir = join(stateHome, `${name}-${hash}`);
+  const dataDir = join(stateHome, projectKey(canonical));
   return {
     root: canonical,
     dataDir,

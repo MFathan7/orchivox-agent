@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { freezeDebugEnabled, logFreeze } from "../agent/freeze-debug";
 import {
   toolParametersToJsonSchema,
   type AgentMode,
@@ -10,13 +11,17 @@ import {
 } from "../types/schema";
 import { resolveWorkspaceArguments } from "./workspace";
 
+export interface ToolExecutionContext {
+  signal?: AbortSignal;
+}
+
 export interface AgentTool<TSchema extends z.ZodTypeAny = z.ZodTypeAny> {
   readonly name: string;
   readonly description: string;
   readonly parameters: TSchema;
   readonly parametersJsonSchema?: JsonSchemaObject;
   readonly readOnly: boolean;
-  execute(args: z.infer<TSchema>): Promise<string> | string;
+  execute(args: z.infer<TSchema>, context?: ToolExecutionContext): Promise<string> | string;
 }
 
 export interface PermissionDecision {
@@ -84,7 +89,7 @@ export class ToolRegistry {
     }));
   }
 
-  async run(call: ToolCall, mode: AgentMode): Promise<ToolResult> {
+  async run(call: ToolCall, mode: AgentMode, signal?: AbortSignal): Promise<ToolResult> {
     const tool = this.tools.get(call.name);
     if (!tool) {
       return { tool_call_id: call.id, content: `unknown tool "${call.name}"`, is_error: true };
@@ -113,10 +118,26 @@ export class ToolRegistry {
       };
     }
 
+    const startedAt = freezeDebugEnabled() ? performance.now() : 0;
     try {
-      const content = await tool.execute(resolveWorkspaceArguments(parsed.data));
+      const content = await tool.execute(resolveWorkspaceArguments(parsed.data), { signal });
+      if (startedAt > 0) {
+        logFreeze("tool", {
+          name: call.name,
+          ms: Math.round(performance.now() - startedAt),
+          ok: true,
+        });
+      }
       return { tool_call_id: call.id, content, is_error: false };
     } catch (error) {
+      if (startedAt > 0) {
+        logFreeze("tool", {
+          name: call.name,
+          ms: Math.round(performance.now() - startedAt),
+          ok: false,
+          error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+        });
+      }
       return {
         tool_call_id: call.id,
         content: error instanceof Error ? error.message : String(error),

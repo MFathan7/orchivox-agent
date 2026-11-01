@@ -67,6 +67,7 @@ import {
   estimateToolsTokens,
   estimateRequestBytes,
   extractSummary,
+  isSyntheticMessage,
   precomputeCompaction,
   pruneToolOutput,
   reduceTranscriptForOverflow,
@@ -100,7 +101,16 @@ import {
   type SkillDocument,
 } from "./skills";
 import { SubagentManager, type SubagentTaskInput, type SubagentTaskResult, type SubagentWorkerState } from "./subagent";
-import { buildSystemPrompt } from "./system-prompt";
+import { closingReminder } from "./prompt/base";
+import { instructionBlocks } from "./prompt/instructions";
+import { planEnterReminder, planLeaveReminder } from "./prompt/plan-mode";
+import {
+  instructionMessage,
+  mergeInstructionMessages,
+  planInstructionUpdates,
+  type InstructionState,
+} from "./prompt/instruction-state";
+import { buildSystemParts } from "./prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
 import { currentTurnContext, runWithTurnContext } from "./turn-context";
 import { sleepAbortable } from "../provider/retry";
@@ -171,30 +181,11 @@ const PROFILE_MODES: Record<AgentProfile, AgentMode> = {
   "orchivox-ultrawork": "ultrawork",
 };
 
-const MUTATING_TOOL_NAMES = new Set([
-  "hash_edit",
-  "write_file",
-  "create_file",
-  "delete_file",
-  "move_file",
-  "apply_unified_patch",
-]);
-
-const VERIFY_TOOL_NAMES = new Set(["diagnostics_check"]);
-
-const VERIFY_COMMAND =
-  /\b(?:bun\s+test|bun\s+run\s+(?:typecheck|test|check|lint)|npm\s+(?:test|run)|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|pytest|cargo\s+test|go\s+test|tsc\b|vitest|jest|eslint|biome)\b/i;
-
 /** `/skill:<name> [args]` forces a skill, like the portable skill command. */
 const SKILL_DIRECTIVE = /^\/skill:([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/;
 
 /** Extra attempts when a provider fails before producing any output. */
 const MAX_TURN_RETRIES = 1;
-
-const VERIFY_NUDGE = [
-  "You changed files but did not verify them.",
-  "Run diagnostics_check and the tests or checks that cover the change, fix what they report, then give the final summary.",
-].join(" ");
 
 const STUDY_NUDGE = [
   "You have some tool results. If you need more information, call more read, search, or command tools now.",
@@ -228,6 +219,12 @@ const MAX_CONCURRENT_TOOLS = 4;
 interface ToolBatch {
   mode: "parallel" | "sequential";
   calls: ToolUseBlock[];
+}
+
+interface InstructionStore {
+  getInstructionState?: (sessionId: string) => InstructionState | undefined;
+  saveInstructionState?: (sessionId: string, state: InstructionState) => void;
+  loadInstructionMessages?: (sessionId: string) => Message[];
 }
 
 /**
@@ -454,20 +451,80 @@ export class AgentOrchestrator implements IAgentRunner {
     };
   }
 
+  private instructionStore(): InstructionStore {
+    return this.database as unknown as InstructionStore;
+  }
+
+  private supportsInstructionState(sessionId: string | undefined): boolean {
+    if (!sessionId) return false;
+    const store = this.instructionStore();
+    return (
+      typeof store.getInstructionState === "function" &&
+      typeof store.saveInstructionState === "function" &&
+      typeof store.loadInstructionMessages === "function"
+    );
+  }
+
+  private loadInstructionState(sessionId: string | undefined): InstructionState | undefined {
+    if (!sessionId) return undefined;
+    const store = this.instructionStore();
+    if (typeof store.getInstructionState !== "function") return undefined;
+    try {
+      return store.getInstructionState(sessionId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private saveInstructionState(sessionId: string | undefined, state: InstructionState): void {
+    if (!sessionId) return;
+    const store = this.instructionStore();
+    if (typeof store.saveInstructionState !== "function") return;
+    try {
+      store.saveInstructionState(sessionId, state);
+    } catch {
+      // A read-only or stub database must not break the turn.
+    }
+  }
+
+  private loadInstructionMessages(sessionId: string | undefined): Message[] {
+    if (!sessionId) return [];
+    const store = this.instructionStore();
+    if (typeof store.loadInstructionMessages !== "function") return [];
+    try {
+      return store.loadInstructionMessages(sessionId);
+    } catch {
+      return [];
+    }
+  }
+
   estimateContextOverhead(mode: AgentMode): number {
-    const providerRef = this.router.getModeModel(mode);
     const compact = this.useCompactPrompt();
-    const system = buildSystemPrompt({
+    const tools = filterToolsForMode(this.registry.listDefinitions(), mode);
+    const providerRef = this.router.getModeModel(mode);
+    const promptBase = {
       mode,
+      providerKind: providerRef?.provider ? this.router.providerKind(providerRef.provider) : undefined,
+      model: providerRef?.model,
+      modelName: providerRef?.model,
       repoRoot: this.root,
       branch: this.branch,
       agentInstructions: this.globalRules,
       projectSummary: this.projectContext?.summary,
       skillsIndex: this.skills.buildIndexPrompt({ compact }),
       compact,
-    });
-    const tools = filterToolsForMode(this.registry.listDefinitions(), mode);
-    return estimateTextTokens(system) + estimateToolsTokens(tools);
+      includeInstructions: false,
+      includeClosing: false,
+      tools: tools.map((tool) => tool.name),
+    };
+    const system = buildSystemParts(promptBase)
+      .map((part) => part.text)
+      .join("\n\n");
+    const instructionTokens = instructionBlocks(promptBase).reduce(
+      (sum, block) => sum + estimateTextTokens(block.text),
+      0,
+    );
+    return estimateTextTokens(system) + estimateToolsTokens(tools) + instructionTokens;
   }
 
   getLastPromptInfo(sessionId?: string): PromptSnapshot | undefined {
@@ -624,8 +681,22 @@ export class AgentOrchestrator implements IAgentRunner {
     // or a second user turn would reuse turn-0 and collide.
     const runId = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const persistedIds = new Set<string>();
+    const useInstructionState = this.supportsInstructionState(sessionId);
+    let instructionState: InstructionState | undefined = useInstructionState
+      ? this.loadInstructionState(sessionId)
+      : undefined;
+    if (useInstructionState) {
+      messages = mergeInstructionMessages(messages, this.loadInstructionMessages(sessionId));
+    }
 
-    const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+    let lastUserIdx = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role === "user" && !isSyntheticMessage(message)) {
+        lastUserIdx = index;
+        break;
+      }
+    }
     if (lastUserIdx !== -1) {
       const userMsg = messages[lastUserIdx];
       const textBlock = userMsg.content.find((b) => b.type === "text");
@@ -646,7 +717,9 @@ export class AgentOrchestrator implements IAgentRunner {
       }
     }
 
-    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    const lastUserMsg = [...messages]
+      .reverse()
+      .find((message) => message.role === "user" && !isSyntheticMessage(message));
     let lastText =
       lastUserMsg?.content.map((b) => (b.type === "text" ? b.text : "")).join(" ") ?? "";
 
@@ -695,6 +768,9 @@ export class AgentOrchestrator implements IAgentRunner {
     const capabilities = requestedRole
       ? this.router.capabilitiesForRole(requestedRole)
       : this.router.capabilitiesForMode(mode);
+    const promptProviderKind = providerRef?.provider
+      ? this.router.providerKind(providerRef.provider)
+      : undefined;
     if (!capabilities.vision) messages = stripImageBlocks(messages);
 
     const compact = this.useCompactPrompt();
@@ -739,7 +815,6 @@ export class AgentOrchestrator implements IAgentRunner {
       namedSkills: namedSkills.map((document) => document.name),
       loadedSkills,
     });
-    const extraHints = skillHint;
 
     const contextWindowBase = effectiveContextWindow(capabilities) ?? this.contextTokenBudget;
     let contextWindow = contextWindowBase;
@@ -757,24 +832,94 @@ export class AgentOrchestrator implements IAgentRunner {
     const activeSkillDocs = loadedSkillDocs.filter(
       (document) => !turnSkills.some((turnSkill) => turnSkill.name === document.name),
     );
+    let tools = this.combineTools(request.tools, mode);
+    if (!capabilities.tool_calling) tools = [];
+    if (activeSpecialist) {
+      tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
+    }
     const promptBase = {
       mode,
       task: request.task,
+      providerKind: promptProviderKind,
+      model: providerRef?.model,
+      modelName: providerRef?.model,
       repoRoot: this.root,
       branch: this.branch,
       agentInstructions: this.globalRules,
       specialistPrompt: activeSpecialist?.systemPrompt,
       projectSummary: this.projectContext?.summary,
       skillsIndex: this.skills.buildIndexPrompt({ compact }),
-      extra: [request.system, extraHints].filter(Boolean).join("\n\n") || undefined,
+      extra: request.system,
       compact,
+      includeInstructions: !useInstructionState,
+      includeClosing: false,
+      tools: tools.map((tool) => tool.name),
     };
-    let system = buildSystemPrompt(promptBase);
-    let tools = this.combineTools(request.tools, mode);
-    if (!capabilities.tool_calling) tools = [];
-    if (activeSpecialist) {
-      tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
-    }
+    const systemParts = buildSystemParts(promptBase);
+    const system = systemParts.map((part) => part.text).join("\n\n");
+    const ensureInstructions = (): void => {
+      if (!useInstructionState) return;
+      const plan = planInstructionUpdates({
+        blocks: instructionBlocks(promptBase),
+        messages,
+        state: instructionState,
+      });
+      if (plan.updates.length > 0) {
+        const additions = plan.updates.map((update, index) =>
+          instructionMessage(`${runId}-instruction-${index}-${update.key}`, update),
+        );
+        insertBeforeLastUser(messages, additions);
+        for (const message of additions) {
+          try {
+            this.database.saveMessage(sessionId as string, message);
+            persistedIds.add(message.id);
+          } catch {
+            // Instruction persistence is best effort; the next turn re-injects it.
+          }
+        }
+      }
+      instructionState = plan.nextState;
+      this.saveInstructionState(sessionId, plan.nextState);
+    };
+    const ensurePlanReminder = (): void => {
+      const enter = planEnterReminder();
+      const leave = planLeaveReminder();
+      const last = lastPlanReminder(messages, enter, leave);
+      const text =
+        mode === "plan"
+          ? last === enter
+            ? undefined
+            : enter
+          : last === enter
+            ? leave
+            : undefined;
+      if (!text) return;
+      const message = {
+        ...makeMessage(`${runId}-plan-${mode}`, "user", text),
+        metadata: { synthetic: true, planReminder: true },
+      };
+      insertBeforeLastUser(messages, [message]);
+      if (sessionId) {
+        try {
+          this.database.saveMessage(sessionId, message);
+          persistedIds.add(message.id);
+        } catch {
+          // Plan reminder persistence is best effort.
+        }
+      }
+    };
+    const ensureDynamicMessages = (): void => {
+      ensureInstructions();
+      ensurePlanReminder();
+    };
+    ensureDynamicMessages();
+    appendSyntheticMessage(messages, `${runId}-context`, request.context);
+    appendSyntheticMessage(messages, `${runId}-skill-hint`, skillHint);
+    appendSyntheticMessage(
+      messages,
+      `${runId}-closing`,
+      closingReminder({ task: request.task }),
+    );
     const overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
     const availableSkillCount = this.skills.listAvailableDocuments().length;
     const mentionedSkillNames = turnSkills.map((document) => document.name);
@@ -815,18 +960,11 @@ export class AgentOrchestrator implements IAgentRunner {
     const totals = zeroUsage();
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
-    let verifyNudges = 0;
     let turnRetries = 0;
     let reasoningRecoveries = 0;
     let forceAction = false;
     let taskNudged = false;
     let studyRetried = false;
-    let editedThisTurn = false;
-    let verifiedThisTurn = false;
-    let wrotePlanThisTurn = false;
-    let implementationNudges = 0;
-    const editedFiles = new Set<string>();
-    const planReference = /\bPLAN[A-Za-z0-9._-]*\.md\b/i.test(lastText);
     // Measured context is everything the last request used: the prompt it sent
     // plus the completion it produced, reasoning included. The assistant message
     // covered by that completion is the last message before the trailing count.
@@ -925,13 +1063,12 @@ export class AgentOrchestrator implements IAgentRunner {
       if (activeSpecialist) {
         tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
       }
-      messages.push(
-        makeMessage(
-          `turn-${turn}-mode`,
-          "system",
-          modeTransitionReminder(from, mode),
-        ),
+      appendSyntheticMessage(
+        messages,
+        `turn-${turn}-mode`,
+        modeTransitionReminder(from, mode),
       );
+      ensurePlanReminder();
       sink({ type: "mode_changed", from, to: mode });
     };
 
@@ -939,9 +1076,12 @@ export class AgentOrchestrator implements IAgentRunner {
       originalText: string,
       correction: string[],
     ): Promise<string> => {
-      const retrySystem = [system, "# Correction", ...correction].join("\n\n");
+      const retryCorrection = ["# Correction", ...correction].join("\n\n");
+      const retryParts = [...systemParts, { text: retryCorrection }];
+      const retrySystem = retryParts.map((part) => part.text).join("\n\n");
       const retryRequest = ChatRequestSchema.parse({
         system: retrySystem,
+        system_parts: retryParts,
         messages: messages.slice(0, -1),
         tools: [],
         tool_choice: "none",
@@ -1004,6 +1144,7 @@ export class AgentOrchestrator implements IAgentRunner {
         });
         if (pruned.prunedResults > 0) {
           messages = pruned.messages;
+          ensureDynamicMessages();
           measuredContext = undefined;
           prunedTokensThisTurn = pruned.prunedTokens;
           sink({
@@ -1097,6 +1238,7 @@ export class AgentOrchestrator implements IAgentRunner {
           compactedThisTurn = true;
           measuredContext = undefined;
           messages = compaction.messages;
+          ensureDynamicMessages();
           maxTokens =
             forcedOutputLimit ??
             Math.max(1024, Math.min(requestedMaxTokens, outputCap, outputHeadroom()));
@@ -1136,12 +1278,12 @@ export class AgentOrchestrator implements IAgentRunner {
         messages.push(makeMessage(`turn-${turn}-advisor`, "system", advisorNote));
       }
 
-      const requestBytesEstimate = estimateRequestBytes({ system, messages, tools: turnTools });
       const requestMessageCount = messages.length;
       const forceActionRequest = forceAction;
       forceAction = false;
       const chatRequest = ChatRequestSchema.parse({
         system,
+        system_parts: systemParts,
         messages,
         tools: turnTools,
         tool_choice: turnTools.length > 0 ? request.tool_choice.mode : "none",
@@ -1423,6 +1565,7 @@ export class AgentOrchestrator implements IAgentRunner {
             precomputeEpoch += 1;
             messages = forced.messages;
             this.appendSkillReload(sessionId, messages, Date.now());
+            ensureDynamicMessages();
             measuredContext = undefined;
             maxTokens =
               forcedOutputLimit ??
@@ -1474,6 +1617,7 @@ export class AgentOrchestrator implements IAgentRunner {
           const beforeTokens = estimatePromptTokens();
           const removedMessages = messages.length - reduced.length;
           messages = reduced;
+          ensureDynamicMessages();
           measuredContext = undefined;
           maxTokens =
             forcedOutputLimit ??
@@ -1541,44 +1685,14 @@ export class AgentOrchestrator implements IAgentRunner {
           messages.push(makeMessage(`turn-${turn}-continue`, "user", nudge));
           continue;
         }
-        if (!turnError && mode === "build" && planReference && implementationNudges < 1) {
-          const implementationFiles = [...editedFiles].filter((path) => !isPlanFilePath(path));
-          const wroteOnlyPlan =
-            (editedFiles.size > 0 || wrotePlanThisTurn) && implementationFiles.length === 0;
-          if (wroteOnlyPlan) {
-            implementationNudges += 1;
-            messages.push(
-              makeMessage(
-                `turn-${turn}-implement`,
-                "user",
-                [
-                  "You wrote or updated a plan file, but no implementation files changed.",
-                  "Writing or updating a plan is not implementation.",
-                  "Read the plan, edit the code files it describes with the edit tools, and verify the result.",
-                  "If the plan is already implemented, say so and show the evidence.",
-                  "Do not claim completion without file changes.",
-                ].join(" "),
-              ),
-            );
-            continue;
-          }
-        }
-        if (
-          !turnError &&
-          contract.verifyEdits &&
-          editedThisTurn &&
-          !verifiedThisTurn &&
-          verifyNudges < 1
-        ) {
-          verifyNudges += 1;
-          messages.push(makeMessage(`turn-${turn}-verify`, "user", VERIFY_NUDGE));
-          continue;
-        }
         if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES) {
           outputLimitContinues += 1;
           if (!outputLimitCompacted) {
             outputLimitCompacted = true;
-            const hasPriorTurn = messages.filter((message) => message.role === "user").length > 1;
+            const hasPriorTurn =
+              messages.filter(
+                (message) => message.role === "user" && !isSyntheticMessage(message),
+              ).length > 1;
             const compacted = hasPriorTurn
               ? await compactMessages(messages, {
                   provider,
@@ -1600,6 +1714,7 @@ export class AgentOrchestrator implements IAgentRunner {
               precomputeEpoch += 1;
               messages = compacted.messages;
               this.appendSkillReload(sessionId, messages, Date.now());
+              ensureDynamicMessages();
               measuredContext = undefined;
               maxTokens =
                 forcedOutputLimit ??
@@ -1714,18 +1829,6 @@ export class AgentOrchestrator implements IAgentRunner {
         const startedAt = Date.now();
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         const filePath = extractFilePath(call.arguments);
-        if (MUTATING_TOOL_NAMES.has(call.name)) {
-          editedThisTurn = true;
-          if (filePath) editedFiles.add(filePath);
-        }
-        if (
-          VERIFY_TOOL_NAMES.has(call.name) ||
-          (call.name === "bash" &&
-            typeof call.arguments.command === "string" &&
-            VERIFY_COMMAND.test(call.arguments.command))
-        ) {
-          verifiedThisTurn = true;
-        }
         const display = toolDisplay(call.name, call.arguments);
         sink({
           type: "tool_start",
@@ -1794,8 +1897,7 @@ export class AgentOrchestrator implements IAgentRunner {
           }
         }
 
-        const result = await this.registry.run(call, mode);
-        if (call.name === "write_plan" && !result.is_error) wrotePlanThisTurn = true;
+        const result = await this.registry.run(call, mode, signal);
         let content = typeof result.content === "string" ? result.content : JSON.stringify(result.content);
         let skillDocument: SkillDocument | undefined;
         if (call.name === "skill" && !result.is_error) {
@@ -2140,8 +2242,15 @@ export class AgentOrchestrator implements IAgentRunner {
       : outputCap;
     const subagentMaxTokens = Math.max(1024, Math.min(requestedMaxTokens, outputCap));
     const compactPrompt = this.useCompactPrompt();
-    const subagentSystem = buildSystemPrompt({
+    const subagentSystemParts = buildSystemParts({
       mode: effectiveMode,
+      providerKind: providerName ? this.router.providerKind(providerName) : undefined,
+      model:
+        input.model ??
+        (role ? this.router.getRole(role)?.model : this.router.getModeModel(mode)?.model),
+      modelName:
+        input.model ??
+        (role ? this.router.getRole(role)?.model : this.router.getModeModel(mode)?.model),
       repoRoot: input.worktreePath ?? this.root,
       branch: this.branch,
       agentInstructions: this.globalRules,
@@ -2149,8 +2258,10 @@ export class AgentOrchestrator implements IAgentRunner {
       projectSummary: this.projectContext?.summary,
       skillsIndex: this.skills.buildIndexPrompt({ compact: compactPrompt }),
       compact: compactPrompt,
+      includeClosing: false,
+      tools: tools.map((tool) => tool.name),
     });
-
+    const subagentSystem = subagentSystemParts.map((part) => part.text).join("\n\n");
     for (let turn = 0; turn < MAX_SUBAGENT_TURNS; turn += 1) {
       for (const instruction of input.drainSteerings()) {
         messages.push(makeMessage(`subagent-steer-${turn}`, "user", `Steering instruction: ${instruction}`));
@@ -2160,6 +2271,7 @@ export class AgentOrchestrator implements IAgentRunner {
       const accumulator = new TurnAccumulator();
       const chatRequest = ChatRequestSchema.parse({
         system: subagentSystem,
+        system_parts: subagentSystemParts,
         messages,
         tools,
         tool_choice: tools.length > 0 ? "auto" : "none",
@@ -2193,7 +2305,7 @@ export class AgentOrchestrator implements IAgentRunner {
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         input.onTranscript(`[tool] ${call.name}`);
-        const result = await this.registry.run(call, effectiveMode);
+        const result = await this.registry.run(call, effectiveMode, input.signal);
         messages.push(
           toolResultMessage(call, typeof result.content === "string" ? result.content : JSON.stringify(result.content), result.is_error),
         );
@@ -2401,6 +2513,46 @@ function makeMessage(id: string, role: Message["role"], content: Message["conten
   };
 }
 
+function messageText(message: Message): string {
+  return message.content
+    .map((block) => (block.type === "text" ? block.text : ""))
+    .join("\n")
+    .trim();
+}
+
+function lastPlanReminder(
+  messages: Message[],
+  enter: string,
+  leave: string,
+): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const text = messageText(messages[index]);
+    if (text === enter || text === leave) return text;
+  }
+  return undefined;
+}
+
+function insertBeforeLastUser(messages: Message[], additions: Message[]): void {
+  if (additions.length === 0) return;
+  let index = messages.length;
+  for (let cursor = messages.length - 1; cursor >= 0; cursor -= 1) {
+    const message = messages[cursor];
+    if (message.role === "user" && !isSyntheticMessage(message)) {
+      index = cursor;
+      break;
+    }
+  }
+  messages.splice(index, 0, ...additions);
+}
+
+function appendSyntheticMessage(messages: Message[], id: string, text: string | undefined): boolean {
+  const trimmed = text?.trim();
+  if (!trimmed) return false;
+  if (messages.some((message) => messageText(message) === trimmed)) return false;
+  messages.push({ ...makeMessage(id, "user", trimmed), metadata: { synthetic: true } });
+  return true;
+}
+
 function toolResultMessage(
   call: ToolCall,
   content: string,
@@ -2429,10 +2581,6 @@ function parseArguments(text: string): Record<string, unknown> {
 function extractFilePath(args: Record<string, unknown>): string | undefined {
   const candidate = args.filePath ?? args.path ?? args.sourcePath;
   return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
-}
-
-function isPlanFilePath(path: string): boolean {
-  return /(^|[\\/])PLAN[A-Za-z0-9._-]*\.md$/i.test(path);
 }
 
 export function stripImageBlocks(messages: Message[]): Message[] {

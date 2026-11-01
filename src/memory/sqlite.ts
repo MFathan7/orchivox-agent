@@ -3,6 +3,11 @@ import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { COMPACT_LABEL } from "../agent/compaction";
+import {
+  isInstructionMessage,
+  isInstructionState,
+  type InstructionState,
+} from "../agent/prompt/instruction-state";
 import type { AgentMode, Message, Role, Usage } from "../types/schema";
 import type { TaskItem, TaskStore } from "../agent/task-board";
 
@@ -101,7 +106,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at INTEGER NOT NULL,
   total_tokens INTEGER NOT NULL DEFAULT 0,
   total_cost_usd REAL NOT NULL DEFAULT 0,
-  compaction_json TEXT
+  compaction_json TEXT,
+  instruction_state_json TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -169,6 +175,9 @@ export class MemoryDatabase implements TaskStore {
     if (!sessionColumns.some((column) => column.name === "compaction_json")) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN compaction_json TEXT;");
     }
+    if (!sessionColumns.some((column) => column.name === "instruction_state_json")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN instruction_state_json TEXT;");
+    }
     const messageColumns = this.db.query("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
     if (!messageColumns.some((column) => column.name === "metadata_json")) {
       this.db.exec("ALTER TABLE messages ADD COLUMN metadata_json TEXT;");
@@ -230,6 +239,26 @@ export class MemoryDatabase implements TaskStore {
     this.db
       .query("UPDATE sessions SET compaction_json = NULL, updated_at = ? WHERE id = ?")
       .run(Date.now(), sessionId);
+  }
+
+  getInstructionState(sessionId: string): InstructionState | undefined {
+    const row = this.db
+      .query("SELECT instruction_state_json FROM sessions WHERE id = ?")
+      .get(sessionId) as { instruction_state_json: string | null } | null;
+    if (!row?.instruction_state_json) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(row.instruction_state_json);
+      return isInstructionState(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  saveInstructionState(sessionId: string, state: InstructionState): void {
+    const result = this.db
+      .query("UPDATE sessions SET instruction_state_json = ?, updated_at = ? WHERE id = ?")
+      .run(JSON.stringify(state), Date.now(), sessionId);
+    if (result.changes === 0) throw new Error(`unknown session "${sessionId}"`);
   }
 
   activateSessionSkill(sessionId: string, skillName: string): void {
@@ -313,6 +342,8 @@ export class MemoryDatabase implements TaskStore {
         });
       }
     }
+    const instructionState = this.getInstructionState(sourceSessionId);
+    if (instructionState) this.saveInstructionState(forked.id, instructionState);
     for (const skill of this.listSessionSkills(sourceSessionId)) {
       this.activateSessionSkill(forked.id, skill.name);
     }
@@ -328,9 +359,11 @@ export class MemoryDatabase implements TaskStore {
     this.db
       .query("INSERT INTO messages (id, session_id, role, content_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
       .run(message.id, sessionId, message.role, JSON.stringify(content), metadata, createdAt);
-    this.db
-      .query("INSERT INTO messages_fts (message_id, session_id, role, content) VALUES (?, ?, ?, ?)")
-      .run(message.id, sessionId, message.role, plainText(content));
+    if (message.metadata?.synthetic !== true) {
+      this.db
+        .query("INSERT INTO messages_fts (message_id, session_id, role, content) VALUES (?, ?, ?, ?)")
+        .run(message.id, sessionId, message.role, plainText(content));
+    }
     this.db.query("UPDATE sessions SET updated_at = ? WHERE id = ?").run(createdAt, sessionId);
   }
 
@@ -354,6 +387,10 @@ export class MemoryDatabase implements TaskStore {
     // Never start the tail on a tool result: its call must stay in the context.
     while (index > 0 && rows[index]?.role === "tool") index -= 1;
     return [summaryMessage(compaction), ...rows.slice(index)];
+  }
+
+  loadInstructionMessages(sessionId: string): Message[] {
+    return this.loadMessages(sessionId).filter(isInstructionMessage);
   }
 
   loadFullMessages(sessionId: string): Message[] {

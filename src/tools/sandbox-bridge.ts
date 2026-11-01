@@ -35,10 +35,10 @@ async function runSandboxScript(
 ): Promise<string> {
   const token = `${crypto.randomUUID()}${crypto.randomUUID()}`;
   let callCounter = 0;
-  const tempDir = await ensureRuntimeTempDir().catch(
+  const tempDir = await ensureRuntimeTempDir(options.root ?? globalThis.process.cwd()).catch(
     () => globalThis.process.env.TMPDIR?.trim() || "/tmp",
   );
-  const workDir = await mkdtemp(join(tempDir, "sandbox-"));
+  const workDir = await mkdtemp(join(tempDir, `sandbox-${process.pid}-`));
 
   const rpc = Bun.serve({
     hostname: "127.0.0.1",

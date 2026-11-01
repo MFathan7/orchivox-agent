@@ -147,6 +147,13 @@ function fitDiffText(text: string, width: number): string {
   return `${truncateToWidth(plain, safeWidth - 3).text}...`;
 }
 
+export const DIFF_PREVIEW_LINES = 5;
+
+export interface DiffRowsOptions {
+  /** Show the old/new path header. Defaults to true. */
+  showFileHeader?: boolean;
+}
+
 export function diffRows(
   oldText: string,
   newText: string,
@@ -156,6 +163,7 @@ export function diffRows(
   theme: Theme,
   unified = false,
   background?: string,
+  options: DiffRowsOptions = {},
 ): RenderRow[] {
   const hunks = collectDiffHunks(oldText, newText);
   const rows: RenderRow[] = [];
@@ -174,16 +182,18 @@ export function diffRows(
     };
   };
 
-  const headerPlain = fitDisplayText(`${oldLabel} → ${newLabel}`, width);
-  rows.push(
-    panelRow(
-      "diff-header",
-      <Text bold color={theme.text} wrap="truncate">
-        {headerPlain}
-      </Text>,
-      headerPlain,
-    ),
-  );
+  if (options.showFileHeader !== false) {
+    const headerPlain = fitDisplayText(`${oldLabel} → ${newLabel}`, width);
+    rows.push(
+      panelRow(
+        "diff-header",
+        <Text bold color={theme.text} wrap="truncate">
+          {headerPlain}
+        </Text>,
+        headerPlain,
+      ),
+    );
+  }
 
   hunks.forEach((hunk, hunkIndex) => {
     rows.push(
@@ -251,6 +261,69 @@ export function diffRows(
     });
   });
 
+  return rows;
+}
+
+export function diffPreviewRows(
+  oldText: string,
+  newText: string,
+  width: number,
+  theme: Theme,
+  background?: string,
+  maxLines = DIFF_PREVIEW_LINES,
+): RenderRow[] {
+  const changed = collectDiffHunks(oldText, newText)
+    .flatMap((hunk) => hunk.lines)
+    .filter((line) => line.kind !== "context");
+  if (changed.length === 0) return [];
+
+  const limit = Math.max(1, maxLines);
+  const visible = changed.slice(0, limit);
+  const remaining = changed.length - visible.length;
+  const rows: RenderRow[] = [];
+  const lineColor = (kind: DisplayLine["kind"]): string =>
+    kind === "add" ? theme.diff.added : kind === "remove" ? theme.diff.removed : theme.muted;
+  const panelRow = (
+    key: string,
+    node: React.ReactNode,
+    plainInput: string,
+  ): RenderRow => {
+    if (!background) return { key, node };
+    return {
+      key,
+      node: panelRowNode([{ text: plainInput, node }], { width, background, margin: 0 }),
+    };
+  };
+
+  visible.forEach((line, index) => {
+    const view = unifiedLine(line, false);
+    const prefix = `${view.marker} ${view.gutter}`;
+    const textWidth = Math.max(8, width - displayWidth(`▎ ${prefix} `));
+    const text = fitDisplayText(line.text, textWidth);
+    rows.push(
+      panelRow(
+        `diff-preview-${index}`,
+        <Text color={lineColor(view.kind)} wrap="truncate">
+          <Text color={theme.border.passive}>▎ </Text>
+          {prefix} {text}
+        </Text>,
+        `▎ ${prefix} ${text}`,
+      ),
+    );
+  });
+
+  if (remaining > 0) {
+    const note = `… ${remaining} more changed line${remaining === 1 ? "" : "s"} · Ctrl+O to expand`;
+    rows.push(
+      panelRow(
+        "diff-preview-more",
+        <Text color={theme.muted} wrap="truncate">
+          {note}
+        </Text>,
+        note,
+      ),
+    );
+  }
   return rows;
 }
 

@@ -182,10 +182,15 @@ function recentStart(conversation: Message[], keepTokens: number): number {
   return conversation.length;
 }
 
+export function isSyntheticMessage(message: Message): boolean {
+  return message.metadata?.synthetic === true;
+}
+
 function lastUserIndex(conversation: Message[], maxIndex: number): number {
   const limit = Math.min(maxIndex, conversation.length - 1);
   for (let index = limit; index >= 0; index -= 1) {
-    if (conversation[index].role === "user") return index;
+    const message = conversation[index];
+    if (message.role === "user" && !isSyntheticMessage(message)) return index;
   }
   return -1;
 }
@@ -279,7 +284,8 @@ export function pruneToolOutput(
   let turns = 0;
   let boundary = messages.length;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role !== "user") continue;
+    const message = messages[index];
+    if (message?.role !== "user" || isSyntheticMessage(message)) continue;
     turns += 1;
     if (turns >= keepTurns) {
       boundary = index;
@@ -411,7 +417,8 @@ export function reduceTranscriptForOverflow(
 
   let lastUser = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === "user") {
+    const message = messages[index];
+    if (message?.role === "user" && !isSyntheticMessage(message)) {
       lastUser = index;
       break;
     }

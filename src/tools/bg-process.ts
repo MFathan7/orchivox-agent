@@ -1,3 +1,5 @@
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { z } from "zod";
 
 import { ensureRuntimeTempDir } from "../runtime-temp";
@@ -50,6 +52,13 @@ export interface BgLogsResult {
 
 const MAX_RING_BUFFER_SIZE = 2000;
 
+function cleanupManagedTemp(managed: ManagedProcess): void {
+  const dir = managed.tempDir;
+  if (!dir) return;
+  managed.tempDir = undefined;
+  void rm(dir, { recursive: true, force: true }).catch(() => undefined);
+}
+
 const URL_PATTERNS = [
   /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/[^\s"']*)?/gi,
   /(?:listening|ready|running|server)\s+(?:on|at)\s+(https?:\/\/[^\s"']+)/gi,
@@ -60,6 +69,7 @@ const URL_PATTERNS = [
 interface ManagedProcess {
   info: BgProcessInfo;
   proc: ReturnType<typeof Bun.spawn>;
+  tempDir?: string;
   ringBuffer: BgProcessLine[];
   lastReadIndex: number;
   lineCounter: number;
@@ -88,7 +98,11 @@ export class BackgroundProcessManager {
     }
 
     const cwd = options.cwd ?? workspaceRoot(this.defaultCwd);
-    const tempDir = await ensureRuntimeTempDir().catch(() => undefined);
+    const tempRoot = await ensureRuntimeTempDir(this.defaultCwd).catch(() => undefined);
+    const tempDir = tempRoot
+      ? join(tempRoot, `bg-${process.pid}-${crypto.randomUUID().slice(0, 8)}`)
+      : undefined;
+    if (tempDir) await mkdir(tempDir, { recursive: true, mode: 0o700 }).catch(() => undefined);
     const env = {
       ...globalThis.process.env,
       ...(tempDir ? { TMPDIR: tempDir } : {}),
@@ -113,12 +127,21 @@ export class BackgroundProcessManager {
       }
     }
 
-    const proc = Bun.spawn(["bash", "-c", options.command], {
-      cwd,
-      env,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    let proc: ReturnType<typeof Bun.spawn>;
+    try {
+      proc = Bun.spawn(["bash", "-c", options.command], {
+        cwd,
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    } catch (error) {
+      if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+    if (tempDir) {
+      await writeFile(join(tempDir, "owner.pid"), String(proc.pid)).catch(() => undefined);
+    }
 
     const info: BgProcessInfo = {
       id,
@@ -134,6 +157,7 @@ export class BackgroundProcessManager {
     const managed: ManagedProcess = {
       info,
       proc,
+      tempDir,
       ringBuffer: [],
       lastReadIndex: 0,
       lineCounter: 0,
@@ -166,18 +190,26 @@ export class BackgroundProcessManager {
       }
     };
 
-    this.streamReader(proc.stdout, (line) => appendLine("stdout", line));
-    this.streamReader(proc.stderr, (line) => appendLine("stderr", line));
+    this.streamReader(
+      proc.stdout as ReadableStream<Uint8Array>,
+      (line) => appendLine("stdout", line),
+    );
+    this.streamReader(
+      proc.stderr as ReadableStream<Uint8Array>,
+      (line) => appendLine("stderr", line),
+    );
 
     proc.exited
       .then((code) => {
         managed.info.exitCode = code;
         managed.info.status = code === 0 ? "stopped" : "failed";
         managed.resolveReady?.(false);
+        cleanupManagedTemp(managed);
       })
       .catch(() => {
         managed.info.status = "failed";
         managed.resolveReady?.(false);
+        cleanupManagedTemp(managed);
       });
 
     if (readyPromise) {
@@ -259,6 +291,7 @@ export class BackgroundProcessManager {
     }
 
     if (managed.info.status === "stopped" || managed.info.status === "failed") {
+      cleanupManagedTemp(managed);
       return true;
     }
 
@@ -280,6 +313,7 @@ export class BackgroundProcessManager {
     }
 
     managed.info.status = "stopped";
+    cleanupManagedTemp(managed);
     return true;
   }
 

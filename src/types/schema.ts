@@ -101,10 +101,19 @@ export function toolParametersToJsonSchema(parameters: ToolParameters): JsonSche
   return z.toJSONSchema(parameters, { target: "draft-7", io: "input" }) as JsonSchemaObject;
 }
 
+export const SystemPartSchema = z.object({
+  text: z.string().min(1),
+  /** Ask the provider to cache this part when it supports cache breakpoints. */
+  cache: z.boolean().optional(),
+});
+export type SystemPart = z.infer<typeof SystemPartSchema>;
+
 export const ChatRequestSchema = z.object({
   model: z.string().min(1).optional(),
   target_path: z.string().min(1).optional(),
   system: z.string().optional(),
+  /** Ordered system blocks. When present, adapters prefer these over `system`. */
+  system_parts: z.array(SystemPartSchema).optional(),
   messages: z.array(MessageSchema).min(1),
   tools: z.array(ToolDefinitionSchema).default([]),
   tool_choice: z.enum(["auto", "none", "required"]).default("auto"),

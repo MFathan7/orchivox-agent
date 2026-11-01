@@ -32,6 +32,8 @@ export const AgentRunRequestSchema = z.object({
   profile: AgentProfileSchema,
   task: z.enum(["study", "review"]).optional(),
   system: z.string().optional(),
+  /** Harness context for this run, appended as a synthetic user message. */
+  context: z.string().optional(),
   messages: z.array(MessageSchema).min(1),
   tools: z.array(ToolDefinitionSchema).default([]),
   tool_choice: ToolChoiceSchema.default({ mode: "auto" }),

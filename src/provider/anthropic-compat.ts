@@ -27,6 +27,7 @@ import {
 } from "./retry";
 import type { LLMProvider } from "./router";
 import { iterateSse } from "./sse";
+import { requestSystemParts } from "./system-parts";
 
 export interface AnthropicCompatProviderOptions {
   baseUrl: string;
@@ -540,15 +541,18 @@ export function buildMessagesPayload(
 }
 
 export function toAnthropicMessages(req: ChatRequest): { system: AnthropicTextBlock[]; messages: AnthropicMessage[] } {
-  const systemTexts: string[] = [];
-  if (req.system) systemTexts.push(req.system);
+  const system: AnthropicTextBlock[] = requestSystemParts(req).map((part) => ({
+    type: "text",
+    text: part.text,
+    ...(part.cache ? { cache_control: { type: "ephemeral" as const } } : {}),
+  }));
   const messages: AnthropicMessage[] = [];
 
   for (const message of req.messages) {
     if (message.role === "system") {
       for (const block of message.content) {
         if (block.type !== "text") throw new Error('messages with role "system" must contain only text blocks');
-        systemTexts.push(block.text);
+        system.push({ type: "text", text: block.text });
       }
       continue;
     }
@@ -594,8 +598,9 @@ export function toAnthropicMessages(req: ChatRequest): { system: AnthropicTextBl
     else messages.push({ role, content: blocks });
   }
 
-  const system: AnthropicTextBlock[] = systemTexts.map((text) => ({ type: "text", text }));
-  if (system.length > 0) system[system.length - 1].cache_control = { type: "ephemeral" };
+  if (system.length > 0 && !system.some((block) => block.cache_control)) {
+    system[system.length - 1].cache_control = { type: "ephemeral" };
+  }
 
   const lastMessage = messages[messages.length - 1];
   if (lastMessage) {

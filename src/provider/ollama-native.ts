@@ -22,6 +22,7 @@ import {
   type RetryPolicy,
 } from "./retry";
 import type { LLMProvider } from "./router";
+import { joinedSystemText } from "./system-parts";
 
 export interface OllamaProviderOptions {
   baseUrl: string;
@@ -74,7 +75,8 @@ function imagesOf(message: Message): string[] {
 
 export function toOllamaMessages(req: ChatRequest): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
-  if (req.system) messages.push({ role: "system", content: req.system });
+  const system = joinedSystemText(req);
+  if (system) messages.push({ role: "system", content: system });
   const toolNames = new Map<string, string>();
   for (const message of req.messages) {
     if (message.role === "tool") {

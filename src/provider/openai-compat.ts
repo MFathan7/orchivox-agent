@@ -26,6 +26,7 @@ import {
 } from "./retry";
 import type { LLMProvider } from "./router";
 import { iterateSse } from "./sse";
+import { requestSystemParts } from "./system-parts";
 
 export interface OpenAICompatProviderOptions {
   baseUrl: string;
@@ -584,7 +585,9 @@ export function toOpenAiMessages(
   defaultImageDetail?: "auto" | "low" | "high",
 ): OpenAiMessage[] {
   const messages: OpenAiMessage[] = [];
-  if (req.system) messages.push({ role: "system", content: req.system });
+  for (const part of requestSystemParts(req)) {
+    messages.push({ role: "system", content: part.text });
+  }
 
   for (const message of req.messages) {
     if (message.role === "tool") {

@@ -10,6 +10,7 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
+import { logFreeze, startEventLoopMonitor } from "./agent/freeze-debug";
 import { modeFromQuestionAnswer, modeTransitionReminder } from "./agent/modes";
 import { buildReviewCommand, buildStudyCommand } from "./agent/task-commands";
 import { currentTurnContext } from "./agent/turn-context";
@@ -53,11 +54,8 @@ import { loadModelCatalogSync, refreshModelCatalog, type ModelCatalog } from "./
 import { primeRuntimeMetadata } from "./provider/runtime-metadata";
 import { ProviderRouter, type LLMProvider } from "./provider/router";
 import { ensureProjectState, resolveProjectState, type ProjectStatePaths } from "./runtime-paths";
-import {
-  cleanupLegacyTempArtifacts,
-  cleanupRuntimeTempDir,
-  cleanupStaleRuntimeTempDirs,
-} from "./runtime-temp";
+import { formatBytes, runCleanup } from "./cache-cleanup";
+import { cleanupRuntimeTempDir } from "./runtime-temp";
 import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
 import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
 import { runGit } from "./vcs/git";
@@ -91,7 +89,7 @@ import {
 } from "./types/schema";
 
 export interface CliOptions {
-  command: "tui" | "serve" | "prompt" | "mcp" | "update" | "doctor";
+  command: "tui" | "serve" | "prompt" | "mcp" | "update" | "doctor" | "clean";
   port?: number;
   prompt?: string;
   format: "text" | "json";
@@ -104,6 +102,7 @@ export interface CliOptions {
   updateRollback?: boolean;
   updateSource?: boolean;
   json?: boolean;
+  cleanAll?: boolean;
   trust?: boolean;
   configPath?: string;
   secretsPath?: string;
@@ -140,8 +139,9 @@ const HELP_TEXT = [
   "                                       update the installed runtime or source checkout",
   "  orchivox self-update                 alias for orchivox update",
   "  orchivox doctor                      show entrypoint, install, config, and update diagnostics",
+  "  orchivox clean [--all]               remove stale temp and cache files",
   "",
-  "flags: -p/--prompt, -f/--format, --mode, --port, --trust, -h/--help",
+  "flags: -p/--prompt, -f/--format, --mode, --port, --trust, --all, -h/--help",
   "       --version                       print the version and commit",
   "       --config <path>                 use a specific config file",
   "       --secrets <path>                use a specific secrets file",
@@ -159,6 +159,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
     else if (arg === "--rollback") options.updateRollback = true;
     else if (arg === "--source") options.updateSource = true;
     else if (arg === "--json") options.json = true;
+    else if (arg === "--all") options.cleanAll = true;
     else if (arg === "--trust") options.trust = true;
     else if (arg === "--config") {
       const value = argv[++index];
@@ -172,6 +173,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
     else if (arg === "mcp") options.command = "mcp";
     else if (arg === "update" || arg === "self-update") options.command = "update";
     else if (arg === "doctor") options.command = "doctor";
+    else if (arg === "clean") options.command = "clean";
     else if (arg === "-p" || arg === "--prompt") {
       options.command = "prompt";
       options.prompt = argv[++index] ?? "";
@@ -275,8 +277,7 @@ export async function bootstrap(
   options: { repoRoot?: string; configPath?: string; secretsPath?: string } = {},
 ): Promise<RuntimeHandle> {
   const root = options.repoRoot ?? globalThis.process.cwd();
-  await cleanupStaleRuntimeTempDirs().catch(() => 0);
-  await cleanupLegacyTempArtifacts().catch(() => 0);
+  await runCleanup().catch(() => undefined);
   const resolved = await resolveConfigPaths({
     cwd: root,
     configFlag: options.configPath,
@@ -355,7 +356,7 @@ export async function bootstrap(
       await mcpClient.close();
       await lsp?.dispose();
       database.close();
-      await cleanupRuntimeTempDir();
+      await cleanupRuntimeTempDir(root);
     },
   };
 }
@@ -430,6 +431,16 @@ export async function main(
     return { close: async () => undefined };
   }
 
+  if (options.command === "clean") {
+    const report = await runCleanup({
+      aggressive: true,
+      includeLegacyTestArtifacts: options.cleanAll,
+    });
+    const noun = report.removed === 1 ? "entry" : "entries";
+    print(`cleanup removed ${report.removed} ${noun} and freed ${formatBytes(report.freedBytes)}`);
+    return { close: async () => undefined };
+  }
+
   if (options.command === "tui") {
     // Workspace trust is handled inside the single Orchivox TUI instance
     // to preserve process.stdin raw mode lifecycle and keyboard protocols.
@@ -489,6 +500,7 @@ async function runTuiSession(
   // Enter first, then push the keyboard flags. The composer must not push
   // again, otherwise the terminal keyboard stack is left dirty on exit.
   enterTerminal();
+  const stopFreezeMonitor = startEventLoopMonitor();
 
   const projectName = basename(globalThis.process.cwd());
   const root = globalThis.process.cwd();
@@ -741,7 +753,12 @@ async function runTuiSession(
 
     const session = runtime.database.getSession(sessionId);
     if (!session) return;
-    const firstUser = messages.find((message) => message.role === "user" && messageText(message).length > 0);
+    const firstUser = messages.find(
+      (message) =>
+        message.role === "user" &&
+        message.metadata?.synthetic !== true &&
+        messageText(message).length > 0,
+    );
     if (!firstUser) return;
     const initial = sessionTitle(messageText(firstUser));
     if (session.title !== initial && !isPlaceholderTitle(session.title)) return;
@@ -828,7 +845,7 @@ async function runTuiSession(
     agent?: string;
     attachments?: FileAttachmentRef[];
     task?: AgentRunRequest["task"];
-    systemContext?: string;
+    context?: string;
   }> = [];
 
   const resetToWelcome = (): void => {
@@ -1196,7 +1213,7 @@ async function runTuiSession(
     options: {
       userEntryPushed?: boolean;
       task?: AgentRunRequest["task"];
-      systemContext?: string;
+      context?: string;
     } = {},
   ): Promise<void> => {
     if (state.busy) {
@@ -1207,7 +1224,7 @@ async function runTuiSession(
         agent: targetAgent,
         attachments,
         task: options.task,
-        systemContext: options.systemContext,
+        context: options.context,
       });
       setNotice("queued; it runs when this turn ends", 3000);
       rerender();
@@ -1309,25 +1326,61 @@ async function runTuiSession(
     state.liveEntry = liveEntry;
     activeAbortController = new AbortController();
     let lastLiveRender = 0;
-    const renderLive = (force = false): void => {
-      const now = Date.now();
-      if (!force && now - lastLiveRender < 40) return;
-      lastLiveRender = now;
-      rerender();
+    let lastRenderDuration = 0;
+    let renderScheduled: ReturnType<typeof setTimeout> | undefined;
+    let rendering = false;
+    const renderFrame = (): void => {
+      if (rendering) return;
+      rendering = true;
+      const startedAt = performance.now();
+      try {
+        rerender();
+      } finally {
+        lastRenderDuration = performance.now() - startedAt;
+        rendering = false;
+        if (lastRenderDuration >= 50) {
+          logFreeze("render", {
+            ms: Math.round(lastRenderDuration),
+            entries: state.entries.length,
+            live_chars: state.streamingText.length,
+            live_tools: liveEntry.toolCalls?.length ?? 0,
+          });
+        }
+      }
     };
-    rerender();
+    const renderLive = (force = false): void => {
+      if (renderScheduled) return;
+      if (synced.isBackpressured()) {
+        renderScheduled = setTimeout(() => {
+          renderScheduled = undefined;
+          renderLive(force);
+        }, 100);
+        return;
+      }
+      const now = Date.now();
+      const delay = Math.max(50, Math.min(250, Math.round(lastRenderDuration * 1.5)));
+      if (!force && now - lastLiveRender < delay) return;
+      const wait = force ? 0 : Math.max(0, delay - (now - lastLiveRender));
+      renderScheduled = setTimeout(() => {
+        renderScheduled = undefined;
+        lastLiveRender = Date.now();
+        renderFrame();
+      }, wait);
+    };
+    renderFrame();
     try {
+      const runContext = [
+        previousSessionMode && previousSessionMode !== state.mode
+          ? modeTransitionReminder(previousSessionMode, state.mode)
+          : "",
+        options.context ?? "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       const request = AgentRunRequestSchema.parse({
         profile: modeToProfile(turnMode),
         messages: state.messages,
-        system: [
-          previousSessionMode && previousSessionMode !== state.mode
-            ? modeTransitionReminder(previousSessionMode, state.mode)
-            : "",
-          options.systemContext ?? "",
-        ]
-          .filter(Boolean)
-          .join("\n\n"),
+        ...(runContext ? { context: runContext } : {}),
         task: options.task,
         metadata: {
           ...(targetAgent ? { agent: targetAgent } : {}),
@@ -1755,14 +1808,18 @@ async function runTuiSession(
           // A deleted session must not break the turn.
         }
       }
+      if (renderScheduled) {
+        clearTimeout(renderScheduled);
+        renderScheduled = undefined;
+      }
       state.busy = false;
-      rerender();
+      renderFrame();
       const next = queuedTurns.shift();
       if (next) {
         void executeTurn(next.text, next.display, next.agent, next.attachments, {
           userEntryPushed: true,
           task: next.task,
-          systemContext: next.systemContext,
+          context: next.context,
         });
       }
     }
@@ -1794,7 +1851,7 @@ async function runTuiSession(
         const command = await buildStudyCommand(root);
         await executeTurn(command.prompt, command.display, undefined, undefined, {
           task: command.task,
-          systemContext: command.context,
+          context: command.context,
         });
         break;
       }
@@ -1806,7 +1863,7 @@ async function runTuiSession(
         }
         await executeTurn(command.request.prompt, command.request.display, undefined, undefined, {
           task: command.request.task,
-          systemContext: command.request.context,
+          context: command.request.context,
         });
         break;
       }
@@ -2186,6 +2243,19 @@ async function runTuiSession(
         rerender();
         break;
       }
+      case "/cleanup": {
+        if (state.busy) {
+          setNotice("Cancel the running turn before cleanup.", 8000);
+          break;
+        }
+        const report = await runCleanup({ aggressive: true });
+        const noun = report.removed === 1 ? "entry" : "entries";
+        const text = `cleanup removed ${report.removed} ${noun} and freed ${formatBytes(report.freedBytes)}`;
+        pushEntry("system", text);
+        setNotice(text, 6000);
+        rerender();
+        break;
+      }
       case "/clear": {
         state.entries = [];
         state.report = undefined;
@@ -2251,6 +2321,7 @@ async function runTuiSession(
     if (noticeTimer) clearTimeout(noticeTimer);
     clearInterval(activityTimer);
     unsubscribeCapabilities();
+    stopFreezeMonitor();
     synced.uninstall();
     setTerminalTitle(projectName);
     leaveTerminal();
@@ -2265,6 +2336,7 @@ async function runTuiSession(
   if (noticeTimer) clearTimeout(noticeTimer);
   clearInterval(activityTimer);
   unsubscribeCapabilities();
+  stopFreezeMonitor();
   synced.uninstall();
   process.removeListener("SIGINT", cleanupSignals);
   process.removeListener("SIGTERM", cleanupSignals);

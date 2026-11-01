@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text, render, useInput, useStdin } from "ink";
 
 import type { AgentMode, Message } from "../types/schema";
+import { freezeDebugEnabled, logFreeze } from "../agent/freeze-debug";
 import { modeContract } from "../agent/modes";
 import type { SubagentWorkerState } from "../agent/subagent";
 import type { SkillDocument } from "../agent/skills";
@@ -31,16 +32,15 @@ import {
   formatContextWindow,
   formatCost,
   formatTokenCount,
-  formatTurnStatus,
   truncateText,
 } from "./format";
 import { isMouseSequence, parseMouseWheel } from "./mouse";
+import { LiveStatus } from "./spinner";
 import { ThemeProvider, getTheme, type ThemeName } from "./theme";
 import {
   ScrollableChatViewport,
   WorkspaceSidebar,
   countWrappedLines,
-  useSpinner,
   useTerminalSize,
   type SidebarFile,
   type SidebarSubagent,
@@ -57,6 +57,8 @@ export interface WriteTarget {
 export interface SyncedOutputHandle {
   flush: () => void;
   uninstall: () => void;
+  /** True when frames are queueing faster than the terminal can consume them. */
+  isBackpressured: () => boolean;
 }
 
 export type InputAction =
@@ -270,6 +272,8 @@ export function installSynchronizedOutput(
   let pending: Array<string | Uint8Array> = [];
   let callbacks: Array<() => void> = [];
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let pendingBytes = 0;
+  let pendingFrames = 0;
 
   const flush = (): void => {
     if (timer !== undefined) {
@@ -279,11 +283,24 @@ export function installSynchronizedOutput(
     if (pending.length === 0) return;
     const chunks = pending;
     const done = callbacks;
+    const frames = pendingFrames;
+    const bytes = pendingBytes;
     pending = [];
     callbacks = [];
-    originalWrite(SYNC_START);
-    for (const chunk of chunks) originalWrite(chunk);
-    originalWrite(SYNC_END);
+    pendingBytes = 0;
+    pendingFrames = 0;
+    const startedAt = Date.now();
+    try {
+      originalWrite(SYNC_START);
+      for (const chunk of chunks) originalWrite(chunk);
+    } finally {
+      // Always leave synchronized update mode, even if one write fails.
+      originalWrite(SYNC_END);
+    }
+    const elapsed = Date.now() - startedAt;
+    if (freezeDebugEnabled() && (elapsed > 50 || frames > 20 || bytes > 1_000_000)) {
+      logFreeze("stdout", { frames, bytes, ms: elapsed });
+    }
     if (options.onFrame) {
       options.onFrame(chunks.map((chunk) => (typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk))).join(""));
     }
@@ -296,6 +313,8 @@ export function installSynchronizedOutput(
     callback?: unknown,
   ) => {
     pending.push(chunk);
+    pendingBytes += typeof chunk === "string" ? chunk.length : chunk.byteLength;
+    pendingFrames += 1;
     if (typeof callback === "function") callbacks.push(callback as () => void);
     if (timer === undefined) timer = setTimeout(flush, frameMs);
     return true;
@@ -303,6 +322,7 @@ export function installSynchronizedOutput(
 
   return {
     flush,
+    isBackpressured: () => pendingBytes > 8_000_000 || pendingFrames > 60,
     uninstall: () => {
       flush();
       (target as unknown as { write: unknown }).write = originalWrite;
@@ -432,10 +452,6 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const [escArmed, setEscArmed] = React.useState(false);
   const escTimerRef = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const streaming = busy || Boolean(streamingText);
-  const liveStartedAt = props.liveEntry?.startedAt;
-  const liveElapsedSeconds = liveStartedAt
-    ? Math.max(0, Math.floor((Date.now() - liveStartedAt) / 1000))
-    : 0;
   const completedTools = (props.liveEntry?.toolCalls ?? []).filter(
     (call) => call.status === "ok" || call.status === "error",
   ).length;
@@ -457,10 +473,6 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           : Math.min(earliest, call.startedAt),
     undefined,
   );
-  const runningSeconds = runningStartedAt
-    ? Math.max(0, Math.floor((Date.now() - runningStartedAt) / 1000))
-    : 0;
-
   React.useEffect(() => {
     if (!streaming) {
       setEscArmed(false);
@@ -496,7 +508,6 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     reasoningPickerOpen;
   // The turn status belongs next to the composer, not between the thinking
   // block and the answer.
-  const statusSpinner = useSpinner(streaming && !hasModalOpen);
 
   useInput((input, key) => {
     if (isMouseSequence(input)) return;
@@ -865,22 +876,15 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         ) : statusMessage ? (
           <Text color={theme.modes.build.primary}>{statusMessage}</Text>
         ) : streaming && !hasModalOpen ? (
-          <Text>
-            <Text color={theme.badge.running} bold>
-              {statusSpinner}{" "}
-            </Text>
-            <Text color={theme.text} bold>
-              {formatTurnStatus({
-                answering: Boolean(streamingText),
-                elapsedSeconds: liveElapsedSeconds,
-                completedTools,
-                runningLabel,
-                runningSeconds,
-                step: props.liveEntry?.step,
-              })}
-            </Text>
-            <Text color={theme.muted}> · Esc twice to stop</Text>
-          </Text>
+          <LiveStatus
+            active={streaming}
+            answering={Boolean(streamingText)}
+            startedAt={props.liveEntry?.startedAt}
+            completedTools={completedTools}
+            runningLabel={runningLabel}
+            runningStartedAt={runningStartedAt}
+            step={props.liveEntry?.step}
+          />
         ) : null}
 
         <PromptComposer

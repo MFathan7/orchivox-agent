@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text, useInput, useStdin } from "ink";
 
 import type { ChatEntryView, ChatToolCallView, WriteTarget } from "./app";
+import { DIFF_PREVIEW_LINES } from "./diff-view";
 import { parseMouseClick } from "./mouse";
 import { groupToolCalls } from "./tool-groups";
 import { WelcomeBanner } from "./logo";
@@ -9,7 +10,12 @@ import { estimateMarkdownLines, markdownRows } from "./markdown";
 import { enterTerminal, leaveTerminal } from "./terminal-protocol";
 import { getTheme, type Theme } from "./theme";
 import { displayWidth, wrapText } from "./text-wrap";
-import { buildTranscriptRows, type TranscriptRow } from "./transcript-lines";
+import {
+  LIVE_TOOL_LIMIT,
+  buildTranscriptRows,
+  liveDisplayText,
+  type TranscriptRow,
+} from "./transcript-lines";
 
 export interface ScreenSize {
   columns: number;
@@ -145,10 +151,23 @@ export function countWrappedLines(text: string, width: number): number {
     .reduce((total, line) => total + Math.max(1, Math.ceil(displayWidth(line) / safeWidth)), 0);
 }
 
+function estimateFileDiffLines(
+  additions: number | undefined,
+  deletions: number | undefined,
+  collapsed: boolean,
+  diffExpanded: boolean,
+): number {
+  if (collapsed) return 1;
+  const changed = (additions ?? 0) + (deletions ?? 0);
+  if (diffExpanded) return Math.max(2, changed + 2);
+  return Math.min(changed, DIFF_PREVIEW_LINES) + (changed > DIFF_PREVIEW_LINES ? 1 : 0);
+}
+
 function estimateToolLines(
   call: ChatToolCallView,
   width: number,
   collapsed: boolean,
+  diffExpanded = false,
 ): number {
   let lines = 4;
   const isCommand = Boolean(call.command) || ["bash", "run_sandbox_script", "bg_start", "bg_logs"].includes(call.name);
@@ -167,8 +186,11 @@ function estimateToolLines(
   if (call.diff) {
     if (collapsed) {
       lines += 1;
-    } else {
+    } else if (diffExpanded) {
       lines += Math.max(2, (call.diff.additions ?? 0) + (call.diff.deletions ?? 0) + 6);
+    } else {
+      const changed = (call.diff.additions ?? 0) + (call.diff.deletions ?? 0);
+      lines += Math.min(changed, DIFF_PREVIEW_LINES) + (changed > DIFF_PREVIEW_LINES ? 1 : 0);
     }
   }
   return lines;
@@ -180,6 +202,7 @@ export function estimateEntryLines(
   collapsed: boolean,
   expandedGroups: ReadonlySet<string> = new Set(),
   thinkingExpanded = false,
+  diffExpanded = false,
 ): number {
   const safeWidth = Math.max(1, width);
   if (entry.role === "compaction") {
@@ -194,7 +217,12 @@ export function estimateEntryLines(
   }
   let lines =
     entry.role === "assistant"
-      ? estimateMarkdownLines(entry.text, safeWidth)
+      ? entry.live
+        ? (() => {
+            const display = liveDisplayText(entry.text);
+            return countWrappedLines(display.text, safeWidth) + (display.truncated ? 1 : 0);
+          })()
+        : estimateMarkdownLines(entry.text, safeWidth)
       : countWrappedLines(entry.text, safeWidth);
   if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
     const visibleSegments = entry.live
@@ -222,10 +250,13 @@ export function estimateEntryLines(
   if (thinkingHeading) {
     lines += 1;
   }
-  lines += (entry.toolCalls ?? []).reduce(
-    (total, call) => total + estimateToolLines(call, safeWidth, collapsed),
+  const calls = entry.toolCalls ?? [];
+  const visibleCalls = entry.live ? calls.slice(-LIVE_TOOL_LIMIT) : calls;
+  lines += visibleCalls.reduce(
+    (total, call) => total + estimateToolLines(call, safeWidth, collapsed, diffExpanded),
     0,
   );
+  if (entry.live && calls.length > LIVE_TOOL_LIMIT) lines += 1;
   const linkedPaths = new Set(
     (entry.toolCalls ?? [])
       .filter((call) => call.diff)
@@ -233,9 +264,11 @@ export function estimateEntryLines(
       .filter((path): path is string => Boolean(path)),
   );
   const unlinkedFiles = (entry.files ?? []).filter((file) => !linkedPaths.has(file.path));
-  lines += unlinkedFiles.length * (collapsed ? 1 : 10);
+  for (const file of unlinkedFiles) {
+    lines += estimateFileDiffLines(file.additions, file.deletions, collapsed, diffExpanded);
+  }
   if (entry.live) lines += 1;
-  if (entry.diff) lines += collapsed ? 1 : 10;
+  if (entry.diff) lines += collapsed ? 1 : diffExpanded ? 10 : Math.min(DIFF_PREVIEW_LINES + 1, 10);
   if (entry.role === "assistant") lines += 2;
   if (
     entry.role === "assistant" &&
@@ -257,6 +290,7 @@ export function findActivityRowAt(
   expandedGroups: ReadonlySet<string>,
   clickRow: number,
   thinkingExpanded = false,
+  diffExpanded = false,
 ): ChatEntryView | undefined {
   const safeWidth = Math.max(1, width);
   const visible = selectWindow(
@@ -267,6 +301,7 @@ export function findActivityRowAt(
     collapsed,
     expandedGroups,
     thinkingExpanded,
+    diffExpanded,
   );
   let row = 0;
   for (const entry of visible) {
@@ -293,7 +328,14 @@ export function findActivityRowAt(
       const headerRow = row + (entry.live ? 1 : 0) + thinking;
       if (Math.abs(clickRow - headerRow) <= 1) return entry;
     }
-    row += estimateEntryLines(entry, width, collapsed, expandedGroups, thinkingExpanded);
+    row += estimateEntryLines(
+      entry,
+      width,
+      collapsed,
+      expandedGroups,
+      thinkingExpanded,
+      diffExpanded,
+    );
   }
   return undefined;
 }
@@ -312,12 +354,20 @@ export function selectWindow(
   collapsed: boolean,
   expandedGroups: ReadonlySet<string> = new Set(),
   thinkingExpanded = false,
+  diffExpanded = false,
 ): ChatEntryView[] {
   const selected: ChatEntryView[] = [];
   let budget = height + offsetFromBottom;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
-    const cost = estimateEntryLines(entry, width, collapsed, expandedGroups, thinkingExpanded);
+    const cost = estimateEntryLines(
+      entry,
+      width,
+      collapsed,
+      expandedGroups,
+      thinkingExpanded,
+      diffExpanded,
+    );
     if (budget <= 0) break;
     selected.unshift(entry);
     budget -= cost;
@@ -337,21 +387,6 @@ export function formatProgressBar(done: number, total: number, width = 8): strin
   const ratio = total === 0 ? 0 : Math.min(1, done / total);
   const filled = Math.round(ratio * width);
   return `[${"#".repeat(filled)}${"-".repeat(width - filled)}] ${done}/${total}`;
-}
-
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-export function useSpinner(active: boolean): string {
-  const [frame, setFrame] = React.useState(0);
-  React.useEffect(() => {
-    if (!active) {
-      setFrame(0);
-      return;
-    }
-    const timer = setInterval(() => setFrame((value) => (value + 1) % SPINNER_FRAMES.length), 110);
-    return () => clearInterval(timer);
-  }, [active]);
-  return SPINNER_FRAMES[frame % SPINNER_FRAMES.length];
 }
 
 export function ScrollableChatViewport({
@@ -377,6 +412,7 @@ export function ScrollableChatViewport({
   const setOffsetFromBottom = onOffsetChange ?? setInternalOffset;
   const [collapsed, setCollapsed] = React.useState(initiallyCollapsed);
   const [thinkingExpanded, setThinkingExpanded] = React.useState(initiallyExpandedThinking);
+  const [diffExpanded, setDiffExpanded] = React.useState(false);
   const allEntries = React.useMemo(
     () => (liveEntry ? [...entries, liveEntry] : entries),
     [entries, liveEntry],
@@ -394,8 +430,9 @@ export function ScrollableChatViewport({
   useInput(
     (input, key) => {
       if (key.ctrl && input === "o") {
-        setCollapsed((value) => !value);
+        setDiffExpanded((value) => !value);
         setThinkingExpanded((value) => !value);
+        setCollapsed(false);
         setExpandedGroups((previous) => {
           if (previous.size > 0) return new Set();
           return new Set(
@@ -409,14 +446,13 @@ export function ScrollableChatViewport({
     { isActive: active },
   );
 
-  const spinner = useSpinner(Boolean(liveEntry));
   const rows: TranscriptRow[] = buildTranscriptRows(allEntries, {
     width,
     theme,
     collapsed,
     expandedGroups,
     thinkingExpanded,
-    spinner,
+    diffExpanded,
     now: Date.now(),
   });
   if (!liveEntry && streamingText) {
@@ -481,6 +517,7 @@ export function ScrollableChatViewport({
 
   React.useEffect(() => {
     setOffsetFromBottom(0);
+    setDiffExpanded(false);
   }, [resetKey]);
 
   const hasChatMessages = allEntries.some((e) => e.role === "user" || e.role === "assistant");

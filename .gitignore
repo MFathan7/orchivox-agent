@@ -3,7 +3,6 @@ node_modules/
 AGENTS*.md
 DESIGN*.md
 PLAN*.md
-RELEASING.md
 
 # Build and release output
 !/docs/

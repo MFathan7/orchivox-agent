@@ -1,10 +1,12 @@
+import { closeSync, openSync } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 
 import { currentTurnContext } from "../agent/turn-context";
 import { ensureRuntimeTempDir } from "../runtime-temp";
 import { DEFAULT_MAX_BYTES, spillToolOutput, truncateTail } from "./output-budget";
-import type { AgentTool } from "./registry";
+import type { AgentTool, ToolExecutionContext } from "./registry";
 
 export interface CommandCheck {
   allowed: boolean;
@@ -37,7 +39,7 @@ interface ShellState {
 export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
   readonly name = "bash";
   readonly description =
-    "Run a bash command. The working directory and exported environment variables persist between calls.";
+    "Run a bash command. The working directory and exported environment variables persist between calls. For a dev server or another long-running process, use bg_start instead of backgrounding the command with &. Use curl --max-time or --connect-timeout for HTTP probes.";
   readonly parameters = ShellArgsSchema;
   readonly readOnly = false;
 
@@ -65,7 +67,7 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
     return { ...this.stateFor(this.defaultDir).env };
   }
 
-  async execute(args: ShellArgs): Promise<string> {
+  async execute(args: ShellArgs, context?: ToolExecutionContext): Promise<string> {
     if (this.interceptor) {
       const decision = await this.interceptor(args.command);
       if (!decision.allowed) {
@@ -73,7 +75,12 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       }
     }
     const root = currentTurnContext()?.workspaceRoot ?? this.defaultDir;
-    return this.runBash(args.command, args.timeoutMs ?? this.defaultTimeoutMs, this.stateFor(root));
+    return this.runBash(
+      args.command,
+      args.timeoutMs ?? this.defaultTimeoutMs,
+      this.stateFor(root),
+      context?.signal,
+    );
   }
 
   private stateFor(root: string): ShellState {
@@ -88,14 +95,22 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
     return state;
   }
 
-  private async runBash(command: string, timeoutMs: number, state: ShellState): Promise<string> {
-    const tempDir = await ensureRuntimeTempDir().catch(
+  private async runBash(
+    command: string,
+    timeoutMs: number,
+    state: ShellState,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const tempDir = await ensureRuntimeTempDir(this.defaultDir).catch(
       () => this.inheritedTmpDir ?? "/tmp",
     );
     if (state.env.TMPDIR === undefined || state.env.TMPDIR === this.inheritedTmpDir) {
       state.env.TMPDIR = tempDir;
     }
-    const metaPath = join(tempDir, `orchivox-shell-${crypto.randomUUID()}.meta`);
+    const nonce = `${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
+    const metaPath = join(tempDir, `shell-${nonce}.meta`);
+    const stdoutPath = join(tempDir, `shell-${nonce}.stdout`);
+    const stderrPath = join(tempDir, `shell-${nonce}.stderr`);
     const script = [
       `cd ${shellQuote(state.dir)} || exit 97`,
       command,
@@ -104,23 +119,66 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       `exit $__orchivox_exit`,
     ].join("\n");
 
-    const proc = Bun.spawn(["bash", "-c", script], {
-      cwd: state.dir,
-      env: state.env,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const stdoutFd = openSync(stdoutPath, "w");
+    let stderrFd: number;
+    try {
+      stderrFd = openSync(stderrPath, "w");
+    } catch (error) {
+      closeSync(stdoutFd);
+      await removeOutputFile(stdoutPath);
+      throw error;
+    }
 
-    const timeoutSignal = AbortSignal.timeout(timeoutMs);
-    const kill = (): void => proc.kill();
-    timeoutSignal.addEventListener("abort", kill, { once: true });
+    const spawn = () =>
+      Bun.spawn(["bash", "-c", script], {
+        cwd: state.dir,
+        env: state.env,
+        stdin: "ignore",
+        stdout: stdoutFd,
+        stderr: stderrFd,
+        detached: process.platform !== "win32",
+      });
 
-    const stdoutPromise = new Response(proc.stdout).text();
-    const stderrPromise = new Response(proc.stderr).text();
-    const exitCode = await proc.exited;
-    timeoutSignal.removeEventListener("abort", kill);
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn();
+    } catch (error) {
+      await Promise.all([removeOutputFile(stdoutPath), removeOutputFile(stderrPath)]);
+      throw error;
+    } finally {
+      closeSync(stdoutFd);
+      closeSync(stderrFd);
+    }
+
+    let timedOut = false;
+    let aborted = signal?.aborted ?? false;
+    let settled = false;
+    const onAbort = (): void => {
+      if (settled) return;
+      aborted = true;
+      killProcessTree(proc);
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    const timeoutTimer = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      killProcessTree(proc);
+    }, timeoutMs);
+
+    let stdout = "";
+    let stderr = "";
+    let exitCode = 0;
+    try {
+      exitCode = await proc.exited;
+      settled = true;
+      stdout = await readOutputFile(stdoutPath);
+      stderr = await readOutputFile(stderrPath);
+    } finally {
+      clearTimeout(timeoutTimer);
+      signal?.removeEventListener("abort", onAbort);
+      await Promise.all([removeOutputFile(stdoutPath), removeOutputFile(stderrPath)]);
+    }
 
     const meta = await readAndClearMeta(metaPath);
     if (meta) {
@@ -128,21 +186,67 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       state.env = meta.env;
     }
 
-    if (timeoutSignal.aborted) {
+    const captured = `--- stdout ---\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`;
+    if (aborted) {
+      throw new Error(`Command cancelled\n${truncateTail(captured).text}`);
+    }
+    if (timedOut) {
       throw new Error(
-        `command timed out after ${timeoutMs}ms and was killed\n${
-          truncateTail(`--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`).text
-        }`,
+        `command timed out after ${timeoutMs}ms and was killed\n${truncateTail(captured).text}`,
       );
     }
 
-    const full = `exit ${exitCode}\n--- stdout ---\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`;
+    const backgroundNote = hasBackgroundChild(command)
+      ? "\n\n[shell exited; background children may still be running]"
+      : "";
+    const full = `exit ${exitCode}\n${captured}${backgroundNote}`;
     if (Buffer.byteLength(full, "utf8") <= DEFAULT_MAX_BYTES) return full;
     const logPath = await spillToolOutput(full, "bash");
     return truncateTail(full, {
       detail: logPath ? `Full output: ${logPath}` : "",
     }).text;
   }
+}
+
+function killProcessTree(proc: ReturnType<typeof Bun.spawn>): void {
+  if (process.platform === "win32") {
+    try {
+      Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)]);
+    } catch {
+      // Fall back to the shell process itself.
+    }
+    try {
+      proc.kill();
+    } catch {
+      // The process already exited.
+    }
+    return;
+  }
+  try {
+    process.kill(-proc.pid, "SIGKILL");
+  } catch {
+    try {
+      proc.kill();
+    } catch {
+      // The process already exited.
+    }
+  }
+}
+
+function hasBackgroundChild(command: string): boolean {
+  return /(^|[^&<>])&(?!&)/m.test(command);
+}
+
+async function readOutputFile(path: string): Promise<string> {
+  try {
+    return await Bun.file(path).text();
+  } catch {
+    return "";
+  }
+}
+
+async function removeOutputFile(path: string): Promise<void> {
+  await unlink(path).catch(() => undefined);
 }
 
 function collectEnv(): Record<string, string> {

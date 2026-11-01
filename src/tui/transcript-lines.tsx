@@ -3,7 +3,7 @@ import { Text } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
 import type { ChatEntryView, ChatToolCallView } from "./app";
-import { diffRows, formatThinkingDuration } from "./diff-view";
+import { diffPreviewRows, diffRows, formatThinkingDuration } from "./diff-view";
 import { formatTokenCount } from "./format";
 import { hashlinePanelParts, parseHashlineOutput } from "./hashline-format";
 import { markdownRows } from "./markdown";
@@ -13,6 +13,7 @@ import {
   type PanelPart,
 } from "./panel";
 import type { RenderRow } from "./rows";
+import { Spinner } from "./spinner";
 import { getTheme, type Theme } from "./theme";
 import {
   displayWidth,
@@ -33,12 +34,69 @@ export interface BuildTranscriptOptions {
   collapsed: boolean;
   expandedGroups: ReadonlySet<string>;
   thinkingExpanded: boolean;
-  spinner?: string;
+  /** Show full edit/create diffs instead of the compact preview. */
+  diffExpanded?: boolean;
   now?: number;
+}
+
+/** Keep live rendering bounded while the final answer still renders in full. */
+export const LIVE_TEXT_LIMIT = 12_000;
+export const LIVE_TEXT_TAIL_LINES = 180;
+export const LIVE_TOOL_LIMIT = 6;
+
+export interface LiveDisplayText {
+  text: string;
+  truncated: boolean;
+}
+
+export function liveDisplayText(text: string): LiveDisplayText {
+  const lines = text.split("\n");
+  if (text.length <= LIVE_TEXT_LIMIT && lines.length <= LIVE_TEXT_TAIL_LINES) {
+    return { text, truncated: false };
+  }
+  const tail = lines.slice(-LIVE_TEXT_TAIL_LINES).join("\n");
+  if (tail.length <= LIVE_TEXT_LIMIT) {
+    return { text: tail, truncated: true };
+  }
+  const cut = tail.slice(-LIVE_TEXT_LIMIT);
+  const newline = cut.indexOf("\n");
+  return {
+    text: newline === -1 ? cut : cut.slice(newline + 1),
+    truncated: true,
+  };
+}
+
+export function visibleLiveToolCalls(entry: ChatEntryView): {
+  calls: ChatToolCallView[];
+  hidden: number;
+} {
+  const calls = entry.toolCalls ?? [];
+  if (!entry.live || calls.length <= LIVE_TOOL_LIMIT) {
+    return { calls, hidden: 0 };
+  }
+  return {
+    calls: calls.slice(-LIVE_TOOL_LIMIT),
+    hidden: calls.length - LIVE_TOOL_LIMIT,
+  };
 }
 
 function blankRow(key: string): TranscriptRow {
   return { key, node: <Text> </Text> };
+}
+
+function plainTextRows(
+  text: string,
+  width: number,
+  theme: Theme,
+  keyPrefix: string,
+): TranscriptRow[] {
+  const safeWidth = Math.max(8, width);
+  return text.split("\n").flatMap((line, lineIndex) =>
+    wrapPreservingWhitespace(line, safeWidth).map((chunk, chunkIndex) => ({
+      key: `${keyPrefix}-${lineIndex}-${chunkIndex}`,
+      node: <Text color={theme.text}>{chunk.length > 0 ? chunk : " "}</Text>,
+    })),
+  );
 }
 
 function dividerLine(label: string, width: number): string {
@@ -93,7 +151,7 @@ function toolCallRows(
   theme: Theme,
   keyPrefix: string,
   indent = 0,
-  spinner?: string,
+  diffExpanded = false,
 ): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
   const isCommand = COMMAND_TOOL_NAMES.has(call.name) || Boolean(call.command);
@@ -126,8 +184,19 @@ function toolCallRows(
     key,
     node: panelRowNode(parts, panelOptions),
   });
+  const diffPanelRows = (rows: RenderRow[], key: string): TranscriptRow[] =>
+    rows.map((row, index) => ({
+      ...row,
+      key: `${key}-${index}`,
+      node: (
+        <Text wrap="truncate">
+          {" ".repeat(TOOL_MARGIN)}
+          {row.node}
+        </Text>
+      ),
+    }));
 
-  const icon = call.status === "running" ? spinner ?? "●" : statusIcon(call.status);
+  const icon = call.status === "running" ? "●" : statusIcon(call.status);
   const suffixParts: PanelPart[] = [];
   if (additions !== undefined || deletions !== undefined) {
     suffixParts.push({
@@ -165,7 +234,16 @@ function toolCallRows(
   rows.push(
     panelRow(keyPrefix, [
       { text: " ".repeat(innerPad) },
-      { text: `${icon} `, node: <Text color={statusTint} bold>{icon} </Text>, color: statusTint },
+      {
+        text: `${icon} `,
+        node:
+          call.status === "running" ? (
+            <Spinner active color={statusTint} />
+          ) : (
+            <Text color={statusTint} bold>{icon} </Text>
+          ),
+        color: statusTint,
+      },
       { text: label, node: <Text bold>{label}</Text> },
       ...(fittedTarget
         ? [
@@ -266,27 +344,26 @@ function toolCallRows(
         ]),
       );
     } else {
-      rows.push(
-        ...diffRows(
-          call.diff.oldText,
-          call.diff.newText,
-          call.diff.oldLabel ?? `a/${target ?? "file"}`,
-          call.diff.newLabel ?? `b/${target ?? "file"}`,
-          panelWidth,
-          theme,
-          true,
-          theme.tool.background,
-        ).map((row, index) => ({
-          ...row,
-          key: `${keyPrefix}-diff-${index}`,
-          node: (
-            <Text wrap="truncate">
-              {" ".repeat(TOOL_MARGIN)}
-              {row.node}
-            </Text>
-          ),
-        })),
-      );
+      const rendered = diffExpanded
+        ? diffRows(
+            call.diff.oldText,
+            call.diff.newText,
+            call.diff.oldLabel ?? `a/${target ?? "file"}`,
+            call.diff.newLabel ?? `b/${target ?? "file"}`,
+            panelWidth,
+            theme,
+            true,
+            theme.tool.background,
+            { showFileHeader: action === "move" },
+          )
+        : diffPreviewRows(
+            call.diff.oldText,
+            call.diff.newText,
+            panelWidth,
+            theme,
+            theme.tool.background,
+          );
+      rows.push(...diffPanelRows(rendered, `${keyPrefix}-diff`));
     }
   }
 
@@ -462,6 +539,8 @@ function assistantRows(
   const theme = options.theme ?? getTheme("tokyonight");
   const rows: TranscriptRow[] = [];
   const allCalls = entry.toolCalls ?? [];
+  const liveCalls = entry.live ? allCalls.slice(-LIVE_TOOL_LIMIT) : allCalls;
+  const hiddenLiveCalls = allCalls.length - liveCalls.length;
   const addGap = (key: string): void => {
     if (rows.length === 0) return;
     const last = rows[rows.length - 1];
@@ -536,9 +615,12 @@ function assistantRows(
         }
       }
 
-      const start = segment.toolIndex;
-      const end = next ? next.toolIndex : allCalls.length;
-      allCalls.slice(start, end).forEach((call, callIndex) => {
+      const start = Math.max(0, segment.toolIndex - hiddenLiveCalls);
+      const end = Math.min(
+        liveCalls.length,
+        (next ? next.toolIndex : allCalls.length) - hiddenLiveCalls,
+      );
+      liveCalls.slice(start, Math.max(start, end)).forEach((call, callIndex) => {
         addGap(`${entry.id}-tool-gap-${index}-${callIndex}`);
         rows.push(
           ...toolCallRows(
@@ -548,7 +630,7 @@ function assistantRows(
             theme,
             `${entry.id}-tool-${index}-${callIndex}`,
             2,
-            options.spinner,
+            options.diffExpanded ?? false,
           ),
         );
       });
@@ -592,7 +674,7 @@ function assistantRows(
   }
 
   if (!segmented) {
-    allCalls.forEach((call, index) => {
+    liveCalls.forEach((call, index) => {
       addGap(`${entry.id}-tool-gap-${index}`);
       rows.push(
         ...toolCallRows(
@@ -602,9 +684,20 @@ function assistantRows(
           theme,
           `${entry.id}-tool-${index}`,
           0,
-          options.spinner,
+          options.diffExpanded ?? false,
         ),
       );
+    });
+  }
+
+  if (hiddenLiveCalls > 0) {
+    rows.push({
+      key: `${entry.id}-live-tools-hidden`,
+      node: (
+        <Text color={theme.muted}>
+          … {hiddenLiveCalls} earlier tool call{hiddenLiveCalls === 1 ? "" : "s"} hidden while live
+        </Text>
+      ),
     });
   }
 
@@ -635,16 +728,24 @@ function assistantRows(
         node: <Text color={theme.muted}>diff hidden (Ctrl+O to expand)</Text>,
       });
     } else {
+      const diff = options.diffExpanded
+        ? diffRows(
+            file.oldText,
+            file.newText,
+            `a/${file.path}`,
+            `b/${file.path}`,
+            width,
+            theme,
+            true,
+            undefined,
+            { showFileHeader: false },
+          )
+        : diffPreviewRows(file.oldText, file.newText, width, theme);
       rows.push(
-        ...diffRows(
-          file.oldText,
-          file.newText,
-          `a/${file.path}`,
-          `b/${file.path}`,
-          width,
-          theme,
-          true,
-        ).map((row, index) => ({ ...row, key: `${entry.id}-file-${fileIndex}-diff-${index}` })),
+        ...diff.map((row, index) => ({
+          ...row,
+          key: `${entry.id}-file-${fileIndex}-diff-${index}`,
+        })),
       );
     }
   });
@@ -660,28 +761,42 @@ function assistantRows(
         ),
       });
     } else {
+      const diff = options.diffExpanded
+        ? diffRows(
+            entry.diff.oldText,
+            entry.diff.newText,
+            entry.diff.oldLabel ?? "old",
+            entry.diff.newLabel ?? "new",
+            width,
+            theme,
+            entry.diff.unified ?? false,
+          )
+        : diffPreviewRows(entry.diff.oldText, entry.diff.newText, width, theme);
       rows.push(
-        ...diffRows(
-          entry.diff.oldText,
-          entry.diff.newText,
-          entry.diff.oldLabel ?? "old",
-          entry.diff.newLabel ?? "new",
-          width,
-          theme,
-          entry.diff.unified ?? false,
-        ).map((row, index) => ({ ...row, key: `${entry.id}-diff-${index}` })),
+        ...diff.map((row, index) => ({ ...row, key: `${entry.id}-diff-${index}` })),
       );
     }
   }
 
   if (entry.text) {
     if (!entry.live) addGap(`${entry.id}-answer-gap`);
-    rows.push(
-      ...markdownRows(entry.text, width, theme).map((row, index) => ({
-        ...row,
-        key: `${entry.id}-text-${index}`,
-      })),
-    );
+    const live = entry.live ? liveDisplayText(entry.text) : undefined;
+    if (live?.truncated) {
+      rows.push({
+        key: `${entry.id}-live-tail`,
+        node: (
+          <Text color={theme.muted}>… showing latest output (full answer after the turn)</Text>
+        ),
+      });
+      rows.push(...plainTextRows(live.text, width, theme, `${entry.id}-text`));
+    } else {
+      rows.push(
+        ...markdownRows(entry.text, width, theme).map((row, index) => ({
+          ...row,
+          key: `${entry.id}-text-${index}`,
+        })),
+      );
+    }
     if (
       !entry.live &&
       (entry.mode || entry.model || entry.tokensPerSecond !== undefined || entry.turnTokens !== undefined || entry.filesChanged !== undefined)
@@ -734,6 +849,7 @@ function cacheKey(entry: ChatEntryView, options: BuildTranscriptOptions): string
   return [
     options.width,
     options.collapsed ? 1 : 0,
+    options.diffExpanded ? 1 : 0,
     options.thinkingExpanded ? 1 : 0,
     options.expandedGroups.has(entry.id) ? 1 : 0,
     (options.theme ?? getTheme("tokyonight")).name,

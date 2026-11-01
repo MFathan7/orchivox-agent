@@ -1,4 +1,5 @@
 import { createTwoFilesPatch } from "diff";
+import { stat } from "node:fs/promises";
 import { z } from "zod";
 
 import { formatLine, readText, splitLines } from "./hashline-edit";
@@ -32,9 +33,24 @@ function parseIgnoreRules(text: string): IgnoreRule[] {
   return rules;
 }
 
+const DEFAULT_IGNORED_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  ".next",
+  "coverage",
+  ".turbo",
+  ".cache",
+  "__pycache__",
+  "target",
+  "vendor",
+]);
+
 function isIgnored(relativePath: string, rules: IgnoreRule[]): boolean {
   if (relativePath === ".git" || relativePath.startsWith(".git/")) return true;
   const segments = relativePath.split("/");
+  if (segments.some((segment) => DEFAULT_IGNORED_DIRS.has(segment))) return true;
   let ignored = false;
   for (let depth = 1; depth <= segments.length; depth += 1) {
     const prefix = segments.slice(0, depth).join("/");
@@ -116,17 +132,28 @@ export function createGrepSearchTool(): AgentTool<typeof GrepSearchArgsSchema> {
       }
 
       const files = await collectFiles(args.basePath, args.include, 5000);
-      const perFile = await Promise.all(
-        files.map(async (relative) => {
-          const text = await readText(`${args.basePath}/${relative}`);
-          if (text.length > 2_000_000) return [];
-          const hits: string[] = [];
-          for (const [index, line] of splitLines(text).entries()) {
-            if (regex.test(line)) hits.push(`${relative}:${formatLine(index + 1, line)}`);
-          }
-          return hits;
-        }),
-      );
+      const perFile: string[][] = [];
+      const chunkSize = 32;
+      for (let offset = 0; offset < files.length; offset += chunkSize) {
+        const chunk = files.slice(offset, offset + chunkSize);
+        const results = await Promise.all(
+          chunk.map(async (relative) => {
+            const fullPath = `${args.basePath}/${relative}`;
+            const info = await stat(fullPath).catch(() => undefined);
+            if (!info || !info.isFile() || info.size > 2_000_000) return [];
+            const text = await readText(fullPath);
+            if (text.includes("\u0000")) return [];
+            const hits: string[] = [];
+            for (const [index, line] of splitLines(text).entries()) {
+              if (regex.test(line)) hits.push(`${relative}:${formatLine(index + 1, line)}`);
+            }
+            return hits;
+          }),
+        );
+        perFile.push(...results);
+        // Keep the event loop responsive while a wide search walks a repository.
+        await new Promise((resolve) => setImmediate(resolve));
+      }
 
       const matches = perFile.flat();
       if (matches.length === 0) return `no matches for /${args.pattern}/`;

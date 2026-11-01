@@ -53,7 +53,12 @@ export function normalizeTitle(raw: string, maxChars = 60): string | undefined {
 }
 
 export async function generateSessionTitle(options: SessionTitleOptions): Promise<string | undefined> {
-  const firstUser = options.messages.find((message) => message.role === "user" && messageText(message).length > 0);
+  const firstUser = options.messages.find(
+    (message) =>
+      message.role === "user" &&
+      message.metadata?.synthetic !== true &&
+      messageText(message).length > 0,
+  );
   if (!firstUser) return undefined;
 
   const firstAssistant = options.messages.find(
