@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { isMap, isSeq, parseDocument, type Document } from "yaml";
 
+import type { ThemeSelection } from "../types/theme";
 import type { ModelCapabilitiesPatch, ProviderProfile } from "./loader";
 
 export type ConfigRole = "main" | "fast" | "advisor";
@@ -90,6 +91,12 @@ export async function saveRoleSelection(
 export async function saveActiveMode(configPath: string, mode: ConfigMode): Promise<void> {
   const document = await readDocument(configPath);
   document.set("active_mode", mode);
+  await writeDocument(configPath, document);
+}
+
+export async function saveTheme(configPath: string, theme: ThemeSelection): Promise<void> {
+  const document = await readDocument(configPath);
+  document.set("theme", theme);
   await writeDocument(configPath, document);
 }
 

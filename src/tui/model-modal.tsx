@@ -48,7 +48,7 @@ import {
   isWordDeleteKey,
   isWordDeleteSequence,
 } from "./text-edit";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 const PROVIDER_KINDS = ProviderKindSchema.options;
 type ModelTarget = ConfigRole | ConfigMode;
@@ -334,7 +334,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     router,
     configPath,
     secretsPath,
-    theme = getTheme("tokyonight"),
+    theme: themeProp,
     initialView,
     initialTarget,
     onViewChange,
@@ -348,6 +348,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     onReasoningChange,
     height = 24,
   } = props;
+  const theme = useActiveTheme(themeProp);
   const compact = (process.stdout.columns ?? 80) < 72 || height < 20;
   const veryCompact = height < 10;
 
@@ -1813,7 +1814,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     const refs = [...confirmAction.refs.roles, ...confirmAction.refs.modes];
     return (
       <Box flexDirection="column" paddingX={1}>
-        <Text bold color={theme.badge.error}>{title}</Text>
+        <Text bold color={theme.status.error}>{title}</Text>
         {refs.length > 0 ? (
           <Text color={theme.muted}>
             Used by: {refs.join(", ")}. These references will be cleared.
@@ -1821,7 +1822,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         ) : (
           <Text color={theme.muted}>This item is not assigned to a role or mode.</Text>
         )}
-        {error ? <Text color={theme.badge.error}>{error}</Text> : null}
+        {error ? <Text color={theme.status.error}>{error}</Text> : null}
         <Text color={theme.muted}>Enter confirm · Esc cancel</Text>
       </Box>
     );
@@ -1959,7 +1960,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         ) : (
           windowGroups.map((group) => (
             <Box key={group.key} flexDirection="column">
-              <Text bold color={theme.modes.plan.primary}>{group.label}</Text>
+              <Text bold color={theme.accent}>{group.label}</Text>
               {group.models.map((entry) => {
                 const index = filteredModels.indexOf(entry);
                 const isSelected = index === clampedModelIndex;
@@ -2024,8 +2025,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
             {disabledCount} disabled provider(s) · manage in Providers
           </Text>
         ) : null}
-        {status ? <Text color={theme.modes.build.primary}>{status}</Text> : null}
-        {error ? <Text color={theme.badge.error}>{error}</Text> : null}
+        {status ? <Text color={theme.status.success}>{status}</Text> : null}
+        {error ? <Text color={theme.status.error}>{error}</Text> : null}
         <Text color={theme.muted} wrap="truncate">
           {compact
             ? veryCompact
@@ -2071,7 +2072,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
                     {isSelected ? "❯ " : "  "}
                   </Text>
                   <Text bold={isSelected} color={theme.text}>{provider.name}</Text>
-                  <Text color={provider.enabled ? theme.modes.build.primary : theme.muted}>
+                  <Text color={provider.enabled ? theme.status.success : theme.muted}>
                     {provider.enabled ? " · on" : " · off"}
                   </Text>
                   <Text color={theme.muted}>
@@ -2088,7 +2089,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
                     {isSelected ? "❯ " : "  "}
                   </Text>
                   <Text bold={isSelected} color={theme.text}>{provider.name.padEnd(20)}</Text>
-                  <Text color={provider.enabled ? theme.modes.build.primary : theme.muted}>
+                  <Text color={provider.enabled ? theme.status.success : theme.muted}>
                     {provider.enabled ? "enabled" : "disabled"}
                   </Text>
                   <Text color={theme.muted}>
@@ -2096,7 +2097,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
                     {kindLabel(provider.kind)} · {provider.models.length} model(s)
                   </Text>
                   {runtime ? (
-                    <Text color={localMissing.length > 0 ? theme.badge.error : theme.muted}>
+                    <Text color={localMissing.length > 0 ? theme.status.error : theme.muted}>
                       {" · "}
                       {provider.models.length - localMissing.length} installed
                       {localMissing.length > 0 ? `, ${localMissing.length} not installed` : ""}
@@ -2107,7 +2108,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
                     <Text
                       color={
                         sync.state === "ok" && sync.missing.length > 0
-                          ? theme.badge.error
+                          ? theme.status.error
                           : theme.muted
                       }
                     >
@@ -2127,8 +2128,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
             );
           })
         )}
-        {status ? <Text color={theme.modes.build.primary}>{status}</Text> : null}
-        {error ? <Text color={theme.badge.error}>{error}</Text> : null}
+        {status ? <Text color={theme.status.success}>{status}</Text> : null}
+        {error ? <Text color={theme.status.error}>{error}</Text> : null}
         {compact ? (
           <Text color={theme.muted} wrap="truncate">
             a add · Enter edit · Esc close
@@ -2223,8 +2224,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
                   {isSelected ? "❯ " : "  "}
                 </Text>
                 <Text bold={isSelected} color={theme.text}>{model}</Text>
-                {missing ? <Text color={theme.badge.error}> · not installed</Text> : null}
-                {missingLive ? <Text color={theme.badge.error}> · missing from live</Text> : null}
+                {missing ? <Text color={theme.status.error}> · not installed</Text> : null}
+                {missingLive ? <Text color={theme.status.error}> · missing from live</Text> : null}
               </Text>
             );
           })
@@ -2242,8 +2243,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
             )}
           </Box>
         ) : null}
-        {status ? <Text color={theme.modes.build.primary}>{status}</Text> : null}
-        {error ? <Text color={theme.badge.error}>{error}</Text> : null}
+        {status ? <Text color={theme.status.success}>{status}</Text> : null}
+        {error ? <Text color={theme.status.error}>{error}</Text> : null}
         {modelInputActive ? (
           <Text color={theme.muted}>
             Type model ID · Ctrl+Backspace/Delete word · Enter add · Esc cancel
@@ -2322,7 +2323,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         <Text color={theme.muted}>
           {capTarget.provider} / {capTarget.model}
         </Text>
-        <Text color={capOverride ? theme.modes.build.primary : theme.muted}>
+        <Text color={capOverride ? theme.status.success : theme.muted}>
           {capOverride ? "override" : `auto (${capSource})`} · s save · r reset
         </Text>
         {rows.map((row, index) => {
@@ -2338,8 +2339,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         <Text color={theme.muted}>
           Space/Enter toggle · Left/Right or type numbers · s save · r reset · Esc back
         </Text>
-        {status ? <Text color={theme.modes.build.primary}>{status}</Text> : null}
-        {error ? <Text color={theme.badge.error}>{error}</Text> : null}
+        {status ? <Text color={theme.status.success}>{status}</Text> : null}
+        {error ? <Text color={theme.status.error}>{error}</Text> : null}
       </Box>
     );
   }
@@ -2431,7 +2432,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         <Text
           color={
             liveNameError || (nameNotice && formMode !== "edit")
-              ? theme.badge.error
+              ? theme.status.error
               : theme.muted
           }
         >
@@ -2457,8 +2458,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
             ? "Custom providers use their own URL. Choose OpenAI-compatible or Anthropic-compatible."
             : "Preset values are editable. Keys are stored in the active secrets file."}
       </Text>
-      {status ? <Text color={theme.modes.build.primary}>{status}</Text> : null}
-      {error ? <Text color={theme.badge.error}>{error}</Text> : null}
+      {status ? <Text color={theme.status.success}>{status}</Text> : null}
+      {error ? <Text color={theme.status.error}>{error}</Text> : null}
     </Box>
   );
 }

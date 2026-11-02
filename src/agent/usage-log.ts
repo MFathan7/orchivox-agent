@@ -17,6 +17,13 @@ export interface UsageLogEntry {
   compacted: boolean;
   pruned_tokens: number;
   provider_reported: boolean;
+  steps?: number;
+  step_limit?: number;
+  tool_calls?: number;
+  tool_counts?: Record<string, number>;
+  repeated_calls?: number;
+  duration_ms?: number;
+  finish_reason?: string;
 }
 
 export function usageLogPath(): string {

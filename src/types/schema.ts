@@ -216,8 +216,66 @@ export type UsageEvent = z.infer<typeof UsageEventSchema>;
 export const StepStartedEventSchema = z.object({
   type: z.literal("step_started"),
   step: z.number().int().positive(),
+  /** Present when this turn has a step budget. */
+  step_limit: z.number().int().positive().optional(),
+  /** Tool calls completed before this step. */
+  tool_calls: z.number().int().nonnegative().optional(),
+  /** Present when this turn has a tool budget. */
+  tool_limit: z.number().int().nonnegative().optional(),
+  elapsed_ms: z.number().int().nonnegative().optional(),
+  /** Present when this turn has a wall clock budget. */
+  time_limit_ms: z.number().int().positive().optional(),
 });
 export type StepStartedEvent = z.infer<typeof StepStartedEventSchema>;
+
+export const TurnBudgetWarningEventSchema = z.object({
+  type: z.literal("turn_budget_warning"),
+  reason: z.enum(["step", "tool", "time"]),
+  used: z.number().nonnegative(),
+  limit: z.number().positive(),
+});
+export type TurnBudgetWarningEvent = z.infer<typeof TurnBudgetWarningEventSchema>;
+
+export const ContextEstimateEventSchema = z.object({
+  type: z.literal("context_estimate"),
+  tokens: z.number().int().nonnegative(),
+  request_bytes: z.number().int().nonnegative(),
+  input_budget: z.number().int().nonnegative(),
+  context_window: z.number().int().positive(),
+  max_request_bytes: z.number().int().nonnegative(),
+  buffer_tokens: z.number().int().nonnegative(),
+});
+export type ContextEstimateEvent = z.infer<typeof ContextEstimateEventSchema>;
+
+export const TurnCompactionSchema = z.object({
+  trigger: z.enum(["tokens", "request_size", "overflow", "output_limit", "manual"]),
+  before_tokens: z.number().int().nonnegative(),
+  after_tokens: z.number().int().nonnegative(),
+  request_bytes: z.number().int().nonnegative().optional(),
+  max_request_bytes: z.number().int().nonnegative().optional(),
+  input_budget: z.number().int().nonnegative().optional(),
+  buffer_tokens: z.number().int().nonnegative().optional(),
+});
+export type TurnCompaction = z.infer<typeof TurnCompactionSchema>;
+
+export const TurnMetricsSchema = z.object({
+  steps: z.number().int().nonnegative(),
+  tool_calls: z.number().int().nonnegative(),
+  tool_counts: z.record(z.string(), z.number().int().nonnegative()),
+  repeated_calls: z.number().int().nonnegative(),
+  duration_ms: z.number().int().nonnegative(),
+  prompt_tokens: z.number().int().nonnegative(),
+  completion_tokens: z.number().int().nonnegative(),
+  total_tokens: z.number().int().nonnegative(),
+  compactions: z.number().int().nonnegative(),
+  last_compaction: TurnCompactionSchema.optional(),
+  prunes: z.number().int().nonnegative(),
+  step_limit: z.number().int().positive().optional(),
+  tool_limit: z.number().int().positive().optional(),
+  time_limit_ms: z.number().int().positive().optional(),
+  finish_reason: z.string().optional(),
+});
+export type TurnMetrics = z.infer<typeof TurnMetricsSchema>;
 
 export const RuleViolationEventSchema = z.object({
   type: z.literal("rule_violation"),
@@ -263,6 +321,7 @@ export const DoneEventSchema = z.object({
   type: z.literal("done"),
   finish_reason: z.enum(["stop", "length", "turn_limit", "tool_calls", "content_filter", "refusal", "aborted", "error"]),
   usage: UsageSchema.optional(),
+  metrics: TurnMetricsSchema.optional(),
 });
 export type DoneEvent = z.infer<typeof DoneEventSchema>;
 export type FinishReason = DoneEvent["finish_reason"];
@@ -457,12 +516,17 @@ export type ContextPrunedEvent = z.infer<typeof ContextPrunedEventSchema>;
 export const CompactionEventSchema = z.object({
   type: z.literal("compaction"),
   reason: CompactionReasonSchema,
+  trigger: z.enum(["tokens", "request_size", "overflow", "output_limit", "manual"]).optional(),
   before_tokens: z.number().int().nonnegative(),
   after_tokens: z.number().int().nonnegative(),
   summary_tokens: z.number().int().nonnegative().default(0),
   summary: z.string().optional(),
   removed_messages: z.number().int().nonnegative().default(0),
   tail_start_message_id: z.string().optional(),
+  request_bytes: z.number().int().nonnegative().optional(),
+  max_request_bytes: z.number().int().nonnegative().optional(),
+  input_budget: z.number().int().nonnegative().optional(),
+  buffer_tokens: z.number().int().nonnegative().optional(),
   attempt: z.number().int().positive().optional(),
   max_attempts: z.number().int().positive().optional(),
   status: z.enum(["done", "error"]).optional(),
@@ -478,6 +542,8 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   ToolCallReadyEventSchema,
   UsageEventSchema,
   StepStartedEventSchema,
+  TurnBudgetWarningEventSchema,
+  ContextEstimateEventSchema,
   RuleViolationEventSchema,
   RetryScheduledEventSchema,
   ModeChangedEventSchema,

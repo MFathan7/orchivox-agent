@@ -8,7 +8,7 @@ import { groupToolCalls } from "./tool-groups";
 import { WelcomeBanner } from "./logo";
 import { estimateMarkdownLines, markdownRows } from "./markdown";
 import { enterTerminal, leaveTerminal } from "./terminal-protocol";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 import { displayWidth, wrapText } from "./text-wrap";
 import {
   LIVE_TOOL_LIMIT,
@@ -170,7 +170,7 @@ function estimateToolLines(
   diffExpanded = false,
 ): number {
   let lines = 4;
-  const isCommand = Boolean(call.command) || ["bash", "run_sandbox_script", "bg_start", "bg_logs"].includes(call.name);
+  const isCommand = Boolean(call.command) || ["bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"].includes(call.name);
   if (isCommand && call.command) {
     lines += wrapText(call.command, Math.max(1, width - 4)).length;
   }
@@ -395,7 +395,7 @@ export function ScrollableChatViewport({
   liveEntry,
   width,
   height,
-  theme = getTheme("tokyonight"),
+  theme: themeProp,
   initiallyCollapsed = false,
   active = true,
   repoPath,
@@ -407,6 +407,7 @@ export function ScrollableChatViewport({
   initiallyExpandedActivity = false,
   initiallyExpandedThinking = false,
 }: ScrollableChatViewportProps): React.ReactElement {
+  const theme = useActiveTheme(themeProp);
   const [internalOffset, setInternalOffset] = React.useState(0);
   const offsetFromBottom = controlledOffset ?? internalOffset;
   const setOffsetFromBottom = onOffsetChange ?? setInternalOffset;
@@ -553,8 +554,9 @@ export function WorkspaceSidebar({
   lspStatus,
   mcpServers,
   subagents,
-  theme = getTheme("tokyonight"),
+  theme: themeProp,
 }: WorkspaceSidebarProps): React.ReactElement {
+  const theme = useActiveTheme(themeProp);
   const done = todos.filter((todo) => todo.status === "completed").length;
   return (
     <Box
@@ -570,8 +572,8 @@ export function WorkspaceSidebar({
         Workspace
       </Text>
 
-      <Text bold>Todos</Text>
-      <Text color={theme.modes.build.primary}>{formatProgressBar(done, todos.length)}</Text>
+      <Text bold color={theme.text}>Todos</Text>
+      <Text color={theme.status.success}>{formatProgressBar(done, todos.length)}</Text>
       {todos.length === 0 ? <Text color={theme.muted}>(none)</Text> : null}
       {todos.map((todo) => (
         <Text key={todo.id} color={todo.status === "completed" ? theme.muted : theme.text}>
@@ -579,22 +581,22 @@ export function WorkspaceSidebar({
         </Text>
       ))}
 
-      <Text bold>Modified files</Text>
+      <Text bold color={theme.text}>Modified files</Text>
       {modifiedFiles.length === 0 ? <Text color={theme.muted}>(none)</Text> : null}
       {modifiedFiles.map((file) => (
         <Text key={file.path}>
           <Text color={theme.diff.added}>+{file.additions}</Text>
           <Text color={theme.muted}> / </Text>
           <Text color={theme.diff.removed}>-{file.deletions}</Text>
-          <Text> {file.path}</Text>
+          <Text color={theme.text}> {file.path}</Text>
         </Text>
       ))}
 
-      <Text bold>Servers</Text>
+      <Text bold color={theme.text}>Servers</Text>
       <Text color={theme.muted}>lsp: {lspStatus}</Text>
       <Text color={theme.muted}>mcp: {mcpServers.length > 0 ? mcpServers.join(", ") : "none"}</Text>
 
-      <Text bold>Subagents</Text>
+      <Text bold color={theme.text}>Subagents</Text>
       {subagents.length === 0 ? <Text color={theme.muted}>(none)</Text> : null}
       {subagents.map((subagent) => (
         <Text key={subagent.id} color={subagent.status === "running" ? theme.badge.running : theme.muted}>
@@ -610,12 +612,13 @@ export function SplitPaneViewport({
   streamingText,
   width,
   height,
-  theme = getTheme("tokyonight"),
+  theme: themeProp,
   initiallyCollapsed = false,
   sidebar,
   initialSidebarVisible = true,
   active = true,
 }: SplitPaneViewportProps): React.ReactElement {
+  const theme = useActiveTheme(themeProp);
   const [sidebarVisible, setSidebarVisible] = React.useState(initialSidebarVisible);
 
   useInput(

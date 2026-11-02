@@ -31,6 +31,8 @@ export interface ModeContract {
   advisor: boolean;
   /** The mode may spawn subagents and drive the task board. */
   subagents: boolean;
+  /** Default provider steps for one turn. 0 means unlimited. */
+  defaultSteps: number;
 }
 
 export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
@@ -46,6 +48,7 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     nudges: 0,
     advisor: false,
     subagents: true,
+    defaultSteps: 20,
   },
   build: {
     label: "BUILD",
@@ -59,6 +62,7 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     nudges: 0,
     advisor: false,
     subagents: true,
+    defaultSteps: 40,
   },
   ultrawork: {
     label: "ULTRAWORK",
@@ -80,8 +84,24 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     nudges: 2,
     advisor: true,
     subagents: true,
+    defaultSteps: 60,
   },
 };
+
+/**
+ * Resolves the step budget for one turn. An explicit programmatic cap wins,
+ * then the user's mode config, then the mode contract default. 0 means
+ * unlimited at every level.
+ */
+export function modeStepLimit(
+  mode: AgentMode,
+  configuredSteps?: number,
+  explicitMaxTurns = 0,
+): number {
+  if (explicitMaxTurns > 0) return explicitMaxTurns;
+  if (configuredSteps !== undefined) return configuredSteps;
+  return modeContract(mode).defaultSteps;
+}
 
 export function modeContract(mode: AgentMode): ModeContract {
   return MODE_CONTRACTS[mode] ?? MODE_CONTRACTS.build;

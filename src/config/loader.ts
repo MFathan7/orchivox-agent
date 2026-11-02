@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import type { CatalogModel } from "../provider/model-catalog";
 import { TokenPricingSchema } from "../types/schema";
+import { AUTO_THEME } from "../types/theme";
 
 export const CONFIG_PATH = ".agent/config.yaml";
 
@@ -39,6 +40,8 @@ export const ModelCapabilitiesSchema = z.object({
   temperature: z.boolean().default(true),
   pdf: z.boolean().default(false),
   parallel_tool_calls: z.boolean().default(true),
+  edit_mode: z.enum(["hashline", "exact"]).default("hashline"),
+  patch: z.boolean().default(true),
   reasoning_efforts: z.array(z.string().min(1)).optional(),
   reasoning_budget_min: z.number().int().positive().optional(),
   reasoning_budget_max: z.number().int().positive().optional(),
@@ -76,6 +79,8 @@ export const ModelCapabilitiesPatchSchema = z.object({
   temperature: z.boolean().optional(),
   pdf: z.boolean().optional(),
   parallel_tool_calls: z.boolean().optional(),
+  edit_mode: z.enum(["hashline", "exact"]).optional(),
+  patch: z.boolean().optional(),
   reasoning_efforts: z.array(z.string().min(1)).optional(),
   reasoning_budget_min: z.number().int().positive().optional(),
   reasoning_budget_max: z.number().int().positive().optional(),
@@ -109,6 +114,8 @@ export function inferModelCapabilities(_kind: ProviderKind, model: string): Mode
     temperature: true,
     pdf: false,
     parallel_tool_calls: true,
+    edit_mode: "hashline",
+    patch: true,
   };
 }
 
@@ -217,6 +224,8 @@ export function resolveModelCapabilities(
     capabilities.temperature = explicit.temperature ?? capabilities.temperature;
     capabilities.pdf = explicit.pdf ?? capabilities.pdf;
     capabilities.parallel_tool_calls = explicit.parallel_tool_calls ?? capabilities.parallel_tool_calls;
+    capabilities.edit_mode = explicit.edit_mode ?? capabilities.edit_mode;
+    capabilities.patch = explicit.patch ?? capabilities.patch;
     capabilities.reasoning_efforts = explicit.reasoning_efforts ?? capabilities.reasoning_efforts;
     capabilities.reasoning_budget_min = explicit.reasoning_budget_min ?? capabilities.reasoning_budget_min;
     capabilities.reasoning_budget_max = explicit.reasoning_budget_max ?? capabilities.reasoning_budget_max;
@@ -343,16 +352,26 @@ export const PermissionRuleSchema = z.object({
 });
 export type PermissionRule = z.infer<typeof PermissionRuleSchema>;
 
+export const CompactionBufferSchema = z
+  .union([
+    z.number().int().nonnegative(),
+    z.string().regex(/^\d+(?:\.\d+)?%$/, "buffer must be a token count or a percentage like 15%"),
+  ])
+  .default("15%");
+
 export const CompactionConfigSchema = z.object({
   auto: z.boolean().default(true),
   keep_tokens: z.number().int().positive().default(15_000),
+  // Room kept free for the reply. A percentage or a token count.
+  buffer: CompactionBufferSchema,
   // Write a summary in the background near the threshold.
   precompute: z.boolean().default(false),
   reserve_tokens: z.number().int().positive().optional(),
   // Output reserve used to compute the prompt budget. Wins over reserve_tokens.
   reserved: z.number().int().positive().optional(),
-  // Drop old tool output before compaction.
-  prune: z.boolean().default(true),
+  // Drop old tool output before compaction. Off by default: the summary keeps
+  // the conversation intact, while prune removes detail without a summary.
+  prune: z.boolean().default(false),
   prune_protect_tokens: z.number().int().positive().default(40_000),
   prune_min_tokens: z.number().int().positive().default(20_000),
   buffer_ratio: z.number().min(0).max(0.9).optional(),
@@ -362,7 +381,8 @@ export type CompactionConfig = z.infer<typeof CompactionConfigSchema>;
 
 export const WebSearchConfigSchema = z.object({
   enabled: z.boolean().default(true),
-  provider: z.enum(["tavily", "brave", "exa", "duckduckgo", "random"]).default("random"),
+  provider: z.enum(["tavily", "brave", "exa", "firecrawl", "duckduckgo", "random"]).default("random"),
+  max_results: z.number().int().positive().default(8),
 });
 export type WebSearchConfig = z.infer<typeof WebSearchConfigSchema>;
 
@@ -386,13 +406,35 @@ export const LimitsConfigSchema = z.object({
   session_tokens: z.number().int().positive().optional(),
   // Stop a turn after this many tokens across its internal steps.
   turn_tokens: z.number().int().positive().optional(),
-  // Compact before a request body grows past this many bytes. 0 disables it.
-  max_request_bytes: z.number().int().nonnegative().default(800_000),
+  // Stop a turn after this many tool calls. 0 disables the check.
+  max_tool_calls: z.number().int().nonnegative().default(150),
+  // Suppress an identical tool call after this many in one turn. 0 disables it.
+  max_repeated_calls: z.number().int().nonnegative().default(3),
+  // Stop a turn after this many seconds. 0 disables the check.
+  max_wall_seconds: z.number().int().nonnegative().default(1200),
+  // Stop new web searches after this many per turn. 0 disables the check.
+  max_web_searches: z.number().int().nonnegative().default(8),
+  // Maximum number of task-board workers held at once.
+  max_workers_per_turn: z.number().int().positive().default(10),
+  // Explicit request-body cap. 0 disables the preflight byte guard.
+  max_request_bytes: z.number().int().nonnegative().default(0),
   // Warn when resuming a session above either size. 0 disables the check.
   session_warn_tokens: z.number().int().nonnegative().default(20_000_000),
   session_warn_bytes: z.number().int().nonnegative().default(800_000),
 });
 export type LimitsConfig = z.infer<typeof LimitsConfigSchema>;
+
+export const ToolsConfigSchema = z.object({
+  // Off by default. read-only batches read tools; full adds file edits.
+  code_mode: z.enum(["off", "read-only", "full"]).default("off"),
+  // Maximum files returned by glob_files.
+  glob_limit: z.number().int().positive().default(100),
+  // Maximum matches returned by grep_search.
+  grep_limit: z.number().int().positive().default(100),
+  // Timeout for glob_files and grep_search.
+  search_timeout_seconds: z.number().int().positive().default(30),
+});
+export type ToolsConfig = z.infer<typeof ToolsConfigSchema>;
 
 export const SkillsConfigSchema = z.object({
   // 0 means no cap. The model context window is the only limit.
@@ -440,6 +482,8 @@ export type ModeModel = z.infer<typeof ModeModelSchema>;
 export const ModeSettingsSchema = z.object({
   model: ModeModelSchema.optional(),
   reasoning: z.string().min(1).optional(),
+  /** Provider steps for one turn. 0 means unlimited. */
+  steps: z.number().int().nonnegative().optional(),
 });
 export type ModeSettings = z.infer<typeof ModeSettingsSchema>;
 
@@ -456,6 +500,11 @@ export const AppConfigSchema = z.object({
   roles: RolesConfigSchema.default({}),
   modes: ModesConfigSchema.prefault({}),
   active_mode: z.enum(["plan", "build", "ultrawork"]).default("build"),
+  theme: z
+    .string()
+    .min(1)
+    .default(AUTO_THEME)
+    .transform((value) => value.trim().toLowerCase()),
   inbound_server: InboundServerConfigSchema.prefault({}),
   lsp: z
     .object({
@@ -476,6 +525,7 @@ export const AppConfigSchema = z.object({
   prompt: PromptConfigSchema.prefault({}),
   reasoning: ReasoningConfigSchema.prefault({}),
   limits: LimitsConfigSchema.prefault({}),
+  tools: ToolsConfigSchema.prefault({}),
   skills: SkillsConfigSchema.prefault({}),
   documents: DocumentsConfigSchema.prefault({}),
 });

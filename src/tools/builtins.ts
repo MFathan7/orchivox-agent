@@ -70,30 +70,62 @@ async function loadIgnoreRules(basePath: string): Promise<IgnoreRule[]> {
   return parseIgnoreRules(await file.text());
 }
 
+export const DEFAULT_SEARCH_TIMEOUT_MS = 30_000;
+export const DEFAULT_GLOB_LIMIT = 100;
+export const DEFAULT_GREP_LIMIT = 100;
+
+export interface CollectFilesResult {
+  files: string[];
+  timedOut: boolean;
+}
+
+export async function collectFilesWithStatus(
+  basePath: string,
+  include: string | undefined,
+  maxFiles: number,
+  timeoutMs: number = DEFAULT_SEARCH_TIMEOUT_MS,
+): Promise<CollectFilesResult> {
+  if (timeoutMs <= 0) return { files: [], timedOut: true };
+  const deadline = Date.now() + timeoutMs;
+  const rules = await loadIgnoreRules(basePath);
+  const glob = new Bun.Glob(include ?? "**/*");
+  const collected: string[] = [];
+  for await (const relative of glob.scan({ cwd: basePath, onlyFiles: true })) {
+    if (Date.now() > deadline) return { files: collected.sort(), timedOut: true };
+    if (isIgnored(relative, rules)) continue;
+    collected.push(relative);
+    if (collected.length >= maxFiles) break;
+  }
+  return { files: collected.sort(), timedOut: false };
+}
+
 export async function collectFiles(
   basePath: string,
   include: string | undefined,
   maxFiles: number,
 ): Promise<string[]> {
-  const rules = await loadIgnoreRules(basePath);
-  const glob = new Bun.Glob(include ?? "**/*");
-  const collected: string[] = [];
-  for await (const relative of glob.scan({ cwd: basePath, onlyFiles: true })) {
-    if (isIgnored(relative, rules)) continue;
-    collected.push(relative);
-    if (collected.length >= maxFiles) break;
-  }
-  return collected.sort();
+  // Existing callers such as the AST map keep their old unbounded behavior.
+  const result = await collectFilesWithStatus(
+    basePath,
+    include,
+    maxFiles,
+    Number.MAX_SAFE_INTEGER,
+  );
+  return result.files;
 }
 
 export const GlobFilesArgsSchema = z.object({
   pattern: z.string().min(1),
   basePath: z.string().default("."),
-  maxResults: z.number().int().positive().default(200),
+  maxResults: z.number().int().positive().default(DEFAULT_GLOB_LIMIT),
 });
 export type GlobFilesArgs = z.infer<typeof GlobFilesArgsSchema>;
 
-export function createGlobFilesTool(): AgentTool<typeof GlobFilesArgsSchema> {
+export function createGlobFilesTool(
+  options: { maxResults?: number; timeoutMs?: number } = {},
+): AgentTool<typeof GlobFilesArgsSchema> {
+  const limit = options.maxResults ?? DEFAULT_GLOB_LIMIT;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
   return {
     name: "glob_files",
     description:
@@ -101,9 +133,22 @@ export function createGlobFilesTool(): AgentTool<typeof GlobFilesArgsSchema> {
     parameters: GlobFilesArgsSchema,
     readOnly: true,
     async execute(args) {
-      const files = await collectFiles(args.basePath, args.pattern, args.maxResults);
-      if (files.length === 0) return `no files matched "${args.pattern}"`;
-      return truncateHead(files.join("\n")).text;
+      const maxResults = Math.min(args.maxResults, limit);
+      const result = await collectFilesWithStatus(
+        args.basePath,
+        args.pattern,
+        maxResults,
+        timeoutMs,
+      );
+      if (result.files.length === 0) {
+        return result.timedOut
+          ? `search timed out after ${Math.round(timeoutMs / 1000)}s before any file matched; narrow the pattern or base path.`
+          : `no files matched "${args.pattern}"`;
+      }
+      const body = truncateHead(result.files.join("\n")).text;
+      return result.timedOut
+        ? `${body}\n[Search timed out after ${Math.round(timeoutMs / 1000)}s; showing partial results. Narrow the pattern or base path.]`
+        : body;
     },
   };
 }
@@ -112,11 +157,16 @@ export const GrepSearchArgsSchema = z.object({
   pattern: z.string().min(1),
   basePath: z.string().default("."),
   include: z.string().optional(),
-  maxResults: z.number().int().positive().default(100),
+  maxResults: z.number().int().positive().default(DEFAULT_GREP_LIMIT),
 });
 export type GrepSearchArgs = z.infer<typeof GrepSearchArgsSchema>;
 
-export function createGrepSearchTool(): AgentTool<typeof GrepSearchArgsSchema> {
+export function createGrepSearchTool(
+  options: { maxResults?: number; timeoutMs?: number; maxFiles?: number } = {},
+): AgentTool<typeof GrepSearchArgsSchema> {
+  const limit = options.maxResults ?? DEFAULT_GREP_LIMIT;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
+  const maxFiles = options.maxFiles ?? 5000;
   return {
     name: "grep_search",
     description:
@@ -131,10 +181,22 @@ export function createGrepSearchTool(): AgentTool<typeof GrepSearchArgsSchema> {
         throw new Error(`invalid regex: ${error instanceof Error ? error.message : String(error)}`);
       }
 
-      const files = await collectFiles(args.basePath, args.include, 5000);
+      const deadline = Date.now() + timeoutMs;
+      const scanned = await collectFilesWithStatus(
+        args.basePath,
+        args.include,
+        maxFiles,
+        timeoutMs,
+      );
+      const files = scanned.files;
+      let timedOut = scanned.timedOut;
       const perFile: string[][] = [];
       const chunkSize = 32;
       for (let offset = 0; offset < files.length; offset += chunkSize) {
+        if (timedOut || Date.now() > deadline) {
+          timedOut = true;
+          break;
+        }
         const chunk = files.slice(offset, offset + chunkSize);
         const results = await Promise.all(
           chunk.map(async (relative) => {
@@ -151,17 +213,26 @@ export function createGrepSearchTool(): AgentTool<typeof GrepSearchArgsSchema> {
           }),
         );
         perFile.push(...results);
+        if (Date.now() > deadline) timedOut = true;
         // Keep the event loop responsive while a wide search walks a repository.
         await new Promise((resolve) => setImmediate(resolve));
       }
 
       const matches = perFile.flat();
-      if (matches.length === 0) return `no matches for /${args.pattern}/`;
-      const shown = matches.slice(0, args.maxResults);
+      const timeoutNote = timedOut
+        ? `[Search timed out after ${Math.round(timeoutMs / 1000)}s; showing partial results. Narrow the pattern, include, or base path.]`
+        : "";
+      if (matches.length === 0) {
+        return timedOut
+          ? `no matches for /${args.pattern}/ before the search timed out after ${Math.round(timeoutMs / 1000)}s; narrow the pattern, include, or base path.`
+          : `no matches for /${args.pattern}/`;
+      }
+      const maxResults = Math.min(args.maxResults, limit);
+      const shown = matches.slice(0, maxResults);
       const truncated = matches.length - shown.length;
       const header = truncated > 0 ? `... ${truncated} more match(es) truncated` : "";
       const budget = truncateHead(shown.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER });
-      return [budget.text, header].filter(Boolean).join("\n");
+      return [budget.text, header, timeoutNote].filter(Boolean).join("\n");
     },
   };
 }

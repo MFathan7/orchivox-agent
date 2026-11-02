@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { freezeDebugEnabled, logFreeze } from "../agent/freeze-debug";
+import type { ToolRulePattern } from "../agent/permissions";
 import {
   toolParametersToJsonSchema,
   type AgentMode,
@@ -35,6 +36,7 @@ export interface IToolPermissionChecker {
     tool: { name: string; readOnly: boolean },
     mode: AgentMode,
     args?: Record<string, unknown>,
+    rules?: readonly ToolRulePattern[],
   ): Promise<PermissionDecision> | PermissionDecision;
 }
 
@@ -43,6 +45,7 @@ export class ToolPermissionManager implements IToolPermissionChecker {
     tool: { name: string; readOnly: boolean },
     mode: AgentMode,
     _args?: Record<string, unknown>,
+    _rules?: readonly ToolRulePattern[],
   ): PermissionDecision {
     if (mode === "plan" && !tool.readOnly && tool.name !== "write_plan" && tool.name !== "spawn_subagents") {
       return {
@@ -89,7 +92,12 @@ export class ToolRegistry {
     }));
   }
 
-  async run(call: ToolCall, mode: AgentMode, signal?: AbortSignal): Promise<ToolResult> {
+  async run(
+    call: ToolCall,
+    mode: AgentMode,
+    signal?: AbortSignal,
+    permissionRules: readonly ToolRulePattern[] = [],
+  ): Promise<ToolResult> {
     const tool = this.tools.get(call.name);
     if (!tool) {
       return { tool_call_id: call.id, content: `unknown tool "${call.name}"`, is_error: true };
@@ -99,7 +107,7 @@ export class ToolRegistry {
     // Resolve path arguments against the worker workspace, but let permission
     // rules match the path the model wrote.
     const args = resolveWorkspaceArguments(rawArgs);
-    const decision = await this.permissions.check(tool, mode, rawArgs);
+    const decision = await this.permissions.check(tool, mode, rawArgs, permissionRules);
     if (!decision.allowed) {
       const feedbackPart = decision.feedback ? ` User feedback: ${decision.feedback}` : "";
       return {

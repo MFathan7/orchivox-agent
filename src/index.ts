@@ -23,6 +23,7 @@ import {
 } from "./agent/answer-stream";
 import { formatAppInfo, formatDoctor, getAppInfo, runUpdate } from "./app-info";
 import { compactMessages, estimateRequestBytes, extractSummary, markPrunedToolResults } from "./agent/compaction";
+import { formatTurnMetrics } from "./agent/turn-metrics";
 import { shouldWarnLargeSession } from "./agent/session-warning";
 import { generateSessionTitle, isPlaceholderTitle, messageText } from "./agent/session-title";
 import type { SkillDocument } from "./agent/skills";
@@ -40,6 +41,7 @@ import {
   saveActiveMode,
   saveModeReasoning,
   saveRoleSelection,
+  saveTheme,
   type ConfigMode,
 } from "./config/writer";
 import { LSPClient } from "./ide/lsp-client";
@@ -60,7 +62,7 @@ import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
 import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
 import { runGit } from "./vcs/git";
 import { WorktreeManager } from "./vcs/worktree";
-import { formatContextUsage, formatContextWindow, formatCost, formatTokenCount, formatTurnUsage } from "./tui/format";
+import { formatElapsed, formatTokenCount } from "./tui/format";
 import {
   installSynchronizedOutput,
   OrchivoxApp,
@@ -68,6 +70,8 @@ import {
   type InputAction,
   type ThinkingSegmentView,
 } from "./tui/app";
+import { applyCompactionMeter, applyContextEstimate } from "./tui/session-meter";
+import { formatStatsReport } from "./tui/stats-report";
 import { buildTranscriptEntries } from "./tui/transcript";
 import { finalizeToolCalls } from "./tui/tool-state";
 import { enterTerminal, leaveTerminal, setTerminalTitle } from "./tui/terminal-protocol";
@@ -75,7 +79,18 @@ import type { FileAttachmentRef } from "./tui/composer";
 import type { PendingQuestion } from "./tui/question-modal";
 import type { QuestionAnswer } from "./tools/question";
 import type { HashlineLifecycle } from "./tools/hashline-edit";
-import type { ThemeName } from "./tui/theme";
+import {
+  AUTO_THEME,
+  THEME_NAMES,
+  isThemeName,
+  isThemeSelection,
+  normalizeThemeSelection,
+  resolveThemeChoice,
+  themeSelectionLabel,
+  type TerminalAppearance,
+  type ThemeSelection,
+} from "./tui/theme";
+import { detectTerminalAppearance } from "./tui/terminal-appearance";
 import { basename, relative } from "node:path";
 import { WorkspaceTrustManager } from "./security/workspace-trust";
 import { WorkspaceTrustPrompt } from "./tui/trust-modal";
@@ -446,6 +461,10 @@ export async function main(
     // to preserve process.stdin raw mode lifecycle and keyboard protocols.
   }
 
+  // Ask the terminal for its background while the rest of the runtime boots.
+  const appearancePromise: Promise<TerminalAppearance> =
+    options.command === "tui" ? detectTerminalAppearance() : Promise.resolve("unknown");
+
   const runtime = await bootstrap({
     configPath: options.configPath,
     secretsPath: options.secretsPath,
@@ -489,13 +508,14 @@ export async function main(
     return { close: async () => undefined };
   }
 
-  return runTuiSession(runtime, print, options);
+  return runTuiSession(runtime, print, options, await appearancePromise);
 }
 
 async function runTuiSession(
   runtime: RuntimeHandle,
   print: (text: string) => void,
   options?: CliOptions,
+  terminalAppearance: TerminalAppearance = "unknown",
 ): Promise<{ close: () => Promise<void> }> {
   // Enter first, then push the keyboard flags. The composer must not push
   // again, otherwise the terminal keyboard stack is left dirty on exit.
@@ -507,6 +527,8 @@ async function runTuiSession(
   setTerminalTitle(`Orchivox - ${projectName}`);
   const trustManager = new WorkspaceTrustManager();
   let isWorkspaceTrusted = Boolean(options?.trust || trustManager.isTrusted(root));
+  const themeSelection = normalizeThemeSelection(runtime.config.theme);
+  const themeChoice = resolveThemeChoice(themeSelection, terminalAppearance);
 
   const state = {
     sessionId: undefined as string | undefined,
@@ -514,7 +536,9 @@ async function runTuiSession(
     entries: [] as ChatEntryView[],
     messages: [] as Message[],
     mode: runtime.config.active_mode as AgentMode,
-    currentTheme: "tokyonight" as ThemeName,
+    currentTheme: themeChoice.theme,
+    themeSelection: themeChoice.selection,
+    terminalAppearance,
     reasoningEffort: "default" as ReasoningEffortLevel,
     reasoningByMode: {
       plan: "default",
@@ -526,6 +550,10 @@ async function runTuiSession(
     modifiedFiles: new Map<string, { path: string; additions: number; deletions: number }>(),
     totalTokens: 0,
     contextTokens: 0,
+    contextRequestBytes: 0,
+    contextInputBudget: 0,
+    contextBufferTokens: 0,
+    maxRequestBytes: runtime.config.limits.max_request_bytes,
     totalPromptTokens: 0,
     totalCompletionTokens: 0,
     totalCostUsd: 0,
@@ -672,6 +700,11 @@ async function runTuiSession(
     removedMessages: number;
     auto?: boolean;
     reason?: CompactionReason;
+    trigger?: "tokens" | "request_size" | "overflow" | "output_limit" | "manual";
+    requestBytes?: number;
+    maxRequestBytes?: number;
+    inputBudget?: number;
+    bufferTokens?: number;
     status?: "running" | "done" | "error";
     error?: string;
     attempt?: number;
@@ -691,6 +724,11 @@ async function runTuiSession(
                 removedMessages: compaction.removedMessages,
                 auto: compaction.auto,
                 reason: compaction.reason,
+                trigger: compaction.trigger,
+                requestBytes: compaction.requestBytes,
+                maxRequestBytes: compaction.maxRequestBytes,
+                inputBudget: compaction.inputBudget,
+                bufferTokens: compaction.bufferTokens,
                 status: compaction.status ?? "done",
                 error: compaction.error,
                 attempt: compaction.attempt,
@@ -708,6 +746,11 @@ async function runTuiSession(
         removedMessages: compaction.removedMessages,
         auto: compaction.auto,
         reason: compaction.reason,
+        trigger: compaction.trigger,
+        requestBytes: compaction.requestBytes,
+        maxRequestBytes: compaction.maxRequestBytes,
+        inputBudget: compaction.inputBudget,
+        bufferTokens: compaction.bufferTokens,
         status: compaction.status ?? "done",
         error: compaction.error,
         attempt: compaction.attempt,
@@ -806,6 +849,22 @@ async function runTuiSession(
     rerender();
   };
 
+  const applyThemeSelection = (next: ThemeSelection): void => {
+    const choice = resolveThemeChoice(next, state.terminalAppearance);
+    state.themeSelection = choice.selection;
+    state.currentTheme = choice.theme;
+    if (choice.selection === next) {
+      void saveTheme(runtime.configPath, next).catch((error) => {
+        setNotice(
+          `Could not save theme: ${error instanceof Error ? error.message : String(error)}`,
+          6000,
+        );
+      });
+    }
+    const label = themeSelectionLabel(choice.selection, choice.theme);
+    setNotice(choice.warning ? `${label}. ${choice.warning}` : `Theme: ${label}`, choice.warning ? 9000 : 6000);
+  };
+
   const warnedLargeSessions = new Set<string>();
   const warnLargeSession = (
     sessionId: string,
@@ -835,6 +894,10 @@ async function runTuiSession(
 
   if (!runtime.configExists) {
     state.notice = "No config found. Use /connect to add a provider.";
+  } else if (!isThemeSelection(runtime.config.theme)) {
+    state.notice = `Unknown theme "${runtime.config.theme}". Using ${themeSelectionLabel(state.themeSelection, state.currentTheme)}.`;
+  } else if (themeChoice.warning) {
+    state.notice = themeChoice.warning;
   }
 
   // A prompt sent while the agent is still working is kept and runs next, so
@@ -858,6 +921,10 @@ async function runTuiSession(
     state.streamingText = "";
     state.activeSkills = [];
     state.contextTokens = 0;
+    state.contextRequestBytes = 0;
+    state.contextInputBudget = 0;
+    state.contextBufferTokens = 0;
+    state.maxRequestBytes = runtime.config.limits.max_request_bytes;
     state.totalTokens = 0;
     state.totalPromptTokens = 0;
     state.totalCompletionTokens = 0;
@@ -881,6 +948,9 @@ async function runTuiSession(
     pluginCount: runtime.plugins.loaded.length,
     totalTokens: state.totalTokens,
     contextTokens: state.contextTokens,
+    contextRequestLabel:
+      state.contextRequestBytes > 0 ? formatBytes(state.contextRequestBytes) : undefined,
+    maxRequestLabel: state.maxRequestBytes > 0 ? formatBytes(state.maxRequestBytes) : undefined,
     totalCostUsd: state.totalCostUsd,
     entries: state.entries,
     streamingText: state.streamingText,
@@ -894,6 +964,7 @@ async function runTuiSession(
     activeSessionId: state.sessionId ?? `draft-${state.sessionEpoch}`,
     activeSessionMessages: state.messages,
     currentTheme: state.currentTheme,
+    themeSelection: state.themeSelection,
     statusMessage: state.notice,
     onStatusMessage: setNotice,
     helpOpen: state.helpOpen,
@@ -990,9 +1061,8 @@ async function runTuiSession(
       state.hubOpen = open;
       rerender();
     },
-    onThemeChange: (nextTheme: ThemeName) => {
-      state.currentTheme = nextTheme;
-      rerender();
+    onThemeChange: (nextTheme: ThemeSelection) => {
+      applyThemeSelection(nextTheme);
     },
     reasoningEffort: state.reasoningEffort,
     onReasoningEffortChange: (effort: ReasoningEffortLevel) => {
@@ -1027,6 +1097,9 @@ async function runTuiSession(
       if (sess) setActiveMode(sess.mode);
       setTerminalTitle(sess?.title ?? `Orchivox - ${projectName}`);
       state.contextTokens = estimateContextTokens(state.mode, state.messages);
+      state.contextRequestBytes = 0;
+      state.contextInputBudget = 0;
+      state.contextBufferTokens = 0;
       warnLargeSession(sessionId, sess?.totalTokens, msgs);
       state.totalTokens = sess?.totalTokens ?? 0;
       state.totalCostUsd = sess?.totalCostUsd ?? 0;
@@ -1059,6 +1132,9 @@ async function runTuiSession(
       const history = runtime.database.loadFullMessages(forked.id);
       state.messages = msgs;
       state.contextTokens = estimateContextTokens(state.mode, state.messages);
+      state.contextRequestBytes = 0;
+      state.contextInputBudget = 0;
+      state.contextBufferTokens = 0;
       warnLargeSession(forked.id, forked.totalTokens, msgs);
       state.activeSkills = runtime.database.listSessionSkills(forked.id).map((skill) => skill.name);
       state.entries = buildTranscriptEntries(history, runtime.database.getCompaction(forked.id));
@@ -1582,7 +1658,7 @@ async function runTuiSession(
           beginCompaction(event.reason, event.attempt, event.max_attempts);
           renderLive(true);
         } else if (event.type === "compaction") {
-          state.contextTokens = event.after_tokens;
+          applyCompactionMeter(state, event);
           finishCompaction({
             summary: event.summary,
             beforeTokens: event.before_tokens,
@@ -1590,6 +1666,11 @@ async function runTuiSession(
             removedMessages: event.removed_messages,
             auto: event.reason !== "manual",
             reason: event.reason,
+            trigger: event.trigger,
+            requestBytes: event.request_bytes,
+            maxRequestBytes: event.max_request_bytes,
+            inputBudget: event.input_budget,
+            bufferTokens: event.buffer_tokens,
             attempt: event.attempt,
             maxAttempts: event.max_attempts,
             status: event.status,
@@ -1642,6 +1723,31 @@ async function runTuiSession(
           finishReason = event.finish_reason;
         } else if (event.type === "step_started") {
           liveEntry.step = event.step;
+          liveEntry.stepLimit = event.step_limit;
+          liveEntry.toolLimit = event.tool_limit;
+          liveEntry.timeLimitSeconds =
+            event.time_limit_ms !== undefined ? Math.ceil(event.time_limit_ms / 1000) : undefined;
+          renderLive(true);
+        } else if (event.type === "turn_budget_warning") {
+          const label =
+            event.reason === "time" ? "time" : event.reason === "tool" ? "tool calls" : "steps";
+          const used =
+            event.reason === "time"
+              ? formatElapsed(Math.round(event.used / 1000))
+              : String(event.used);
+          const limit =
+            event.reason === "time"
+              ? formatElapsed(Math.round(event.limit / 1000))
+              : String(event.limit);
+          const exhausted = event.used >= event.limit;
+          setNotice(
+            exhausted
+              ? `Turn budget reached: ${used}/${limit} ${label}. Summarizing.`
+              : `Turn budget: ${used}/${limit} ${label} used. Finish the current check and summarize.`,
+            exhausted ? 8000 : 10000,
+          );
+        } else if (event.type === "context_estimate") {
+          applyContextEstimate(state, event);
           renderLive(true);
         } else if (event.type === "usage") {
           const usedTokens = event.prompt_tokens + event.completion_tokens;
@@ -1751,8 +1857,17 @@ async function runTuiSession(
           });
         }
       } else {
-        state.lastOutcome = `completed: ${finishReason ?? "stop"}`;
+        state.lastOutcome =
+          finishReason === "turn_limit"
+            ? "stopped at the step limit"
+            : `completed: ${finishReason ?? "stop"}`;
         pushEntry("assistant", answer || "(no output)", entryMeta);
+        if (finishReason === "turn_limit") {
+          pushEntry(
+            "system",
+            "Turn budget reached. Send another message to continue, or raise the limit in config.",
+          );
+        }
         if (finishReason === "length") {
           pushEntry(
             "system",
@@ -1881,13 +1996,16 @@ async function runTuiSession(
       }
       case "/theme": {
         const targetTheme = args.trim().toLowerCase();
-        if (targetTheme === "tokyonight" || targetTheme === "catppuccin" || targetTheme === "gruvbox" || targetTheme === "monochrome") {
-          state.currentTheme = targetTheme as ThemeName;
-          setNotice(`Theme: ${targetTheme}`);
+        if (targetTheme === AUTO_THEME || isThemeName(targetTheme)) {
+          applyThemeSelection(targetTheme);
         } else if (!targetTheme) {
-          setNotice(`Current theme: ${state.currentTheme}. Options: tokyonight, catppuccin, gruvbox, monochrome`);
+          const options = [AUTO_THEME, ...THEME_NAMES].join(", ");
+          setNotice(
+            `Current theme: ${themeSelectionLabel(state.themeSelection, state.currentTheme)}. Options: ${options}`,
+          );
         } else {
-          setNotice(`Unknown theme "${targetTheme}". Options: tokyonight, catppuccin, gruvbox, monochrome`, 8000);
+          const options = [AUTO_THEME, ...THEME_NAMES].join(", ");
+          setNotice(`Unknown theme "${targetTheme}". Options: ${options}`, 8000);
         }
         break;
       }
@@ -2010,43 +2128,68 @@ async function runTuiSession(
         const modeModel = runtime.router.getModeModel(state.mode);
         const capabilities = runtime.router.capabilitiesForMode(state.mode);
         const contextWindow = capabilities.context_window;
+        const turnMetrics = runtime.orchestrator.getLastTurnMetrics(state.sessionId);
+        const allSessionsCost = runtime.database
+          .listSessions()
+          .reduce((sum, session) => sum + session.totalCostUsd, 0);
         state.report = {
           title: "Session statistics",
-          text: [
-            "Session Statistics:",
-            `  Active Session ID : ${state.sessionId ?? "(draft)"}`,
-            `  Messages in Memory: ${state.messages.length} messages`,
-            `  Total Token Usage : ${formatTokenCount(state.totalTokens, false)} tokens`,
-            `    Input tokens    : ${formatTokenCount(state.totalPromptTokens, false)}`,
-            `    Output tokens   : ${formatTokenCount(state.totalCompletionTokens, false)}`,
-            `  Last Prompt Tokens : ${formatTokenCount(state.lastPromptTokens, false)} provider / ${formatTokenCount(state.lastEstimatedPromptTokens, false)} estimated`,
-            `  Last Completion    : ${formatTokenCount(state.lastCompletionTokens, false)}`,
-            `  Last Request Total : ${formatTokenCount(state.lastTotalTokens, false)}`,
-            `  Last Turn Outcome  : ${state.lastOutcome ?? "unknown"}`,
-            `  Estimated Cost    : ${formatCost(state.totalCostUsd)}`,
-            `  Active Agent Mode : ${state.mode}`,
-            `  Mode Model        : ${modeModel ? `${modeModel.provider} / ${modeModel.model}` : "not configured"}`,
-            `  Context (used)    : ${formatContextUsage(state.contextTokens, contextWindow)}`,
-            `  Local Estimate    : ${formatTokenCount(state.lastEstimatedPromptTokens, false)} tokens`,
-            `  Turn Usage        : ${formatTurnUsage({
-              promptTokens: state.turnPromptTokens,
-              completionTokens: state.turnCompletionTokens,
-              totalTokens: state.turnTotalTokens,
-            })}`,
-            `  Context Window    : ${formatContextWindow(contextWindow)} (${capabilities.limit_sources?.context ?? capabilities.source ?? "default"})`,
-            `  Input Limit       : ${capabilities.max_input ? `${formatContextWindow(capabilities.max_input)} (${capabilities.limit_sources?.input ?? "default"})` : "follows context"}`,
-            `  Output Limit      : ${formatContextWindow(capabilities.max_output)} (${capabilities.limit_sources?.output ?? "default"})`,
-            `  Reasoning Level   : ${state.reasoningEffort} (${state.mode})`,
-            `  Visual Theme      : ${state.currentTheme}`,
-            `  Connected MCP     : ${runtime.mcpServers.length > 0 ? runtime.mcpServers.join(", ") : "none"}`,
-            `  Loaded Plugins    : ${runtime.plugins.loaded.length > 0 ? runtime.plugins.loaded.join(", ") : "none"}`,
-            `  Skills Installed  : ${skillCount}`,
-            `  Session Skills    : ${state.activeSkills.length > 0 ? state.activeSkills.join(", ") : "none"}`,
-            `  Task Board        : ${taskSummary.completed}/${taskSummary.total} completed, ${taskSummary.running} running, ${taskSummary.blocked} blocked`,
-            `  Git Branch        : ${branch}`,
-            `  VCS Snapshots     : ${snapshotCount} snapshots recorded`,
-            `  Saved Sessions    : ${sessionCount} total sessions in database`,
-          ].join("\n"),
+          text: formatStatsReport({
+            sessionId: state.sessionId,
+            messageCount: state.messages.length,
+            totalTokens: state.totalTokens,
+            lastPromptTokens: state.lastPromptTokens,
+            lastEstimatedPromptTokens: state.lastEstimatedPromptTokens,
+            lastCompletionTokens: state.lastCompletionTokens,
+            lastTotalTokens: state.lastTotalTokens,
+            lastOutcome: state.lastOutcome,
+            turnMetrics,
+            sessionCostUsd: state.totalCostUsd,
+            allSessionsCostUsd: allSessionsCost,
+            mode: state.mode,
+            modeModel: modeModel ? `${modeModel.provider} / ${modeModel.model}` : undefined,
+            contextTokens: state.contextTokens,
+            contextWindow,
+            contextSource: capabilities.limit_sources?.context ?? capabilities.source ?? "default",
+            requestBytes: state.contextRequestBytes,
+            maxRequestBytes: state.maxRequestBytes,
+            inputBudget: state.contextInputBudget,
+            bufferTokens: state.contextBufferTokens,
+            prune: runtime.config.compaction.prune,
+            pruneProtectTokens: runtime.config.compaction.prune_protect_tokens,
+            pruneMinTokens: runtime.config.compaction.prune_min_tokens,
+            turnPromptTokens: state.turnPromptTokens,
+            turnCompletionTokens: state.turnCompletionTokens,
+            turnTotalTokens: state.turnTotalTokens,
+            inputLimit: capabilities.max_input,
+            inputSource: capabilities.limit_sources?.input ?? "default",
+            outputLimit: capabilities.max_output,
+            outputSource: capabilities.limit_sources?.output ?? "default",
+            reasoningEffort: state.reasoningEffort,
+            themeLabel: themeSelectionLabel(state.themeSelection, state.currentTheme),
+            mcpLabel: runtime.mcpServers.length > 0 ? runtime.mcpServers.join(", ") : "none",
+            pluginLabel:
+              runtime.plugins.loaded.length > 0 ? runtime.plugins.loaded.join(", ") : "none",
+            skillCount,
+            activeSkills: state.activeSkills,
+            taskSummary,
+            branch,
+            snapshotCount,
+            sessionCount,
+          }),
+        };
+        rerender();
+        break;
+      }
+      case "/turn-report": {
+        const metrics = runtime.orchestrator.getLastTurnMetrics(state.sessionId);
+        if (!metrics) {
+          setNotice("No turn metrics recorded yet. Run a turn first.");
+          break;
+        }
+        state.report = {
+          title: "Turn report",
+          text: formatTurnMetrics(metrics),
         };
         rerender();
         break;
@@ -2216,6 +2359,10 @@ async function runTuiSession(
         state.report = undefined;
         state.totalTokens = 0;
         state.contextTokens = 0;
+        state.contextRequestBytes = 0;
+        state.contextInputBudget = 0;
+        state.contextBufferTokens = 0;
+        state.maxRequestBytes = runtime.config.limits.max_request_bytes;
         state.totalPromptTokens = 0;
         state.totalCompletionTokens = 0;
         state.totalCostUsd = 0;

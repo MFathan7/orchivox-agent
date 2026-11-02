@@ -3,27 +3,58 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { ensureRuntimeTempDir } from "../runtime-temp";
+import { truncateHead } from "./output-budget";
 import type { AgentTool, ToolRegistry } from "./registry";
+
+export type CodeMode = "read-only" | "full";
+
+export const CODE_MODE_READ_ONLY_TOOLS = [
+  "read_file",
+  "glob_files",
+  "grep_search",
+  "json_query",
+  "web_fetch",
+  "web_search",
+] as const;
+
+export const CODE_MODE_FULL_TOOLS = [
+  ...CODE_MODE_READ_ONLY_TOOLS,
+  "hash_edit",
+  "replace_text",
+  "create_file",
+  "delete_file",
+  "move_file",
+  "apply_unified_patch",
+] as const;
 
 export interface SandboxBridgeOptions {
   root?: string;
   timeoutMs?: number;
+  mode?: CodeMode;
+  name?: string;
 }
 
 export function createSandboxScriptTool(registry: ToolRegistry, options: SandboxBridgeOptions = {}): AgentTool {
+  const mode = options.mode ?? "read-only";
+  const name = options.name ?? "run_sandbox_script";
+  const allowed = new Set<string>(
+    mode === "read-only" ? CODE_MODE_READ_ONLY_TOOLS : CODE_MODE_FULL_TOOLS,
+  );
   return {
-    name: "run_sandbox_script",
+    name,
     description:
-      "Run a TypeScript or Python script in an isolated process. Inside the script, `await agent.callTool(name, arguments)` calls the agent's own tools such as read_file or grep_search and returns their result text.",
+      mode === "read-only"
+        ? "Run a TypeScript or Python script in an isolated process. Inside the script, `await agent.callTool(name, arguments)` calls read-only tools (read_file, glob_files, grep_search, json_query, web_fetch, web_search) and returns their result text. Use it to batch independent reads and return only the relevant result."
+        : "Run a TypeScript or Python script in an isolated process. Inside the script, `await agent.callTool(name, arguments)` calls read-only tools and file edit tools, and returns their result text. Shell, subagents, and tasks are not available.",
     parameters: z.object({
       language: z.enum(["typescript", "python"]),
       code: z.string().min(1),
-      timeoutMs: z.number().int().positive().max(600_000).optional(),
+      timeoutMs: z.number().int().positive().max(120_000).optional(),
     }),
-    readOnly: false,
+    readOnly: mode === "read-only",
     execute: async (args) => {
       const request = args as { language: "typescript" | "python"; code: string; timeoutMs?: number };
-      return runSandboxScript(registry, request, options);
+      return runSandboxScript(registry, request, { ...options, mode, allowed });
     },
   };
 }
@@ -31,9 +62,10 @@ export function createSandboxScriptTool(registry: ToolRegistry, options: Sandbox
 async function runSandboxScript(
   registry: ToolRegistry,
   request: { language: "typescript" | "python"; code: string; timeoutMs?: number },
-  options: SandboxBridgeOptions,
+  options: SandboxBridgeOptions & { mode: CodeMode; allowed: Set<string> },
 ): Promise<string> {
   const token = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+  const toolAbort = new AbortController();
   let callCounter = 0;
   const tempDir = await ensureRuntimeTempDir(options.root ?? globalThis.process.cwd()).catch(
     () => globalThis.process.env.TMPDIR?.trim() || "/tmp",
@@ -57,6 +89,12 @@ async function runSandboxScript(
       if (!body || typeof body.name !== "string") {
         return Response.json({ error: "invalid rpc payload" }, { status: 400 });
       }
+      if (!options.allowed.has(body.name)) {
+        return Response.json(
+          { error: `tool "${body.name}" is not allowed in code mode` },
+          { status: 403 },
+        );
+      }
       callCounter += 1;
       const result = await registry.run(
         {
@@ -64,7 +102,8 @@ async function runSandboxScript(
           name: body.name,
           arguments: (body.arguments ?? {}) as Record<string, unknown>,
         },
-        "build",
+        options.mode === "read-only" ? "plan" : "build",
+        toolAbort.signal,
       );
       return Response.json({ result: { content: result.content, is_error: result.is_error } });
     },
@@ -94,15 +133,19 @@ async function runSandboxScript(
     const timeoutMs = request.timeoutMs ?? options.timeoutMs ?? 30_000;
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
     const kill = (): void => proc.kill();
+    const abortTools = (): void => toolAbort.abort();
     timeoutSignal.addEventListener("abort", kill, { once: true });
+    timeoutSignal.addEventListener("abort", abortTools, { once: true });
     const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     const exitCode = await proc.exited;
     timeoutSignal.removeEventListener("abort", kill);
+    timeoutSignal.removeEventListener("abort", abortTools);
 
     if (timeoutSignal.aborted) {
       throw new Error(`sandbox script timed out after ${timeoutMs}ms\n${stdout}\n${stderr}`);
     }
-    return `exit ${exitCode}\n--- stdout ---\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`;
+    const output = `exit ${exitCode}\n--- stdout ---\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`;
+    return truncateHead(output, { maxBytes: 50 * 1024 }).text;
   } finally {
     rpc.stop(true);
     await rm(workDir, { recursive: true, force: true }).catch(() => undefined);

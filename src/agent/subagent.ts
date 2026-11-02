@@ -38,6 +38,7 @@ export type SubagentExecutor = (input: SubagentTaskInput) => Promise<SubagentTas
 export interface SubagentWorkerState {
   id: string;
   agent?: string;
+  description?: string;
   task: string;
   roleModel?: "main" | "fast" | "advisor";
   provider?: string;
@@ -59,6 +60,7 @@ export type SubagentBatchMode = "parallel" | "chain";
 export interface SubagentSpawnTask {
   id?: string;
   agent?: string;
+  description?: string;
   task: string;
   mode?: AgentMode;
   roleModel?: "main" | "fast" | "advisor";
@@ -66,6 +68,7 @@ export interface SubagentSpawnTask {
   model?: string;
   outputJsonSchema?: JsonSchemaObject;
   writeIsolation?: boolean;
+  continueFrom?: string;
 }
 
 export interface SubagentMergeReport {
@@ -121,6 +124,7 @@ export class SubagentManager {
   spawnOne(input: {
     id?: string;
     agent?: string;
+    description?: string;
     task: string;
     mode?: AgentMode;
     roleModel?: "main" | "fast" | "advisor";
@@ -149,6 +153,7 @@ export class SubagentManager {
     const worker: SubagentWorkerState = {
       id,
       agent: resolvedAgent,
+      description: input.description,
       task: input.task,
       roleModel: input.roleModel,
       provider: input.provider,
@@ -193,11 +198,12 @@ export class SubagentManager {
     options: { mode?: SubagentBatchMode; merge?: boolean } = {},
   ): Promise<{ results: SubagentResult[]; merged: SubagentMergeReport[] }> {
     const mode = options.mode ?? "parallel";
+    const resolvedTasks = tasks.map((task) => this.withContinuation(task));
     const results: SubagentResult[] = [];
 
     if (mode === "chain") {
       let previous = "";
-      for (const [index, task] of tasks.entries()) {
+      for (const [index, task] of resolvedTasks.entries()) {
         const worker = this.spawnOne({
           ...task,
           task: index === 0 ? task.task : interpolatePrevious(task.task, previous),
@@ -210,12 +216,12 @@ export class SubagentManager {
         if (result.state !== "completed") break;
       }
     } else {
-      if (tasks.length > MAX_PARALLEL_SUBAGENTS) {
+      if (resolvedTasks.length > MAX_PARALLEL_SUBAGENTS) {
         throw new Error(
-          `too many parallel subagents (${tasks.length}). The limit is ${MAX_PARALLEL_SUBAGENTS}; split the batch or use chain mode.`,
+          `too many parallel subagents (${resolvedTasks.length}). The limit is ${MAX_PARALLEL_SUBAGENTS}; split the batch or use chain mode.`,
         );
       }
-      const workers = tasks.map((task) => this.spawnOne(task));
+      const workers = resolvedTasks.map((task) => this.spawnOne(task));
       await Promise.all(workers.map((worker) => this.completions.get(worker.id)));
       results.push(...workers.map((worker) => this.resultOf(worker)));
     }
@@ -245,6 +251,35 @@ export class SubagentManager {
     }
 
     return { results, merged };
+  }
+
+  /**
+   * Resolves `continueFrom` against a completed worker. A continuation runs in
+   * the current checkout by default; an isolated worker must be merged first if
+   * its file changes matter.
+   */
+  private withContinuation(task: SubagentSpawnTask): SubagentSpawnTask {
+    if (!task.continueFrom) return task;
+    const previous = this.workers.get(task.continueFrom);
+    if (!previous) throw new Error(`unknown subagent "${task.continueFrom}"`);
+    if (previous.status !== "completed") {
+      throw new Error(`subagent "${task.continueFrom}" is ${previous.status}, not completed`);
+    }
+    const output = previous.result?.output ?? previous.transcript.slice(-40).join("\n");
+    const trimmed =
+      output.length > PREVIOUS_RESULT_LIMIT
+        ? `${output.slice(0, PREVIOUS_RESULT_LIMIT)}\n\n[... previous output truncated]`
+        : output;
+    return {
+      ...task,
+      description: task.description ?? previous.description,
+      agent: task.agent ?? previous.agent,
+      roleModel: task.roleModel ?? previous.roleModel,
+      provider: task.provider ?? previous.provider,
+      model: task.model ?? previous.model,
+      writeIsolation: task.writeIsolation ?? false,
+      task: `Previous subagent ${previous.id} output:\n${trimmed || "(no output)"}\n\nContinue with:\n${task.task}`,
+    };
   }
 
   private resultOf(worker: SubagentWorkerState): SubagentResult {
@@ -397,6 +432,7 @@ export class SubagentManager {
           "Each task can set agent, a model role or provider/model route, a JSON output schema, and write isolation (a git worktree per worker).",
           "Chain steps share the working tree by default because a later step depends on the files the earlier one wrote; parallel workers are isolated by default.",
           "Set merge to merge each completed isolated worker back into the current branch afterwards.",
+          "Set continue_from to a completed worker id to continue from its output. Merge an isolated worker first if its files matter.",
           "Each worker has its own context, so include every file path and decision it needs.",
         ].join(" "),
       parameters: z.object({
@@ -405,12 +441,14 @@ export class SubagentManager {
             z.object({
               id: z.string().min(1).optional(),
               agent: z.string().min(1).optional(),
+              description: z.string().min(1).optional(),
               task: z.string().min(1),
               role_model: z.enum(["main", "fast", "advisor"]).optional(),
               provider: z.string().min(1).optional(),
               model: z.string().min(1).optional(),
               outputJsonSchema: z.record(z.string(), z.unknown()).optional(),
               writeIsolation: z.boolean().optional(),
+              continue_from: z.string().min(1).optional(),
             }),
           )
           .min(1),
@@ -423,12 +461,14 @@ export class SubagentManager {
           tasks: Array<{
             id?: string;
             agent?: string;
+            description?: string;
             task: string;
             role_model?: "main" | "fast" | "advisor";
             provider?: string;
             model?: string;
             outputJsonSchema?: JsonSchemaObject;
             writeIsolation?: boolean;
+            continue_from?: string;
           }>;
           mode: SubagentBatchMode;
           merge: boolean;
@@ -437,18 +477,23 @@ export class SubagentManager {
           request.tasks.map((entry) => ({
             id: entry.id,
             agent: entry.agent,
+            description: entry.description,
             task: entry.task,
             roleModel: entry.role_model,
             provider: entry.provider,
             model: entry.model,
             outputJsonSchema: entry.outputJsonSchema,
             writeIsolation: entry.writeIsolation,
+            continueFrom: entry.continue_from,
           })),
           { mode: request.mode, merge: request.merge },
         );
 
         const sections = batch.results.map((result) => {
-          const lines = [`# subagent ${result.id} (${result.state})`];
+          const worker = this.workers.get(result.id);
+          const lines = [
+            `# subagent ${result.id} (${result.state})${worker?.description ? `: ${worker.description}` : ""}`,
+          ];
           lines.push(result.error ? `${result.output}\nerror: ${result.error.message}` : result.output);
           if (result.files_changed.length > 0) {
             lines.push(`files: ${result.files_changed.join(", ")}`);

@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { EventEmitter } from "node:events";
 import { applyPatch } from "diff";
 
@@ -91,6 +91,7 @@ const MEDIUM_RISK_COMMAND_PATTERNS = [
 const SHELL_TOOL_NAMES = new Set(["bash", "bg_start"]);
 export const EDIT_TOOL_NAMES = new Set([
   "hash_edit",
+  "replace_text",
   "write_file",
   "create_file",
   "delete_file",
@@ -224,11 +225,11 @@ function isInsideWorkspace(repoRoot: string, value: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function shellPathsOutsideWorkspace(
+function shellOutsidePath(
   command: string,
   cwd: string,
   repoRoot: string,
-): boolean {
+): string | undefined {
   for (const segment of splitShellSegments(command)) {
     const tokens = tokenizeShellSegment(segment);
     for (let index = 0; index < tokens.length; index += 1) {
@@ -238,12 +239,21 @@ function shellPathsOutsideWorkspace(
       if (token.startsWith("-") && token.includes("=")) {
         token = token.slice(token.indexOf("=") + 1);
       }
-      if (token.startsWith("~")) return true;
+      if (token.startsWith("~")) return "*";
       if (!token.startsWith(".") && !token.startsWith("/") && !token.includes("/")) continue;
-      if (!isInsideWorkspace(repoRoot, resolve(cwd, token))) return true;
+      const resolved = resolve(cwd, token);
+      if (!isInsideWorkspace(repoRoot, resolved)) return resolved;
     }
   }
-  return false;
+  return undefined;
+}
+
+function shellPathsOutsideWorkspace(
+  command: string,
+  cwd: string,
+  repoRoot: string,
+): boolean {
+  return shellOutsidePath(command, cwd, repoRoot) !== undefined;
 }
 
 export function permissionRulesFromConfig(
@@ -252,7 +262,19 @@ export function permissionRulesFromConfig(
   const rulesForAction = (action: string): string[] => {
     if (action === "shell") return [...SHELL_TOOL_NAMES];
     if (action === "edit") return [...EDIT_TOOL_NAMES];
-    if (action === "read") return ["read_file"];
+    if (action === "read") {
+      return [
+        "read_file",
+        "read_document",
+        "read_skeleton",
+        "glob_files",
+        "grep_search",
+        "json_query",
+        "diff_view",
+        "web_fetch",
+        "web_search",
+      ];
+    }
     if (action === "*") return ["*"];
     return [action];
   };
@@ -382,8 +404,64 @@ const PLAN_READ_ONLY_GIT_COMMANDS = new Set([
   "grep",
 ]);
 
-/** Redirections, command substitution and newlines are never read-only. */
-const SHELL_WRITE_PATTERN = /[><`\n]|\$\(/;
+/** Redirections, command substitution, and background operators are never read-only. */
+const SHELL_DYNAMIC_PATTERN = /\$\(|\$\{|`/;
+const SHELL_BACKGROUND_PATTERN = /(^|[^&])&([^&]|$)/;
+
+export interface ShellScanResult {
+  allowed: boolean;
+  reason?: string;
+}
+
+function hasBalancedQuotes(command: string): boolean {
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) {
+      if (char === "\\" && quote === '"') {
+        index += 1;
+        continue;
+      }
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') quote = char;
+  }
+  return quote === undefined;
+}
+
+/**
+ * Conservative scanner for commands that may run in plan mode. It rejects
+ * malformed quoting, dynamic evaluation, redirection, background jobs, and any
+ * segment that is not a known read-only inspection command.
+ */
+export function scanReadOnlyShellCommand(command: string): ShellScanResult {
+  const trimmed = command.trim();
+  if (!trimmed) return { allowed: false, reason: "empty command" };
+  if (trimmed.includes("\n")) {
+    return { allowed: false, reason: "multi-line commands are not read-only" };
+  }
+  if (!hasBalancedQuotes(trimmed)) {
+    return { allowed: false, reason: "unbalanced quotes" };
+  }
+  if (SHELL_DYNAMIC_PATTERN.test(trimmed)) {
+    return { allowed: false, reason: "dynamic command evaluation is not read-only" };
+  }
+  if (/[<>]/.test(trimmed)) {
+    return { allowed: false, reason: "redirection is not read-only" };
+  }
+  if (SHELL_BACKGROUND_PATTERN.test(trimmed)) {
+    return { allowed: false, reason: "background commands are not read-only" };
+  }
+  const segments = splitShellSegments(trimmed);
+  if (segments.length === 0) return { allowed: false, reason: "empty command" };
+  for (const segment of segments) {
+    if (!isReadOnlyShellSegment(segment)) {
+      return { allowed: false, reason: `not a read-only command: ${segment}` };
+    }
+  }
+  return { allowed: true };
+}
 
 /**
  * Returns true for shell commands that only inspect the workspace or system.
@@ -392,14 +470,7 @@ const SHELL_WRITE_PATTERN = /[><`\n]|\$\(/;
  * stays blocked.
  */
 export function isPlanReadOnlyShellCommand(command: string): boolean {
-  const trimmed = command.trim();
-  if (!trimmed || SHELL_WRITE_PATTERN.test(trimmed)) return false;
-  const segments = trimmed
-    .split(/&&|\|\||;|\|/)
-    .map((segment) => segment.trim())
-    .filter((segment) => segment.length > 0);
-  if (segments.length === 0) return false;
-  return segments.every((segment) => isReadOnlyShellSegment(segment));
+  return scanReadOnlyShellCommand(command).allowed;
 }
 
 function isReadOnlyShellSegment(segment: string): boolean {
@@ -619,8 +690,9 @@ export class GranularPermissionEngine extends EventEmitter {
     tool: { name: string; readOnly: boolean },
     mode: AgentMode,
     args?: Record<string, unknown>,
+    rules: readonly ToolRulePattern[] = [],
   ): Promise<{ allowed: boolean; reason?: string; feedback?: string }> {
-    return this.checkPermission(tool, args ?? {}, mode);
+    return this.checkPermission(tool, args ?? {}, mode, `call-${Date.now()}`, rules);
   }
 
   async checkPermission(
@@ -628,6 +700,7 @@ export class GranularPermissionEngine extends EventEmitter {
     args: Record<string, unknown>,
     mode: AgentMode,
     toolCallId = `call-${Date.now()}`,
+    extraRules: readonly ToolRulePattern[] = [],
   ): Promise<{ allowed: boolean; reason?: string; feedback?: string }> {
     const cwd = typeof args.cwd === "string" ? args.cwd : this.repoRoot;
     const shellRisk =
@@ -635,23 +708,41 @@ export class GranularPermissionEngine extends EventEmitter {
         ? evaluateShellRisk(args.command, cwd)
         : undefined;
 
+    let externalAsk = false;
+    const externalTarget = this.externalTarget(tool.name, args, cwd);
+    if (externalTarget) {
+      const externalRule = this.matchConfigRule("external_directory", externalTarget, extraRules);
+      if (externalRule?.action === "deny") {
+        return {
+          allowed: false,
+          reason: `Denied by external directory rule: ${externalRule.raw}`,
+        };
+      }
+      if (externalRule?.action === "ask") externalAsk = true;
+    }
+
     if (mode === "plan") {
-      if (tool.readOnly || tool.name === "write_plan" || tool.name === "spawn_subagents") {
+      if (!externalAsk && (tool.readOnly || tool.name === "write_plan" || tool.name === "spawn_subagents")) {
         return { allowed: true };
       }
       if (tool.name === "bash" && typeof args.command === "string") {
-        if (isPlanReadOnlyShellCommand(args.command) && shellRisk?.riskLevel === "low") {
+        const scan = scanReadOnlyShellCommand(args.command);
+        if (!externalAsk && scan.allowed && shellRisk?.riskLevel === "low") {
           return { allowed: true };
         }
+        if (!externalAsk) {
+          return {
+            allowed: false,
+            reason: `PLAN mode allows only read-only shell commands. ${scan.reason ?? shellRisk?.warning ?? "Use a safe inspection command or switch to build mode."}`,
+          };
+        }
+      }
+      if (!externalAsk) {
         return {
           allowed: false,
-          reason: `PLAN mode allows only read-only shell commands. ${shellRisk?.warning ?? "Use a safe inspection command or switch to build mode."}`,
+          reason: `Tool "${tool.name}" modifies files or state, and PLAN mode only allows read-only tools.`,
         };
       }
-      return {
-        allowed: false,
-        reason: `Tool "${tool.name}" modifies files or state, and PLAN mode only allows read-only tools.`,
-      };
     }
 
     if (shellRisk?.riskLevel === "critical") {
@@ -662,7 +753,7 @@ export class GranularPermissionEngine extends EventEmitter {
     }
 
     const targetKey = this.extractTargetKey(tool.name, args);
-    const matchedRule = this.matchConfigRule(tool.name, targetKey);
+    const matchedRule = this.matchConfigRule(tool.name, targetKey, extraRules);
     let forceApproval = false;
     if (matchedRule) {
       if (matchedRule.action === "allow") return { allowed: true };
@@ -686,17 +777,17 @@ export class GranularPermissionEngine extends EventEmitter {
       return { allowed: true };
     }
 
-    if (modeContract(mode).fullAccess && !forceApproval) {
+    if (modeContract(mode).fullAccess && !forceApproval && !externalAsk) {
       // Build and ultrawork run without approval prompts. Configuration deny
       // rules and the critical shell guard above still apply.
       return { allowed: true };
     }
 
-    if (tool.readOnly && !forceApproval) {
+    if (tool.readOnly && !forceApproval && !externalAsk) {
       return { allowed: true };
     }
 
-    if (!forceApproval) {
+    if (!forceApproval && !externalAsk) {
       if (EDIT_TOOL_NAMES.has(tool.name) && typeof args.filePath === "string") {
         if (isInsideWorkspace(this.repoRoot, resolve(cwd, args.filePath))) {
           return { allowed: true };
@@ -725,7 +816,9 @@ export class GranularPermissionEngine extends EventEmitter {
       filePath: typeof args.filePath === "string" ? args.filePath : undefined,
       diffPreview,
       shellDetails: shellRisk,
-      reason: shellRisk?.warning ?? "This tool requires approval before executing changes.",
+      reason: externalAsk
+        ? "External directory access requires approval."
+        : (shellRisk?.warning ?? "This tool requires approval before executing changes."),
       alwaysAllowLabel: this.alwaysAllowLabel(tool.name, args),
     };
 
@@ -781,6 +874,28 @@ export class GranularPermissionEngine extends EventEmitter {
     return decision;
   }
 
+  private externalTarget(
+    toolName: string,
+    args: Record<string, unknown>,
+    cwd: string,
+  ): string | undefined {
+    if (typeof args.filePath === "string") {
+      const resolved = resolve(cwd, args.filePath);
+      if (isInsideWorkspace(this.repoRoot, resolved)) return undefined;
+      return `${dirname(resolved).replace(/\\/g, "/")}/*`;
+    }
+    if (SHELL_TOOL_NAMES.has(toolName) && typeof args.command === "string") {
+      const outside = shellOutsidePath(args.command, cwd, this.repoRoot);
+      if (outside === "*") return "*";
+      if (outside) return `${dirname(outside).replace(/\\/g, "/")}/*`;
+    }
+    const resolvedCwd = resolve(this.repoRoot, cwd);
+    if (!isInsideWorkspace(this.repoRoot, resolvedCwd)) {
+      return `${dirname(resolvedCwd).replace(/\\/g, "/")}/*`;
+    }
+    return undefined;
+  }
+
   private extractTargetKey(toolName: string, args: Record<string, unknown>): string {
     if ((toolName === "bash" || toolName === "bg_start") && typeof args.command === "string") {
       return args.command.trim();
@@ -791,30 +906,38 @@ export class GranularPermissionEngine extends EventEmitter {
     return "*";
   }
 
-  private matchConfigRule(toolName: string, targetKey: string): ToolRulePattern | undefined {
+  private matchConfigRule(
+    toolName: string,
+    targetKey: string,
+    extraRules: readonly ToolRulePattern[] = [],
+  ): ToolRulePattern | undefined {
     const shellTarget = SHELL_TOOL_NAMES.has(toolName) || toolName === "bg_start";
-    for (let index = this.rules.length - 1; index >= 0; index -= 1) {
-      const rule = this.rules[index];
-      if (rule.toolName !== "*" && rule.toolName !== toolName) {
-        continue;
-      }
-      if (shellTarget) {
-        // Shell targets are commands, not paths: a path glob would refuse to
-        // let "*" cross a slash, so "rm *" could never match "rm src/foo.ts".
-        if (matchCommandPattern(rule.pattern, targetKey)) return rule;
-        continue;
-      }
-      try {
-        const glob = new Bun.Glob(rule.pattern);
-        if (glob.match(targetKey)) {
-          return rule;
+    const match = (rules: readonly ToolRulePattern[]): ToolRulePattern | undefined => {
+      for (let index = rules.length - 1; index >= 0; index -= 1) {
+        const rule = rules[index];
+        if (rule.toolName !== "*" && rule.toolName !== toolName) {
+          continue;
         }
-      } catch {
-        if (targetKey.startsWith(rule.pattern.replace(/\*+$/, ""))) {
-          return rule;
+        if (shellTarget) {
+          // Shell targets are commands, not paths: a path glob would refuse to
+          // let "*" cross a slash, so "rm *" could never match "rm src/foo.ts".
+          if (matchCommandPattern(rule.pattern, targetKey)) return rule;
+          continue;
+        }
+        try {
+          const glob = new Bun.Glob(rule.pattern);
+          if (glob.match(targetKey)) {
+            return rule;
+          }
+        } catch {
+          if (targetKey.startsWith(rule.pattern.replace(/\*+$/, ""))) {
+            return rule;
+          }
         }
       }
-    }
-    return undefined;
+      return undefined;
+    };
+    // Agent rules are appended after global rules, so they win.
+    return match(extraRules) ?? match(this.rules);
   }
 }

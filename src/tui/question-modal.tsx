@@ -3,7 +3,7 @@ import { Box, Text, useInput } from "ink";
 
 import type { QuestionAnswer, QuestionRequest } from "../tools/question";
 import { isMouseSequence } from "./mouse";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export interface PendingQuestion extends QuestionRequest {
   id: string;
@@ -20,11 +20,9 @@ export function normalizeQuestionOptionLabel(label: string): string {
   return stripped.length > 0 ? stripped : label.trim();
 }
 
-export function QuestionModal({
-  request,
-  onAnswer,
-  theme = getTheme("tokyonight"),
-}: QuestionModalProps): React.ReactElement {
+export function QuestionModal(props: QuestionModalProps): React.ReactElement {
+  const { request, onAnswer, theme: themeProp } = props;
+  const theme = useActiveTheme(themeProp);
   const [selected, setSelected] = React.useState(0);
   const [toggled, setToggled] = React.useState<Set<number>>(new Set());
   const [customMode, setCustomMode] = React.useState(

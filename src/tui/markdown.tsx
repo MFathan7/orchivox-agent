@@ -12,7 +12,7 @@ import {
   wrapText,
 } from "./text-wrap";
 import { PANEL_END, PANEL_PAD } from "./panel";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export interface MarkdownViewProps {
   content: string;
@@ -420,7 +420,7 @@ export function renderInline(text: string, theme: Theme): React.ReactNode[] {
     } else {
       const marker = winner.match[2] ? `:${winner.match[2]}` : "";
       nodes.push(
-        <Text key={key} color={theme.modes.plan.primary} bold>
+        <Text key={key} color={theme.accent} bold>
           {`${winner.match[1]}${marker}`}
         </Text>,
       );
@@ -709,7 +709,7 @@ function inlineSegmentNode(
     case "url":
       return <Text key={key} color={theme.muted}>{segment.text}</Text>;
     case "file":
-      return <Text key={key} color={theme.modes.plan.primary} bold>{segment.text}</Text>;
+      return <Text key={key} color={theme.accent} bold>{segment.text}</Text>;
     default:
       return (
         <Text
@@ -1105,11 +1105,9 @@ export function estimateMarkdownLines(content: string, width: number): number {
   return result;
 }
 
-export function MarkdownView({
-  content,
-  width = 80,
-  theme = getTheme("tokyonight"),
-}: MarkdownViewProps): React.ReactElement {
+export function MarkdownView(props: MarkdownViewProps): React.ReactElement {
+  const { content, width = 80, theme: themeProp } = props;
+  const theme = useActiveTheme(themeProp);
   const blocks = React.useMemo(() => parseMarkdown(content), [content]);
   const safeWidth = Math.max(12, width);
 

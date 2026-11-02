@@ -1,3 +1,31 @@
+import { displayWidth } from "./text-wrap";
+
+export interface DisplaySegment {
+  key: string;
+  text: string;
+  dropOrder: number;
+}
+
+/**
+ * Chooses the segments that fit. The highest dropOrder (100 and above) is
+ * pinned; lower values drop first until the measured line fits.
+ */
+export function fitSegments(segments: DisplaySegment[], width: number): Set<string> {
+  const selected = new Set(segments.map((segment) => segment.key));
+  const totalWidth = (): number =>
+    segments
+      .filter((segment) => selected.has(segment.key))
+      .reduce((sum, segment) => sum + displayWidth(segment.text), 0);
+  while (totalWidth() > width) {
+    const drop = segments
+      .filter((segment) => selected.has(segment.key) && segment.dropOrder < 100)
+      .sort((left, right) => left.dropOrder - right.dropOrder)[0];
+    if (!drop) break;
+    selected.delete(drop.key);
+  }
+  return selected;
+}
+
 export function formatTokenCount(count: number, compact = true): string {
   const safe = Math.max(0, Math.round(count));
   if (!compact) return safe.toLocaleString("en-US");
@@ -54,6 +82,26 @@ export function formatTurnUsage(input: {
 }
 
 /** One line for the live turn status: what the agent is doing and for how long. */
+export function formatElapsed(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  if (safe < 60) return `${safe}s`;
+  const minutes = Math.floor(safe / 60);
+  const rest = safe % 60;
+  return rest === 0 ? `${minutes}m` : `${minutes}m ${rest}s`;
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${Math.max(0, Math.round(bytes))} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
 export function formatTurnStatus(input: {
   answering: boolean;
   elapsedSeconds: number;
@@ -61,24 +109,75 @@ export function formatTurnStatus(input: {
   runningLabel?: string;
   runningSeconds?: number;
   step?: number;
+  stepLimit?: number;
+  toolLimit?: number;
+  timeLimitSeconds?: number;
+  contextPercent?: number;
+  requestLabel?: string;
+  /** Available columns. Extra segments are dropped when space is tight. */
+  width?: number;
 }): string {
-  const parts: string[] = [];
-  if (input.step !== undefined && input.step > 1) parts.push(`Step ${input.step}`);
-  parts.push(
-    input.runningLabel
-      ? input.runningLabel
-      : input.answering
-        ? "Answering"
-        : "Thinking",
-  );
+  const segments: Array<{ text: string; priority: number }> = [];
+  if (input.step !== undefined && input.step > 1) {
+    segments.push({
+      text:
+        input.stepLimit !== undefined
+          ? `Step ${input.step}/${input.stepLimit}`
+          : `Step ${input.step}`,
+      priority: 5,
+    });
+  }
+  segments.push({
+    text: input.runningLabel ? input.runningLabel : input.answering ? "Answering" : "Thinking",
+    priority: 4,
+  });
   const seconds = Math.max(
     0,
     Math.floor(input.runningLabel ? (input.runningSeconds ?? 0) : input.elapsedSeconds),
   );
-  if (seconds > 0) parts.push(`${seconds}s`);
+  if (seconds > 0) {
+    segments.push({
+      text:
+        input.timeLimitSeconds !== undefined && !input.runningLabel
+          ? `${formatElapsed(seconds)}/${formatElapsed(input.timeLimitSeconds)}`
+          : formatElapsed(seconds),
+      priority: 2,
+    });
+  }
   const tools = Math.max(0, Math.floor(input.completedTools));
-  if (tools > 0) parts.push(`${tools} ${tools === 1 ? "tool" : "tools"}`);
-  return parts.join(" · ");
+  if (tools > 0) {
+    segments.push({
+      text:
+        input.toolLimit !== undefined
+          ? `${tools}/${input.toolLimit} ${tools === 1 && input.toolLimit === 1 ? "tool" : "tools"}`
+          : `${tools} ${tools === 1 ? "tool" : "tools"}`,
+      priority: 3,
+    });
+  }
+  if (input.contextPercent !== undefined) {
+    segments.push({ text: `ctx ${input.contextPercent}%`, priority: 1 });
+  }
+  if (input.requestLabel) {
+    segments.push({ text: `req ${input.requestLabel}`, priority: 0 });
+  }
+
+  // Drop the lowest-priority segment until the line fits. The caller owns the
+  // spinner and hint columns, so this width is already the text budget.
+  if (input.width !== undefined) {
+    while (
+      segments.length > 1 &&
+      displayWidth(segments.map((segment) => segment.text).join(" · ")) > input.width
+    ) {
+      const lowest = Math.min(...segments.map((segment) => segment.priority));
+      const index = segments.findIndex((segment) => segment.priority === lowest);
+      segments.splice(index, 1);
+    }
+  }
+
+  if (segments.length === 0) {
+    segments.push({ text: input.answering ? "Answering" : "Thinking", priority: 4 });
+  }
+  return segments.map((segment) => segment.text).join(" · ");
 }
 
 export function truncateText(text: string, maxWidth: number): string {

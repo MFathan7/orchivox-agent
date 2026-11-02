@@ -4,7 +4,7 @@ import { Box, Text, useInput } from "ink";
 import type { SkillDocument } from "../agent/skills";
 import { truncateText } from "./format";
 import { isMouseSequence } from "./mouse";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export interface SkillsModalProps {
   skills: SkillDocument[];
@@ -15,14 +15,16 @@ export interface SkillsModalProps {
   onClose: () => void;
 }
 
-export function SkillsModal({
-  skills,
-  activeSkills = [],
-  width = 100,
-  theme = getTheme("tokyonight"),
-  onReload,
-  onClose,
-}: SkillsModalProps): React.ReactElement {
+export function SkillsModal(props: SkillsModalProps): React.ReactElement {
+  const {
+    skills,
+    activeSkills = [],
+    width = 100,
+    theme: themeProp,
+    onReload,
+    onClose,
+  } = props;
+  const theme = useActiveTheme(themeProp);
   const [selected, setSelected] = React.useState(0);
   const listWindow = 10;
 

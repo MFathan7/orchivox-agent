@@ -5,7 +5,7 @@ import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import { collectDiffHunks, diffRows } from "./diff-view";
 import { isMouseSequence } from "./mouse";
 import type { RenderRow } from "./rows";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 import { displayWidth, fitDisplayText, wrapPreservingWhitespace } from "./text-wrap";
 
 export interface ToolApprovalModalProps {
@@ -62,8 +62,9 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
     onDecision,
     width = 80,
     height = 24,
-    theme = getTheme("tokyonight"),
+    theme: themeProp,
   } = props;
+  const theme = useActiveTheme(themeProp);
 
   const [feedbackMode, setFeedbackMode] = React.useState(false);
   const [feedbackText, setFeedbackText] = React.useState("");

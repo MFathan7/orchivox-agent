@@ -108,7 +108,7 @@ export function resolveAnchorWithFuzzyRecovery(
       .join("\n");
 
     throw new EditRejectedError(
-      `ambiguous anchor ${anchor}: found ${candidates.length} candidate lines in window [${minLine}-${maxLine}] (${candidates.join(", ")}):\n${snippet}`,
+      `ambiguous anchor ${anchor}: found ${candidates.length} candidate lines in window [${minLine}-${maxLine}] (${candidates.join(", ")}). Re-read the range and use a unique anchor.\n${snippet}`,
     );
   }
 
@@ -118,9 +118,11 @@ export function resolveAnchorWithFuzzyRecovery(
     .slice(snippetStart - 1, snippetEnd)
     .map((l, idx) => formatLine(snippetStart + idx, l))
     .join("\n");
+  const closestLine = lines.length > 0 ? Math.max(1, Math.min(lines.length, line)) : 0;
+  const closest = closestLine > 0 ? formatLine(closestLine, lines[closestLine - 1]) : "none";
 
   throw new EditRejectedError(
-    `anchor mismatch: ${anchor} not found in lines ${minLine}-${maxLine} (line ${line} has hash ${line <= lines.length ? computeLineHash(lines[line - 1]) : "EOF"}):\n${snippet}`,
+    `anchor mismatch: ${anchor} not found in lines ${minLine}-${maxLine}. Closest line: ${closest}. Re-read the file and copy the current line:hash anchor.\n${snippet}`,
   );
 }
 
@@ -213,7 +215,7 @@ export function createHashEditTool(lifecycle: HashlineLifecycle = {}): AgentTool
 
         if (end.resolvedLine < start.resolvedLine) {
           throw new EditRejectedError(
-            `endAnchor (${hunk.endAnchor} -> line ${end.resolvedLine}) must not come before startAnchor (${hunk.startAnchor} -> line ${start.resolvedLine})`,
+            `endAnchor (${hunk.endAnchor} -> line ${end.resolvedLine}) must not come before startAnchor (${hunk.startAnchor} -> line ${start.resolvedLine}). Check the anchor order.`,
           );
         }
 
@@ -258,6 +260,60 @@ export function createHashEditTool(lifecycle: HashlineLifecycle = {}): AgentTool
         recoveredAnchors.length > 0 ? ` (fuzzy recovered: ${recoveredAnchors.join(", ")})` : "";
 
       return `updated ${args.filePath}: applied ${resolvedHunks.length} hunk(s)${recoveryNote} (${appliedDetails.join("; ")}), file now has ${lines.length} line(s)`;
+    },
+  };
+}
+
+export const ReplaceTextArgsSchema = z.object({
+  filePath: z.string().min(1),
+  oldString: z.string().min(1),
+  newString: z.string(),
+  replaceAll: z.boolean().default(false),
+});
+export type ReplaceTextArgs = z.infer<typeof ReplaceTextArgsSchema>;
+
+function countOccurrences(text: string, needle: string): number {
+  let count = 0;
+  let index = text.indexOf(needle);
+  while (index !== -1) {
+    count += 1;
+    index = text.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
+export function createReplaceTextTool(
+  lifecycle: HashlineLifecycle = {},
+): AgentTool<typeof ReplaceTextArgsSchema> {
+  return {
+    name: "replace_text",
+    description:
+      "Replace exact text in an existing file. oldString must match exactly once unless replaceAll is true. Use this for a focused edit when the model does not use hashline anchors.",
+    parameters: ReplaceTextArgsSchema,
+    readOnly: false,
+    async execute(args) {
+      const text = await readText(args.filePath);
+      const occurrences = countOccurrences(text, args.oldString);
+      if (occurrences === 0) {
+        throw new EditRejectedError(
+          `oldString not found in ${args.filePath}. Re-read the file and copy the exact text.`,
+        );
+      }
+      if (!args.replaceAll && occurrences > 1) {
+        throw new EditRejectedError(
+          `oldString matches ${occurrences} times in ${args.filePath}. Add surrounding text or set replaceAll to true.`,
+        );
+      }
+
+      const nextText = args.replaceAll
+        ? text.split(args.oldString).join(args.newString)
+        : text.replace(args.oldString, args.newString);
+      await lifecycle.onBeforeModify?.(args.filePath);
+      await Bun.write(args.filePath, nextText);
+      await lifecycle.onAfterModify?.(args.filePath, nextText);
+
+      const replaced = args.replaceAll ? occurrences : 1;
+      return `updated ${args.filePath}: replaced ${replaced} occurrence(s)`;
     },
   };
 }

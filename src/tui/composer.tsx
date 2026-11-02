@@ -15,7 +15,7 @@ import {
 } from "./autocomplete";
 import { continueList, displayListLine } from "./list-format";
 import { collapsePastedText, expandPastedText, pastedPlaceholderAfter, pastedPlaceholderBefore, type PastedEntry } from "./paste";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 import { formatTokenCount } from "./format";
 import { isInputDebugEnabled, writeInputDebug } from "./input-debug";
 import { isMouseSequence } from "./mouse";
@@ -544,7 +544,7 @@ function normalizeInsertedText(input: string): string {
 export function PromptComposer(props: PromptComposerProps) {
   const {
     mode = "build",
-    theme = getTheme("tokyonight"),
+    theme: themeProp,
     repoRoot,
     width,
     maxRows,
@@ -564,6 +564,7 @@ export function PromptComposer(props: PromptComposerProps) {
     onScrollToBottom,
   } = props;
 
+  const theme = useActiveTheme(themeProp);
   const [text, setText] = React.useState("");
   const [cursorPos, setCursorPos] = React.useState(0);
   const [attachedFiles, setAttachedFiles] = React.useState<FileAttachmentRef[]>([]);
@@ -1207,7 +1208,7 @@ export function PromptComposer(props: PromptComposerProps) {
           {attachedFiles.slice(0, 3).map((file) => (
             <Text
               key={file.raw}
-              color={file.exists ? theme.modes.build.primary : theme.badge.error}
+              color={file.exists ? theme.status.success : theme.status.error}
             >
               {file.raw.length > 28 ? `${file.raw.slice(0, 25)}...` : file.raw}{" "}
               {file.kind === "image" ? "(image)" : `(~${file.tokens} tok)`}

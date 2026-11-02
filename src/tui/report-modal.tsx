@@ -2,7 +2,7 @@ import React from "react";
 import { Box, Text, useInput } from "ink";
 
 import { isMouseSequence } from "./mouse";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export interface ReportModalProps {
   title: string;
@@ -13,14 +13,9 @@ export interface ReportModalProps {
   onClose: () => void;
 }
 
-export function ReportModal({
-  title,
-  text,
-  width = 100,
-  height = 24,
-  theme = getTheme("tokyonight"),
-  onClose,
-}: ReportModalProps): React.ReactElement {
+export function ReportModal(props: ReportModalProps): React.ReactElement {
+  const { title, text, width = 100, height = 24, theme: themeProp, onClose } = props;
+  const theme = useActiveTheme(themeProp);
   const lines = React.useMemo(() => text.split("\n"), [text]);
   const visibleCount = Math.max(1, height - 4);
   const maxOffset = Math.max(0, lines.length - visibleCount);

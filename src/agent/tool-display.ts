@@ -8,6 +8,7 @@ const LABELS: Record<string, string> = {
   read_document: "Reading document",
   read_skeleton: "Reading code skeleton",
   hash_edit: "Editing file",
+  replace_text: "Replacing text",
   create_file: "Creating file",
   delete_file: "Deleting file",
   move_file: "Moving file",
@@ -43,6 +44,7 @@ const LABELS: Record<string, string> = {
   symbol_impact_analysis: "Analyzing impact",
   debug_session: "Debugging session",
   run_sandbox_script: "Running sandbox script",
+  execute: "Running code",
   remember_insight: "Updating memory",
   recall_insights: "Reading memory",
   question: "Asking a question",
@@ -63,11 +65,15 @@ export function toolDisplay(name: string, args: Record<string, unknown> = {}): T
 }
 
 function detailFor(name: string, args: Record<string, unknown>): string | undefined {
+  if (name === "execute") {
+    return typeof args.language === "string" ? args.language : undefined;
+  }
   switch (name) {
     case "read_file":
     case "read_document":
     case "read_skeleton":
     case "hash_edit":
+    case "replace_text":
     case "create_file":
     case "delete_file":
     case "move_file":

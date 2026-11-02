@@ -49,6 +49,7 @@
     "test:installer": "bun test tests/installer",
     "install:global": "bun run scripts/install-global.ts",
     "check:secrets": "bun run scripts/check-secrets.ts",
+    "observe:turn": "bun run scripts/observe-turn-budget.ts",
     "typecheck": "tsc --noEmit"
   },
   "publishConfig": {

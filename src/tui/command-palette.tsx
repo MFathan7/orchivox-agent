@@ -4,7 +4,16 @@ import { Box, Text, useInput } from "ink";
 import type { ProviderRole, ProviderRouter } from "../provider/router";
 import { filterFuzzy } from "./autocomplete";
 import { isMouseSequence } from "./mouse";
-import { getTheme, type Theme, type ThemeName, THEME_ORDER } from "./theme";
+import {
+  AUTO_THEME,
+  DEFAULT_THEME,
+  useActiveTheme,
+  type Theme,
+  type ThemeName,
+  type ThemeSelection,
+  THEME_ORDER,
+  THEMES,
+} from "./theme";
 
 export type ReasoningEffortLevel = "default" | "off" | "low" | "medium" | "high" | "max" | (string & {});
 
@@ -22,10 +31,11 @@ export interface PaletteItem {
 export interface CommandPaletteModalProps {
   router: ProviderRouter;
   currentTheme?: ThemeName;
+  themeSelection?: ThemeSelection;
   reasoningEffort?: ReasoningEffortLevel;
   reasoningLevels?: string[];
   onSelectReasoning?: (effort: ReasoningEffortLevel) => void;
-  onSelectTheme?: (theme: ThemeName) => void;
+  onSelectTheme?: (theme: ThemeSelection) => void;
   onOpenModels?: () => void;
   onAction?: (actionKey: string) => void;
   onClose: () => void;
@@ -61,7 +71,8 @@ export function reasoningLevelsFor(
 export function CommandPaletteModal(props: CommandPaletteModalProps) {
   const {
     router,
-    currentTheme = "tokyonight",
+    currentTheme = DEFAULT_THEME,
+    themeSelection,
     reasoningEffort = "default",
     reasoningLevels,
     onSelectReasoning,
@@ -69,8 +80,9 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     onOpenModels,
     onAction,
     onClose,
-    theme = getTheme(currentTheme),
+    theme: themeProp,
   } = props;
+  const theme = useActiveTheme(themeProp);
 
   const levels = React.useMemo(
     () => reasoningLevelsFor(reasoningLevels ?? REASONING_LEVELS.map((level) => level.id)),
@@ -118,14 +130,29 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       });
     }
 
+    const activeSelection = themeSelection ?? currentTheme;
+    list.push({
+      id: "theme-auto",
+      category: "theme",
+      section: "Theme",
+      title: "Auto",
+      subtitle: "Follow the terminal background",
+      badge: activeSelection === AUTO_THEME ? "ACTIVE" : undefined,
+      isCurrent: activeSelection === AUTO_THEME,
+      onExecute: () => {
+        onSelectTheme?.(AUTO_THEME);
+        onClose();
+      },
+    });
+
     for (const name of THEME_ORDER) {
-      const isCurrent = currentTheme === name;
+      const isCurrent = activeSelection === name;
       list.push({
         id: `theme-${name}`,
         category: "theme",
         section: "Theme",
-        title: name,
-        subtitle: isCurrent ? "Current preset" : "Switch preset",
+        title: THEMES[name].label,
+        subtitle: isCurrent ? "Current preset" : THEMES[name].description,
         badge: isCurrent ? "ACTIVE" : undefined,
         isCurrent,
         onExecute: () => {
@@ -152,6 +179,8 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       { key: "run_commit", title: "Atomic commit", subtitle: "Split changes into commits (/commit)" },
       { key: "run_compact", title: "Compact context", subtitle: "Summarize history to save tokens (/compact)" },
       { key: "run_plugins", title: "List plugins", subtitle: "Show active plugins (/plugins)" },
+      { key: "run_stats", title: "Session statistics", subtitle: "Context, request, spend, and last turn (/stats)" },
+      { key: "run_turn_report", title: "Turn report", subtitle: "Steps, tools, and budget for the last turn (/turn-report)" },
     ];
 
     for (const action of actions) {
@@ -169,7 +198,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     }
 
     return list;
-  }, [router, currentTheme, reasoningEffort, levels, onSelectReasoning, onSelectTheme, onOpenModels, onAction, onClose]);
+  }, [router, currentTheme, themeSelection, reasoningEffort, levels, onSelectReasoning, onSelectTheme, onOpenModels, onAction, onClose]);
 
   const source = React.useMemo(() => {
     const trimmed = query.trim();
@@ -261,7 +290,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
             return (
               <Box key={item.id} flexDirection="column">
                 {showSection ? (
-                  <Text bold color={theme.modes.plan.primary}>{item.section}</Text>
+                  <Text bold color={theme.accent}>{item.section}</Text>
                 ) : null}
                 <Box justifyContent="space-between">
                   <Box>
@@ -270,7 +299,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
                     {item.subtitle ? <Text color={theme.muted}> · {item.subtitle}</Text> : null}
                   </Box>
                   {item.badge ? (
-                    <Text color={item.badge === "EMPTY" ? theme.badge.error : theme.modes.build.primary} bold>
+                    <Text color={item.badge === "EMPTY" ? theme.status.error : theme.status.success} bold>
                       {item.badge}
                     </Text>
                   ) : null}

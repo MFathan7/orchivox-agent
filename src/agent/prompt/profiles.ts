@@ -21,6 +21,8 @@ export const DEFAULT_PROMPT_PROFILE: PromptProfile = {
   mode: "override",
 };
 
+// Evidence gate: add a model-specific profile only after `observe:turn` records
+// a concrete over-verification case, and add a regression test with it.
 export const PROMPT_PROFILES: PromptProfile[] = [DEFAULT_PROMPT_PROFILE];
 
 export function selectPromptProfile(

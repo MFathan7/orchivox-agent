@@ -28,15 +28,28 @@ import { SkillsModal } from "./skills-modal";
 import { WorkspaceTrustPrompt } from "./trust-modal";
 import {
   contextUsagePercent,
+  fitSegments,
   formatContextUsage,
   formatContextWindow,
   formatCost,
   formatTokenCount,
   truncateText,
+  type DisplaySegment,
 } from "./format";
 import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { LiveStatus } from "./spinner";
-import { ThemeProvider, getTheme, type ThemeName } from "./theme";
+import {
+  AUTO_THEME,
+  DEFAULT_THEME,
+  ThemeProvider,
+  THEMES,
+  THEME_ORDER,
+  getTheme,
+  isThemeSelection,
+  themeSelectionLabel,
+  type ThemeName,
+  type ThemeSelection,
+} from "./theme";
 import {
   ScrollableChatViewport,
   WorkspaceSidebar,
@@ -105,6 +118,11 @@ export interface ChatCompactionView {
   removedMessages: number;
   auto?: boolean;
   reason?: "auto" | "manual" | "retry" | "output_limit" | "request_size";
+  trigger?: "tokens" | "request_size" | "overflow" | "output_limit" | "manual";
+  requestBytes?: number;
+  maxRequestBytes?: number;
+  inputBudget?: number;
+  bufferTokens?: number;
   status?: "running" | "done" | "error";
   error?: string;
   attempt?: number;
@@ -132,6 +150,9 @@ export interface ChatEntryView {
   live?: boolean;
   startedAt?: number;
   step?: number;
+  stepLimit?: number;
+  toolLimit?: number;
+  timeLimitSeconds?: number;
   mode?: AgentMode;
   model?: string;
   tokensPerSecond?: number;
@@ -148,6 +169,8 @@ export interface OrchivoxAppProps {
   pluginCount?: number;
   totalTokens?: number;
   contextTokens?: number;
+  contextRequestLabel?: string;
+  maxRequestLabel?: string;
   totalCostUsd?: number;
   entries: ChatEntryView[];
   streamingText?: string;
@@ -170,7 +193,8 @@ export interface OrchivoxAppProps {
   activeSessionId?: string;
   activeSessionMessages?: Message[];
   currentTheme?: ThemeName;
-  onThemeChange?: (theme: ThemeName) => void;
+  themeSelection?: ThemeSelection;
+  onThemeChange?: (theme: ThemeSelection) => void;
   reasoningEffort?: ReasoningEffortLevel;
   onReasoningEffortChange?: (effort: ReasoningEffortLevel) => void;
   onModeModelChange?: (mode: ConfigMode, provider: string, model: string) => void;
@@ -262,6 +286,8 @@ export function computeViewportHeight(rows: number, chromeRows: number, composer
   const gap = available > 6 ? 1 : 0;
   return Math.max(1, available - gap);
 }
+
+
 
 export function installSynchronizedOutput(
   options: { frameMs?: number; target?: WriteTarget; onFrame?: (frame: string) => void },
@@ -372,6 +398,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const [internalSessionTab, setInternalSessionTab] = React.useState<SessionModalTab | null>(null);
   const [modePickerOpen, setModePickerOpen] = React.useState(false);
   const [reasoningPickerOpen, setReasoningPickerOpen] = React.useState(false);
+  const [themePickerOpen, setThemePickerOpen] = React.useState(false);
 
   const helpOpen = props.helpOpen ?? internalHelpOpen;
   const setHelpOpen = (open: boolean) => {
@@ -421,7 +448,26 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   };
 
   const terminalSize = useTerminalSize();
-  const theme = getTheme(props.currentTheme ?? "tokyonight");
+  const theme = getTheme(props.currentTheme ?? DEFAULT_THEME);
+  const activeThemeSelection = props.themeSelection ?? props.currentTheme ?? DEFAULT_THEME;
+  const themeChoices = [
+    {
+      id: AUTO_THEME,
+      label: "Auto",
+      description: "Follow the terminal background",
+      current: activeThemeSelection === AUTO_THEME,
+    },
+    ...THEME_ORDER.map((name) => ({
+      id: name,
+      label: THEMES[name].label,
+      description: `${THEMES[name].description} · ${THEMES[name].appearance} background`,
+      current: activeThemeSelection === name,
+    })),
+  ];
+  const initialThemeIndex = Math.max(
+    0,
+    themeChoices.findIndex((choice) => choice.current),
+  );
   const modePalette = theme.modes[mode] ?? theme.modes.build;
   const modeInfo = modeContract(mode);
   const reasoningOptions = props.router
@@ -435,7 +481,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     contextPercent === undefined
       ? theme.muted
       : contextPercent >= 95
-        ? theme.badge.error
+        ? theme.status.error
         : contextPercent >= 80
           ? theme.badge.running
           : theme.muted;
@@ -505,7 +551,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     Boolean(sessionTab) ||
     hubOpen ||
     modePickerOpen ||
-    reasoningPickerOpen;
+    reasoningPickerOpen ||
+    themePickerOpen;
   // The turn status belongs next to the composer, not between the thinking
   // block and the answer.
 
@@ -555,11 +602,6 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   }));
 
   const innerWidth = Math.max(1, terminalSize.columns - 2);
-  const headerShowHint = innerWidth >= 150;
-  const headerShowLogo = innerWidth >= 80;
-  const headerShowBranch = innerWidth >= 100 && Boolean(branch) && branch !== "unknown";
-  const headerShowCost = innerWidth >= 110;
-  const headerShowModel = innerWidth >= 60 && Boolean(modeModel);
   const headerProjectLimit =
     innerWidth >= 150 ? 24 : innerWidth >= 100 ? 20 : innerWidth >= 80 ? 16 : innerWidth >= 60 ? 14 : 10;
   const headerModelLimit = innerWidth >= 150 ? 28 : innerWidth >= 100 ? 22 : innerWidth >= 80 ? 16 : 12;
@@ -595,44 +637,140 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const divider = "─".repeat(innerWidth);
   const contextLabel =
     innerWidth < 70
-      ? `${formatTokenCount(contextTokens)}/${formatContextWindow(modeCapabilities?.context_window)}`
-      : formatContextUsage(contextTokens, modeCapabilities?.context_window);
+      ? `ctx ${formatTokenCount(contextTokens)}/${formatContextWindow(modeCapabilities?.context_window)}`
+      : `ctx ${formatContextUsage(contextTokens, modeCapabilities?.context_window)}`;
+  const requestLabel = props.contextRequestLabel
+    ? `${props.contextRequestLabel}${props.maxRequestLabel ? `/${props.maxRequestLabel}` : ""}`
+    : undefined;
   const headerProject = truncateText(projectName, headerProjectLimit);
-  const headerBranch = branch ? truncateText(branch, 16) : "";
+  const headerBranch = branch && branch !== "unknown" ? truncateText(branch, 16) : "";
   const headerModel = modeModel
     ? `${truncateText(modeModel.model, headerModelLimit)}${headerReasoning}`
     : "";
+  const headerParts: Array<DisplaySegment & { node: React.ReactNode }> = [
+    {
+      key: "mode",
+      text: `[${modeInfo.label}]`,
+      dropOrder: 100,
+      node: (
+        <Text key="mode" bold color={modePalette.primary}>
+          [{modeInfo.label}]
+        </Text>
+      ),
+    },
+  ];
+  if (modeInfo.hint) {
+    headerParts.push({
+      key: "hint",
+      text: ` ${modeInfo.hint}`,
+      dropOrder: 0,
+      node: (
+        <Text key="hint" color={theme.muted}>
+          {" "}
+          {modeInfo.hint}
+        </Text>
+      ),
+    });
+  }
+  headerParts.push({
+    key: "logo",
+    text: " (◎)",
+    dropOrder: 1,
+    node: (
+      <Text key="logo" color={theme.border.passive}>
+        {" ("}
+        <Text bold color={theme.accent}>
+          ◎
+        </Text>
+        {")"}
+      </Text>
+    ),
+  });
+  headerParts.push({
+    key: "project",
+    text: ` ${headerProject}`,
+    dropOrder: 100,
+    node: (
+      <Text key="project" bold color={theme.text}>
+        {" "}
+        {headerProject}
+      </Text>
+    ),
+  });
+  if (headerBranch) {
+    headerParts.push({
+      key: "branch",
+      text: ` (${headerBranch})`,
+      dropOrder: 3,
+      node: (
+        <Text key="branch" color={theme.muted}>
+          {" "}
+          ({headerBranch})
+        </Text>
+      ),
+    });
+  }
+  if (headerModel) {
+    headerParts.push({
+      key: "model",
+      text: ` · ${headerModel}`,
+      dropOrder: 4,
+      node: (
+        <Text key="model" color={theme.muted}>
+          {" · "}
+          {headerModel}
+        </Text>
+      ),
+    });
+  }
+  headerParts.push({
+    key: "context",
+    text: ` · ${contextLabel}`,
+    dropOrder: 100,
+    node: (
+      <React.Fragment key="context">
+        <Text color={theme.muted}> · </Text>
+        <Text color={contextColor}>{contextLabel}</Text>
+      </React.Fragment>
+    ),
+  });
+  headerParts.push({
+    key: "cost",
+    text: ` · ${formatCost(totalCostUsd)}`,
+    dropOrder: 5,
+    node: (
+      <React.Fragment key="cost">
+        <Text color={theme.muted}> · </Text>
+        <Text color={theme.text}>{formatCost(totalCostUsd)}</Text>
+      </React.Fragment>
+    ),
+  });
+  if (requestLabel) {
+    headerParts.push({
+      key: "request",
+      text: ` · req ${requestLabel}`,
+      dropOrder: 2,
+      node: (
+        <Text key="request" color={theme.muted}>
+          {" · req "}
+          {requestLabel}
+        </Text>
+      ),
+    });
+  }
+  const headerSelected = fitSegments(headerParts, innerWidth);
 
   const runCommand = (command: string): void => {
     onSubmit(command, { kind: "command", command, raw: command });
   };
 
   return (
-    <ThemeProvider theme={props.currentTheme ?? "tokyonight"}>
+    <ThemeProvider theme={props.currentTheme ?? DEFAULT_THEME}>
       <Box flexDirection="column" paddingX={1}>
         <Text wrap="truncate">
-          <Text bold color={modePalette.primary}>
-            [{modeInfo.label}]
-          </Text>
-          {headerShowHint ? <Text color={theme.muted}> {modeInfo.hint}</Text> : null}
-          {headerShowLogo ? (
-            <Text color={theme.border.passive}>
-              {" ("}
-              <Text bold color={theme.accent}>◎</Text>
-              {")"}
-            </Text>
-          ) : null}
-          <Text bold color={theme.text}> {headerProject}</Text>
-          {headerShowBranch && headerBranch ? (
-            <Text color={theme.muted}> ({headerBranch})</Text>
-          ) : null}
-          {headerShowModel && headerModel ? (
-            <Text color={theme.muted}> · {headerModel}</Text>
-          ) : null}
-          <Text color={theme.muted}> · </Text>
-          <Text color={contextColor}>{contextLabel}</Text>
-          {headerShowCost ? <Text color={theme.muted}> · </Text> : null}
-          {headerShowCost ? <Text color={theme.text}>{formatCost(totalCostUsd)}</Text> : null}
+          {headerParts
+            .filter((part) => headerSelected.has(part.key))
+            .map((part) => part.node)}
         </Text>
         <Text color={theme.border.passive}>{divider}</Text>
 
@@ -660,6 +798,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onDecision={props.onApprovalDecision}
             width={innerWidth}
             height={viewportHeight}
+            theme={theme}
           />
         ) : props.pendingQuestion && props.onQuestionAnswer ? (
           <QuestionModal
@@ -707,6 +846,20 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               setModePickerOpen(false);
             }}
             onCancel={() => setModePickerOpen(false)}
+          />
+        ) : themePickerOpen ? (
+          <ChoiceModal
+            title="Theme"
+            subtitle={`Current: ${themeSelectionLabel(activeThemeSelection, props.currentTheme ?? DEFAULT_THEME)}`}
+            options={themeChoices}
+            initialIndex={initialThemeIndex}
+            width={innerWidth}
+            theme={theme}
+            onSelect={(id) => {
+              if (isThemeSelection(id)) props.onThemeChange?.(id);
+              setThemePickerOpen(false);
+            }}
+            onCancel={() => setThemePickerOpen(false)}
           />
         ) : reasoningPickerOpen ? (
           <ChoiceModal
@@ -763,6 +916,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <CommandPaletteModal
             router={props.router}
             currentTheme={props.currentTheme}
+            themeSelection={props.themeSelection}
             reasoningEffort={props.reasoningEffort}
             reasoningLevels={reasoningOptions}
             onSelectTheme={props.onThemeChange}
@@ -800,6 +954,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 runCommand("/compact");
               } else if (action === "run_plugins") {
                 runCommand("/plugins");
+              } else if (action === "run_stats") {
+                runCommand("/stats");
+              } else if (action === "run_turn_report") {
+                runCommand("/turn-report");
               }
             }}
             onClose={() => setPaletteOpen(false)}
@@ -818,6 +976,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onRestoreSnapshot={props.onRestoreSnapshot}
             onClose={() => setSessionTab(null)}
             height={viewportHeight}
+            theme={theme}
           />
         ) : hubOpen ? (
           <AgentHub
@@ -874,7 +1033,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         {escArmed ? (
           <Text color={theme.badge.running}>Press Esc again to stop the current turn</Text>
         ) : statusMessage ? (
-          <Text color={theme.modes.build.primary}>{statusMessage}</Text>
+          <Text color={theme.status.info}>{statusMessage}</Text>
         ) : streaming && !hasModalOpen ? (
           <LiveStatus
             active={streaming}
@@ -884,6 +1043,12 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             runningLabel={runningLabel}
             runningStartedAt={runningStartedAt}
             step={props.liveEntry?.step}
+            stepLimit={props.liveEntry?.stepLimit}
+            toolLimit={props.liveEntry?.toolLimit}
+            timeLimitSeconds={props.liveEntry?.timeLimitSeconds}
+            contextPercent={contextPercent}
+            requestLabel={requestLabel}
+            width={terminalSize.columns}
           />
         ) : null}
 
@@ -930,6 +1095,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 }
                 if (action.command === "/reasoning" && (action.args ?? "").trim().length === 0) {
                   setReasoningPickerOpen(true);
+                  return;
+                }
+                if (action.command === "/theme" && (action.args ?? "").trim().length === 0) {
+                  setThemePickerOpen(true);
                   return;
                 }
                 if (action.command === "/models") {

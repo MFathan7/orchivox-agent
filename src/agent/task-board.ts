@@ -95,6 +95,8 @@ export interface TaskBoardOptions {
   canceller?: TaskCanceller;
   merger?: TaskMerger;
   maxConcurrent?: number;
+  /** Upper bound for tasks held by the board at once. */
+  maxTasks?: number;
   onUpdate?: (task: TaskItem) => void;
   store?: TaskStore;
 }
@@ -108,6 +110,7 @@ export class TaskBoard {
   private readonly canceller: TaskCanceller | undefined;
   private readonly merger: TaskMerger | undefined;
   private readonly maxConcurrent: number;
+  private readonly maxTasks: number;
   private readonly onUpdate: ((task: TaskItem) => void) | undefined;
   private readonly store: TaskStore | undefined;
   private active = 0;
@@ -119,6 +122,7 @@ export class TaskBoard {
     this.canceller = options.canceller;
     this.merger = options.merger;
     this.maxConcurrent = Math.max(1, options.maxConcurrent ?? 3);
+    this.maxTasks = Math.max(1, options.maxTasks ?? 10);
     this.onUpdate = options.onUpdate;
     this.store = options.store;
     if (this.store) this.hydrate(this.store.loadTasks());
@@ -161,6 +165,11 @@ export class TaskBoard {
 
   add(input: TaskCreateInput | TaskCreateInput[]): TaskItem[] {
     const requests = Array.isArray(input) ? input : [input];
+    if (this.tasks.size + requests.length > this.maxTasks) {
+      throw new Error(
+        `too many tasks (${this.tasks.size + requests.length}). The limit is ${this.maxTasks}; complete or cancel existing tasks first.`,
+      );
+    }
     const created: TaskItem[] = [];
 
     for (const request of requests) {

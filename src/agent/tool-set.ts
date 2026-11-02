@@ -25,6 +25,7 @@ export const BUILD_TOOL_NAMES: ReadonlySet<string> = new Set([
   "read_file",
   "read_document",
   "hash_edit",
+  "replace_text",
   "create_file",
   "delete_file",
   "move_file",
@@ -52,6 +53,7 @@ export const BUILD_TOOL_NAMES: ReadonlySet<string> = new Set([
   "task_dispatch",
   "task_cancel",
   "task_merge",
+  "execute",
 ]);
 
 export function filterToolsForMode<T extends { name: string }>(

@@ -3,7 +3,7 @@ import { Box, Text, useInput } from "ink";
 
 import { OrchivoxLogo } from "./logo";
 import { isMouseSequence } from "./mouse";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export interface WorkspaceTrustPromptProps {
   workspacePath: string;
@@ -17,12 +17,9 @@ const OPTIONS = [
   { id: "exit", label: "No, exit" },
 ];
 
-export function WorkspaceTrustPrompt({
-  workspacePath,
-  onTrust,
-  onExit,
-  theme = getTheme("tokyonight"),
-}: WorkspaceTrustPromptProps): React.ReactElement {
+export function WorkspaceTrustPrompt(props: WorkspaceTrustPromptProps): React.ReactElement {
+  const { workspacePath, onTrust, onExit, theme: themeProp } = props;
+  const theme = useActiveTheme(themeProp);
   const [selectedIndex, setSelectedIndex] = React.useState(0);
 
   useInput((input, key) => {

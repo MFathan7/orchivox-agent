@@ -29,6 +29,7 @@ import {
   createHashEditTool,
   createMoveFileTool,
   createReadFileTool,
+  createReplaceTextTool,
   type HashlineLifecycle,
 } from "../tools/hashline-edit";
 import {
@@ -37,13 +38,14 @@ import {
   runTscDiagnostics,
   type LSPDiagnostic,
 } from "../ide/lsp-fixer";
+import { createSandboxScriptTool } from "../tools/sandbox-bridge";
 import { ToolRegistry } from "../tools/registry";
 import { PersistentShellTool } from "../tools/shell";
 import { BackgroundProcessManager } from "../tools/bg-process";
 import { createInspectImageTool } from "../tools/vision";
 import { createReadDocumentTool } from "../tools/read-document";
 import { createWritePlanTool } from "../tools/plan-file";
-import { registerWebTools } from "../tools/web-reader";
+import { registerWebTools, type WebSearchSession } from "../tools/web-reader";
 import {
   ChatRequestSchema,
   type AgentMode,
@@ -54,6 +56,7 @@ import {
   type ToolCallDeltaEvent,
   type ToolCallReadyEvent,
   type ToolUseBlock,
+  type TurnMetrics,
   type Usage,
   type UsageEvent,
 } from "../types/schema";
@@ -71,14 +74,17 @@ import {
   precomputeCompaction,
   pruneToolOutput,
   reduceTranscriptForOverflow,
+  resolveCompactionBuffer,
   OVERFLOW_SHRINK_STEPS,
   type PrecomputedCompaction,
 } from "./compaction";
 import { appendUsageLog, usageLogEnabled } from "./usage-log";
+import { TurnMetricsTracker, timeBudgetReached, turnBudgetWarning } from "./turn-metrics";
+import { ReadFileCache, ToolCallTracker, toolCallSignature } from "./tool-call-tracker";
 import { filterToolsForMode, isConcurrentSafeTool } from "./tool-set";
 import { CustomCommandEngine } from "./custom-commands";
 import { HookRunner, type PluginLoadReport } from "./hooks";
-import { GranularPermissionEngine } from "./permissions";
+import { GranularPermissionEngine, permissionRulesFromConfig } from "./permissions";
 import { SpecialistAgentRegistry, type SpecialistAgentProfile } from "./specialist-agents";
 import {
   loadProjectContext,
@@ -119,7 +125,7 @@ import {
   isOutputBudgetError,
   isUnsupportedParamsError,
 } from "../provider/errors";
-import { modeContract, modeTransitionReminder } from "./modes";
+import { modeContract, modeStepLimit, modeTransitionReminder } from "./modes";
 import { SKILL_ALWAYS_ALLOWED_TOOLS, SkillToolPolicy } from "./skill-policy";
 import { TodoEngine } from "./todo";
 import { runGit } from "../vcs/git";
@@ -169,6 +175,16 @@ const PRECOMPUTE_SHARE = 0.85;
 const PRECOMPUTE_MIN_TOKENS = 64_000;
 const CONTINUE_AFTER_OUTPUT_LIMIT =
   "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces and continue.";
+const FINAL_STEP_REMINDER = [
+  "This is the final step of this turn.",
+  "Tools are unavailable now.",
+  "Summarize what changed, what remains, and the next action.",
+  "Do not ask to continue automatically.",
+].join(" ");
+const FINAL_STEP_FALLBACK =
+  "The step budget is exhausted, so I stopped before running another tool. The work above is what completed in this turn. Send another message to continue.";
+const BUDGET_WARNING =
+  "You are near the turn budget. Finish the current check, then summarize what changed and what remains. Do not start new work.";
 
 /** Longest reasoning block that may stand in for a missing answer. */
 const MAX_REASONING_ANSWER_CHARS = 4000;
@@ -300,6 +316,8 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly database: MemoryDatabase;
   private readonly ephemeralSkills = new Set<string>();
   private readonly lastPrompts = new Map<string, PromptSnapshot>();
+  private readonly lastTurnMetrics = new Map<string, TurnMetrics>();
+  private readonly webSearchSessions = new Map<string, WebSearchSession>();
   private readonly lastSkillReload = new Map<string, number>();
   private readonly precomputedCompactions = new Map<string, PrecomputedCompaction>();
   private readonly precomputeInFlight = new Map<string, Promise<void>>();
@@ -341,19 +359,24 @@ export class AgentOrchestrator implements IAgentRunner {
       options.config?.compaction ?? {
         auto: true,
         keep_tokens: 15_000,
+        buffer: "15%",
         precompute: false,
-        prune: true,
+        prune: false,
         prune_protect_tokens: 40_000,
         prune_min_tokens: 20_000,
       };
-    this.webSearchConfig = options.config?.websearch ?? { enabled: true, provider: "random" };
+    this.webSearchConfig = options.config?.websearch ?? {
+      enabled: true,
+      provider: "random",
+      max_results: 8,
+    };
     this.webFetchConfig = options.config?.webfetch ?? { enabled: true, max_chars: 24_000 };
     this.promptStyle = options.config?.prompt?.style ?? "auto";
     this.config = options.config;
     this.maxSilentReasoningChars = options.config?.reasoning?.max_silent_chars ?? 0;
     this.maxSilentReasoningSeconds = options.config?.reasoning?.max_silent_seconds ?? 180;
     this.maxTurnTokens = options.config?.limits?.turn_tokens;
-    this.maxRequestBytes = options.config?.limits?.max_request_bytes ?? 800_000;
+    this.maxRequestBytes = options.config?.limits?.max_request_bytes ?? 0;
     this.skillMaxBodyChars = options.config?.skills?.max_body_chars ?? 0;
     this.permissions = options.permissions ?? new GranularPermissionEngine({ repoRoot: this.root });
     this.questionHandler = options.onQuestion;
@@ -374,6 +397,7 @@ export class AgentOrchestrator implements IAgentRunner {
       canceller: (workerId) => this.subagents.kill(workerId),
       merger: (workerId) => options.worktrees.mergeAndCleanup(workerId),
       maxConcurrent: 3,
+      maxTasks: options.config?.limits?.max_workers_per_turn ?? 10,
       store: options.database,
     });
     this.registerDefaultTools();
@@ -500,8 +524,12 @@ export class AgentOrchestrator implements IAgentRunner {
 
   estimateContextOverhead(mode: AgentMode): number {
     const compact = this.useCompactPrompt();
-    const tools = filterToolsForMode(this.registry.listDefinitions(), mode);
     const providerRef = this.router.getModeModel(mode);
+    const capabilities = providerRef ? this.router.capabilitiesForMode(mode) : undefined;
+    const tools = this.filterToolsForCapabilities(
+      filterToolsForMode(this.registry.listDefinitions(), mode),
+      capabilities,
+    );
     const promptBase = {
       mode,
       providerKind: providerRef?.provider ? this.router.providerKind(providerRef.provider) : undefined,
@@ -529,6 +557,10 @@ export class AgentOrchestrator implements IAgentRunner {
 
   getLastPromptInfo(sessionId?: string): PromptSnapshot | undefined {
     return sessionId ? this.lastPrompts.get(sessionId) : undefined;
+  }
+
+  getLastTurnMetrics(sessionId?: string): TurnMetrics | undefined {
+    return sessionId ? this.lastTurnMetrics.get(sessionId) : undefined;
   }
 
   async runOnce(request: AgentRunRequest): Promise<AgentRunResult> {
@@ -619,12 +651,35 @@ export class AgentOrchestrator implements IAgentRunner {
       }),
     );
     this.registry.register(createHashEditTool(lifecycle));
+    this.registry.register(createReplaceTextTool(lifecycle));
     this.registry.register(createCreateFileTool(lifecycle, { repoRoot: this.root }));
     this.registry.register(createDeleteFileTool(lifecycle));
     this.registry.register(createMoveFileTool(lifecycle));
     this.registry.register(createApplyUnifiedPatchTool(lifecycle));
-    this.registry.register(createGlobFilesTool());
-    this.registry.register(createGrepSearchTool());
+    const searchTimeoutMs = (this.config?.tools?.search_timeout_seconds ?? 30) * 1000;
+    this.registry.register(
+      createGlobFilesTool({
+        maxResults: this.config?.tools?.glob_limit,
+        timeoutMs: searchTimeoutMs,
+      }),
+    );
+    this.registry.register(
+      createGrepSearchTool({
+        maxResults: this.config?.tools?.grep_limit,
+        timeoutMs: searchTimeoutMs,
+      }),
+    );
+    const codeMode = this.config?.tools?.code_mode ?? "off";
+    if (codeMode !== "off") {
+      this.registry.register(
+        createSandboxScriptTool(this.registry, {
+          root: this.root,
+          name: "execute",
+          mode: codeMode,
+          timeoutMs: 30_000,
+        }),
+      );
+    }
     this.registry.register(createDiffViewTool());
     this.registry.register(createJsonQueryTool());
     this.registry.register(new PersistentShellTool({ cwd: this.root }));
@@ -646,6 +701,16 @@ export class AgentOrchestrator implements IAgentRunner {
     registerWebTools(this.registry, {
       search: this.webSearchConfig,
       fetch: this.webFetchConfig,
+      getSession: () => {
+        const sessionId = currentTurnContext()?.sessionId;
+        if (!sessionId) return undefined;
+        let session = this.webSearchSessions.get(sessionId);
+        if (!session) {
+          session = {};
+          this.webSearchSessions.set(sessionId, session);
+        }
+        return session;
+      },
     });
     registerCodeIntelTools(this.registry, { lsp: this.lsp, repoRoot: this.root });
     if (this.lsp) this.lsp.registerTools(this.registry);
@@ -666,9 +731,76 @@ export class AgentOrchestrator implements IAgentRunner {
   private async executeInner(
     request: AgentRunRequest,
     signal: AbortSignal | undefined,
-    sink: (event: StreamEvent) => void,
+    rawSink: (event: StreamEvent) => void,
     mode: AgentMode,
   ): Promise<AgentRunResult> {
+    const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
+    // Ids are stored in the session database, so every run needs its own prefix
+    // or a second user turn would reuse turn-0 and collide.
+    const runId = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const metrics = new TurnMetricsTracker();
+    let totals: Usage = zeroUsage();
+    const configuredSteps = this.config?.modes?.[mode]?.steps;
+    const stepLimit = modeStepLimit(mode, configuredSteps, this.maxTurns);
+    const toolLimit = this.config?.limits?.max_tool_calls ?? 0;
+    const wallLimitMs = (this.config?.limits?.max_wall_seconds ?? 0) * 1000;
+    const webSearchLimit = this.config?.limits?.max_web_searches ?? 0;
+    const maxRepeatedCalls = this.config?.limits?.max_repeated_calls ?? 0;
+    const toolCallTracker = new ToolCallTracker(maxRepeatedCalls);
+    const readFileCache = new ReadFileCache();
+    let budgetWarned = false;
+    let toolBudgetExhausted = false;
+    let webSearchCalls = 0;
+    const sink = (event: StreamEvent): void => {
+      switch (event.type) {
+        case "step_started":
+          metrics.recordStep();
+          break;
+        case "tool_start":
+          metrics.recordTool(event.name);
+          break;
+        case "compaction":
+          metrics.recordCompaction({
+            trigger:
+              event.trigger ??
+              (event.reason === "request_size"
+                ? "request_size"
+                : event.reason === "retry"
+                  ? "overflow"
+                  : event.reason === "output_limit"
+                    ? "output_limit"
+                    : event.reason === "manual"
+                      ? "manual"
+                      : "tokens"),
+            before_tokens: event.before_tokens,
+            after_tokens: event.after_tokens,
+            request_bytes: event.request_bytes,
+            max_request_bytes: event.max_request_bytes,
+            input_budget: event.input_budget,
+            buffer_tokens: event.buffer_tokens,
+          });
+          break;
+        case "context_pruned":
+          metrics.recordPrune();
+          break;
+        case "done": {
+          const snapshot = metrics.snapshot({
+            usage: totals,
+            finishReason: event.finish_reason,
+            stepLimit: stepLimit > 0 ? stepLimit : undefined,
+            toolLimit: toolLimit > 0 ? toolLimit : undefined,
+            timeLimitMs: wallLimitMs > 0 ? wallLimitMs : undefined,
+          });
+          this.lastTurnMetrics.set(sessionId ?? runId, snapshot);
+          rawSink({ ...event, metrics: snapshot });
+          return;
+        }
+        default:
+          break;
+      }
+      rawSink(event);
+    };
+
     let activeSpecialist: SpecialistAgentProfile | undefined;
     if (typeof request.metadata?.agent === "string") {
       activeSpecialist = await this.specialistAgents.getAgent(request.metadata.agent as string);
@@ -676,10 +808,6 @@ export class AgentOrchestrator implements IAgentRunner {
 
     let messages: Message[] = [...request.messages];
     let contract = modeContract(mode);
-    const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
-    // Ids are stored in the session database, so every run needs its own prefix
-    // or a second user turn would reuse turn-0 and collide.
-    const runId = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const persistedIds = new Set<string>();
     const useInstructionState = this.supportsInstructionState(sessionId);
     let instructionState: InstructionState | undefined = useInstructionState
@@ -832,7 +960,10 @@ export class AgentOrchestrator implements IAgentRunner {
     const activeSkillDocs = loadedSkillDocs.filter(
       (document) => !turnSkills.some((turnSkill) => turnSkill.name === document.name),
     );
-    let tools = this.combineTools(request.tools, mode);
+    let tools = this.filterToolsForCapabilities(
+      this.combineTools(request.tools, mode),
+      capabilities,
+    );
     if (!capabilities.tool_calling) tools = [];
     if (activeSpecialist) {
       tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
@@ -957,7 +1088,6 @@ export class AgentOrchestrator implements IAgentRunner {
       activatedSkills.add(document.name);
       if (document.allowedTools !== undefined) skillPolicy.activate(document.allowedTools);
     }
-    const totals = zeroUsage();
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
     let turnRetries = 0;
@@ -978,12 +1108,20 @@ export class AgentOrchestrator implements IAgentRunner {
     const outputCap = Math.min(capabilities.max_output ?? 32_000, 256_000);
     const defaultOutput = reasoningBudget > 0 ? Math.max(outputCap, reasoningBudget + 2048) : outputCap;
     const requestedMaxTokens = request.max_tokens ?? defaultOutput;
+    const inputBase = Math.min(capabilities.max_input ?? contextWindow, contextWindow);
+    const bufferTokens = resolveCompactionBuffer(inputBase, {
+      buffer: this.compactionConfig.buffer,
+      reserved: this.compactionConfig.reserved,
+      reserveTokens: this.compactionConfig.reserve_tokens,
+      bufferTokens: this.compactionConfig.buffer_tokens,
+      bufferRatio: this.compactionConfig.buffer_ratio,
+    });
     const inputBudget = computeInputBudget({
       contextWindow,
       maxInput: capabilities.max_input,
       maxOutput: capabilities.max_output,
       requestedOutput: requestedMaxTokens,
-      reserved: this.compactionConfig.reserved,
+      reserved: bufferTokens,
     });
     const estimatePromptTokens = (): number => {
       const estimated =
@@ -1058,7 +1196,7 @@ export class AgentOrchestrator implements IAgentRunner {
       const from = mode;
       mode = next;
       contract = modeContract(mode);
-      tools = this.combineTools(request.tools, mode);
+      tools = this.filterToolsForCapabilities(this.combineTools(request.tools, mode), capabilities);
       if (!capabilities.tool_calling) tools = [];
       if (activeSpecialist) {
         tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
@@ -1119,7 +1257,21 @@ export class AgentOrchestrator implements IAgentRunner {
         "Use the project evidence and tool results already present in the conversation.",
       ]);
 
-    for (let turn = 0; this.maxTurns === 0 || turn < this.maxTurns; turn += 1) {
+    for (let turn = 0; stepLimit === 0 || turn < stepLimit || toolBudgetExhausted; turn += 1) {
+      const finalStep = toolBudgetExhausted || (stepLimit > 0 && turn === stepLimit - 1);
+      if (timeBudgetReached(metrics.elapsedMs(), wallLimitMs)) {
+        const seconds = Math.round(wallLimitMs / 1000);
+        const label = seconds >= 60 ? `${Math.round(seconds / 60)} minutes` : `${seconds} seconds`;
+        const notice = `Wall-clock budget reached (${label}). Send another message to continue, or raise limits.max_wall_seconds.`;
+        sink({ type: "final_text", text: notice });
+        sink(usageEvent(totals, true));
+        sink({ type: "done", finish_reason: "turn_limit" });
+        return {
+          message: makeMessage(`${runId}-time-budget`, "assistant", notice),
+          usage: totals,
+          finish_reason: "turn_limit",
+        };
+      }
       const requestedMode = this.consumeModeSwitch();
       if (requestedMode) applyModeSwitch(requestedMode, turn);
       const spentTokens = totals.prompt_tokens + totals.completion_tokens;
@@ -1134,7 +1286,29 @@ export class AgentOrchestrator implements IAgentRunner {
           finish_reason: "turn_limit",
         };
       }
-      sink({ type: "step_started", step: turn + 1 });
+      let pendingBudgetWarning = false;
+      if (!budgetWarned) {
+        const warning = turnBudgetWarning({
+          steps: turn + 1,
+          toolCalls: metrics.toolCallCount,
+          elapsedMs: metrics.elapsedMs(),
+          limits: { stepLimit, toolLimit, timeLimitMs: wallLimitMs },
+        });
+        if (warning) {
+          budgetWarned = true;
+          pendingBudgetWarning = true;
+          sink({ type: "turn_budget_warning", ...warning });
+        }
+      }
+      sink({
+        type: "step_started",
+        step: turn + 1,
+        ...(stepLimit > 0 ? { step_limit: stepLimit } : {}),
+        tool_calls: metrics.toolCallCount,
+        ...(toolLimit > 0 ? { tool_limit: toolLimit } : {}),
+        elapsed_ms: metrics.elapsedMs(),
+        ...(wallLimitMs > 0 ? { time_limit_ms: wallLimitMs } : {}),
+      });
       let compactedThisTurn = false;
       let prunedTokensThisTurn = 0;
       if (this.compactionConfig.prune) {
@@ -1167,7 +1341,7 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
       const measuredBeforeCompaction = measuredPromptTokens();
-      const turnTools = skillPolicy.filter(tools);
+      const turnTools = finalStep ? [] : skillPolicy.filter(tools);
       const requestBytes = estimateRequestBytes({ system, messages, tools: turnTools });
       const requestSizeOverLimit =
         this.maxRequestBytes > 0 && requestBytes > this.maxRequestBytes;
@@ -1190,6 +1364,7 @@ export class AgentOrchestrator implements IAgentRunner {
           provider,
           contextWindow,
           keepTokens: this.compactionConfig.keep_tokens,
+          buffer: this.compactionConfig.buffer,
           reserveTokens: this.compactionConfig.reserve_tokens,
           bufferTokens: this.compactionConfig.buffer_tokens,
           bufferRatio: this.compactionConfig.buffer_ratio,
@@ -1217,6 +1392,7 @@ export class AgentOrchestrator implements IAgentRunner {
           provider,
           contextWindow,
           keepTokens: keepTokensForAttempt(),
+          buffer: this.compactionConfig.buffer,
           reserveTokens: this.compactionConfig.reserve_tokens,
           bufferTokens: this.compactionConfig.buffer_tokens,
           bufferRatio: this.compactionConfig.buffer_ratio,
@@ -1245,12 +1421,17 @@ export class AgentOrchestrator implements IAgentRunner {
           sink({
             type: "compaction",
             reason: requestSizeOverLimit ? "request_size" : "auto",
+            trigger: requestSizeOverLimit ? "request_size" : "tokens",
             before_tokens: compaction.beforeTokens,
             after_tokens: compaction.afterTokens,
             summary_tokens: compaction.summaryTokens,
             summary: compaction.summary,
             removed_messages: compaction.removedMessages,
             tail_start_message_id: persistableTail(compaction.tailStartMessageId),
+            request_bytes: requestBytes,
+            max_request_bytes: this.maxRequestBytes,
+            input_budget: inputBudget,
+            buffer_tokens: bufferTokens,
           });
           if (sessionId) {
             const compactedAt = Date.now();
@@ -1277,6 +1458,23 @@ export class AgentOrchestrator implements IAgentRunner {
         sink({ type: "advisor_note", note: advisorNote, severity: "info" });
         messages.push(makeMessage(`turn-${turn}-advisor`, "system", advisorNote));
       }
+
+      if (pendingBudgetWarning) {
+        appendSyntheticMessage(messages, `turn-${turn}-budget`, BUDGET_WARNING);
+      }
+      if (finalStep && turn > 0) {
+        appendSyntheticMessage(messages, `turn-${turn}-final`, FINAL_STEP_REMINDER);
+      }
+
+      sink({
+        type: "context_estimate",
+        tokens: estimatePromptTokens(),
+        request_bytes: estimateRequestBytes({ system, messages, tools: turnTools }),
+        input_budget: inputBudget,
+        context_window: contextWindow,
+        max_request_bytes: this.maxRequestBytes,
+        buffer_tokens: bufferTokens,
+      });
 
       const requestMessageCount = messages.length;
       const forceActionRequest = forceAction;
@@ -1409,6 +1607,12 @@ export class AgentOrchestrator implements IAgentRunner {
       if (usageLogEnabled()) {
         // Await the tiny append so a headless run does not exit before the line
         // reaches disk. appendUsageLog catches its own errors.
+        const metricsSnapshot = metrics.snapshot({
+          usage: totals,
+          stepLimit: stepLimit > 0 ? stepLimit : undefined,
+          toolLimit: toolLimit > 0 ? toolLimit : undefined,
+          timeLimitMs: wallLimitMs > 0 ? wallLimitMs : undefined,
+        });
         await appendUsageLog({
           at: Date.now(),
           session_id: sessionId,
@@ -1424,6 +1628,13 @@ export class AgentOrchestrator implements IAgentRunner {
           compacted: compactedThisTurn,
           pruned_tokens: prunedTokensThisTurn,
           provider_reported: Boolean(lastUsage),
+          steps: metricsSnapshot.steps,
+          step_limit: metricsSnapshot.step_limit,
+          tool_calls: metricsSnapshot.tool_calls,
+          tool_counts: metricsSnapshot.tool_counts,
+          repeated_calls: metricsSnapshot.repeated_calls,
+          duration_ms: metricsSnapshot.duration_ms,
+          finish_reason: finishReason,
         });
       }
 
@@ -1551,6 +1762,7 @@ export class AgentOrchestrator implements IAgentRunner {
             provider,
             contextWindow,
             keepTokens,
+            buffer: this.compactionConfig.buffer,
             reserveTokens: this.compactionConfig.reserve_tokens,
             bufferTokens: this.compactionConfig.buffer_tokens,
             bufferRatio: this.compactionConfig.buffer_ratio,
@@ -1573,12 +1785,17 @@ export class AgentOrchestrator implements IAgentRunner {
             sink({
               type: "compaction",
               reason: "retry",
+              trigger: "overflow",
               before_tokens: forced.beforeTokens,
               after_tokens: forced.afterTokens,
               summary_tokens: forced.summaryTokens,
               summary: forced.summary,
               removed_messages: forced.removedMessages,
               tail_start_message_id: forced.tailStartMessageId,
+              request_bytes: estimateRequestBytes({ system, messages, tools: turnTools }),
+              max_request_bytes: this.maxRequestBytes,
+              input_budget: inputBudget,
+              buffer_tokens: bufferTokens,
               attempt: overflowAttempts,
               max_attempts: OVERFLOW_SHRINK_STEPS.length,
             });
@@ -1595,10 +1812,15 @@ export class AgentOrchestrator implements IAgentRunner {
           sink({
             type: "compaction",
             reason: "retry",
+            trigger: "overflow",
             before_tokens: tokens,
             after_tokens: tokens,
             summary_tokens: 0,
             removed_messages: 0,
+            request_bytes: estimateRequestBytes({ system, messages, tools: turnTools }),
+            max_request_bytes: this.maxRequestBytes,
+            input_budget: inputBudget,
+            buffer_tokens: bufferTokens,
             attempt: overflowAttempts,
             max_attempts: OVERFLOW_SHRINK_STEPS.length,
             status: "error",
@@ -1625,10 +1847,15 @@ export class AgentOrchestrator implements IAgentRunner {
           sink({
             type: "compaction",
             reason: "retry",
+            trigger: "overflow",
             before_tokens: beforeTokens,
             after_tokens: estimatePromptTokens(),
             summary_tokens: 0,
             removed_messages: removedMessages,
+            request_bytes: afterBytes,
+            max_request_bytes: this.maxRequestBytes,
+            input_budget: inputBudget,
+            buffer_tokens: bufferTokens,
             attempt: overflowAttempts,
             max_attempts: OVERFLOW_SHRINK_STEPS.length,
             status: "done",
@@ -1663,19 +1890,36 @@ export class AgentOrchestrator implements IAgentRunner {
       }
 
       const assistantMessage = accumulator.toMessage(`${runId}-turn-${turn}`);
+      let toolUses = assistantMessage.content.filter((block) => block.type === "tool_use");
+      if (finalStep && toolUses.length > 0) {
+        // The final step never runs tools. Keep any text the model produced and
+        // add a clear fallback when it produced only tool calls.
+        assistantMessage.content = assistantMessage.content.filter(
+          (block) => block.type !== "tool_use",
+        );
+        if (
+          !assistantMessage.content.some(
+            (block) => block.type === "text" && block.text.trim().length > 0,
+          )
+        ) {
+          assistantMessage.content.push({ type: "text", text: FINAL_STEP_FALLBACK });
+          sink({ type: "final_text", text: FINAL_STEP_FALLBACK });
+        }
+        toolUses = [];
+        finishReason = "stop";
+      }
       messages.push(assistantMessage);
       persistConversationMessage(assistantMessage);
-      const toolUses = assistantMessage.content.filter((block) => block.type === "tool_use");
 
       if (toolUses.length === 0 || turnError) {
-        if (!turnError && contract.enforceTodos) {
+        if (!turnError && contract.enforceTodos && !finalStep) {
           const enforcement = this.todos.checkPendingTodos();
           if (enforcement.hasPending) {
             messages.push(makeMessage(`turn-${turn}-todo`, "user", enforcement.continuationPrompt));
             continue;
           }
         }
-        if (!turnError && finishReason === "stop" && ultraworkNudges < contract.nudges) {
+        if (!turnError && finishReason === "stop" && ultraworkNudges < contract.nudges && !finalStep) {
           ultraworkNudges += 1;
           const nudge = [
             "You are not finished yet.",
@@ -1685,7 +1929,7 @@ export class AgentOrchestrator implements IAgentRunner {
           messages.push(makeMessage(`turn-${turn}-continue`, "user", nudge));
           continue;
         }
-        if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES) {
+        if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES && !finalStep) {
           outputLimitContinues += 1;
           if (!outputLimitCompacted) {
             outputLimitCompacted = true;
@@ -1698,6 +1942,7 @@ export class AgentOrchestrator implements IAgentRunner {
                   provider,
                   contextWindow,
                   keepTokens: this.compactionConfig.keep_tokens,
+                  buffer: this.compactionConfig.buffer,
                   reserveTokens: this.compactionConfig.reserve_tokens,
                   bufferTokens: this.compactionConfig.buffer_tokens,
                   bufferRatio: this.compactionConfig.buffer_ratio,
@@ -1722,12 +1967,17 @@ export class AgentOrchestrator implements IAgentRunner {
               sink({
                 type: "compaction",
                 reason: "output_limit",
+                trigger: "output_limit",
                 before_tokens: compacted.beforeTokens,
                 after_tokens: compacted.afterTokens,
                 summary_tokens: compacted.summaryTokens,
                 summary: compacted.summary,
                 removed_messages: compacted.removedMessages,
                 tail_start_message_id: persistableTail(compacted.tailStartMessageId),
+                request_bytes: estimateRequestBytes({ system, messages, tools: turnTools }),
+                max_request_bytes: this.maxRequestBytes,
+                input_budget: inputBudget,
+                buffer_tokens: bufferTokens,
               });
             }
           }
@@ -1817,7 +2067,11 @@ export class AgentOrchestrator implements IAgentRunner {
           });
         }
         await this.hooks.runOnStop({});
-        const finalReason: FinishReason = turnError ? "error" : finishReason;
+        const finalReason: FinishReason = turnError
+          ? "error"
+          : finalStep && finishReason !== "error"
+            ? "turn_limit"
+            : finishReason;
         sink(usageEvent(totals, true));
         sink({ type: "done", finish_reason: finalReason });
         return { message: finalMessage, usage: totals, finish_reason: finalReason };
@@ -1849,6 +2103,91 @@ export class AgentOrchestrator implements IAgentRunner {
       ): Promise<{ message: Message; skillDocument?: SkillDocument }> => {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         const filePath = extractFilePath(call.arguments);
+        const readOffset =
+          call.name === "read_file" && typeof call.arguments.offset === "number"
+            ? call.arguments.offset
+            : 1;
+        const readLimit =
+          call.name === "read_file" && typeof call.arguments.limit === "number"
+            ? call.arguments.limit
+            : 2000;
+        const readPath =
+          call.name === "read_file" && typeof call.arguments.filePath === "string"
+            ? call.arguments.filePath
+            : undefined;
+
+        const signature = toolCallSignature(call.name, call.arguments, this.root);
+        const readUnchanged = readPath
+          ? await readFileCache.unchanged(readPath, readOffset, readLimit, this.root)
+          : false;
+        if (readPath && !readUnchanged) {
+          // A changed file makes this a fresh read, not a repeat.
+          toolCallTracker.resetSignature(signature);
+        }
+        const callState = toolCallTracker.record(signature, call.name, call.id);
+        if (callState.repeated) {
+          metrics.recordRepeatedCall();
+          const readOnly = this.registry.get(call.name)?.readOnly === true;
+          const message = toolResultMessage(
+            call,
+            readOnly
+              ? `The same ${call.name} call was already made ${callState.count} times in this turn. This call was not run. Use the earlier result${callState.previousCallId ? ` from ${callState.previousCallId}` : ""}, or change the request.`
+              : `The same mutating ${call.name} call was already made ${callState.count} times in this turn. This call was not run. Change the approach or ask the user before repeating it.`,
+            true,
+            runId,
+          );
+          sink({
+            type: "tool_end",
+            id: call.id,
+            name: call.name,
+            status: "error",
+            duration_ms: Date.now() - toolStartedAt,
+            file_path: filePath,
+            output: readOnly
+              ? "repeated read-only call suppressed"
+              : "repeated mutating call suppressed",
+          });
+          return { message };
+        }
+
+        if (readUnchanged) {
+          const message = toolResultMessage(
+            call,
+            "File unchanged since the last read in this turn; use the previous content or request a different range.",
+            false,
+            runId,
+          );
+          sink({
+            type: "tool_end",
+            id: call.id,
+            name: call.name,
+            status: "ok",
+            duration_ms: Date.now() - toolStartedAt,
+            file_path: filePath,
+            output: "unchanged since the last read",
+          });
+          return { message };
+        }
+
+        if (call.name === "web_search" && webSearchLimit > 0 && webSearchCalls >= webSearchLimit) {
+          const message = toolResultMessage(
+            call,
+            `Web search budget reached (${webSearchLimit} searches in this turn). This search was not run.`,
+            true,
+            runId,
+          );
+          sink({
+            type: "tool_end",
+            id: call.id,
+            name: call.name,
+            status: "error",
+            duration_ms: Date.now() - toolStartedAt,
+            file_path: filePath,
+            output: "web search budget reached",
+          });
+          return { message };
+        }
+        if (call.name === "web_search") webSearchCalls += 1;
 
         if (!skillPolicy.allows(call.name)) {
           const blocked = toolResultMessage(call, `blocked: the active skill does not allow the ${call.name} tool`, true, runId);
@@ -1897,7 +2236,13 @@ export class AgentOrchestrator implements IAgentRunner {
           }
         }
 
-        const result = await this.registry.run(call, mode, signal);
+        const agentRules = activeSpecialist?.permissions?.length
+          ? permissionRulesFromConfig(activeSpecialist.permissions)
+          : [];
+        const result = await this.registry.run(call, mode, signal, agentRules);
+        if (call.name === "read_file" && readPath && !result.is_error) {
+          await readFileCache.remember(readPath, readOffset, readLimit, this.root);
+        }
         let content = typeof result.content === "string" ? result.content : JSON.stringify(result.content);
         let skillDocument: SkillDocument | undefined;
         if (call.name === "skill" && !result.is_error) {
@@ -2002,7 +2347,30 @@ export class AgentOrchestrator implements IAgentRunner {
         ? partitionToolBatches(toolUses, isConcurrentSafe)
         : toolUses.map((block): ToolBatch => ({ mode: "sequential", calls: [block] }));
 
-      for (const batch of batches) {
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+        const batch = batches[batchIndex];
+        const remaining = toolLimit > 0 ? toolLimit - metrics.toolCallCount : Number.POSITIVE_INFINITY;
+        if (remaining <= 0 || (Number.isFinite(remaining) && batch.calls.length > remaining)) {
+          toolBudgetExhausted = true;
+          sink({
+            type: "turn_budget_warning",
+            reason: "tool",
+            used: metrics.toolCallCount,
+            limit: toolLimit,
+          });
+          for (const block of batches.slice(batchIndex).flatMap((entry) => entry.calls)) {
+            const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
+            const message = toolResultMessage(
+              call,
+              `Tool budget reached (${toolLimit} calls in this turn). This tool was not run.`,
+              true,
+              runId,
+            );
+            messages.push(message);
+            persistConversationMessage(message);
+          }
+          break;
+        }
         if (batch.mode === "parallel") {
           const started = batch.calls.map((block) => ({ block, at: startTool(block) }));
           const outcomes: Array<{ message: Message; skillDocument?: SkillDocument }> = new Array(
@@ -2028,6 +2396,21 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
 
+      if (toolBudgetExhausted) {
+        if (stepLimit === 0 || turn + 1 < stepLimit) {
+          continue;
+        }
+        const notice = `Tool budget reached (${toolLimit} calls in this turn). Send another message to continue, or raise limits.max_tool_calls.`;
+        sink({ type: "final_text", text: notice });
+        sink(usageEvent(totals, true));
+        sink({ type: "done", finish_reason: "turn_limit" });
+        return {
+          message: makeMessage(`${runId}-tool-budget`, "assistant", notice),
+          usage: totals,
+          finish_reason: "turn_limit",
+        };
+      }
+
       const switchedMode = this.consumeModeSwitch();
       if (switchedMode) applyModeSwitch(switchedMode, turn);
 
@@ -2043,7 +2426,7 @@ export class AgentOrchestrator implements IAgentRunner {
       }
     }
 
-    const notice = `Stopped after reaching the ${this.maxTurns} step limit with work still in progress. Send another message to continue, or raise the step limit.`;
+    const notice = `Stopped after reaching the ${stepLimit} step limit for ${mode.toUpperCase()} mode with work still in progress. Send another message to continue, or raise modes.${mode}.steps.`;
     sink({ type: "final_text", text: notice });
     sink(usageEvent(totals, true));
     sink({ type: "done", finish_reason: "turn_limit" });
@@ -2229,9 +2612,10 @@ export class AgentOrchestrator implements IAgentRunner {
     const totals = zeroUsage();
 
     const effectiveMode = input.mode ?? (specialist?.readOnly ? "plan" : "build");
-    let tools = filterToolsForMode(this.registry.listDefinitions(), effectiveMode).filter(
-      (tool) => !SUBAGENT_BLOCKED_TOOLS.has(tool.name),
-    );
+    let tools = this.filterToolsForCapabilities(
+      filterToolsForMode(this.registry.listDefinitions(), effectiveMode),
+      capabilities,
+    ).filter((tool) => !SUBAGENT_BLOCKED_TOOLS.has(tool.name));
     if (!capabilities.tool_calling) tools = [];
     if (specialist) {
       tools = this.specialistAgents.filterTools(specialist, tools, this.readOnlyToolNames());
@@ -2305,7 +2689,10 @@ export class AgentOrchestrator implements IAgentRunner {
       for (const block of toolUses) {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         input.onTranscript(`[tool] ${call.name}`);
-        const result = await this.registry.run(call, effectiveMode, input.signal);
+        const specialistRules = specialist?.permissions?.length
+          ? permissionRulesFromConfig(specialist.permissions)
+          : [];
+        const result = await this.registry.run(call, effectiveMode, input.signal, specialistRules);
         messages.push(
           toolResultMessage(call, typeof result.content === "string" ? result.content : JSON.stringify(result.content), result.is_error),
         );
@@ -2349,6 +2736,18 @@ export class AgentOrchestrator implements IAgentRunner {
       branch: branch.exitCode === 0 ? branch.stdout.trim() || undefined : undefined,
       diff: diff.length > 0 ? diff.slice(0, 20_000) : undefined,
     };
+  }
+
+  private filterToolsForCapabilities<T extends { name: string }>(
+    tools: T[],
+    capabilities?: { edit_mode?: "hashline" | "exact"; patch?: boolean },
+  ): T[] {
+    return tools.filter((tool) => {
+      if (tool.name === "replace_text") return capabilities?.edit_mode === "exact";
+      if (tool.name === "hash_edit") return capabilities?.edit_mode !== "exact";
+      if (tool.name === "apply_unified_patch") return capabilities?.patch !== false;
+      return true;
+    });
   }
 
   private combineTools(
@@ -2623,7 +3022,7 @@ function countLineChanges(before: string, after: string): { additions: number; d
   return { additions, deletions };
 }
 
-const COMMAND_OUTPUT_TOOLS = new Set(["bash", "run_sandbox_script", "bg_start", "bg_logs"]);
+const COMMAND_OUTPUT_TOOLS = new Set(["bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"]);
 const CONTENT_OUTPUT_TOOLS = new Set([
   "read_file",
   "read_skeleton",

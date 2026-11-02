@@ -7,7 +7,7 @@ import type { Message } from "../types/schema";
 import { truncateText } from "./format";
 import { isMouseSequence } from "./mouse";
 import { deleteSessionFromList } from "./session-actions";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 import { useTerminalSize } from "./viewport";
 
 export type SessionModalTab = "sessions" | "fork" | "timeline";
@@ -63,8 +63,9 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
     onRestoreSnapshot,
     onClose,
     height,
-    theme = getTheme("tokyonight"),
+    theme: themeProp,
   } = props;
+  const theme = useActiveTheme(themeProp);
 
   const [activeTab, setActiveTab] = React.useState<SessionModalTab>(initialTab);
 
@@ -320,7 +321,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                 ? "Conversation Forking"
                 : "Git Snapshots"}
           </Text>
-          <Text dimColor>Tab switch · Esc close</Text>
+          <Text color={theme.muted}>Tab switch · Esc close</Text>
         </Box>
       ) : (
         <Box justifyContent="space-between" marginBottom={0}>
@@ -333,24 +334,24 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
             </Text>
             <Text
               bold={activeTab === "fork"}
-              color={activeTab === "fork" ? theme.modes.build.primary : theme.muted}
+              color={activeTab === "fork" ? theme.accent : theme.muted}
             >
               2. Conversation Forking
             </Text>
             <Text
               bold={activeTab === "timeline"}
-              color={activeTab === "timeline" ? theme.modes.ultrawork.primary : theme.muted}
+              color={activeTab === "timeline" ? theme.accent : theme.muted}
             >
               3. Git Snapshot Timeline
             </Text>
           </Box>
-          <Text dimColor>Esc Close  |  Tab Switch Tab  |  Ctrl+N New Session</Text>
+          <Text color={theme.muted}>Esc Close  |  Tab Switch Tab  |  Ctrl+N New Session</Text>
         </Box>
       )}
 
       {statusNotice ? (
         <Box marginY={0}>
-          <Text color={theme.modes.ultrawork.primary}>{statusNotice}</Text>
+          <Text color={theme.status.info}>{statusNotice}</Text>
         </Box>
       ) : null}
 
@@ -363,7 +364,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
               </Text>
               <Text>{searchQuery}</Text>
               <Text inverse color={theme.accent}> </Text>
-              {searchQuery.length === 0 ? <Text dimColor> type to filter</Text> : null}
+              {searchQuery.length === 0 ? <Text color={theme.muted}> type to filter</Text> : null}
             </Text>
           ) : (
             <Box borderStyle="single" borderColor={theme.border.passive} paddingX={1} marginY={0}>
@@ -373,14 +374,14 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
               <Text>{searchQuery}</Text>
               <Text inverse color={theme.accent}> </Text>
               {searchQuery.length === 0 ? (
-                <Text dimColor>Type keyword for instant FTS search across sessions...</Text>
+                <Text color={theme.muted}>Type keyword for instant FTS search across sessions...</Text>
               ) : null}
             </Box>
           )}
 
           <Box flexDirection="column" marginY={compact ? 0 : 1}>
             {!compact ? (
-              <Text bold color={theme.modes.plan.primary}>
+              <Text bold color={theme.accent}>
                 {searchHits.length > 0
                   ? `Search Results (${searchHits.length})`
                   : `Session History (${sessions.length})`}
@@ -403,7 +404,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                 );
               })
             ) : sessions.length === 0 ? (
-              <Text dimColor>No conversation sessions found.</Text>
+              <Text color={theme.muted}>No conversation sessions found.</Text>
             ) : (
               visibleSessions.map((sess, offset) => {
                 const idx = sessionStart + offset;
@@ -413,7 +414,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                   return (
                     <Text
                       key={sess.id}
-                      color={isSelected ? theme.accent : undefined}
+                      color={isSelected ? theme.selection : theme.text}
                       bold={isSelected}
                       wrap="truncate"
                     >
@@ -426,20 +427,20 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                 return (
                   <Box key={sess.id} justifyContent="space-between">
                     <Box>
-                      <Text color={isSelected ? theme.accent : undefined} bold={isSelected} wrap="truncate">
+                      <Text color={isSelected ? theme.selection : theme.text} bold={isSelected} wrap="truncate">
                         {isSelected ? "❯ " : "  "}
                         {truncateText(sess.title, Math.max(16, columns - 34))}
                       </Text>
-                      {isCurrent ? <Text color={theme.modes.build.primary}> (active)</Text> : null}
+                      {isCurrent ? <Text color={theme.status.success}> (active)</Text> : null}
                     </Box>
-                    <Text dimColor>{formatTimestamp(sess.updatedAt)}</Text>
+                    <Text color={theme.muted}>{formatTimestamp(sess.updatedAt)}</Text>
                   </Box>
                 );
               })
             )}
           </Box>
 
-          <Text dimColor wrap="truncate">
+          <Text color={theme.muted} wrap="truncate">
             {compact
               ? columns < 50
                 ? "Enter resume · Esc close"
@@ -452,14 +453,14 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
       {activeTab === "fork" ? (
         <Box flexDirection="column" marginY={1}>
           <Box justifyContent="space-between" marginBottom={1}>
-            <Text bold color={theme.modes.build.primary}>
+            <Text bold color={theme.accent}>
               Conversation Forking: Choose a Turn to Create a New Branch
             </Text>
-            <Text dimColor>{activeMessages.length} turns</Text>
+            <Text color={theme.muted}>{activeMessages.length} turns</Text>
           </Box>
 
           {activeMessages.length === 0 ? (
-            <Text dimColor>No message turns available to fork in this session.</Text>
+            <Text color={theme.muted}>No message turns available to fork in this session.</Text>
           ) : (
             activeMessages.slice(0, 10).map((msg, idx) => {
               const isSelected = idx === turnIndex;
@@ -467,11 +468,11 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
 
               return (
                 <Box key={msg.id} marginY={0}>
-                  <Text color={isSelected ? theme.modes.build.primary : undefined} bold={isSelected}>
+                  <Text color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                     {isSelected ? "❯ " : "  "}
                     Turn {idx + 1} {msg.role.toUpperCase()}:{" "}
                   </Text>
-                  <Text dimColor={!isSelected}>
+                  <Text color={!isSelected ? theme.muted : theme.text}>
                     {textContent.length > 70 ? `${textContent.slice(0, 67)}...` : textContent}
                   </Text>
                 </Box>
@@ -480,7 +481,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
           )}
 
           <Box marginTop={1} justifyContent="space-between">
-            <Text dimColor>
+            <Text color={theme.muted}>
               f / Enter Fork New Session from Selected Turn  |  Up/Down Select Turn
             </Text>
           </Box>
@@ -490,10 +491,10 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
       {activeTab === "timeline" ? (
         <Box flexDirection="column" marginY={1}>
           <Box justifyContent="space-between" marginBottom={1}>
-            <Text bold color={theme.modes.ultrawork.primary}>
+            <Text bold color={theme.accent}>
               Shadow Git Snapshot Timeline
             </Text>
-            <Text dimColor>
+            <Text color={theme.muted}>
               {snapshotHistory.entries.length} snapshots stored
             </Text>
           </Box>
@@ -501,7 +502,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
           <Box flexDirection="row">
             <Box flexDirection="column" width="55%" paddingRight={1}>
               {snapshotHistory.entries.length === 0 ? (
-                <Text dimColor>No git snapshots recorded yet.</Text>
+                <Text color={theme.muted}>No git snapshots recorded yet.</Text>
               ) : (
                 snapshotHistory.entries.slice(0, 8).map((snap, idx) => {
                   const isSelected = idx === snapshotIndex;
@@ -510,18 +511,18 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                   return (
                     <Box key={snap.id} justifyContent="space-between">
                       <Box>
-                        <Text color={isSelected ? theme.modes.ultrawork.primary : undefined} bold={isSelected}>
+                        <Text color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                           {isSelected ? "❯ " : "  "}
                           {snap.label.slice(0, 30)}
                         </Text>
                         {isCurrent ? (
-                          <Text color={theme.modes.build.primary} bold>
+                          <Text color={theme.status.success} bold>
                             {" "}
                             ACTIVE
                           </Text>
                         ) : null}
                       </Box>
-                      <Text dimColor>{formatTimestamp(snap.createdAt)}</Text>
+                      <Text color={theme.muted}>{formatTimestamp(snap.createdAt)}</Text>
                     </Box>
                   );
                 })
@@ -533,10 +534,10 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
                 Changed Files
               </Text>
               {changedFiles.length === 0 ? (
-                <Text dimColor>(No modified files in this snapshot)</Text>
+                <Text color={theme.muted}>(No modified files in this snapshot)</Text>
               ) : (
                 changedFiles.map((file, idx) => (
-                  <Text key={`file-${idx}`} color={theme.modes.build.primary}>
+                  <Text key={`file-${idx}`} color={theme.text}>
                     • {file}
                   </Text>
                 ))
@@ -545,7 +546,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
           </Box>
 
           <Box marginTop={1} justifyContent="space-between">
-            <Text dimColor>
+            <Text color={theme.muted}>
               Enter Restore Workspace to Snapshot  |  Up/Down Select Snapshot
             </Text>
           </Box>

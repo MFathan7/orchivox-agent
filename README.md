@@ -93,6 +93,12 @@ Useful commands:
 - `/commit` splits the current diff into commits.
 - `/help` shows all commands and shortcuts.
 
+## Context and compaction
+
+Orchivox budgets by tokens first. It keeps a buffer for the reply and summarizes older history near the model's input budget. `/stats` shows the context used, the request size, the input budget, and session spend.
+
+Prune is off by default. When on, it removes old tool output without writing a summary, which can save context but can also increase how often the conversation needs a full summary. To opt in, set `compaction.prune: true` in `.agent/config.yaml`. The default budgets protect the most recent 40K tokens and only prune when the change frees at least 20K.
+
 ## Features
 
 - Plan, build, and ultrawork modes.
@@ -102,6 +108,16 @@ Useful commands:
 - Resumable sessions with search and branching.
 - Parallel workers for large tasks.
 - Hosted and local model support.
+- Seven color themes, including a light preset, saved with your settings.
+- Per-turn step, tool, and time budgets that stop with a summary instead of running forever.
+- Token-first compaction with a configurable context buffer; session spend and total tokens survive compaction.
+- Repeated-call detection and a per-turn read cache.
+- Model-aware edit tools and bounded code search.
+- Optional code mode for batching tool calls in one sandboxed script.
+- Web search through Tavily, Brave, Exa, Firecrawl, or DuckDuckGo, with provider fallback and per-session memory.
+- Per-agent permissions, a conservative plan-mode shell scanner, and task board caps.
+- Live turn budget status and a `/turn-report` breakdown.
+- A turn observation script to compare models and reasoning levels before adding a profile.
 - Automation options for scripts and other tools.
 
 ## Update
@@ -150,6 +166,7 @@ If the installer added Orchivox to your PATH, remove the block between `# >>> or
 
 - If `orchivox` is not found, add `~/.orchivox/bin` to your PATH and restart your terminal.
 - If no model is available, run `/connect` and then `/models`.
+- If the light theme is not picked up or a theme looks unreadable, set `ORCHIVOX_APPEARANCE=light` or `ORCHIVOX_APPEARANCE=dark` before starting.
 - If an update fails, run `orchivox update --rollback`.
 - For other problems, open an issue at https://github.com/MFathan7/orchivox-agent/issues.
 

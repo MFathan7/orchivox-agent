@@ -2,6 +2,7 @@ import React from "react";
 import { Text } from "ink";
 
 import { formatTurnStatus } from "./format";
+import { fitDisplayText } from "./text-wrap";
 import { useTheme } from "./theme";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -49,6 +50,12 @@ export interface LiveStatusProps {
   runningLabel?: string;
   runningStartedAt?: number;
   step?: number;
+  stepLimit?: number;
+  toolLimit?: number;
+  timeLimitSeconds?: number;
+  contextPercent?: number;
+  requestLabel?: string;
+  width?: number;
 }
 
 /**
@@ -64,6 +71,12 @@ export function LiveStatus({
   runningLabel,
   runningStartedAt,
   step,
+  stepLimit,
+  toolLimit,
+  timeLimitSeconds,
+  contextPercent,
+  requestLabel,
+  width,
 }: LiveStatusProps): React.ReactElement | null {
   const theme = useTheme();
   const frame = useSpinner(active);
@@ -81,6 +94,24 @@ export function LiveStatus({
   const runningSeconds = runningStartedAt
     ? Math.max(0, Math.floor((Date.now() - runningStartedAt) / 1000))
     : 0;
+  const showHint = width === undefined || width >= 120;
+  const hint = showHint ? " · Esc twice to stop" : "";
+  const available = width !== undefined ? Math.max(8, width - 2 - hint.length) : undefined;
+  const status = formatTurnStatus({
+    answering,
+    elapsedSeconds,
+    completedTools,
+    runningLabel,
+    runningSeconds,
+    step,
+    stepLimit,
+    toolLimit,
+    timeLimitSeconds,
+    contextPercent,
+    requestLabel,
+    width: available,
+  });
+  const display = available !== undefined ? fitDisplayText(status, available) : status;
 
   return (
     <Text>
@@ -88,16 +119,9 @@ export function LiveStatus({
         {frame}{" "}
       </Text>
       <Text color={theme.text} bold>
-        {formatTurnStatus({
-          answering,
-          elapsedSeconds,
-          completedTools,
-          runningLabel,
-          runningSeconds,
-          step,
-        })}
+        {display}
       </Text>
-      <Text color={theme.muted}> · Esc twice to stop</Text>
+      {hint ? <Text color={theme.muted}>{hint}</Text> : null}
     </Text>
   );
 }

@@ -1,7 +1,7 @@
 import React from "react";
 import { Box, Text, useInput } from "ink";
 
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export interface HelpRow {
   keys: string;
@@ -39,6 +39,7 @@ export const HELP_SECTIONS: HelpSection[] = [
       { keys: "/commit", description: "Split changes into atomic commits" },
       { keys: "/compact", description: "Compact the context window" },
       { keys: "/stats", description: "Open the session statistics panel" },
+      { keys: "/turn-report", description: "Open the last turn metrics panel" },
       { keys: "/debug", description: "Inspect the last system prompt and active skills" },
       { keys: "/about", description: "Show version, entrypoint, and config source" },
       { keys: "/doctor", description: "Show terminal and config diagnostics" },
@@ -129,12 +130,9 @@ export function buildHelpLines(): HelpLine[] {
   return lines;
 }
 
-export function HelpOverlay({
-  theme = getTheme("tokyonight"),
-  width = 80,
-  height = 24,
-  onClose,
-}: HelpOverlayProps): React.ReactElement {
+export function HelpOverlay(props: HelpOverlayProps): React.ReactElement {
+  const { theme: themeProp, width = 80, height = 24, onClose } = props;
+  const theme = useActiveTheme(themeProp);
   const lines = React.useMemo(() => buildHelpLines(), []);
   const visibleCount = Math.max(6, height - 4);
   const [offset, setOffset] = React.useState(0);
@@ -177,7 +175,7 @@ export function HelpOverlay({
           if (line.kind === "blank") return <Text key={index}> </Text>;
           if (line.kind === "section") {
             return (
-              <Text key={index} bold color={theme.modes.plan.primary}>
+              <Text key={index} bold color={theme.accent}>
                 {line.text}
               </Text>
             );

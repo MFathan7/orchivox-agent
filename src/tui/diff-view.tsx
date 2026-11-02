@@ -15,7 +15,7 @@ import {
   wrapPreservingWhitespace,
 } from "./text-wrap";
 import type { ThinkingSegmentView } from "./app";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export interface DiffViewProps {
   oldText: string;
@@ -335,8 +335,9 @@ export function DiffView({
   unified = false,
   context = 3,
   width = 80,
-  theme = getTheme("tokyonight"),
+  theme: themeProp,
 }: DiffViewProps) {
+  const theme = useActiveTheme(themeProp);
   const hunks = React.useMemo(() => collectDiffHunks(oldText, newText, context), [oldText, newText, context]);
   const sideBySide = !unified && width >= 100;
 
@@ -405,9 +406,10 @@ export function ToolCallBadge({
   durationMs,
   status = "ok",
   lspStatus,
-  theme = getTheme("tokyonight"),
+  theme: themeProp,
 }: ToolCallBadgeProps) {
-  const statusColor = status === "running" ? theme.badge.running : status === "error" ? theme.badge.error : theme.badge.ok;
+  const theme = useActiveTheme(themeProp);
+  const statusColor = status === "running" ? theme.badge.running : status === "error" ? theme.status.error : theme.status.success;
   const statusIcon = status === "running" ? "●" : status === "error" ? "✖" : "✔";
   return (
     <Box gap={1} marginY={0}>
@@ -436,8 +438,9 @@ export function ThinkingTimeline({
   live = false,
   showHeader = true,
   width = 80,
-  theme = getTheme("tokyonight"),
+  theme: themeProp,
 }: ThinkingTimelineProps) {
+  const theme = useActiveTheme(themeProp);
   const visible = live ? segments.filter((segment) => segment.completedAt !== undefined) : segments;
   if (visible.length === 0) return null;
   const contentWidth = Math.max(8, width - 2);
@@ -498,8 +501,9 @@ export function ThinkingBlock({
   live = false,
   durationMs,
   width = 80,
-  theme = getTheme("tokyonight"),
+  theme: themeProp,
 }: ThinkingBlockProps) {
+  const theme = useActiveTheme(themeProp);
   const [open, setOpen] = React.useState(defaultOpen);
   useInput(
     (input, key) => {

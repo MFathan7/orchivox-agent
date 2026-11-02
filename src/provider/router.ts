@@ -121,6 +121,8 @@ export class ProviderRouter {
         temperature: true,
         pdf: false,
         parallel_tool_calls: true,
+        edit_mode: "hashline",
+        patch: true,
         source: "default",
         limit_sources: { context: "default", output: "default" },
       };

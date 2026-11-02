@@ -2,7 +2,7 @@ import React from "react";
 import { Box, Text, useInput } from "ink";
 
 import { isMouseSequence } from "./mouse";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export interface ChoiceOption {
   id: string;
@@ -22,16 +22,18 @@ export interface ChoiceModalProps {
   onCancel: () => void;
 }
 
-export function ChoiceModal({
-  title,
-  subtitle,
-  options,
-  initialIndex = 0,
-  width = 100,
-  theme = getTheme("tokyonight"),
-  onSelect,
-  onCancel,
-}: ChoiceModalProps): React.ReactElement {
+export function ChoiceModal(props: ChoiceModalProps): React.ReactElement {
+  const {
+    title,
+    subtitle,
+    options,
+    initialIndex = 0,
+    width = 100,
+    theme: themeProp,
+    onSelect,
+    onCancel,
+  } = props;
+  const theme = useActiveTheme(themeProp);
   const [selected, setSelected] = React.useState(() =>
     Math.max(0, Math.min(options.length - 1, initialIndex)),
   );

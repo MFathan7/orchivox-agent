@@ -4,7 +4,7 @@ import { Text } from "ink";
 import { toolDisplay } from "../agent/tool-display";
 import type { ChatEntryView, ChatToolCallView } from "./app";
 import { diffPreviewRows, diffRows, formatThinkingDuration } from "./diff-view";
-import { formatTokenCount } from "./format";
+import { formatBytes, formatTokenCount } from "./format";
 import { hashlinePanelParts, parseHashlineOutput } from "./hashline-format";
 import { markdownRows } from "./markdown";
 import {
@@ -14,7 +14,7 @@ import {
 } from "./panel";
 import type { RenderRow } from "./rows";
 import { Spinner } from "./spinner";
-import { getTheme, type Theme } from "./theme";
+import { type Theme } from "./theme";
 import {
   displayWidth,
   fitDisplayText,
@@ -30,7 +30,7 @@ export interface TranscriptRow extends RenderRow {
 
 export interface BuildTranscriptOptions {
   width: number;
-  theme?: Theme;
+  theme: Theme;
   collapsed: boolean;
   expandedGroups: ReadonlySet<string>;
   thinkingExpanded: boolean;
@@ -113,12 +113,12 @@ function statusIcon(status: ChatToolCallView["status"]): string {
 
 function statusColor(status: ChatToolCallView["status"], theme: Theme): string {
   if (status === "running") return theme.badge.running;
-  if (status === "error") return theme.badge.error;
-  return theme.badge.ok;
+  if (status === "error") return theme.status.error;
+  return theme.status.success;
 }
 
 const TOOL_MARGIN = 2;
-const COMMAND_TOOL_NAMES = new Set(["bash", "run_sandbox_script", "bg_start", "bg_logs"]);
+const COMMAND_TOOL_NAMES = new Set(["bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"]);
 const HASHLINE_TOOL_NAMES = new Set(["read_file", "grep_search"]);
 const EDIT_TOOL_NAMES = new Set([
   "hash_edit",
@@ -471,19 +471,44 @@ function compactionRows(
   if (entry.compaction?.error) {
     rows.push({
       key: `${entry.id}-error`,
-      node: <Text color={theme.badge.error}>{entry.compaction.error}</Text>,
+      node: <Text color={theme.status.error}>{entry.compaction.error}</Text>,
     });
   }
 
   if (entry.compaction && entry.compaction.status !== "running") {
+    const trigger = entry.compaction.trigger ?? entry.compaction.reason;
+    const label =
+      entry.compaction.status === "error"
+        ? "compaction failed"
+        : trigger === "request_size"
+          ? "request size compacted"
+          : trigger === "overflow" || trigger === "retry"
+            ? "overflow compacted"
+            : trigger === "output_limit"
+              ? "output limit compacted"
+              : trigger === "manual"
+                ? "manual compacted"
+                : "auto compacted";
+    const requestDetail =
+      entry.compaction.requestBytes !== undefined
+        ? ` · request ${formatBytes(entry.compaction.requestBytes)}${
+            entry.compaction.maxRequestBytes
+              ? `/${formatBytes(entry.compaction.maxRequestBytes)}`
+              : ""
+          }`
+        : "";
+    const budgetDetail =
+      entry.compaction.inputBudget !== undefined
+        ? ` · budget ${formatTokenCount(entry.compaction.inputBudget)}`
+        : "";
     rows.push({
       key: `${entry.id}-footer`,
       node: (
         <Text color={theme.border.passive} wrap="truncate">
           {dividerLine(
-            `${formatTokenCount(entry.compaction.beforeTokens)} -> ${formatTokenCount(
+            `${label} · ${formatTokenCount(entry.compaction.beforeTokens)} -> ${formatTokenCount(
               entry.compaction.afterTokens,
-            )} tokens · ${entry.compaction.removedMessages} messages removed`,
+            )} tokens · ${entry.compaction.removedMessages} messages removed${requestDetail}${budgetDetail}`,
             width,
           )}
         </Text>
@@ -518,7 +543,7 @@ function systemRows(entry: ChatEntryView, width: number, theme: Theme): Transcri
         key: `${entry.id}-line-${lineIndex}-${chunkIndex}`,
         node: (
           <Text wrap="truncate">
-            <Text color={theme.modes.plan.primary}>
+            <Text color={theme.status.info}>
               {lineIndex === 0 && chunkIndex === 0 ? "ℹ " : "  "}
             </Text>
             <Text color={theme.text}>{chunk}</Text>
@@ -536,7 +561,7 @@ function assistantRows(
   now: number,
 ): TranscriptRow[] {
   const width = options.width;
-  const theme = options.theme ?? getTheme("tokyonight");
+  const theme = options.theme;
   const rows: TranscriptRow[] = [];
   const allCalls = entry.toolCalls ?? [];
   const liveCalls = entry.live ? allCalls.slice(-LIVE_TOOL_LIMIT) : allCalls;
@@ -834,7 +859,7 @@ function buildEntryRows(
   options: BuildTranscriptOptions,
   now: number,
 ): TranscriptRow[] {
-  const theme = options.theme ?? getTheme("tokyonight");
+  const theme = options.theme;
   if (entry.role === "compaction") {
     return compactionRows(entry, options.width, options.collapsed, theme);
   }
@@ -852,7 +877,7 @@ function cacheKey(entry: ChatEntryView, options: BuildTranscriptOptions): string
     options.diffExpanded ? 1 : 0,
     options.thinkingExpanded ? 1 : 0,
     options.expandedGroups.has(entry.id) ? 1 : 0,
-    (options.theme ?? getTheme("tokyonight")).name,
+    options.theme.name,
   ].join(":");
 }
 

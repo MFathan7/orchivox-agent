@@ -8,7 +8,7 @@ import { readText } from "../tools/hashline-edit";
 import { CustomCommandEngine } from "../agent/custom-commands";
 import { SpecialistAgentRegistry } from "../agent/specialist-agents";
 import { SkillRegistry } from "../agent/skills";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export type AutocompleteTrigger = "command" | "file" | "symbol" | "skill";
 
@@ -68,7 +68,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/ultrawork", description: "Switch to autonomous ultrawork mode" },
   { name: "/study", description: "Study the project and report what exists" },
   { name: "/review", requiresArgs: true, description: "Review a file or answer a code question" },
-  { name: "/theme", requiresArgs: true, description: "Change or inspect the terminal theme" },
+  { name: "/theme", requiresArgs: false, description: "Change or inspect the terminal theme" },
   { name: "/reasoning", requiresArgs: false, description: "Set thinking effort" },
   { name: "/palette", description: "Search actions and settings" },
   { name: "/sessions", description: "Open session manager and past conversation search" },
@@ -84,6 +84,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/commit", description: "Analyze git diff and create atomic commits" },
   { name: "/compact", description: "Compact conversation history to save context tokens" },
   { name: "/stats", description: "Show session and workspace statistics" },
+  { name: "/turn-report", description: "Show the last turn step, tool, and budget report" },
   { name: "/about", description: "Show version, commit, entrypoint, and config source" },
   { name: "/doctor", description: "Show entrypoint, config, and terminal diagnostics" },
   { name: "/update", description: "Check for an Orchivox update" },
@@ -521,10 +522,11 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
     items,
     selectedIndex,
     trigger,
-    theme = getTheme("tokyonight"),
+    theme: themeProp,
     maxVisible = 6,
     width = 80,
   } = props;
+  const theme = useActiveTheme(themeProp);
 
   if (items.length === 0) {
     return null;
@@ -544,19 +546,15 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
   const visibleItems = items.slice(startIndex, startIndex + maxVisible);
 
   let triggerLabel = "QUICK SEARCH";
-  let triggerColor = theme.accent;
+  const triggerColor = theme.focus;
   if (trigger === "command") {
     triggerLabel = "SLASH COMMANDS";
-    triggerColor = theme.modes.plan.primary;
   } else if (trigger === "file") {
     triggerLabel = "FILES & SPECIALIST AGENTS";
-    triggerColor = theme.modes.build.primary;
   } else if (trigger === "symbol") {
     triggerLabel = "AST SYMBOLS";
-    triggerColor = theme.modes.ultrawork.primary;
   } else if (trigger === "skill") {
     triggerLabel = "SKILLS";
-    triggerColor = theme.modes.plan.secondary;
   }
 
   return (
@@ -571,7 +569,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
         <Text bold color={triggerColor}>
           {triggerLabel}
         </Text>
-        <Text dimColor>
+        <Text color={theme.muted}>
           {clampedSelected + 1} of {items.length} options
         </Text>
       </Box>
@@ -584,7 +582,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
           if (trigger === "command") {
             if (compactPopup) {
               return (
-                <Text key={item.id} color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                <Text key={item.id} color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                   {isSelected ? "❯ " : "  "}
                   {truncateText(item.label, Math.max(8, popupWidth - 6))}
                   {item.detail ? <Text color={theme.muted}> {truncateText(item.detail, 8)}</Text> : null}
@@ -594,7 +592,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
             return (
               <Box key={item.id}>
                 <Box width={13}>
-                  <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                  <Text color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                     {isSelected ? "❯ " : "  "}
                     {item.label}
                   </Text>
@@ -608,7 +606,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
                 </Box>
                 {item.description ? (
                   <Box flexGrow={1}>
-                    <Text dimColor>{truncateText(item.description, commandDescWidth)}</Text>
+                    <Text color={theme.muted}>{truncateText(item.description, commandDescWidth)}</Text>
                   </Box>
                 ) : null}
               </Box>
@@ -618,7 +616,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
           if (trigger === "file") {
             if (compactPopup) {
               return (
-                <Text key={item.id} color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                <Text key={item.id} color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                   {isSelected ? "❯ " : "  "}
                   {truncateText(item.label, Math.max(8, popupWidth - 6))}
                 </Text>
@@ -629,7 +627,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
             return (
               <Box key={item.id} justifyContent="space-between">
                 <Box width={labelWidth} flexShrink={1}>
-                  <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                  <Text color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                     {isSelected ? "❯ " : "  "}
                     {truncateText(item.label, Math.max(4, labelWidth - 2 - detailBudget))}
                   </Text>
@@ -637,7 +635,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
                 </Box>
                 {item.description ? (
                   <Box width={descWidth} marginLeft={2} flexShrink={0}>
-                    <Text dimColor>{truncateText(item.description, descWidth)}</Text>
+                    <Text color={theme.muted}>{truncateText(item.description, descWidth)}</Text>
                   </Box>
                 ) : null}
               </Box>
@@ -646,7 +644,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
 
           if (compactPopup) {
             return (
-              <Text key={item.id} color={isSelected ? triggerColor : undefined} bold={isSelected}>
+              <Text key={item.id} color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                 {isSelected ? "❯ " : "  "}
                 {truncateText(item.label, Math.max(8, popupWidth - 6))}
               </Text>
@@ -659,14 +657,14 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
           return (
             <Box key={item.id}>
               <Box width={commandLabelWidth}>
-                <Text color={isSelected ? triggerColor : undefined} bold={isSelected}>
+                <Text color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                   {isSelected ? "❯ " : "  "}
                   {truncateText(commandLabel, commandLabelWidth - 2)}
                 </Text>
               </Box>
               {item.description ? (
                 <Box flexGrow={1}>
-                  <Text dimColor>
+                  <Text color={theme.muted}>
                     {truncateText(item.description, Math.max(10, popupWidth - commandLabelWidth - 4))}
                   </Text>
                 </Box>
@@ -677,7 +675,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
       </Box>
 
       <Box marginTop={0}>
-        <Text dimColor>
+        <Text color={theme.muted}>
           Navigate: Up/Down · Insert: Tab/Enter · Dismiss: Esc
         </Text>
       </Box>

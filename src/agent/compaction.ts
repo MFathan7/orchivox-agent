@@ -43,9 +43,11 @@ export interface CompactionOptions {
   inputLimit?: number;
   outputLimit?: number;
   keepTokens?: number;
+  buffer?: string | number;
   bufferTokens?: number;
   bufferRatio?: number;
   reserveTokens?: number;
+  reserved?: number;
   force?: boolean;
   previousSummary?: string;
   overheadTokens?: number;
@@ -75,6 +77,57 @@ export function compactionReserve(window: number, options: { bufferTokens?: numb
  * The prompt budget for one request. Reserve the output the request asks for and
  * a small safety margin, so the request never sits exactly on the window edge.
  */
+export interface CompactionBufferOptions {
+  /** New preferred buffer: a percentage string or a token count. */
+  buffer?: string | number;
+  reserved?: number;
+  reserveTokens?: number;
+  bufferTokens?: number;
+  bufferRatio?: number;
+}
+
+/**
+ * Resolves the room kept free for the reply. A positive value gets a 16K
+ * minimum on normal windows; 0 disables the buffer. Precedence is
+ * buffer, reserved, reserve_tokens, buffer_tokens, buffer_ratio, default.
+ */
+export function resolveCompactionBuffer(
+  window: number,
+  options: CompactionBufferOptions = {},
+): number {
+  const minimum = window >= 32_000 ? 16_000 : 0;
+  const normalize = (value: number | undefined): number | undefined => {
+    if (value === undefined || !Number.isFinite(value)) return undefined;
+    const tokens = Math.max(0, Math.floor(value));
+    return tokens === 0 ? 0 : Math.max(minimum, tokens);
+  };
+
+  if (typeof options.buffer === "number") {
+    return normalize(options.buffer) ?? compactionReserve(window);
+  }
+  if (typeof options.buffer === "string") {
+    const match = /^(\d+(?:\.\d+)?)%$/.exec(options.buffer.trim());
+    if (match) {
+      return (
+        normalize(Math.floor((window * Number(match[1])) / 100)) ??
+        compactionReserve(window)
+      );
+    }
+  }
+
+  const legacy = [
+    options.reserved,
+    options.reserveTokens,
+    options.bufferTokens,
+    options.bufferRatio !== undefined ? Math.floor(window * options.bufferRatio) : undefined,
+  ];
+  for (const raw of legacy) {
+    const value = normalize(raw);
+    if (value !== undefined) return value;
+  }
+  return compactionReserve(window);
+}
+
 export function computeInputBudget(input: {
   contextWindow: number;
   maxInput?: number;
@@ -85,7 +138,7 @@ export function computeInputBudget(input: {
 }): number {
   const base = Math.min(input.maxInput ?? input.contextWindow, input.contextWindow);
   const output = Math.max(1024, input.requestedOutput ?? input.maxOutput ?? 32_000);
-  const reserved = Math.max(1024, input.reserved ?? compactionReserve(base));
+  const reserved = Math.max(0, input.reserved ?? compactionReserve(base));
   const safety = Math.max(2_048, Math.floor(base * (input.safetyRatio ?? 0.02)));
   return Math.max(1_024, base - Math.max(output, reserved) - safety);
 }
@@ -433,7 +486,7 @@ export function reduceTranscriptForOverflow(
 
 export async function compactMessages(messages: Message[], options: CompactionOptions): Promise<CompactionResult> {
   const contextWindow = options.inputLimit ?? options.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-  const buffer = compactionReserve(contextWindow, options);
+  const buffer = resolveCompactionBuffer(contextWindow, options);
   const overhead = options.overheadTokens ?? 0;
   const estimatedTokens = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + overhead;
   const beforeTokens = options.contextTokens ?? estimatedTokens;

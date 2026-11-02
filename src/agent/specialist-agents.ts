@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import type { ToolDefinition } from "../types/schema";
+import type { PermissionAction, PermissionConfigRule } from "./permissions";
 
 export type SpecialistAgentRoleModel = "main" | "advisor" | "fast" | string;
 
@@ -13,6 +14,7 @@ export interface SpecialistAgentProfile {
   readOnly?: boolean;
   thinkingBudget?: number;
   allowedTools?: string[];
+  permissions?: PermissionConfigRule[];
   systemPrompt: string;
   source: "builtin" | "custom";
 }
@@ -172,6 +174,21 @@ export class SpecialistAgentRegistry {
           const allowedTools = Array.isArray(parsed?.allowedTools)
             ? parsed.allowedTools.map(String)
             : undefined;
+          const permissions = Array.isArray(parsed?.permissions)
+            ? parsed.permissions.flatMap((entry) => {
+                if (!entry || typeof entry !== "object") return [];
+                const record = entry as Record<string, unknown>;
+                const action = typeof record.action === "string" ? record.action : undefined;
+                const resource = typeof record.resource === "string" ? record.resource : undefined;
+                const effect: PermissionAction | undefined =
+                  record.effect === "allow" || record.effect === "deny" || record.effect === "ask"
+                    ? record.effect
+                    : undefined;
+                return action && resource && effect
+                  ? [{ action, resource, effect }]
+                  : [];
+              })
+            : undefined;
           const systemPrompt = match[2].trim();
 
           map.set(name, {
@@ -181,6 +198,7 @@ export class SpecialistAgentRegistry {
             readOnly,
             thinkingBudget,
             allowedTools,
+            permissions,
             systemPrompt,
             source: "custom",
           });
@@ -241,6 +259,7 @@ export class SpecialistAgentRegistry {
       } else {
         const mutatingToolNames = new Set([
           "hash_edit",
+          "replace_text",
           "create_file",
           "delete_file",
           "move_file",
@@ -251,6 +270,7 @@ export class SpecialistAgentRegistry {
           "bg_stop",
           "todo_write",
           "spawn_subagents",
+          "execute",
           "task_create",
           "task_dispatch",
           "task_cancel",

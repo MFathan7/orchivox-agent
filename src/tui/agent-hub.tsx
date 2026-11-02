@@ -3,7 +3,7 @@ import { Box, Text, useInput } from "ink";
 
 import type { SubagentWorkerState } from "../agent/subagent";
 import type { TaskItem, TaskState } from "../agent/task-board";
-import { getTheme, type Theme } from "./theme";
+import { useActiveTheme, type Theme } from "./theme";
 
 export type AgentHubTab = "workers" | "tasks";
 
@@ -28,35 +28,37 @@ function workerStatusColor(status: string, theme: Theme): string {
   if (status === "running" || status === "preparing" || status === "finalizing" || status === "queued") {
     return theme.badge.running;
   }
-  if (status === "completed") return theme.badge.ok;
-  if (status === "failed" || status === "timed_out") return theme.badge.error;
+  if (status === "completed") return theme.status.success;
+  if (status === "failed" || status === "timed_out") return theme.status.error;
   return theme.badge.idle;
 }
 
 function taskStatusColor(state: TaskState, theme: Theme): string {
   if (state === "running") return theme.badge.running;
-  if (state === "completed") return theme.badge.ok;
-  if (state === "failed" || state === "blocked") return theme.badge.error;
+  if (state === "completed") return theme.status.success;
+  if (state === "failed" || state === "blocked") return theme.status.error;
   if (state === "cancelled") return theme.badge.idle;
   return theme.muted;
 }
 
-export function AgentHub({
-  workers,
-  tasks = [],
-  active = true,
-  initialTab = "workers",
-  onTabChange,
-  onSteer,
-  onKill,
-  onCancelTask,
-  onDispatchTasks,
-  onMergeTask,
-  onExit,
-  initialSelected = 0,
-  width = 100,
-  theme = getTheme("tokyonight"),
-}: AgentHubProps) {
+export function AgentHub(props: AgentHubProps) {
+  const {
+    workers,
+    tasks = [],
+    active = true,
+    initialTab = "workers",
+    onTabChange,
+    onSteer,
+    onKill,
+    onCancelTask,
+    onDispatchTasks,
+    onMergeTask,
+    onExit,
+    initialSelected = 0,
+    width = 100,
+    theme: themeProp,
+  } = props;
+  const theme = useActiveTheme(themeProp);
   const textLimit = Math.max(30, Math.floor(width * 0.5));
   const [tab, setTab] = React.useState<AgentHubTab>(initialTab);
   const [workerSelected, setWorkerSelected] = React.useState(Math.min(initialSelected, Math.max(workers.length - 1, 0)));
@@ -207,7 +209,7 @@ export function AgentHub({
                     : "0"}
                   {currentWorker.usage?.cost_usd !== undefined ? ` ($${currentWorker.usage.cost_usd.toFixed(4)})` : ""}
                 </Text>
-                <Text bold color={theme.modes.plan.primary}>Live transcript</Text>
+                <Text bold color={theme.accent}>Live transcript</Text>
                 {currentWorker.transcript.length === 0 ? <Text color={theme.muted}>(empty)</Text> : null}
                 {currentWorker.transcript.slice(-8).map((line, index) => (
                   <Text key={index} color={theme.muted}>
@@ -252,18 +254,18 @@ export function AgentHub({
                 </Text>
                 <Text color={theme.text}>deps: {currentTask.dependsOn.length > 0 ? currentTask.dependsOn.join(", ") : "none"}</Text>
                 <Text color={theme.text}>worker: {currentTask.workerId ?? "not started"}</Text>
-                {currentTask.error ? <Text color={theme.badge.error}>error: {currentTask.error}</Text> : null}
+                {currentTask.error ? <Text color={theme.status.error}>error: {currentTask.error}</Text> : null}
                 {currentTask.filesChanged.length > 0 ? (
-                  <Text color={theme.modes.plan.primary}>files: {currentTask.filesChanged.join(", ")}</Text>
+                  <Text color={theme.text}>files: {currentTask.filesChanged.join(", ")}</Text>
                 ) : null}
                 {currentTask.merged !== undefined ? (
-                  <Text color={currentTask.merged ? theme.badge.ok : theme.badge.error}>
+                  <Text color={currentTask.merged ? theme.status.success : theme.status.error}>
                     {currentTask.merged ? `merged: ${currentTask.mergeSummary ?? "ok"}` : `merge failed: ${currentTask.mergeSummary ?? "conflict"}`}
                   </Text>
                 ) : null}
                 {currentTask.result ? (
                   <>
-                    <Text bold color={theme.modes.plan.primary}>Result</Text>
+                    <Text bold color={theme.accent}>Result</Text>
                     {currentTask.result.split("\n").slice(0, 6).map((line, index) => (
                       <Text key={index} color={theme.text}>
                         {line.length > textLimit ? `${line.slice(0, textLimit - 3)}...` : line}
@@ -273,7 +275,7 @@ export function AgentHub({
                 ) : null}
                 {currentTask.diff ? (
                   <>
-                    <Text bold color={theme.modes.plan.primary}>Diff</Text>
+                    <Text bold color={theme.accent}>Diff</Text>
                     {currentTask.diff.split("\n").slice(0, 8).map((line, index) => (
                       <Text key={index} color={line.startsWith("+") ? theme.diff.added : line.startsWith("-") ? theme.diff.removed : theme.muted}>
                         {line.length > textLimit ? `${line.slice(0, textLimit - 3)}...` : line}

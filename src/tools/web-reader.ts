@@ -3,9 +3,14 @@ import { z } from "zod";
 import { truncateHead } from "./output-budget";
 import type { AgentTool, ToolRegistry } from "./registry";
 
-export type WebSearchProvider = "tavily" | "brave" | "exa" | "duckduckgo";
+export type WebSearchProvider = "tavily" | "brave" | "exa" | "firecrawl" | "duckduckgo";
 export type WebSearchProviderChoice = WebSearchProvider | "random";
 export type WebFetchFormat = "markdown" | "text" | "html";
+
+/** Per-session search state. Cooldowns stay shared across sessions. */
+export interface WebSearchSession {
+  preferredProvider?: WebSearchProvider;
+}
 
 export interface WebReaderOptions {
   fetchImpl?: typeof fetch;
@@ -14,16 +19,22 @@ export interface WebReaderOptions {
     tavily?: string;
     brave?: string;
     exa?: string;
+    firecrawl?: string;
     duckduckgo?: string;
   };
   search?: {
     enabled?: boolean;
     provider?: WebSearchProviderChoice;
+    max_results?: number;
   };
   fetch?: {
     enabled?: boolean;
     max_chars?: number;
   };
+  /** A fixed session, used by tests and direct callers. */
+  session?: WebSearchSession;
+  /** Resolves the current session at call time. */
+  getSession?: () => WebSearchSession | undefined;
 }
 
 export interface WebFetchOptions extends WebReaderOptions {
@@ -47,6 +58,7 @@ const DEFAULT_ENDPOINTS = {
   tavily: "https://api.tavily.com/search",
   brave: "https://api.search.brave.com/res/v1/web/search",
   exa: "https://api.exa.ai/search",
+  firecrawl: "https://api.firecrawl.dev/v2/search",
   duckduckgo: "https://html.duckduckgo.com/html/",
 };
 
@@ -80,7 +92,10 @@ export function createWebSearchTool(options: WebReaderOptions = {}): AgentTool {
     readOnly: true,
     execute: async (args) => {
       const request = args as { query: string };
-      const result = await webSearch(request, options);
+      const result = await webSearch(
+        { ...request, maxResults: options.search?.max_results },
+        options,
+      );
       return formatSearchResults(request.query, result);
     },
   };
@@ -130,7 +145,14 @@ export async function webSearch(
   options: WebReaderOptions = {},
 ): Promise<WebSearchResult> {
   const env = options.env ?? globalThis.process.env;
-  const providers = providerOrder(options.search?.provider, env);
+  const session = options.session ?? options.getSession?.();
+  const providers = providerOrder(
+    options.search?.provider,
+    env,
+    session?.preferredProvider,
+  );
+  const maxResults =
+    request.maxResults ?? options.search?.max_results ?? DEFAULT_SEARCH_RESULTS;
   const errors: string[] = [];
   let lastProvider: WebSearchProvider = providers[0] ?? "duckduckgo";
   const now = Date.now();
@@ -138,16 +160,12 @@ export async function webSearch(
     lastProvider = provider;
     if ((providerCooldowns.get(provider) ?? 0) > now) continue;
     try {
-      const results = await searchWith(
-        provider,
-        request.query,
-        request.maxResults ?? DEFAULT_SEARCH_RESULTS,
-        options,
-      );
+      const results = await searchWith(provider, request.query, maxResults, options);
       if (results.length === 0) {
         errors.push(`${provider}: no results`);
         continue;
       }
+      if (session) session.preferredProvider = provider;
       return { provider, results };
     } catch (error) {
       if (error instanceof WebSearchRateLimitError) {
@@ -165,13 +183,20 @@ export async function webSearch(
 function providerOrder(
   choice: WebSearchProviderChoice | undefined,
   env: Record<string, string | undefined>,
+  preferred?: WebSearchProvider,
 ): WebSearchProvider[] {
   const available: WebSearchProvider[] = [];
   if (env.TAVILY_API_KEY) available.push("tavily");
   if (env.BRAVE_API_KEY) available.push("brave");
   if (env.EXA_API_KEY) available.push("exa");
+  if (env.FIRECRAWL_API_KEY) available.push("firecrawl");
   available.push("duckduckgo");
-  if (!choice || choice === "random") return available;
+  if (!choice || choice === "random") {
+    if (preferred && available.includes(preferred)) {
+      return [preferred, ...available.filter((provider) => provider !== preferred)];
+    }
+    return available;
+  }
   return [choice, ...available.filter((provider) => provider !== choice)];
 }
 
@@ -285,6 +310,33 @@ async function searchWith(
       url: item.url ?? "",
       snippet: item.text ?? "",
       published: item.publishedDate,
+    }));
+  }
+
+  if (provider === "firecrawl") {
+    const key = requireKey(env, "FIRECRAWL_API_KEY");
+    const response = await fetchImpl(
+      endpoints.firecrawl,
+      searchInit({
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        body: JSON.stringify({ query, limit: maxResults }),
+      }),
+    );
+    assertSearchResponse(response, provider);
+    const body = (await readJson(response)) as {
+      success?: boolean;
+      error?: string;
+      data?:
+        | { web?: Array<{ title?: string; url?: string; description?: string }> }
+        | Array<{ title?: string; url?: string; description?: string }>;
+    };
+    if (body.success === false) throw new Error(body.error ?? "firecrawl search failed");
+    const items = Array.isArray(body.data) ? body.data : (body.data?.web ?? []);
+    return items.map((item) => ({
+      title: item.title ?? item.url ?? "untitled",
+      url: item.url ?? "",
+      snippet: item.description ?? "",
     }));
   }
 
