@@ -190,7 +190,7 @@ export function HelpOverlay(props: HelpOverlayProps): React.ReactElement {
           return (
             <Text key={index}>
               <Text color={theme.accent}>{line.keys}</Text>
-              <Text>{"  "}</Text>
+              <Text>{" "}</Text>
               <Text color={theme.text}>{line.description}</Text>
             </Text>
           );

@@ -39,7 +39,7 @@ export interface BuildTranscriptOptions {
   now?: number;
 }
 
-/** Keep live rendering bounded while the final answer still renders in full. */
+/** Keep auto-scroll live rendering bounded; scrolling up freezes the full entry. */
 export const LIVE_TEXT_LIMIT = 12_000;
 export const LIVE_TEXT_TAIL_LINES = 180;
 export const LIVE_TOOL_LIMIT = 6;
@@ -71,7 +71,8 @@ export function visibleLiveToolCalls(entry: ChatEntryView): {
   hidden: number;
 } {
   const calls = entry.toolCalls ?? [];
-  if (!entry.live || calls.length <= LIVE_TOOL_LIMIT) {
+  const liveView = entry.live && !entry.frozenLive;
+  if (!liveView || calls.length <= LIVE_TOOL_LIMIT) {
     return { calls, hidden: 0 };
   }
   return {
@@ -563,8 +564,9 @@ function assistantRows(
   const width = options.width;
   const theme = options.theme;
   const rows: TranscriptRow[] = [];
+  const liveView = entry.live && !entry.frozenLive;
   const allCalls = entry.toolCalls ?? [];
-  const liveCalls = entry.live ? allCalls.slice(-LIVE_TOOL_LIMIT) : allCalls;
+  const liveCalls = liveView ? allCalls.slice(-LIVE_TOOL_LIMIT) : allCalls;
   const hiddenLiveCalls = allCalls.length - liveCalls.length;
   const addGap = (key: string): void => {
     if (rows.length === 0) return;
@@ -587,7 +589,7 @@ function assistantRows(
     const segments = entry.thinkingSegments ?? [];
     segments.forEach((segment, index) => {
       const next = segments[index + 1];
-      const visibleSegment = !entry.live || segment.completedAt !== undefined;
+      const visibleSegment = !liveView || segment.completedAt !== undefined;
       if (visibleSegment && !answerCameFromThinking) {
         const duration = Math.max(
           0,
@@ -606,7 +608,7 @@ function assistantRows(
             ),
           );
         }
-      } else if (entry.live) {
+      } else if (liveView) {
         if (entry.text) {
           rows.push(
             thinkingHeaderRow(
@@ -665,7 +667,7 @@ function assistantRows(
       }
     });
   } else if (entry.thinking) {
-    if (entry.live) {
+    if (liveView) {
       if (entry.text) {
         const duration =
           entry.thinkingStartedAt !== undefined
@@ -732,7 +734,7 @@ function assistantRows(
     if (call.diff?.oldLabel) linkedPaths.add(call.diff.oldLabel.replace(/^[ab]\//, ""));
     if (call.diff?.newLabel) linkedPaths.add(call.diff.newLabel.replace(/^[ab]\//, ""));
   }
-  const files = (entry.live ? (entry.files ?? []).slice(-2) : (entry.files ?? [])).filter(
+  const files = (liveView ? (entry.files ?? []).slice(-2) : (entry.files ?? [])).filter(
     (file) => !linkedPaths.has(file.path),
   );
   files.forEach((file, fileIndex) => {
@@ -804,8 +806,8 @@ function assistantRows(
   }
 
   if (entry.text) {
-    if (!entry.live) addGap(`${entry.id}-answer-gap`);
-    const live = entry.live ? liveDisplayText(entry.text) : undefined;
+    if (!liveView) addGap(`${entry.id}-answer-gap`);
+    const live = liveView ? liveDisplayText(entry.text) : undefined;
     if (live?.truncated) {
       rows.push({
         key: `${entry.id}-live-tail`,
@@ -878,6 +880,8 @@ function cacheKey(entry: ChatEntryView, options: BuildTranscriptOptions): string
     options.thinkingExpanded ? 1 : 0,
     options.expandedGroups.has(entry.id) ? 1 : 0,
     options.theme.name,
+    entry.frozenLive ? 1 : 0,
+    entry.text.length,
   ].join(":");
 }
 
@@ -890,7 +894,7 @@ export function buildTranscriptRows(
 
   for (const entry of entries) {
     let entryRows: TranscriptRow[];
-    if (entry.live) {
+    if (entry.live && !entry.frozenLive) {
       entryRows = buildEntryRows(entry, options, now);
     } else {
       let cache = entryRowCache.get(entry);

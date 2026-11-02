@@ -148,6 +148,8 @@ export interface ChatEntryView {
   toolCalls?: ChatToolCallView[];
   files?: ChatFileChangeView[];
   live?: boolean;
+  /** A paused live entry keeps its full text and tool history while the user scrolls. */
+  frozenLive?: boolean;
   startedAt?: number;
   step?: number;
   stepLimit?: number;

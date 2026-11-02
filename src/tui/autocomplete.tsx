@@ -54,6 +54,17 @@ function truncateText(text: string, max: number): string {
   return `${text.slice(0, max - 3)}...`;
 }
 
+export function commandPopupMetrics(
+  labels: readonly string[],
+  popupWidth: number,
+): { labelWidth: number; descriptionWidth: number } {
+  const labelWidth = Math.min(24, Math.max(10, ...labels.map((label) => label.length)));
+  return {
+    labelWidth,
+    descriptionWidth: Math.max(12, popupWidth - labelWidth - 4),
+  };
+}
+
 export const BUILTIN_SLASH_COMMANDS: Array<{
   name: string;
   requiresArgs?: boolean;
@@ -535,7 +546,6 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
   const popupWidth = Math.max(24, width);
   const compactPopup = popupWidth < 72;
   const descWidth = Math.max(12, Math.min(48, popupWidth - 34));
-  const commandDescWidth = Math.max(12, popupWidth - 42);
 
   const clampedSelected = Math.max(0, Math.min(items.length - 1, selectedIndex));
   const halfWindow = Math.floor(maxVisible / 2);
@@ -544,6 +554,10 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
     startIndex = Math.max(0, items.length - maxVisible);
   }
   const visibleItems = items.slice(startIndex, startIndex + maxVisible);
+  const commandMetrics = commandPopupMetrics(
+    items.map((item) => item.label),
+    popupWidth,
+  );
 
   let triggerLabel = "QUICK SEARCH";
   const triggerColor = theme.focus;
@@ -589,26 +603,29 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
                 </Text>
               );
             }
+            const detail = item.detail ?? "";
+            const descriptionWidth = Math.max(
+              10,
+              commandMetrics.descriptionWidth - (detail ? detail.length + 3 : 0),
+            );
+            const description = item.description
+              ? truncateText(item.description, descriptionWidth)
+              : "";
+            const meta =
+              description && detail
+                ? `${description} · ${detail}`
+                : description || detail;
             return (
               <Box key={item.id}>
-                <Box width={13}>
+                <Box width={commandMetrics.labelWidth + 3}>
                   <Text color={isSelected ? theme.selection : theme.text} bold={isSelected}>
                     {isSelected ? "❯ " : "  "}
-                    {item.label}
+                    {truncateText(item.label, commandMetrics.labelWidth)}
                   </Text>
                 </Box>
-                <Box width={25}>
-                  {item.detail ? (
-                    <Text color={theme.muted}>{item.detail}</Text>
-                  ) : (
-                    <Text> </Text>
-                  )}
+                <Box flexGrow={1}>
+                  <Text color={theme.muted}>{meta}</Text>
                 </Box>
-                {item.description ? (
-                  <Box flexGrow={1}>
-                    <Text color={theme.muted}>{truncateText(item.description, commandDescWidth)}</Text>
-                  </Box>
-                ) : null}
               </Box>
             );
           }

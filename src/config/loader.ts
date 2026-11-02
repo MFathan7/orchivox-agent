@@ -407,13 +407,13 @@ export const LimitsConfigSchema = z.object({
   // Stop a turn after this many tokens across its internal steps.
   turn_tokens: z.number().int().positive().optional(),
   // Stop a turn after this many tool calls. 0 disables the check.
-  max_tool_calls: z.number().int().nonnegative().default(150),
+  max_tool_calls: z.number().int().nonnegative().default(0),
   // Suppress an identical tool call after this many in one turn. 0 disables it.
-  max_repeated_calls: z.number().int().nonnegative().default(3),
+  max_repeated_calls: z.number().int().nonnegative().default(0),
   // Stop a turn after this many seconds. 0 disables the check.
-  max_wall_seconds: z.number().int().nonnegative().default(1200),
+  max_wall_seconds: z.number().int().nonnegative().default(0),
   // Stop new web searches after this many per turn. 0 disables the check.
-  max_web_searches: z.number().int().nonnegative().default(8),
+  max_web_searches: z.number().int().nonnegative().default(0),
   // Maximum number of task-board workers held at once.
   max_workers_per_turn: z.number().int().positive().default(10),
   // Explicit request-body cap. 0 disables the preflight byte guard.

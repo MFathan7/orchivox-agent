@@ -176,13 +176,14 @@ const PRECOMPUTE_MIN_TOKENS = 64_000;
 const CONTINUE_AFTER_OUTPUT_LIMIT =
   "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces and continue.";
 const FINAL_STEP_REMINDER = [
-  "This is the final step of this turn.",
-  "Tools are unavailable now.",
+  "This is the final step of this turn because a turn budget is exhausted.",
+  "Do not call tools.",
   "Summarize what changed, what remains, and the next action.",
+  "State that the turn budget for this turn is exhausted.",
   "Do not ask to continue automatically.",
 ].join(" ");
 const FINAL_STEP_FALLBACK =
-  "The step budget is exhausted, so I stopped before running another tool. The work above is what completed in this turn. Send another message to continue.";
+  "The turn budget is exhausted, so I stopped before running another tool. The work above is what completed in this turn. Send another message to continue.";
 const BUDGET_WARNING =
   "You are near the turn budget. Finish the current check, then summarize what changed and what remains. Do not start new work.";
 
@@ -1341,7 +1342,7 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
       const measuredBeforeCompaction = measuredPromptTokens();
-      const turnTools = finalStep ? [] : skillPolicy.filter(tools);
+      const turnTools = skillPolicy.filter(tools);
       const requestBytes = estimateRequestBytes({ system, messages, tools: turnTools });
       const requestSizeOverLimit =
         this.maxRequestBytes > 0 && requestBytes > this.maxRequestBytes;
@@ -1484,7 +1485,11 @@ export class AgentOrchestrator implements IAgentRunner {
         system_parts: systemParts,
         messages,
         tools: turnTools,
-        tool_choice: turnTools.length > 0 ? request.tool_choice.mode : "none",
+        tool_choice: finalStep
+          ? "none"
+          : turnTools.length > 0
+            ? request.tool_choice.mode
+            : "none",
         max_tokens: maxTokens,
         temperature: request.temperature,
         top_p: request.top_p,

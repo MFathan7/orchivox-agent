@@ -151,6 +151,20 @@ export function countWrappedLines(text: string, width: number): number {
     .reduce((total, line) => total + Math.max(1, Math.ceil(displayWidth(line) / safeWidth)), 0);
 }
 
+/** Snapshot a live entry so pausing auto-scroll keeps the full text and tool history. */
+export function freezeLiveEntry(entry: ChatEntryView): ChatEntryView {
+  return {
+    ...entry,
+    frozenLive: true,
+    toolCalls: entry.toolCalls?.map((call) => ({
+      ...call,
+      diff: call.diff ? { ...call.diff } : undefined,
+    })),
+    files: entry.files?.map((file) => ({ ...file })),
+    thinkingSegments: entry.thinkingSegments?.map((segment) => ({ ...segment })),
+  };
+}
+
 function estimateFileDiffLines(
   additions: number | undefined,
   deletions: number | undefined,
@@ -205,6 +219,7 @@ export function estimateEntryLines(
   diffExpanded = false,
 ): number {
   const safeWidth = Math.max(1, width);
+  const liveView = entry.live && !entry.frozenLive;
   if (entry.role === "compaction") {
     const header = 1;
     const footer = entry.compaction?.status === "running" ? 0 : 1;
@@ -217,7 +232,7 @@ export function estimateEntryLines(
   }
   let lines =
     entry.role === "assistant"
-      ? entry.live
+      ? liveView
         ? (() => {
             const display = liveDisplayText(entry.text);
             return countWrappedLines(display.text, safeWidth) + (display.truncated ? 1 : 0);
@@ -225,7 +240,7 @@ export function estimateEntryLines(
         : estimateMarkdownLines(entry.text, safeWidth)
       : countWrappedLines(entry.text, safeWidth);
   if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
-    const visibleSegments = entry.live
+    const visibleSegments = liveView
       ? entry.thinkingSegments.filter((segment) => segment.completedAt !== undefined)
       : entry.thinkingSegments;
     if (visibleSegments.length > 0) {
@@ -235,7 +250,7 @@ export function estimateEntryLines(
       );
       lines += thinkingExpanded ? 1 + textLines : 1;
     }
-  } else if (entry.thinking && !entry.live) {
+  } else if (entry.thinking && !liveView) {
     lines += thinkingExpanded ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2)) : 1;
   }
   const hasThinkingContent =
@@ -251,12 +266,12 @@ export function estimateEntryLines(
     lines += 1;
   }
   const calls = entry.toolCalls ?? [];
-  const visibleCalls = entry.live ? calls.slice(-LIVE_TOOL_LIMIT) : calls;
+  const visibleCalls = liveView ? calls.slice(-LIVE_TOOL_LIMIT) : calls;
   lines += visibleCalls.reduce(
     (total, call) => total + estimateToolLines(call, safeWidth, collapsed, diffExpanded),
     0,
   );
-  if (entry.live && calls.length > LIVE_TOOL_LIMIT) lines += 1;
+  if (liveView && calls.length > LIVE_TOOL_LIMIT) lines += 1;
   const linkedPaths = new Set(
     (entry.toolCalls ?? [])
       .filter((call) => call.diff)
@@ -267,7 +282,7 @@ export function estimateEntryLines(
   for (const file of unlinkedFiles) {
     lines += estimateFileDiffLines(file.additions, file.deletions, collapsed, diffExpanded);
   }
-  if (entry.live) lines += 1;
+  if (liveView) lines += 1;
   if (entry.diff) lines += collapsed ? 1 : diffExpanded ? 10 : Math.min(DIFF_PREVIEW_LINES + 1, 10);
   if (entry.role === "assistant") lines += 2;
   if (
@@ -305,11 +320,12 @@ export function findActivityRowAt(
   );
   let row = 0;
   for (const entry of visible) {
+    const liveView = entry.live && !entry.frozenLive;
     const activity = groupToolCalls(entry.toolCalls);
     if (entry.role === "assistant" && activity.total > 0) {
       let thinking = 0;
       if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
-        const visibleSegments = entry.live
+        const visibleSegments = liveView
           ? entry.thinkingSegments.filter((segment) => segment.completedAt !== undefined)
           : entry.thinkingSegments;
         if (visibleSegments.length > 0) {
@@ -320,12 +336,12 @@ export function findActivityRowAt(
           );
           thinking = thinkingExpanded ? 1 + textLines : 1;
         }
-      } else if (entry.thinking && !entry.live) {
+      } else if (entry.thinking && !liveView) {
         thinking = thinkingExpanded
           ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2))
           : 1;
       }
-      const headerRow = row + (entry.live ? 1 : 0) + thinking;
+      const headerRow = row + (liveView ? 1 : 0) + thinking;
       if (Math.abs(clickRow - headerRow) <= 1) return entry;
     }
     row += estimateEntryLines(
@@ -414,9 +430,21 @@ export function ScrollableChatViewport({
   const [collapsed, setCollapsed] = React.useState(initiallyCollapsed);
   const [thinkingExpanded, setThinkingExpanded] = React.useState(initiallyExpandedThinking);
   const [diffExpanded, setDiffExpanded] = React.useState(false);
+  const [frozenLiveEntry, setFrozenLiveEntry] = React.useState<ChatEntryView | undefined>();
+
+  React.useEffect(() => {
+    if (!liveEntry || offsetFromBottom <= 0) {
+      if (frozenLiveEntry) setFrozenLiveEntry(undefined);
+      return;
+    }
+    if (!frozenLiveEntry) setFrozenLiveEntry(freezeLiveEntry(liveEntry));
+  }, [liveEntry, offsetFromBottom, frozenLiveEntry]);
+
+  const displayedLiveEntry =
+    offsetFromBottom > 0 && liveEntry && frozenLiveEntry ? frozenLiveEntry : liveEntry;
   const allEntries = React.useMemo(
-    () => (liveEntry ? [...entries, liveEntry] : entries),
-    [entries, liveEntry],
+    () => (displayedLiveEntry ? [...entries, displayedLiveEntry] : entries),
+    [entries, displayedLiveEntry],
   );
   const [expandedGroups, setExpandedGroups] = React.useState<Set<string>>(() => {
     if (!initiallyExpandedActivity) return new Set();
@@ -525,7 +553,7 @@ export function ScrollableChatViewport({
   const showWelcome = !hasChatMessages && !streamingText && !liveEntry;
 
   return (
-    <Box flexDirection="column" height={height} overflowY="hidden">
+    <Box flexDirection="column" height={height} flexShrink={0} overflowY="hidden">
       {showWelcome ? (
         height >= 12 && width >= 100 ? (
           <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />

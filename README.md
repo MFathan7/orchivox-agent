@@ -97,6 +97,8 @@ Useful commands:
 
 Orchivox budgets by tokens first. It keeps a buffer for the reply and summarizes older history near the model's input budget. `/stats` shows the context used, the request size, the input budget, and session spend.
 
+Step, tool call, wall clock, repeated call, and web search caps are off by default. A turn continues until the model stops or you interrupt it. Set `modes.<mode>.steps` or the matching `limits.*` key to opt into a cap. When a step cap is reached, Orchivox keeps the tool definitions for the final request, disables tool choice, and asks for a summary instead of reporting an error.
+
 Prune is off by default. When on, it removes old tool output without writing a summary, which can save context but can also increase how often the conversation needs a full summary. To opt in, set `compaction.prune: true` in `.agent/config.yaml`. The default budgets protect the most recent 40K tokens and only prune when the change frees at least 20K.
 
 ## Features
@@ -109,9 +111,9 @@ Prune is off by default. When on, it removes old tool output without writing a s
 - Parallel workers for large tasks.
 - Hosted and local model support.
 - Seven color themes, including a light preset, saved with your settings.
-- Per-turn step, tool, and time budgets that stop with a summary instead of running forever.
+- Optional per-turn step, tool, and time caps, off by default, for when you want to bound a turn.
 - Token-first compaction with a configurable context buffer; session spend and total tokens survive compaction.
-- Repeated-call detection and a per-turn read cache.
+- Optional repeated-call detection and a per-turn read cache.
 - Model-aware edit tools and bounded code search.
 - Optional code mode for batching tool calls in one sandboxed script.
 - Web search through Tavily, Brave, Exa, Firecrawl, or DuckDuckGo, with provider fallback and per-session memory.

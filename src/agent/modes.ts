@@ -48,7 +48,7 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     nudges: 0,
     advisor: false,
     subagents: true,
-    defaultSteps: 20,
+    defaultSteps: 0,
   },
   build: {
     label: "BUILD",
@@ -62,7 +62,7 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     nudges: 0,
     advisor: false,
     subagents: true,
-    defaultSteps: 40,
+    defaultSteps: 0,
   },
   ultrawork: {
     label: "ULTRAWORK",
@@ -84,7 +84,7 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     nudges: 2,
     advisor: true,
     subagents: true,
-    defaultSteps: 60,
+    defaultSteps: 0,
   },
 };
 

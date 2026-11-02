@@ -1188,7 +1188,7 @@ export function PromptComposer(props: PromptComposerProps) {
   }, [layoutRows, onLayoutRows]);
 
   return (
-    <Box flexDirection="column" marginTop={0}>
+    <Box flexDirection="column" flexShrink={0} marginTop={0}>
       {autocompleteItems.length > 0 && autocompleteContext ? (
         <AutocompletePopup
           items={autocompleteItems}

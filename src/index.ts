@@ -1862,19 +1862,11 @@ async function runTuiSession(
             ? "stopped at the step limit"
             : `completed: ${finishReason ?? "stop"}`;
         pushEntry("assistant", answer || "(no output)", entryMeta);
-        if (finishReason === "turn_limit") {
-          pushEntry(
-            "system",
-            "Turn budget reached. Send another message to continue, or raise the limit in config.",
-          );
-        }
         if (finishReason === "length") {
           pushEntry(
             "system",
             "response truncated after automatic continuation limit; send another message to continue",
           );
-        } else if (finishReason === "turn_limit") {
-          pushEntry("system", "agent turn limit reached; send another message to continue");
         }
         const assistantMsg: Message = {
           id: `assistant-${Date.now().toString(36)}`,

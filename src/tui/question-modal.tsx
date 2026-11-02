@@ -3,6 +3,18 @@ import { Box, Text, useInput } from "ink";
 
 import type { QuestionAnswer, QuestionRequest } from "../tools/question";
 import { isMouseSequence } from "./mouse";
+import {
+  clampCursor,
+  deleteCharacterAfter,
+  deleteCharacterBefore,
+  deleteNextWord,
+  deletePreviousWord,
+  findNextWordEnd,
+  findPreviousWordStart,
+  insertTextAt,
+  isWordBackspaceKey,
+  isWordDeleteKey,
+} from "./text-edit";
 import { useActiveTheme, type Theme } from "./theme";
 
 export interface PendingQuestion extends QuestionRequest {
@@ -20,6 +32,69 @@ export function normalizeQuestionOptionLabel(label: string): string {
   return stripped.length > 0 ? stripped : label.trim();
 }
 
+export interface CustomAnswerKey {
+  ctrl?: boolean;
+  meta?: boolean;
+  backspace?: boolean;
+  delete?: boolean;
+  leftArrow?: boolean;
+  rightArrow?: boolean;
+  home?: boolean;
+  end?: boolean;
+}
+
+export interface CustomAnswerState {
+  text: string;
+  cursor: number;
+}
+
+/** Applies one editing key to the custom answer. Returns undefined for keys it does not handle. */
+export function applyCustomAnswerEdit(
+  state: CustomAnswerState,
+  input: string,
+  key: CustomAnswerKey,
+): CustomAnswerState | undefined {
+  const text = state.text;
+  const cursor = clampCursor(text, state.cursor);
+  const edited = (nextText: string, nextCursor: number): CustomAnswerState => ({
+    text: nextText,
+    cursor: nextCursor,
+  });
+
+  if (key.ctrl && key.leftArrow) return edited(text, findPreviousWordStart(text, cursor));
+  if (key.ctrl && key.rightArrow) return edited(text, findNextWordEnd(text, cursor));
+  if (key.leftArrow) return edited(text, Math.max(0, cursor - 1));
+  if (key.rightArrow) return edited(text, Math.min(text.length, cursor + 1));
+  if (key.home || (key.ctrl && input === "a") || input === "\x1b[H" || input === "\x1b[1~") {
+    return edited(text, 0);
+  }
+  if (key.end || (key.ctrl && input === "e") || input === "\x1b[F" || input === "\x1b[4~") {
+    return edited(text, text.length);
+  }
+
+  if (isWordDeleteKey(key, input)) {
+    const result = deleteNextWord(text, cursor);
+    return edited(result.nextText, result.nextCursor);
+  }
+  if (isWordBackspaceKey(key, input)) {
+    const result = deletePreviousWord(text, cursor);
+    return edited(result.nextText, result.nextCursor);
+  }
+  if (input === "\x1b[3~") {
+    const result = deleteCharacterAfter(text, cursor);
+    return edited(result.nextText, result.nextCursor);
+  }
+  if (key.backspace || key.delete || input === "\x7f" || input === "\b") {
+    const result = deleteCharacterBefore(text, cursor);
+    return edited(result.nextText, result.nextCursor);
+  }
+  if (!key.ctrl && !key.meta && input.length > 0 && input >= " " && input !== "\x7f") {
+    const result = insertTextAt(text, cursor, input);
+    return edited(result.nextText, result.nextCursor);
+  }
+  return undefined;
+}
+
 export function QuestionModal(props: QuestionModalProps): React.ReactElement {
   const { request, onAnswer, theme: themeProp } = props;
   const theme = useActiveTheme(themeProp);
@@ -29,12 +104,19 @@ export function QuestionModal(props: QuestionModalProps): React.ReactElement {
     request.options.length === 0 && request.allow_custom,
   );
   const [customText, setCustomText] = React.useState("");
+  const [customCursor, setCustomCursor] = React.useState(0);
   const [notice, setNotice] = React.useState("");
 
   const customIndex = request.allow_custom ? request.options.length : -1;
   const total = request.options.length + (request.allow_custom ? 1 : 0);
   const clamped = Math.max(0, Math.min(total - 1, selected));
   const labels = request.options.map((option) => normalizeQuestionOptionLabel(option.label));
+
+  const enterCustomMode = (): void => {
+    setCustomMode(true);
+    setCustomCursor(customText.length);
+    setNotice("");
+  };
 
   useInput((input, key) => {
     if (isMouseSequence(input)) return;
@@ -58,12 +140,10 @@ export function QuestionModal(props: QuestionModalProps): React.ReactElement {
         onAnswer({ selected: selectedLabels, custom, cancelled: false });
         return;
       }
-      if (key.backspace || key.delete || input === "\x7f" || input === "\b") {
-        setCustomText((previous) => previous.slice(0, -1));
-        return;
-      }
-      if (!key.ctrl && !key.meta && input.length > 0 && input >= " " && input !== "\x7f") {
-        setCustomText((previous) => previous + input);
+      const next = applyCustomAnswerEdit({ text: customText, cursor: customCursor }, input, key);
+      if (next) {
+        setCustomText(next.text);
+        setCustomCursor(next.cursor);
       }
       return;
     }
@@ -106,15 +186,13 @@ export function QuestionModal(props: QuestionModalProps): React.ReactElement {
       if (request.allow_custom && index === request.options.length) {
         setSelected(index);
         setNotice("");
-        setCustomMode(true);
-        setCustomText("");
+        enterCustomMode();
         return;
       }
     }
     if (input === " ") {
       if (clamped === customIndex) {
-        setCustomMode(true);
-        setCustomText("");
+        enterCustomMode();
         return;
       }
       if (request.multiple) {
@@ -129,8 +207,7 @@ export function QuestionModal(props: QuestionModalProps): React.ReactElement {
     }
     if (key.return) {
       if (clamped === customIndex) {
-        setCustomMode(true);
-        setCustomText("");
+        enterCustomMode();
         return;
       }
       if (request.multiple) {
@@ -208,10 +285,11 @@ export function QuestionModal(props: QuestionModalProps): React.ReactElement {
           <Text color={theme.text} bold>Custom answer:</Text>
           <Box>
             <Text color={theme.muted}>❯ </Text>
-            <Text color={theme.text}>{customText}</Text>
-            <Text inverse color={theme.text}> </Text>
+            <Text color={theme.text}>{customText.slice(0, customCursor)}</Text>
+            <Text inverse color={theme.text}>{customText[customCursor] ?? " "}</Text>
+            <Text color={theme.text}>{customText.slice(customCursor + 1)}</Text>
           </Box>
-          <Text color={theme.muted}>Enter submit · Esc back</Text>
+          <Text color={theme.muted}>Left/Right move · Home/End jump · Enter submit · Esc back</Text>
         </Box>
       ) : (
         <Text color={theme.muted}>
