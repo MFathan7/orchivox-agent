@@ -174,4 +174,4 @@ If the installer added Orchivox to your PATH, remove the block between `# >>> or
 
 ## Status
 
-Orchivox is at version `0.5.0`. For long tasks, use a model with strong tool calling and a context window that matches the repository size.
+Orchivox is at version `0.5.1`. For long tasks, use a model with strong tool calling and a context window that matches the repository size.
