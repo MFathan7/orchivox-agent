@@ -224,23 +224,23 @@ Workflow menjalankan:
    - build launcher dan cek tidak ada diff
    - pack check
    - secret scan
-2. Build lima asset:
+2. Build lima asset platform:
    - `orchivox-linux-x64.gz`
    - `orchivox-linux-arm64.gz`
    - `orchivox-darwin-x64.gz`
    - `orchivox-darwin-arm64.gz`
    - `orchivox-windows-x64.exe.gz`
-3. Smoke test setiap binary dengan `--version`.
-4. Sign `latest.json` dengan Ed25519.
-5. Buat draft GitHub Release.
-6. Upload asset satu per satu, termasuk `SHA256SUMS`, `latest.json`, dan
-   `latest.json.sig`.
-7. Publish release sebagai latest.
-8. Publish package `orchivox` ke npm dengan provenance.
+3. Copy `launcher.mjs`, `install.sh`, dan `install.cmd`.
+4. Smoke test setiap binary dengan `--version`.
+5. Sign `latest.json` dengan Ed25519.
+6. Buat draft GitHub Release.
+7. Upload asset satu per satu, termasuk `launcher.mjs`, `install.sh`, `install.cmd`,
+   `SHA256SUMS`, `latest.json`, dan `latest.json.sig`.
+8. Publish release sebagai latest.
+9. Publish package `orchivox` ke npm dengan provenance.
 
-Catatan: workflow CI tidak menjalankan `bun test`. Test lokal dijalankan oleh
-script `bun run release` jika folder `tests/` tersedia. Folder `tests/` tidak
-ikut repository publik.
+Catatan: workflow CI menjalankan `bun test` di Ubuntu, test installer di Windows,
+dan PTY smoke untuk source installer.
 
 ## 9. Verifikasi setelah publish
 
@@ -257,6 +257,9 @@ Pastikan asset berikut ada:
 - `orchivox-darwin-x64.gz`
 - `orchivox-darwin-arm64.gz`
 - `orchivox-windows-x64.exe.gz`
+- `launcher.mjs`
+- `install.sh`
+- `install.cmd`
 - `SHA256SUMS`
 - `latest.json`
 - `latest.json.sig`
@@ -373,7 +376,8 @@ bun run build:release --version 0.4.0 --manifest-only \
 - [ ] Guided release selesai sampai tag di-push.
 - [ ] Environment `release` sudah di-approve.
 - [ ] Workflow release hijau.
-- [ ] Lima asset release ada.
+- [ ] Lima asset platform release ada.
+- [ ] `launcher.mjs`, `install.sh`, dan `install.cmd` ada.
 - [ ] `SHA256SUMS`, `latest.json`, dan `latest.json.sig` ada.
 - [ ] `npm view orchivox@X.Y.Z version` mengembalikan versi yang benar.
 - [ ] `npx --yes orchivox@latest --version` menampilkan versi baru.

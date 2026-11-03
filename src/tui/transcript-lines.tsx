@@ -81,6 +81,15 @@ export function visibleLiveToolCalls(entry: ChatEntryView): {
   };
 }
 
+export function toolOutputLines(
+  lines: string[],
+  isCommand: boolean,
+  expanded: boolean,
+): string[] {
+  if (expanded) return lines;
+  return lines.slice(0, isCommand ? 24 : 14);
+}
+
 function blankRow(key: string): TranscriptRow {
   return { key, node: <Text> </Text> };
 }
@@ -95,7 +104,11 @@ function plainTextRows(
   return text.split("\n").flatMap((line, lineIndex) =>
     wrapPreservingWhitespace(line, safeWidth).map((chunk, chunkIndex) => ({
       key: `${keyPrefix}-${lineIndex}-${chunkIndex}`,
-      node: <Text color={theme.text}>{chunk.length > 0 ? chunk : " "}</Text>,
+      node: (
+        <Text wrap="truncate" color={theme.text}>
+          {chunk.length > 0 ? chunk : " "}
+        </Text>
+      ),
     })),
   );
 }
@@ -292,7 +305,7 @@ function toolCallRows(
       );
     } else {
       const lines = call.output.split("\n");
-      const visible = lines.slice(0, isCommand ? 24 : 14);
+      const visible = toolOutputLines(lines, isCommand, diffExpanded);
       const anchored = HASHLINE_TOOL_NAMES.has(call.name)
         ? parseHashlineOutput(visible.join("\n"))
         : undefined;
@@ -326,7 +339,7 @@ function toolCallRows(
         });
       }
       if (lines.length > visible.length) {
-        const plain = `${" ".repeat(innerPad)}… ${lines.length - visible.length} more lines`;
+        const plain = `${" ".repeat(innerPad)}… ${lines.length - visible.length} more lines · Ctrl+O to expand`;
         rows.push(
           panelRow(`${keyPrefix}-output-more`, [
             { text: plain, node: <Text color={theme.muted}>{plain}</Text>, color: theme.muted },
@@ -451,13 +464,21 @@ function compactionRows(
   if (entry.compaction?.status === "running") {
     rows.push({
       key: `${entry.id}-running`,
-      node: <Text color={theme.badge.running}>compacting...</Text>,
+      node: (
+        <Text wrap="truncate" color={theme.badge.running}>
+          compacting...
+        </Text>
+      ),
     });
   } else if (entry.text) {
     if (collapsed) {
       rows.push({
         key: `${entry.id}-hidden`,
-        node: <Text color={theme.muted}>summary hidden (Ctrl+O to expand)</Text>,
+        node: (
+          <Text wrap="truncate" color={theme.muted}>
+            summary hidden (Ctrl+O to expand)
+          </Text>
+        ),
       });
     } else {
       rows.push(
@@ -470,10 +491,18 @@ function compactionRows(
   }
 
   if (entry.compaction?.error) {
-    rows.push({
-      key: `${entry.id}-error`,
-      node: <Text color={theme.status.error}>{entry.compaction.error}</Text>,
-    });
+    rows.push(
+      ...wrapPreservingWhitespace(entry.compaction.error, Math.max(8, width)).map(
+        (line, index) => ({
+          key: `${entry.id}-error-${index}`,
+          node: (
+            <Text color={theme.status.error} wrap="truncate">
+              {line || " "}
+            </Text>
+          ),
+        }),
+      ),
+    );
   }
 
   if (entry.compaction && entry.compaction.status !== "running") {
@@ -721,7 +750,7 @@ function assistantRows(
     rows.push({
       key: `${entry.id}-live-tools-hidden`,
       node: (
-        <Text color={theme.muted}>
+        <Text wrap="truncate" color={theme.muted}>
           … {hiddenLiveCalls} earlier tool call{hiddenLiveCalls === 1 ? "" : "s"} hidden while live
         </Text>
       ),
@@ -752,7 +781,11 @@ function assistantRows(
     if (options.collapsed) {
       rows.push({
         key: `${entry.id}-file-${fileIndex}-hidden`,
-        node: <Text color={theme.muted}>diff hidden (Ctrl+O to expand)</Text>,
+        node: (
+          <Text wrap="truncate" color={theme.muted}>
+            diff hidden (Ctrl+O to expand)
+          </Text>
+        ),
       });
     } else {
       const diff = options.diffExpanded
@@ -812,7 +845,9 @@ function assistantRows(
       rows.push({
         key: `${entry.id}-live-tail`,
         node: (
-          <Text color={theme.muted}>… showing latest output (full answer after the turn)</Text>
+          <Text wrap="truncate" color={theme.muted}>
+            … showing latest output (full answer after the turn)
+          </Text>
         ),
       });
       rows.push(...plainTextRows(live.text, width, theme, `${entry.id}-text`));

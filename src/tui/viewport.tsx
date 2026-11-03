@@ -193,7 +193,9 @@ function estimateToolLines(
       lines += 1;
     } else {
       const outputLines = call.output.split("\n").length;
-      const visible = Math.min(isCommand ? 24 : 14, outputLines);
+      const visible = diffExpanded
+        ? outputLines
+        : Math.min(isCommand ? 24 : 14, outputLines);
       lines += visible + (outputLines > visible ? 1 : 0);
     }
   }
@@ -224,7 +226,9 @@ export function estimateEntryLines(
     const header = 1;
     const footer = entry.compaction?.status === "running" ? 0 : 1;
     const body = collapsed ? 1 : countWrappedLines(entry.text, safeWidth);
-    const error = entry.compaction?.error ? 1 : 0;
+    const error = entry.compaction?.error
+      ? countWrappedLines(entry.compaction.error, safeWidth)
+      : 0;
     return header + body + footer + error + 2;
   }
   if (entry.role === "user") {
@@ -399,6 +403,75 @@ export function transcriptAlignsToBottom(
   return offsetFromBottom <= 0 && totalLines > height;
 }
 
+export interface ViewportWindow {
+  /** First row in the visible slice. */
+  start: number;
+  /** Rows available for content, excluding the paused banner when shown. */
+  contentHeight: number;
+  maxOffset: number;
+  effectiveOffset: number;
+  showIndicator: boolean;
+}
+
+/**
+ * The paused banner takes one row. When it appears, the first offset must
+ * still reveal one new row above it; otherwise the banner silently eats the
+ * first scroll step.
+ */
+export function computeViewportWindow(
+  rowCount: number,
+  height: number,
+  offsetFromBottom: number,
+): ViewportWindow {
+  const safeRows = Math.max(0, rowCount);
+  const safeHeight = Math.max(1, height);
+
+  if (safeHeight <= 1) {
+    const maxOffset = Math.max(0, safeRows - 1);
+    const effectiveOffset = Math.min(Math.max(0, offsetFromBottom), maxOffset);
+    return {
+      start: Math.max(0, safeRows - 1 - effectiveOffset),
+      contentHeight: 1,
+      maxOffset,
+      effectiveOffset,
+      showIndicator: false,
+    };
+  }
+
+  const baseMaxOffset = Math.max(0, safeRows - safeHeight);
+  const baseOffset = Math.min(Math.max(0, offsetFromBottom), baseMaxOffset);
+  if (baseOffset <= 0) {
+    return {
+      start: Math.max(0, safeRows - safeHeight),
+      contentHeight: safeHeight,
+      maxOffset: baseMaxOffset,
+      effectiveOffset: 0,
+      showIndicator: false,
+    };
+  }
+
+  const contentHeight = safeHeight - 1;
+  const maxOffset = Math.max(0, safeRows - contentHeight - 1);
+  const effectiveOffset = Math.min(Math.max(0, offsetFromBottom), maxOffset);
+  if (effectiveOffset <= 0) {
+    return {
+      start: Math.max(0, safeRows - safeHeight),
+      contentHeight: safeHeight,
+      maxOffset: baseMaxOffset,
+      effectiveOffset: 0,
+      showIndicator: false,
+    };
+  }
+
+  return {
+    start: Math.max(0, safeRows - contentHeight - effectiveOffset - 1),
+    contentHeight,
+    maxOffset,
+    effectiveOffset,
+    showIndicator: true,
+  };
+}
+
 export function formatProgressBar(done: number, total: number, width = 8): string {
   const ratio = total === 0 ? 0 : Math.min(1, done / total);
   const filled = Math.round(ratio * width);
@@ -501,17 +574,9 @@ export function ScrollableChatViewport({
     );
   }
 
-  let availableHeight = Math.max(1, height);
-  let maxOffset = Math.max(0, rows.length - availableHeight);
-  let effectiveOffset = Math.min(offsetFromBottom, maxOffset);
-  if (effectiveOffset > 0) {
-    availableHeight = Math.max(0, height - 1);
-    maxOffset = Math.max(0, rows.length - availableHeight);
-    effectiveOffset = Math.min(offsetFromBottom, maxOffset);
-  }
-  const showIndicator = effectiveOffset > 0;
-  const start = Math.max(0, rows.length - availableHeight - effectiveOffset);
-  const visibleRows = rows.slice(start, start + availableHeight);
+  const window = computeViewportWindow(rows.length, height, offsetFromBottom);
+  const { start, contentHeight, maxOffset, showIndicator } = window;
+  const visibleRows = rows.slice(start, start + contentHeight);
   const visibleRowsRef = React.useRef(visibleRows);
   visibleRowsRef.current = visibleRows;
 

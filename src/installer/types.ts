@@ -5,7 +5,7 @@ export type PlatformId =
   | "darwin-arm64"
   | "windows-x64";
 
-export type InstallMethod = "standalone" | "source" | "npm" | "bun";
+export type InstallMethod = "standalone" | "source" | "local" | "npm" | "bun";
 
 export interface ReleaseAsset {
   url: string;

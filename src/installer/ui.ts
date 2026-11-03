@@ -1,4 +1,6 @@
+import { closeSync, openSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { ReadStream as TtyReadStream } from "node:tty";
 
 import { supportsTrueColor, createStyler, type Styler } from "./theme";
 import { InstallerError, type DownloadProgress } from "./types";
@@ -20,6 +22,8 @@ export interface InstallerUIOptions {
   stdout?: NodeJS.WriteStream;
   stderr?: NodeJS.WriteStream;
   stdin?: NodeJS.ReadStream;
+  /** Prompt input when stdin is a pipe but a terminal is still available. */
+  promptStream?: NodeJS.ReadStream;
   env?: NodeJS.ProcessEnv;
   interactive?: boolean;
   color?: boolean;
@@ -99,9 +103,12 @@ export class InstallerUI {
   readonly interactive: boolean;
   readonly animations: boolean;
   readonly color: boolean;
+  readonly promptAvailable: boolean;
   readonly width: number;
   readonly signal: AbortSignal;
 
+  private readonly promptStream?: NodeJS.ReadStream;
+  private readonly ownedPromptStream: boolean;
   private readonly styler: Styler;
   private readonly abortController = new AbortController();
   private readonly onSigint = () => {
@@ -125,15 +132,33 @@ export class InstallerUI {
     this.stderr = options.stderr ?? process.stderr;
     this.stdin = options.stdin ?? process.stdin;
     this.env = options.env ?? process.env;
+    const canPrompt = Boolean(
+      this.stdout.isTTY && !this.env.CI && this.env.TERM !== "dumb",
+    );
+    const opened =
+      options.promptStream || this.stdin.isTTY || !canPrompt
+        ? undefined
+        : openPromptStream();
+    this.promptStream =
+      options.promptStream ?? (this.stdin.isTTY ? this.stdin : opened?.stream);
+    this.ownedPromptStream = Boolean(opened);
+    this.promptAvailable = Boolean(this.promptStream);
     this.interactive =
       options.interactive ??
-      Boolean(this.stdout.isTTY && this.stdin.isTTY && !this.env.CI && this.env.TERM !== "dumb");
+      Boolean(
+        this.stdout.isTTY &&
+          this.promptStream &&
+          !this.env.CI &&
+          this.env.TERM !== "dumb",
+      );
     this.color =
       options.color ??
       Boolean(this.stdout.isTTY && !this.env.NO_COLOR && this.env.TERM !== "dumb");
     this.animations =
-      options.animations ??
-      (this.interactive && !this.env.CI && !this.env.ORCHIVOX_NO_ANIM);
+      Boolean(options.animations ?? true) &&
+      this.interactive &&
+      !this.env.CI &&
+      !this.env.ORCHIVOX_NO_ANIM;
     const columns =
       options.width ?? (this.stdout.columns && this.stdout.columns > 0 ? this.stdout.columns : 80);
     this.width = Math.max(20, Math.min(columns, 72));
@@ -143,6 +168,30 @@ export class InstallerUI {
       trueColor: supportsTrueColor(this.env),
     });
     process.once("SIGINT", this.onSigint);
+  }
+
+  inactiveReason(): string | undefined {
+    if (this.interactive) return undefined;
+    if (this.env.CI) return "CI is set, so the installer uses plain output.";
+    if (this.env.TERM === "dumb") return "TERM=dumb, so the installer uses plain output.";
+    if (!this.stdout.isTTY) return "Output is not a terminal, so the installer uses plain output.";
+    if (!this.promptAvailable) {
+      return "No terminal input is available, so the installer uses plain output.";
+    }
+    return undefined;
+  }
+
+  diagnostics(): string {
+    return [
+      `stdout_tty=${Boolean(this.stdout.isTTY)}`,
+      `stdin_tty=${Boolean(this.stdin.isTTY)}`,
+      `prompt=${this.promptAvailable ? "tty" : "none"}`,
+      `interactive=${this.interactive}`,
+      `animations=${this.animations}`,
+      `color=${this.color}`,
+      `ci=${Boolean(this.env.CI)}`,
+      `term=${this.env.TERM ?? "unknown"}`,
+    ].join(" ");
   }
 
   async banner(version: string, platform: string): Promise<void> {
@@ -184,11 +233,12 @@ export class InstallerUI {
   }
 
   async confirm(question: string, defaultValue: boolean, automatic = false): Promise<boolean> {
-    if (!this.interactive || automatic) return defaultValue;
+    const input = this.promptStream;
+    if (!this.interactive || automatic || !input) return defaultValue;
     const suffix = defaultValue ? "[Y/n]" : "[y/N]";
     const prompt = `${this.styler.accent("❯")} ${question} ${suffix} `;
     const rl = createInterface({
-      input: this.stdin,
+      input,
       output: this.stdout,
       terminal: true,
       signal: this.signal,
@@ -305,14 +355,18 @@ export class InstallerUI {
     this.live = false;
   }
 
-  failActive(detail?: string): void {
+  failActive(detail?: string): boolean {
     const active = this.steps.find((entry) => entry.status === "active");
     if (active) {
       this.failStep(active.id, detail);
-      return;
+      return true;
     }
     const last = [...this.steps].reverse().find((entry) => entry.status !== "done");
-    if (last) this.failStep(last.id, detail);
+    if (last) {
+      this.failStep(last.id, detail);
+      return true;
+    }
+    return false;
   }
 
   summary(summary: InstallerSummary): void {
@@ -365,6 +419,7 @@ export class InstallerUI {
     this.closed = true;
     this.stopSpinner();
     process.removeListener("SIGINT", this.onSigint);
+    if (this.ownedPromptStream) this.promptStream?.destroy();
     if (this.interactive) this.stdout.write("\x1b[?25h");
   }
 
@@ -448,4 +503,24 @@ export function createInstallerUI(options: InstallerUIOptions = {}): InstallerUI
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function openPromptStream(): { stream: NodeJS.ReadStream; owned: boolean } | undefined {
+  const path = process.platform === "win32" ? "CONIN$" : "/dev/tty";
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const stream = new TtyReadStream(fd);
+    stream.once("error", () => undefined);
+    return { stream, owned: true };
+  } catch {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // The descriptor is already gone.
+      }
+    }
+    return undefined;
+  }
 }

@@ -42,6 +42,8 @@ export interface UpdateOptions {
   rollback?: boolean;
   source?: boolean;
   json?: boolean;
+  noAnim?: boolean;
+  verbose?: boolean;
   timeoutMs?: number;
 }
 
@@ -287,9 +289,6 @@ async function runManagedUpdate(
   if (options.json && !options.yes) {
     throw new Error("--json for update requires --yes");
   }
-  if (!options.yes && !process.stdin.isTTY) {
-    throw new Error("update requires --yes in non-interactive mode");
-  }
 
   const asset = assetForPlatform(manifest, platform);
   if (options.json) {
@@ -310,9 +309,23 @@ async function runManagedUpdate(
     };
   }
 
-  const ui = createInstallerUI({ env: process.env });
+  const ui = createInstallerUI({
+    env: process.env,
+    animations: options.noAnim ? false : undefined,
+  });
+  if (!options.yes && !ui.interactive) {
+    ui.close();
+    throw new Error("update requires --yes in non-interactive mode");
+  }
   try {
     await ui.banner(current, platformLabel(platform));
+    const inactive = ui.inactiveReason();
+    if (inactive) ui.info(inactive);
+    if (options.verbose) {
+      ui.info(
+        `installer: ${ui.diagnostics()} platform=${platformLabel(platform)} launch=update install=${paths.baseDir}`,
+      );
+    }
     ui.info(`Update available: ${current} -> ${manifest.version}`);
     ui.info(`Channel: ${manifest.channel}`);
     ui.info(`Download: ${formatBytes(asset.size)}`);
@@ -362,7 +375,9 @@ async function runManagedUpdate(
     };
   } catch (error) {
     if (!(error instanceof InstallerError && error.code === "cancelled")) {
-      ui.failActive(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      const marked = ui.failActive(message);
+      if (!marked || !ui.interactive || message.includes("\n")) ui.error(message);
     }
     throw error;
   } finally {

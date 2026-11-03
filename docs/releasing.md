@@ -107,7 +107,7 @@ lockfile before tagging.
 
 ## Local build
 
-Build all five assets and an unsigned manifest:
+Build all platform assets, bootstrap files, and an unsigned manifest:
 
 ```bash
 bun run build:release --version 0.3.0
@@ -122,6 +122,7 @@ dist/release/v0.3.0/
   orchivox-darwin-x64.gz
   orchivox-darwin-arm64.gz
   orchivox-windows-x64.exe.gz
+  launcher.mjs
   latest.json
   SHA256SUMS
 ```
@@ -216,7 +217,7 @@ The `release` workflow then:
 4. Runs `--version` smoke tests on native runners.
 5. Regenerates and signs `latest.json`.
 6. Creates or updates the GitHub Release.
-7. Uploads binaries, `SHA256SUMS`, `latest.json`, and `latest.json.sig`.
+7. Uploads binaries, `launcher.mjs`, `install.sh`, `install.cmd`, `SHA256SUMS`, `latest.json`, and `latest.json.sig`.
 8. Publishes the launcher package to npm with provenance.
 
 The publish job waits for approval on the `release` environment before it can
@@ -243,6 +244,12 @@ A dry run builds and signs but does not create a GitHub Release.
 | `orchivox-darwin-x64.gz` | macOS Intel |
 | `orchivox-darwin-arm64.gz` | macOS Apple Silicon |
 | `orchivox-windows-x64.exe.gz` | Windows x64 |
+| `launcher.mjs` | Bootstrap launcher for `install.sh` and `install.cmd` |
+| `install.sh` | macOS and Linux bootstrap |
+| `install.cmd` | Windows bootstrap without PowerShell |
+
+`install.sh` and `install.cmd` download `launcher.mjs` from the latest release,
+then run the same Node installer as the npm launcher.
 
 Linux Alpine and other musl systems are not supported by the glibc asset.
 

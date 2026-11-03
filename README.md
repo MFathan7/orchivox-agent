@@ -30,6 +30,27 @@ Orchivox works with hosted models such as OpenAI, Anthropic, OpenRouter, and Ope
 
 You need Node.js 20 or newer. You also need a model provider: a local Ollama server or an API key for a hosted provider. Git is optional, but undo and snapshots need it.
 
+### macOS and Linux
+
+Install with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MFathan7/orchivox-agent/main/install.sh | bash
+```
+
+### Windows
+
+Run the batch installer from `cmd.exe` or PowerShell:
+
+```bat
+curl.exe -fsSL https://raw.githubusercontent.com/MFathan7/orchivox-agent/main/install.cmd -o install.cmd
+install.cmd
+```
+
+The Windows installer does not use PowerShell scripts. If PowerShell blocks `orchivox.ps1`, run `orchivox.cmd` instead.
+
+### npm
+
 Install the launcher:
 
 ```bash
@@ -167,6 +188,8 @@ If the installer added Orchivox to your PATH, remove the block between `# >>> or
 ## If something goes wrong
 
 - If `orchivox` is not found, add `~/.orchivox/bin` to your PATH and restart your terminal.
+- If PowerShell says running scripts is disabled, run `orchivox.cmd` instead of `orchivox`.
+- If the installer shows plain output, it is non-interactive. Run it in a terminal, unset `CI` or `TERM=dumb`, or pass `--verbose` to see the detection result.
 - If no model is available, run `/connect` and then `/models`.
 - If the light theme is not picked up or a theme looks unreadable, set `ORCHIVOX_APPEARANCE=light` or `ORCHIVOX_APPEARANCE=dark` before starting.
 - If an update fails, run `orchivox update --rollback`.

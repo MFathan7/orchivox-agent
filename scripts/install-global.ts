@@ -1,61 +1,61 @@
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+#!/usr/bin/env bun
+import { lstatSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, relative } from "node:path";
-import packageJson from "../package.json";
-import { readInstallRecord, resolveInstallPaths, writeInstallRecord } from "../src/installer/paths";
-import { detectLibc, platformId } from "../src/installer/platform";
+import { join } from "node:path";
 
-console.log("==> Building standalone Orchivox binary...");
-const buildProc = Bun.spawn(["bun", "run", "scripts/build-binary.ts"], {
-  cwd: process.cwd(),
-  stdout: "inherit",
-  stderr: "inherit",
-});
-const buildExit = await buildProc.exited;
-if (buildExit !== 0) {
-  console.error("Failed to build standalone binary.");
-  process.exit(buildExit);
+import packageJson from "../package.json";
+import { parseInstallArgs, runLocalInstallCommand } from "../src/installer/cli";
+import { resolveInstallPaths } from "../src/installer/paths";
+
+async function buildRuntime(): Promise<void> {
+  const proc = Bun.spawn(["bun", "run", "scripts/build-binary.ts"], {
+    cwd: process.cwd(),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const code = await proc.exited;
+  if (code !== 0) {
+    const detail = (stderr || stdout).trim();
+    throw new Error(
+      `Build failed with exit code ${code}.${detail ? `\n${detail}` : ""}`,
+    );
+  }
 }
 
+const parsed = parseInstallArgs(process.argv.slice(2));
 const sourceBinary = join(process.cwd(), "orchivox");
-if (!existsSync(sourceBinary)) {
-  console.error("Binary not found at:", sourceBinary);
+const extraLinkPaths = process.env.ORCHIVOX_INSTALL_DIR
+  ? []
+  : [join(homedir(), ".local", "bin", "orchivox")];
+
+let result;
+try {
+  result = await runLocalInstallCommand({
+    binaryPath: sourceBinary,
+    version: packageJson.version,
+    method: "source",
+    parsed,
+    launcherVersion: packageJson.version,
+    build: buildRuntime,
+    extraLinkPaths,
+  });
+} catch {
   process.exit(1);
 }
 
-const userHome = homedir();
-const localBin = join(userHome, ".local", "bin");
-const paths = resolveInstallPaths();
-const orchivoxBinDir = paths.binDir;
-
-mkdirSync(localBin, { recursive: true });
-mkdirSync(orchivoxBinDir, { recursive: true });
-
-const targetLocalBin = join(localBin, "orchivox");
-const targetOrchivoxBin = paths.binaryPath;
-
-function safeInstallBinary(dest: string) {
-  try {
-    if (existsSync(dest) || lstatSync(dest, { throwIfNoEntry: false })) {
-      unlinkSync(dest);
-    }
-  } catch {
-    // Ignore error if destination file doesn't exist.
-  }
-  copyFileSync(sourceBinary, dest);
-  chmodSync(dest, 0o755);
-  console.log(`Installed standalone binary to: ${dest}`);
+if (!result) {
+  process.exit(0);
 }
 
-safeInstallBinary(targetLocalBin);
-safeInstallBinary(targetOrchivoxBin);
-
-// Save source repository metadata so `orchivox update` can locate and rebuild from source:
-const installSourcePath = join(paths.baseDir, "install_source.json");
+const paths = resolveInstallPaths();
 try {
   writeFileSync(
-    installSourcePath,
-    JSON.stringify(
+    join(paths.baseDir, "install_source.json"),
+    `${JSON.stringify(
       {
         sourceDir: process.cwd(),
         installedAt: new Date().toISOString(),
@@ -63,51 +63,28 @@ try {
       },
       null,
       2,
-    ),
+    )}\n`,
     "utf8",
   );
-  console.log(`Saved install source metadata to: ${installSourcePath}`);
 } catch {
   // Best-effort metadata save.
 }
 
-try {
-  const existing = readInstallRecord(paths);
-  writeInstallRecord(paths, {
-    schema: 1,
-    version: packageJson.version,
-    platform: platformId(process.platform, process.arch, detectLibc()),
-    channel: "stable",
-    method: "source",
-    binary: relative(paths.baseDir, targetOrchivoxBin),
-    installed_at: new Date().toISOString(),
-    previous:
-      existing && existing.version !== packageJson.version ? existing.version : existing?.previous,
-  });
-  console.log(`Saved install metadata to: ${paths.installFile}`);
-} catch {
-  // Best-effort metadata save.
-}
-
-// Clean up stale ~/.bun/bin/orchivox if present so it doesn't shadow the binary
-const bunBin = join(userHome, ".bun", "bin", "orchivox");
-try {
-  const stat = lstatSync(bunBin, { throwIfNoEntry: false });
-  if (stat) {
-    unlinkSync(bunBin);
-    // Point bun/bin to the new compiled binary as well
-    Bun.spawnSync(["ln", "-sf", targetLocalBin, bunBin]);
-    console.log(`Updated ~/.bun/bin/orchivox -> ${targetLocalBin}`);
+if (process.platform !== "win32") {
+  const bunBin = join(homedir(), ".bun", "bin", "orchivox");
+  try {
+    const stat = lstatSync(bunBin, { throwIfNoEntry: false });
+    if (stat) {
+      unlinkSync(bunBin);
+      Bun.spawnSync([
+        "ln",
+        "-sf",
+        result.binaryPath,
+        bunBin,
+      ]);
+      console.log(`Updated ${bunBin} -> ${result.binaryPath}`);
+    }
+  } catch {
+    // Ignored if .bun/bin is not present.
   }
-} catch {
-  // Ignored if .bun/bin is not present.
 }
-
-console.log("\n==> Verifying global installation:");
-const testProc = Bun.spawn([targetLocalBin, "--version"], {
-  stdout: "inherit",
-  stderr: "inherit",
-});
-await testProc.exited;
-
-console.log("\nOrchivox global installation complete! You can now run `orchivox` from anywhere.\n");

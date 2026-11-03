@@ -119,6 +119,8 @@ export interface CliOptions {
   json?: boolean;
   cleanAll?: boolean;
   trust?: boolean;
+  noAnim?: boolean;
+  verbose?: boolean;
   configPath?: string;
   secretsPath?: string;
 }
@@ -158,6 +160,8 @@ const HELP_TEXT = [
   "",
   "flags: -p/--prompt, -f/--format, --mode, --port, --trust, --all, -h/--help",
   "       --version                       print the version and commit",
+  "       --no-anim                       disable installer animation",
+  "       --verbose                       print installer diagnostics",
   "       --config <path>                 use a specific config file",
   "       --secrets <path>                use a specific secrets file",
 ].join("\n");
@@ -176,6 +180,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
     else if (arg === "--json") options.json = true;
     else if (arg === "--all") options.cleanAll = true;
     else if (arg === "--trust") options.trust = true;
+    else if (arg === "--no-anim") options.noAnim = true;
+    else if (arg === "--verbose") options.verbose = true;
     else if (arg === "--config") {
       const value = argv[++index];
       if (!value) throw new Error("--config requires a file path");
@@ -441,6 +447,8 @@ export async function main(
       rollback: options.updateRollback,
       source: options.updateSource,
       json: options.json,
+      noAnim: options.noAnim,
+      verbose: options.verbose,
     });
     if (result.output) print(result.output);
     return { close: async () => undefined };

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { createHash, createPrivateKey, sign } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 
@@ -108,6 +108,44 @@ export function releaseNotesUrl(version: string): string {
 
 export function assetPath(outDir: string, target: ReleaseTarget): string {
   return join(outDir, target.asset);
+}
+
+export const LAUNCHER_ASSET = "launcher.mjs";
+export const BOOTSTRAP_ASSETS = ["install.sh", "install.cmd"] as const;
+
+export function launcherAssetPath(outDir: string): string {
+  return join(outDir, LAUNCHER_ASSET);
+}
+
+export function bootstrapAssetPath(outDir: string, name: string): string {
+  return join(outDir, name);
+}
+
+export function writeLauncherAsset(outDir: string): void {
+  const source = join(ROOT, "bin", "launcher.mjs");
+  if (!existsSync(source)) {
+    throw new Error(`missing launcher asset: ${source}. Run bun run build:launcher first.`);
+  }
+  mkdirSync(outDir, { recursive: true });
+  copyFileSync(source, launcherAssetPath(outDir));
+}
+
+export function writeBootstrapAssets(outDir: string): void {
+  for (const name of BOOTSTRAP_ASSETS) {
+    const source = join(ROOT, name);
+    if (!existsSync(source)) {
+      throw new Error(`missing bootstrap asset: ${source}`);
+    }
+    const destination = bootstrapAssetPath(outDir, name);
+    copyFileSync(source, destination);
+    if (name === "install.sh") {
+      try {
+        chmodSync(destination, 0o755);
+      } catch {
+        // Some filesystems do not expose POSIX modes.
+      }
+    }
+  }
 }
 
 export function sha256File(path: string): string {
@@ -289,6 +327,13 @@ function writeManifestFiles(options: {
     file: target.asset,
     sha256: sha256File(assetPath(options.outDir, target)),
   }));
+  entries.push({ file: LAUNCHER_ASSET, sha256: sha256File(launcherAssetPath(options.outDir)) });
+  for (const name of BOOTSTRAP_ASSETS) {
+    entries.push({
+      file: name,
+      sha256: sha256File(bootstrapAssetPath(options.outDir, name)),
+    });
+  }
   entries.push({ file: "latest.json", sha256: sha256File(manifestPath) });
   writeFileSync(join(options.outDir, "SHA256SUMS"), formatChecksums(entries));
 
@@ -319,12 +364,14 @@ export async function runCli(argv: string[]): Promise<void> {
   const baseUrl = releaseBaseUrl(version, options.baseUrl);
   const notesUrl = options.notesUrl ?? releaseNotesUrl(version);
 
+  mkdirSync(outDir, { recursive: true });
   if (!options.manifestOnly) {
-    mkdirSync(outDir, { recursive: true });
     for (const target of RELEASE_TARGETS) {
       await buildTarget(target, outDir);
     }
   }
+  writeLauncherAsset(outDir);
+  writeBootstrapAssets(outDir);
 
   const manifest = buildManifest({
     version,

@@ -3,8 +3,6 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { InstallerError } from "./types";
-
 const MARKER_START = "# >>> orchivox installer >>>";
 const MARKER_END = "# <<< orchivox installer <<<";
 
@@ -32,7 +30,7 @@ export function pathExpression(binDir: string, env: NodeJS.ProcessEnv = process.
   const home = homeDir(env);
   const relativeToHome = relative(home, binDir);
   if (relativeToHome && !relativeToHome.startsWith("..") && !relativeToHome.startsWith("/")) {
-    return `$HOME/${relativeToHome}`;
+    return `$HOME/${relativeToHome.replace(/\\/g, "/")}`;
   }
   return binDir.replace(/"/g, '\\"');
 }
@@ -112,33 +110,152 @@ export function isCommandOnPath(
   }
 }
 
-export function addToWindowsUserPath(
-  binDir: string,
+/**
+ * `where` can find an npm .ps1 shim that a restricted PowerShell still
+ * refuses to run. Treat a result as usable only when at least one match is
+ * not a .ps1 file.
+ */
+export function isUsableWindowsCommandOutput(output: string): boolean {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .some((line) => !line.toLowerCase().endsWith(".ps1"));
+}
+
+export function isCommandUsableOnWindows(
+  command: string,
   env: NodeJS.ProcessEnv = process.env,
-): { changed: boolean; detail: string } {
-  const escaped = binDir.replace(/'/g, "''");
-  const script = [
-    `$dir = '${escaped}'`,
-    "$path = [Environment]::GetEnvironmentVariable('Path', 'User')",
-    "$parts = @($path -split ';' | Where-Object { $_ -ne '' })",
-    "if ($parts -contains $dir) { Write-Output 'already'; exit 0 }",
-    "$next = (@($parts) + $dir) -join ';'",
-    "[Environment]::SetEnvironmentVariable('Path', $next, 'User')",
-    "Write-Output 'added'",
-  ].join("; ");
-  const result = spawnSync(
-    "powershell",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    { env, encoding: "utf8" },
-  );
-  if (result.status !== 0) {
-    throw new InstallerError(
-      "path_update_failed",
-      `Could not update the Windows user PATH: ${result.stderr?.trim() || result.stdout?.trim() || "unknown error"}`,
-    );
+): boolean {
+  try {
+    const result = spawnSync("where", [command], {
+      env,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    if (result.status !== 0) return false;
+    return isUsableWindowsCommandOutput(result.stdout ?? "");
+  } catch {
+    return false;
+  }
+}
+
+export interface WindowsPathResult {
+  changed: boolean;
+  pathOnPath: boolean;
+  detail: string;
+  manual?: string;
+}
+
+export interface SpawnSyncResult {
+  status: number | null;
+  stdout?: string;
+  stderr?: string;
+  error?: Error;
+}
+
+export type SpawnSyncRunner = (
+  command: string,
+  args: string[],
+  options: {
+    env?: NodeJS.ProcessEnv;
+    encoding: "utf8";
+    windowsHide?: boolean;
+    timeout?: number;
+  },
+) => SpawnSyncResult;
+
+const defaultRunner: SpawnSyncRunner = (command, args, options) => {
+  const result = spawnSync(command, args, options);
+  return {
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    error: result.error,
+  };
+};
+
+function normalizeWindowsPath(value: string): string {
+  return value
+    .trim()
+    .replace(/^"|"$/g, "")
+    .replace(/\//g, "\\")
+    .replace(/\\+$/, "")
+    .toLowerCase();
+}
+
+function expandWindowsEnv(value: string, env: NodeJS.ProcessEnv): string {
+  return value.replace(/%([^%]+)%/g, (match, name: string) => {
+    const key = Object.keys(env).find((entry) => entry.toLowerCase() === name.toLowerCase());
+    return key ? env[key] ?? match : match;
+  });
+}
+
+function readWindowsUserPath(
+  env: NodeJS.ProcessEnv,
+  runner: SpawnSyncRunner,
+): { value: string; error?: string } {
+  const result = runner("reg", ["query", "HKCU\\Environment", "/v", "Path"], {
+    env,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 10_000,
+  });
+  if (result.status === 0) {
+    const line = (result.stdout ?? "")
+      .split(/\r?\n/)
+      .find((entry) => /\bPath\b/i.test(entry));
+    const match = line?.match(/\bPath\s+REG_(?:EXPAND_)?SZ\s+(.*)$/i);
+    return { value: match?.[1]?.trim() ?? "" };
+  }
+
+  const output = `${result.stderr ?? ""}\n${result.stdout ?? ""}`.trim();
+  if (/unable to find|not find/i.test(output)) {
+    return { value: "" };
   }
   return {
-    changed: (result.stdout ?? "").includes("added"),
-    detail: (result.stdout ?? "").trim(),
+    value: "",
+    error: output || result.error?.message || "Could not read the Windows user PATH.",
   };
+}
+
+/**
+ * Adds the install directory to the per-user PATH with reg.exe. It never
+ * throws: a blocked or missing command returns a manual fallback so the
+ * installation itself can still succeed.
+ */
+export function configureWindowsPath(
+  binDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+  runner: SpawnSyncRunner = defaultRunner,
+): WindowsPathResult {
+  const normalized = normalizeWindowsPath(binDir);
+  const current = readWindowsUserPath(env, runner);
+  if (current.error) {
+    return {
+      changed: false,
+      pathOnPath: false,
+      detail: current.error,
+      manual: binDir,
+    };
+  }
+  const parts = current.value.split(";").map((part) => part.trim()).filter(Boolean);
+  const present = parts.some(
+    (part) => normalizeWindowsPath(expandWindowsEnv(part, env)) === normalized,
+  );
+  if (present) {
+    return { changed: false, pathOnPath: true, detail: "already present" };
+  }
+
+  const next = [...parts, binDir].join(";");
+  const result = runner(
+    "reg",
+    ["add", "HKCU\\Environment", "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", next, "/f"],
+    { env, encoding: "utf8", windowsHide: true, timeout: 10_000 },
+  );
+  if (result.status !== 0) {
+    const detail = (result.stderr ?? result.stdout ?? result.error?.message ?? "reg add failed").trim();
+    return { changed: false, pathOnPath: false, detail, manual: binDir };
+  }
+  return { changed: true, pathOnPath: true, detail: "added" };
 }

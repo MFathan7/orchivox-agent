@@ -616,7 +616,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const liveStatusRows = streaming && !hasModalOpen && !statusText ? 1 : 0;
   const chromeRows = 2 + statusRows + liveStatusRows;
   const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
-  const chatScrollStep = Math.max(3, Math.floor(viewportHeight / 4));
+  const chatWheelStep = 3;
+  const chatPageStep = Math.max(1, viewportHeight - 2);
   const { stdin, internal_eventEmitter } = useStdin();
   React.useLayoutEffect(
     () => installKeyNormalizer(internal_eventEmitter),
@@ -626,13 +627,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     const onData = (data: Buffer): void => {
       const delta = parseMouseWheel(data.toString());
       if (delta === 0 || hasModalOpen) return;
-      setChatOffsetFromBottom((previous) => Math.max(0, previous + delta * chatScrollStep));
+      setChatOffsetFromBottom((previous) => Math.max(0, previous + delta * chatWheelStep));
     };
     stdin.on("data", onData);
     return () => {
       stdin.off("data", onData);
     };
-  }, [hasModalOpen, chatScrollStep]);
+  }, [hasModalOpen, chatWheelStep]);
   const showSidebar = sidebarVisible && innerWidth >= 120;
   const chatWidth = showSidebar ? Math.max(20, Math.floor(innerWidth * 0.72)) : innerWidth;
   const sidebarWidth = showSidebar ? Math.max(20, innerWidth - chatWidth) : 0;
@@ -1077,10 +1078,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onOpenPalette={() => setPaletteOpen(true)}
             onOpenSessions={() => setSessionTab("sessions")}
             onScrollLine={(delta) =>
-              setChatOffsetFromBottom((value) => Math.max(0, value + delta * chatScrollStep))
+              setChatOffsetFromBottom((value) => Math.max(0, value + delta))
             }
             onScrollPage={(delta) =>
-              setChatOffsetFromBottom((value) => Math.max(0, value + delta * viewportHeight))
+              setChatOffsetFromBottom((value) => Math.max(0, value + delta * chatPageStep))
             }
             onScrollToBottom={() => setChatOffsetFromBottom(0)}
             onSubmit={(payload) => {

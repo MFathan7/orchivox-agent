@@ -11,10 +11,60 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run build:launcher
       - run: git diff --exit-code -- bin/launcher.mjs
       - run: bun run pack:check
       - run: bun run check:secrets
+
+  installer-pty:
+    name: installer pty
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Run install.sh with a local launcher
+        shell: bash
+        env:
+          ORCHIVOX_INSTALL_DIR: ${{ runner.temp }}/orchivox-sh
+        run: |
+          set -euo pipefail
+          ORCHIVOX_LAUNCHER_URL="file://$PWD/bin/launcher.mjs" ./install.sh --help | tee /tmp/orchivox-install-sh.log
+          grep -q "usage:" /tmp/orchivox-install-sh.log
+      - name: Run the source installer in a PTY
+        shell: bash
+        env:
+          ORCHIVOX_INSTALL_DIR: ${{ runner.temp }}/orchivox
+        run: |
+          set -euo pipefail
+          script -qec "bun run scripts/install-global.ts --no-path" /dev/null | tee /tmp/orchivox-installer.log
+          VERSION="$(node -p 'require("./package.json").version')"
+          grep -q "Orchivox ${VERSION} is ready" /tmp/orchivox-installer.log
+          grep -q "Build" /tmp/orchivox-installer.log
+          test -x "${ORCHIVOX_INSTALL_DIR}/bin/orchivox"
+          "${ORCHIVOX_INSTALL_DIR}/bin/orchivox" --version | grep -q "${VERSION}"
+
+  windows:
+    name: windows installer
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - name: Run install.cmd against a local launcher
+        shell: cmd
+        run: |
+          start /b node -e "const http=require('http'),fs=require('fs');http.createServer(function(q,r){r.setHeader('content-type','text/javascript');r.end(fs.readFileSync('bin/launcher.mjs'))}).listen(8123)"
+          ping 127.0.0.1 -n 2 >nul
+          set ORCHIVOX_LAUNCHER_URL=http://127.0.0.1:8123/launcher.mjs
+          install.cmd --help
