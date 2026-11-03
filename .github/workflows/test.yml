@@ -48,11 +48,17 @@ jobs:
           grep -q "Orchivox ${VERSION} is ready" /tmp/orchivox-installer.log
           grep -q "Build" /tmp/orchivox-installer.log
           test -x "${ORCHIVOX_INSTALL_DIR}/bin/orchivox"
-          VERSION_OUTPUT="$("${ORCHIVOX_INSTALL_DIR}/bin/orchivox" --version 2>&1)" || {
-            echo "version command failed with $?"
-          }
-          printf 'version output: %s\n' "$VERSION_OUTPUT"
-          case "$VERSION_OUTPUT" in
+          set +e
+          "${ORCHIVOX_INSTALL_DIR}/bin/orchivox" --version > /tmp/orchivox-version.txt 2>&1
+          VERSION_EXIT=$?
+          set -e
+          cat /tmp/orchivox-version.txt
+          echo "version exit: $VERSION_EXIT"
+          if [ "$VERSION_EXIT" -ne 0 ]; then
+            echo "version command failed"
+            exit 1
+          fi
+          case "$(cat /tmp/orchivox-version.txt)" in
             *"$VERSION"*) ;;
             *) echo "version output missing $VERSION"; exit 1 ;;
           esac
