@@ -132,7 +132,10 @@ jobs:
           chmod +x /tmp/orchivox
           OUTPUT=$(/tmp/orchivox --version)
           printf '%s\n' "$OUTPUT"
-          printf '%s\n' "$OUTPUT" | grep -q "Orchivox $VERSION"
+          case "$OUTPUT" in
+            *"Orchivox $VERSION"*) ;;
+            *) echo "unexpected version output"; exit 1 ;;
+          esac
       - name: run version check
         if: runner.os == 'Windows'
         shell: pwsh
