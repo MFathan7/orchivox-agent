@@ -71,6 +71,16 @@ jobs:
         shell: cmd
         run: |
           bun run build:binary
+          set "ORCHIVOX_VERSION_FILE=%TEMP%\orchivox-version.txt"
+          if exist "%ORCHIVOX_VERSION_FILE%" del "%ORCHIVOX_VERSION_FILE%"
+          orchivox.exe --version
+          echo version_exit=%ERRORLEVEL%
+          if exist "%ORCHIVOX_VERSION_FILE%" (
+            echo --- version file ---
+            type "%ORCHIVOX_VERSION_FILE%"
+          ) else (
+            echo version file was not written
+          )
           orchivox.exe --version | findstr /B /C:"Orchivox " >nul
           if errorlevel 1 (
             echo orchivox.exe --version produced no version line

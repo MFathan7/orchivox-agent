@@ -336,21 +336,29 @@ export async function runLocalInstallCommand(
 
   try {
     const binaryPath = resolve(options.binaryPath);
-    if (!existsSync(binaryPath)) {
-      throw new InstallerError("binary_not_found", `Local binary not found: ${binaryPath}`);
-    }
-
     let version = options.version;
     let reported: string | undefined;
-    if (!version) {
-      reported = await runBinaryVersion(binaryPath, isolatedVersionEnv(env));
-      version = parseBinaryVersion(reported);
-      if (!version) {
-        throw new InstallerError(
-          "invalid_version",
-          "Could not determine the local binary version. Pass --version <semver>.",
-        );
+
+    if (!options.build) {
+      if (!existsSync(binaryPath)) {
+        throw new InstallerError("binary_not_found", `Local binary not found: ${binaryPath}`);
       }
+      if (!version) {
+        reported = await runBinaryVersion(binaryPath, isolatedVersionEnv(env));
+        version = parseBinaryVersion(reported);
+      }
+    } else if (!version) {
+      throw new InstallerError(
+        "invalid_version",
+        "A local build install requires a version.",
+      );
+    }
+
+    if (!version) {
+      throw new InstallerError(
+        "invalid_version",
+        "Could not determine the local binary version. Pass --version <semver>.",
+      );
     }
 
     await ui.banner(version, platformName);
@@ -383,6 +391,12 @@ export async function runLocalInstallCommand(
       ui.stage("build", "compiling runtime");
       await options.build();
       ui.completeStep("build", "binary built");
+      if (!existsSync(binaryPath)) {
+        throw new InstallerError(
+          "binary_not_found",
+          `Local binary not found after build: ${binaryPath}`,
+        );
+      }
     }
 
     ui.stage("verify", "version check");
