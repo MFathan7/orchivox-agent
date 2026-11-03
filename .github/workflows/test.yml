@@ -48,9 +48,14 @@ jobs:
           grep -q "Orchivox ${VERSION} is ready" /tmp/orchivox-installer.log
           grep -q "Build" /tmp/orchivox-installer.log
           test -x "${ORCHIVOX_INSTALL_DIR}/bin/orchivox"
-          VERSION_OUTPUT="$("${ORCHIVOX_INSTALL_DIR}/bin/orchivox" --version)"
-          printf '%s\n' "$VERSION_OUTPUT"
-          printf '%s\n' "$VERSION_OUTPUT" | grep -q "${VERSION}"
+          VERSION_OUTPUT="$("${ORCHIVOX_INSTALL_DIR}/bin/orchivox" --version 2>&1)" || {
+            echo "version command failed with $?"
+          }
+          printf 'version output: %s\n' "$VERSION_OUTPUT"
+          case "$VERSION_OUTPUT" in
+            *"$VERSION"*) ;;
+            *) echo "version output missing $VERSION"; exit 1 ;;
+          esac
 
   windows:
     name: windows installer

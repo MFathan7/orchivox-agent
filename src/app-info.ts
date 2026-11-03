@@ -195,14 +195,47 @@ export function formatAppInfo(info: AppInfo): string {
   ].join("\n");
 }
 
+const CLI_TOKENS = new Set([
+  "--version",
+  "--help",
+  "-h",
+  "serve",
+  "mcp",
+  "update",
+  "self-update",
+  "doctor",
+  "clean",
+  "-p",
+  "--prompt",
+  "-f",
+  "--format",
+  "--mode",
+  "--port",
+  "--trust",
+  "--config",
+  "--secrets",
+  "--check",
+  "--binary",
+  "--yes",
+  "--rollback",
+  "--source",
+  "--json",
+  "--all",
+  "--no-anim",
+  "--verbose",
+]);
+
 /**
- * Source runs have the script at argv[1]; some compiled binaries put the first
- * user argument there instead. Compare against Bun.main so both shapes work.
+ * Source runs have the script at argv[1]; compiled binaries vary by platform.
+ * Find the first known CLI token so `--version` and subcommands survive both
+ * shapes.
  */
 export function userArgs(
   argv: string[] = process.argv,
   main: string | undefined = (globalThis as { Bun?: { main?: string } }).Bun?.main,
 ): string[] {
+  const first = argv.findIndex((arg, index) => index > 0 && CLI_TOKENS.has(arg));
+  if (first > 0) return argv.slice(first);
   return main && argv[1] === main ? argv.slice(2) : argv.slice(1);
 }
 
