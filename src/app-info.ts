@@ -239,6 +239,12 @@ export function userArgs(
   return main && argv[1] === main ? argv.slice(2) : argv.slice(1);
 }
 
+/** Compiled runtimes may report import.meta.main differently per platform. */
+export function isCompiledExecutable(execPath: string = process.execPath): boolean {
+  const name = basename(execPath).toLowerCase();
+  return name !== "bun" && name !== "bun.exe";
+}
+
 async function runCommand(command: string, args: string[], cwd: string): Promise<string> {
   const processHandle = Bun.spawn([command, ...args], {
     cwd,
