@@ -44,11 +44,11 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          script -qec "bun run scripts/install-global.ts --no-path" /dev/null | tee /tmp/orchivox-installer.log
+          CI= script -qec "bun run scripts/install-global.ts --no-path" /dev/null | tee /tmp/orchivox-installer.log
           INSTALLER_EXIT=${PIPESTATUS[0]}
           set -e
           echo "installer exit: $INSTALLER_EXIT"
-          VERSION="$(node -p 'require("./package.json").version')"
+          VERSION="$(bun -e 'console.log(require("./package.json").version)')"
           grep -q "Orchivox ${VERSION} is ready" /tmp/orchivox-installer.log
           grep -q "Build" /tmp/orchivox-installer.log
           ls -la "${ORCHIVOX_INSTALL_DIR}/bin" "${ORCHIVOX_INSTALL_DIR}/versions/${VERSION}" || true
