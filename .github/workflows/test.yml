@@ -48,7 +48,9 @@ jobs:
           grep -q "Orchivox ${VERSION} is ready" /tmp/orchivox-installer.log
           grep -q "Build" /tmp/orchivox-installer.log
           test -x "${ORCHIVOX_INSTALL_DIR}/bin/orchivox"
-          "${ORCHIVOX_INSTALL_DIR}/bin/orchivox" --version | grep -q "${VERSION}"
+          VERSION_OUTPUT="$("${ORCHIVOX_INSTALL_DIR}/bin/orchivox" --version)"
+          printf '%s\n' "$VERSION_OUTPUT"
+          printf '%s\n' "$VERSION_OUTPUT" | grep -q "${VERSION}"
 
   windows:
     name: windows installer

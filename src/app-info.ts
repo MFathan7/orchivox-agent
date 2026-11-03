@@ -195,6 +195,17 @@ export function formatAppInfo(info: AppInfo): string {
   ].join("\n");
 }
 
+/**
+ * Source runs have the script at argv[1]; some compiled binaries put the first
+ * user argument there instead. Compare against Bun.main so both shapes work.
+ */
+export function userArgs(
+  argv: string[] = process.argv,
+  main: string | undefined = (globalThis as { Bun?: { main?: string } }).Bun?.main,
+): string[] {
+  return main && argv[1] === main ? argv.slice(2) : argv.slice(1);
+}
+
 async function runCommand(command: string, args: string[], cwd: string): Promise<string> {
   const processHandle = Bun.spawn([command, ...args], {
     cwd,

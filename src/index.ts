@@ -22,7 +22,7 @@ import {
   replaceAnswer,
   takeAnswer,
 } from "./agent/answer-stream";
-import { formatAppInfo, formatDoctor, getAppInfo, runUpdate } from "./app-info";
+import { formatAppInfo, formatDoctor, getAppInfo, runUpdate, userArgs } from "./app-info";
 import { compactMessages, estimateRequestBytes, extractSummary, markPrunedToolResults } from "./agent/compaction";
 import { formatTurnMetrics } from "./agent/turn-metrics";
 import { shouldWarnLargeSession } from "./agent/session-warning";
@@ -2508,7 +2508,7 @@ async function runTuiSession(
 }
 
 if (import.meta.main) {
-  void main(globalThis.process.argv.slice(2))
+  void main(userArgs())
     .then(async () => {
       await flushOutput();
     })
