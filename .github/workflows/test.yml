@@ -47,7 +47,11 @@ jobs:
           VERSION="$(node -p 'require("./package.json").version')"
           grep -q "Orchivox ${VERSION} is ready" /tmp/orchivox-installer.log
           grep -q "Build" /tmp/orchivox-installer.log
-          test -x "${ORCHIVOX_INSTALL_DIR}/bin/orchivox"
+          ls -la "${ORCHIVOX_INSTALL_DIR}/bin" "${ORCHIVOX_INSTALL_DIR}/versions/${VERSION}" || true
+          if [ ! -x "${ORCHIVOX_INSTALL_DIR}/bin/orchivox" ]; then
+            echo "installed binary missing or not executable"
+            exit 1
+          fi
           set +e
           "${ORCHIVOX_INSTALL_DIR}/bin/orchivox" --version > /tmp/orchivox-version.txt 2>&1
           VERSION_EXIT=$?
