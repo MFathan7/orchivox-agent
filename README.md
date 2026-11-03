@@ -51,17 +51,22 @@ The Windows installer does not use PowerShell scripts. If PowerShell blocks `orc
 
 ### npm
 
-Install the launcher:
+For the global `orchivox` command:
 
 ```bash
 npm install -g orchivox
-```
-
-Start Orchivox:
-
-```bash
 orchivox
 ```
+
+If you install it in a project instead, npm puts the launcher in
+`node_modules/.bin`. Run it with `npx`:
+
+```bash
+npm install orchivox
+npx orchivox
+```
+
+A local install does not add `orchivox` to your shell PATH. Use a global install if you want to run it from any folder.
 
 The first run downloads the runtime for your platform and opens the terminal app. It also asks whether you trust the current folder.
 
@@ -73,7 +78,7 @@ ollama serve
 
 The app saves your provider and model choices. You do not need to edit a config file.
 
-To try it without a global install:
+To try the latest version without installing:
 
 ```bash
 npx orchivox@latest
@@ -188,6 +193,7 @@ If the installer added Orchivox to your PATH, remove the block between `# >>> or
 ## If something goes wrong
 
 - If `orchivox` is not found, add `~/.orchivox/bin` to your PATH and restart your terminal.
+- If `orchivox` is not found after `npm install orchivox`, that install was local. Run `npx orchivox` or install globally with `npm install -g orchivox`.
 - If PowerShell says running scripts is disabled, run `orchivox.cmd` instead of `orchivox`.
 - If the installer shows plain output, it is non-interactive. Run it in a terminal, unset `CI` or `TERM=dumb`, or pass `--verbose` to see the detection result.
 - If no model is available, run `/connect` and then `/models`.
@@ -197,4 +203,4 @@ If the installer added Orchivox to your PATH, remove the block between `# >>> or
 
 ## Status
 
-Orchivox is at version `0.5.2`. For long tasks, use a model with strong tool calling and a context window that matches the repository size.
+Orchivox is at version `0.5.3`. For long tasks, use a model with strong tool calling and a context window that matches the repository size.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import React from "react";
 import { render } from "ink";
+import { writeFileSync } from "node:fs";
 
 import {
   AgentGatewayServer,
@@ -425,12 +426,23 @@ export async function main(
   const print = io.print ?? ((text: string) => console.log(text));
   const options = parseCliArgs(argv);
   if (options.help) {
-    print(HELP_TEXT);
+    if (io.print) io.print(HELP_TEXT);
+    else await writeStdout(HELP_TEXT);
     return { close: async () => undefined };
   }
 
   if (options.version) {
-    print(formatAppInfo(await getAppInfo()));
+    const text = formatAppInfo(await getAppInfo());
+    const versionFile = process.env.ORCHIVOX_VERSION_FILE;
+    if (versionFile) {
+      try {
+        writeFileSync(versionFile, `${text}\n`, "utf8");
+      } catch {
+        // The installer falls back to stdout when the file cannot be written.
+      }
+    }
+    if (io.print) io.print(text);
+    else await writeStdout(text);
     return { close: async () => undefined };
   }
 
@@ -2496,15 +2508,42 @@ async function runTuiSession(
 }
 
 if (import.meta.main) {
-  void main(globalThis.process.argv.slice(2)).catch((error: unknown) => {
-    const cancelled =
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      (error as { code?: unknown }).code === "cancelled";
-    if (!cancelled) {
-      console.error(error instanceof Error ? error.message : String(error));
-    }
-    globalThis.process.exit(cancelled ? 130 : 1);
-  });
+  void main(globalThis.process.argv.slice(2))
+    .then(async () => {
+      await flushOutput();
+    })
+    .catch(async (error: unknown) => {
+      const cancelled =
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        (error as { code?: unknown }).code === "cancelled";
+      if (!cancelled) {
+        console.error(error instanceof Error ? error.message : String(error));
+      }
+      await flushOutput();
+      globalThis.process.exit(cancelled ? 130 : 1);
+    });
+}
+
+async function writeStdout(text: string): Promise<void> {
+  await Promise.race([
+    new Promise<void>((resolve) => {
+      process.stdout.write(`${text}\n`, () => resolve());
+    }),
+    new Promise<void>((resolve) => setTimeout(resolve, 500)),
+  ]);
+}
+
+async function flushOutput(): Promise<void> {
+  await Promise.all([flushStream(process.stdout), flushStream(process.stderr)]);
+}
+
+async function flushStream(stream: NodeJS.WriteStream): Promise<void> {
+  await Promise.race([
+    new Promise<void>((resolve) => {
+      stream.write("", () => resolve());
+    }),
+    new Promise<void>((resolve) => setTimeout(resolve, 250)),
+  ]);
 }

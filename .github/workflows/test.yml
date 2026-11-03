@@ -61,6 +61,21 @@ jobs:
           bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
+      - name: Run installer tests when present
+        shell: cmd
+        run: |
+          if exist tests (
+            bun test tests/installer/path-setup.test.ts tests/installer/windows.test.ts tests/installer/launcher.test.ts
+          )
+      - name: Build and check the Windows binary
+        shell: cmd
+        run: |
+          bun run build:binary
+          orchivox.exe --version | findstr /B /C:"Orchivox " >nul
+          if errorlevel 1 (
+            echo orchivox.exe --version produced no version line
+            exit /b 1
+          )
       - name: Run install.cmd against a local launcher
         shell: cmd
         run: |

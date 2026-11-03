@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmodSync, copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -312,18 +312,30 @@ export async function runBinaryVersion(
   binaryPath: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
+  const versionFile = join(
+    tmpdir(),
+    `orchivox-version-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`,
+  );
   try {
     const result = await execFileAsync(binaryPath, ["--version"], {
       timeout: 15_000,
       maxBuffer: 1_000_000,
-      env,
+      env: { ...env, ORCHIVOX_VERSION_FILE: versionFile },
     });
-    return `${result.stdout}\n${result.stderr}`;
+    let fileText = "";
+    try {
+      fileText = readFileSync(versionFile, "utf8");
+    } catch {
+      fileText = "";
+    }
+    return `${result.stdout}\n${result.stderr}\n${fileText}`;
   } catch (error) {
     throw new InstallerError(
       "binary_validation_failed",
       `Could not run the downloaded binary: ${error instanceof Error ? error.message : String(error)}`,
     );
+  } finally {
+    rmSync(versionFile, { force: true });
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "orchivox",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Personal AI coding agent runtime: IDE-grade code editing, isolated Git worktree subagents, time-traveling stream rules, and a dual-direction OpenAPI and OpenClaude gateway.",
   "type": "module",
   "license": "MIT",
@@ -31,6 +31,7 @@
   },
   "files": [
     "bin/launcher.mjs",
+    "bin/postinstall.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -44,6 +45,7 @@
     "release": "bun run scripts/release.ts",
     "release:key": "bun run scripts/release-key.ts",
     "prepack": "bun run build:launcher",
+    "postinstall": "node bin/postinstall.mjs",
     "prepublishOnly": "bun run typecheck && bun run check:secrets",
     "pack:check": "npm pack --dry-run",
     "test:installer": "bun test tests/installer",

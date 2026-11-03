@@ -130,7 +130,9 @@ jobs:
           cd "dist/release/v$VERSION"
           gunzip -c "${{ matrix.asset }}" > /tmp/orchivox
           chmod +x /tmp/orchivox
-          /tmp/orchivox --version
+          OUTPUT=$(/tmp/orchivox --version)
+          printf '%s\n' "$OUTPUT"
+          printf '%s\n' "$OUTPUT" | grep -q "Orchivox $VERSION"
       - name: run version check
         if: runner.os == 'Windows'
         shell: pwsh
@@ -148,7 +150,12 @@ jobs:
           $gzip.Dispose()
           $target.Dispose()
           $source.Dispose()
-          .\orchivox.exe --version
+          $versionOutput = .\orchivox.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "orchivox.exe --version failed" }
+          if (-not ($versionOutput -match "Orchivox $env:VERSION")) {
+            throw "unexpected version output: $versionOutput"
+          }
+          $versionOutput
 
   release:
     name: publish release
