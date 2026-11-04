@@ -1,6 +1,6 @@
 {
   "name": "orchivox",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Personal AI coding agent runtime: IDE-grade code editing, isolated Git worktree subagents, time-traveling stream rules, and a dual-direction OpenAPI and OpenClaude gateway.",
   "type": "module",
   "license": "MIT",
@@ -51,6 +51,7 @@
     "test:installer": "bun test tests/installer",
     "install:global": "bun run scripts/install-global.ts",
     "check:secrets": "bun run scripts/check-secrets.ts",
+    "shell:smoke": "bun run scripts/shell-smoke.ts",
     "observe:turn": "bun run scripts/observe-turn-budget.ts",
     "typecheck": "tsc --noEmit"
   },

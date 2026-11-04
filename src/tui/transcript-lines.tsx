@@ -132,7 +132,7 @@ function statusColor(status: ChatToolCallView["status"], theme: Theme): string {
 }
 
 const TOOL_MARGIN = 2;
-const COMMAND_TOOL_NAMES = new Set(["bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"]);
+const COMMAND_TOOL_NAMES = new Set(["shell", "bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"]);
 const HASHLINE_TOOL_NAMES = new Set(["read_file", "grep_search"]);
 const EDIT_TOOL_NAMES = new Set([
   "hash_edit",

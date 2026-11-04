@@ -63,10 +63,10 @@ async function resolvePlanTarget(directory: string, requested?: string): Promise
 }
 
 /**
- * Plan mode is read-only except for a plan file in the active project. The
- * model must only call this tool when the user explicitly asks to save a plan.
- * The user's path wins. Without a named path, the default is PLAN.md at the
- * project root.
+ * Plan mode is read-only except for a plan file in the global Orchivox plan
+ * directory. The model must only call this tool when the user explicitly asks
+ * to save a plan. The user's path wins when it stays inside the plan directory.
+ * Without a named path, the default is PLAN.md there.
  */
 export function createWritePlanTool(options: {
   repoRoot: string;

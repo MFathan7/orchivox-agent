@@ -351,6 +351,7 @@ export const ShellRiskDetailsSchema = z.object({
   cwd: z.string(),
   riskLevel: z.enum(["low", "medium", "high", "critical"]),
   warning: z.string().optional(),
+  shellLabel: z.string().optional(),
 });
 export type ShellRiskDetails = z.infer<typeof ShellRiskDetailsSchema>;
 

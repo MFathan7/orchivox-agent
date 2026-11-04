@@ -184,7 +184,7 @@ function estimateToolLines(
   diffExpanded = false,
 ): number {
   let lines = 4;
-  const isCommand = Boolean(call.command) || ["bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"].includes(call.name);
+  const isCommand = Boolean(call.command) || ["shell", "bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"].includes(call.name);
   if (isCommand && call.command) {
     lines += wrapText(call.command, Math.max(1, width - 4)).length;
   }

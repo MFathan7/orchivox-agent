@@ -170,6 +170,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       },
       { key: "open_connect", title: "Provider manager", subtitle: "Add, edit, enable, or delete providers (/connect)" },
       { key: "open_skills", title: "Skills", subtitle: "Inspect installed skills (/skills)" },
+      { key: "open_settings", title: "Settings", subtitle: "Approvals, safety, and step limits (/settings)" },
       { key: "open_tasks", title: "Task board", subtitle: "Multi-agent tasks and results (/tasks)" },
       { key: "open_sessions", title: "Sessions", subtitle: "Browse, search, fork, and restore (Ctrl+S)" },
       { key: "open_timeline", title: "Snapshot timeline", subtitle: "Inspect and restore file changes" },

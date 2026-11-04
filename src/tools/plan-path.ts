@@ -1,5 +1,8 @@
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 
+import type { AgentMode } from "../types/schema";
+import { planDirectory } from "./plan-directory";
+
 export const DEFAULT_PLAN_FILE = "PLAN.md";
 
 const PLAN_FILE_NAME = /^PLAN[A-Za-z0-9._-]*\.md$/i;
@@ -41,30 +44,50 @@ export function userRequestedPlanPath(userText: string | undefined, path: string
   return text.includes(parent);
 }
 
-export function defaultPlanPath(root: string): string {
-  return resolve(root, DEFAULT_PLAN_FILE);
+/**
+ * Plan mode keeps plans in the user's global plan directory. Build and
+ * Ultrawork keep plans in the active project root.
+ */
+export function defaultPlanPath(root: string, mode: AgentMode = "build"): string {
+  return mode === "plan"
+    ? resolve(planDirectory(), DEFAULT_PLAN_FILE)
+    : resolve(root, DEFAULT_PLAN_FILE);
 }
 
 /**
- * `create_file` stays general. This guard only catches a PLAN*.md file placed
- * under .agent when the user did not ask for that path. Every other file keeps
- * the path the model requested.
+ * `create_file` stays general. A PLAN*.md file the user did not name is
+ * redirected to the mode's canonical plan location. `.agent` is reserved for
+ * configuration, so a plan file is never written there even when the model
+ * names that path.
  */
 export function redirectPlanPath(input: {
   path: string;
   userText?: string;
   root?: string;
+  mode?: AgentMode;
   defaultPath?: string;
 }): { path: string; redirectedFrom?: string } {
-  if (!isPlanFileName(input.path) || !isAgentDirectoryPath(input.path)) {
+  if (!isPlanFileName(input.path)) {
     return { path: input.path };
   }
   const root = input.root ?? globalThis.process.cwd();
-  if (userRequestedPlanPath(input.userText, relativeToRoot(root, input.path))) {
+  const mode = input.mode ?? "build";
+  const target =
+    input.defaultPath ?? defaultPlanPath(root, mode);
+  const absoluteInput = resolve(root, input.path);
+  const agentPath = isAgentDirectoryPath(input.path);
+  if (
+    mode !== "plan" &&
+    !agentPath &&
+    userRequestedPlanPath(input.userText, relativeToRoot(root, input.path))
+  ) {
     return { path: input.path };
   }
+  if (absoluteInput === resolve(target)) {
+    return { path: target };
+  }
   return {
-    path: input.defaultPath ?? defaultPlanPath(root),
+    path: target,
     redirectedFrom: input.path,
   };
 }

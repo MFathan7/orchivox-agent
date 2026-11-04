@@ -2,7 +2,13 @@ import type { Dirent } from "node:fs";
 import { readdir } from "node:fs/promises";
 
 import type { HooksConfig } from "../config/loader";
+import { killProcessTree } from "../tools/process-tree";
 import type { AgentTool, ToolRegistry } from "../tools/registry";
+import {
+  detectShell,
+  ShellAdapterError,
+  type ShellAdapter,
+} from "../tools/shell-adapter";
 
 export type HookPhase = "PreToolUse" | "PostToolUse" | "OnStop";
 
@@ -48,12 +54,21 @@ export class HookRunner {
   private readonly hooksConfig: HooksConfig;
   private readonly pluginsDir: string;
   private readonly cwd: string;
+  private readonly adapter: ShellAdapter | undefined;
   private readonly handlers = new Map<HookPhase, HookHandler[]>();
 
-  constructor(options: { hooks?: HooksConfig; pluginsDir?: string; cwd?: string } = {}) {
+  constructor(
+    options: {
+      hooks?: HooksConfig;
+      pluginsDir?: string;
+      cwd?: string;
+      adapter?: ShellAdapter;
+    } = {},
+  ) {
     this.hooksConfig = options.hooks ?? { pre_tool_use: [], post_tool_use: [], on_stop: [] };
     this.pluginsDir = options.pluginsDir ?? `${options.cwd ?? globalThis.process.cwd()}/.agent/plugins`;
     this.cwd = options.cwd ?? globalThis.process.cwd();
+    this.adapter = options.adapter;
     for (const phase of HOOK_PHASES) this.handlers.set(phase, []);
   }
 
@@ -134,20 +149,48 @@ export class HookRunner {
 
   private async runCommandHook(command: string, timeoutMs: number | undefined, context: HookContext): Promise<HookOutcome> {
     const timeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
-    const proc = Bun.spawn(["bash", "-c", command], {
-      cwd: this.cwd,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...collectEnv(),
-        ORCHIVOX_HOOK_PHASE: context.phase,
-        ORCHIVOX_TOOL_NAME: context.toolName ?? "",
-        ORCHIVOX_FILE_PATH: context.filePath ?? "",
-      },
-    });
+    const env = {
+      ...collectEnv(),
+      ORCHIVOX_HOOK_PHASE: context.phase,
+      ORCHIVOX_TOOL_NAME: context.toolName ?? "",
+      ORCHIVOX_FILE_PATH: context.filePath ?? "",
+    };
+    let adapter: ShellAdapter;
+    try {
+      adapter = this.adapter ?? detectShell({ env });
+    } catch (error) {
+      const detail = error instanceof ShellAdapterError ? error.message : String(error);
+      return {
+        allowed: false,
+        reason: `hook shell unavailable: ${detail}`,
+        notes: [`hook failed (${command}): ${detail}`],
+      };
+    }
+
+    const [program, ...programArgs] = adapter.command(command);
+    const spawn = () =>
+      Bun.spawn([program, ...programArgs], {
+        cwd: this.cwd,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env,
+        detached: process.platform !== "win32",
+      });
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return {
+        allowed: false,
+        reason: `hook command failed to start: ${detail}`,
+        notes: [`hook failed (${command}): ${detail}`],
+      };
+    }
+
     const timeoutSignal = AbortSignal.timeout(timeout);
-    const kill = (): void => proc.kill();
+    const kill = (): void => killProcessTree(proc, { force: true });
     timeoutSignal.addEventListener("abort", kill, { once: true });
     const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     const exitCode = await proc.exited;

@@ -2,8 +2,10 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { EventEmitter } from "node:events";
 import { applyPatch } from "diff";
 
+import type { ApprovalPreset } from "../config/loader";
 import type { AgentMode, ToolCall } from "../types/schema";
 import { readText, splitLines } from "../tools/hashline-edit";
+import { detectShell, type ShellAdapter } from "../tools/shell-adapter";
 import { modeContract } from "./modes";
 
 export type PermissionAction = "allow" | "ask" | "deny";
@@ -15,6 +17,8 @@ export interface ShellRiskDetails {
   cwd: string;
   riskLevel: "low" | "medium" | "high" | "critical";
   warning?: string;
+  /** Resolved shell label, such as "bash" or "PowerShell 7 (pwsh)". */
+  shellLabel?: string;
 }
 
 export interface DiffPreviewDetails {
@@ -59,6 +63,8 @@ export interface GranularPermissionEngineOptions {
   safeCommands?: string[];
   dangerousCommands?: string[];
   safePaths?: string[];
+  /** Injected shell adapter for dialect-aware scanning and approval text. */
+  shellAdapter?: ShellAdapter;
 }
 
 const FATAL_COMMAND_PATTERNS = [
@@ -88,7 +94,7 @@ const MEDIUM_RISK_COMMAND_PATTERNS = [
   /\bchown\b/i,
 ];
 
-const SHELL_TOOL_NAMES = new Set(["bash", "bg_start"]);
+const SHELL_TOOL_NAMES = new Set(["shell", "bash", "bg_start"]);
 export const EDIT_TOOL_NAMES = new Set([
   "hash_edit",
   "replace_text",
@@ -289,6 +295,77 @@ export function permissionRulesFromConfig(
   );
 }
 
+const ENV_ONLY_RULES: PermissionConfigRule[] = [
+  { action: "read", resource: "**/.env", effect: "ask" },
+  { action: "read", resource: "**/.env.*", effect: "ask" },
+  { action: "read", resource: "**/.env.example", effect: "allow" },
+];
+
+const SAFER_BUILD_RULES: PermissionConfigRule[] = [
+  // Credentials and secrets.
+  { action: "read", resource: "**/.env", effect: "ask" },
+  { action: "read", resource: "**/.env.*", effect: "ask" },
+  { action: "read", resource: "**/.env.example", effect: "allow" },
+  { action: "read", resource: "**/*.pem", effect: "ask" },
+  { action: "read", resource: "**/*.key", effect: "ask" },
+  { action: "read", resource: "**/*.p12", effect: "ask" },
+  { action: "read", resource: "**/*.pfx", effect: "ask" },
+  { action: "read", resource: "**/secrets/*", effect: "ask" },
+  { action: "read", resource: "**/.ssh/*", effect: "ask" },
+  { action: "read", resource: "**/credentials*", effect: "ask" },
+
+  // Databases and migrations.
+  { action: "edit", resource: "**/*.db", effect: "ask" },
+  { action: "edit", resource: "**/*.sqlite", effect: "ask" },
+  { action: "edit", resource: "**/*.sqlite3", effect: "ask" },
+  { action: "edit", resource: "**/*.duckdb", effect: "ask" },
+  { action: "edit", resource: "**/*.mdb", effect: "ask" },
+  { action: "edit", resource: "**/migrations/*", effect: "ask" },
+
+  // Destructive shell commands, including PowerShell equivalents.
+  { action: "shell", resource: "rm *", effect: "ask" },
+  { action: "shell", resource: "sudo rm *", effect: "ask" },
+  { action: "shell", resource: "rmdir *", effect: "ask" },
+  { action: "shell", resource: "del *", effect: "ask" },
+  { action: "shell", resource: "remove-item *", effect: "ask" },
+  { action: "shell", resource: "clear-content *", effect: "ask" },
+  { action: "shell", resource: "set-content *", effect: "ask" },
+  { action: "shell", resource: "git reset --hard*", effect: "ask" },
+  { action: "shell", resource: "git clean -f*", effect: "ask" },
+  { action: "shell", resource: "dropdb *", effect: "ask" },
+  { action: "shell", resource: "psql *", effect: "ask" },
+  { action: "shell", resource: "mysql *", effect: "ask" },
+  { action: "shell", resource: "sqlite3 *", effect: "ask" },
+  { action: "shell", resource: "mongosh *", effect: "ask" },
+  { action: "shell", resource: "redis-cli *", effect: "ask" },
+  { action: "shell", resource: "invoke-sqlcmd *", effect: "ask" },
+
+  // Arbitrary code can read credentials or run database queries invisibly.
+  { action: "execute", resource: "*", effect: "ask" },
+];
+
+/** Default approval rules for a preset, before user permissions are appended. */
+export function presetPermissionRules(preset: ApprovalPreset = "safer"): ToolRulePattern[] {
+  if (preset === "permissive" || preset === "custom") return [];
+  return permissionRulesFromConfig(
+    preset === "env-only" ? ENV_ONLY_RULES : SAFER_BUILD_RULES,
+  );
+}
+
+/**
+ * Resolves the effective rules: preset defaults first, then the user's explicit
+ * rules. Later rules win, so a user can explicitly allow a safer-default ask.
+ */
+export function resolvePermissionRules(config: {
+  approvals?: { preset?: ApprovalPreset };
+  permissions?: readonly PermissionConfigRule[];
+}): ToolRulePattern[] {
+  return [
+    ...presetPermissionRules(config.approvals?.preset ?? "safer"),
+    ...permissionRulesFromConfig(config.permissions ?? []),
+  ];
+}
+
 /** Matches a shell command against a rule pattern where "*" crosses any character. */
 export function matchCommandPattern(pattern: string, command: string): boolean {
   const trimmed = pattern.trim();
@@ -298,7 +375,9 @@ export function matchCommandPattern(pattern: string, command: string): boolean {
     .replace(/\*/g, ".*")
     .replace(/\?/g, ".");
   try {
-    return new RegExp(`^${escaped}$`, "s").test(command.trim());
+    return new RegExp(`^${escaped}$`, process.platform === "win32" ? "is" : "s").test(
+      command.trim(),
+    );
   } catch {
     return false;
   }
@@ -469,8 +548,211 @@ export function scanReadOnlyShellCommand(command: string): ShellScanResult {
  * `pwd && ls -la` or `ls -la | grep x` work in plan mode while `cat > file`
  * stays blocked.
  */
-export function isPlanReadOnlyShellCommand(command: string): boolean {
-  return scanReadOnlyShellCommand(command).allowed;
+export function isPlanReadOnlyShellCommand(
+  command: string,
+  dialect: "posix" | "powershell" = "posix",
+): boolean {
+  return dialect === "powershell"
+    ? scanReadOnlyPowerShellCommand(command).allowed
+    : scanReadOnlyShellCommand(command).allowed;
+}
+
+const POWERSHELL_READ_ONLY_COMMANDS = new Set([
+  "get-childitem",
+  "gci",
+  "ls",
+  "dir",
+  "get-content",
+  "gc",
+  "cat",
+  "type",
+  "get-location",
+  "pwd",
+  "gl",
+  "test-path",
+  "select-string",
+  "sls",
+  "get-item",
+  "gi",
+  "get-command",
+  "gcm",
+  "get-help",
+  "help",
+  "man",
+]);
+
+const POWERSHELL_DANGEROUS_COMMANDS = new Set([
+  "invoke-expression",
+  "iex",
+  "start-process",
+  "start-job",
+  "remove-item",
+  "set-content",
+  "add-content",
+  "out-file",
+  "new-item",
+  "copy-item",
+  "move-item",
+  "rename-item",
+  "clear-content",
+  "set-item",
+  "set-location",
+  "push-location",
+  "pop-location",
+  "stop-process",
+  "new-object",
+  "add-type",
+  "invoke-webrequest",
+  "invoke-restmethod",
+  "curl",
+  "wget",
+  "format-volume",
+  "clear-disk",
+  "remove-partition",
+  "stop-computer",
+  "restart-computer",
+  "remove-variable",
+  "clear-variable",
+  "remove-module",
+]);
+
+const POWERSHELL_DYNAMIC_PATTERN = /\$\(|\$\{|`|\@\(|[()]/;
+const POWERSHELL_ASSIGNMENT_PATTERN = /^\s*\$[A-Za-z_][A-Za-z0-9_:]*\s*=/;
+
+/**
+ * Conservative read-only scanner for PowerShell. It allows a small set of
+ * inspection cmdlets, git subcommands, and pipes between them. Anything that
+ * can evaluate code, change state, redirect output, or start a process is
+ * rejected.
+ */
+export function scanReadOnlyPowerShellCommand(command: string): ShellScanResult {
+  const trimmed = command.trim();
+  if (!trimmed) return { allowed: false, reason: "empty command" };
+  if (trimmed.includes("\n")) {
+    return { allowed: false, reason: "multi-line commands are not read-only" };
+  }
+  if (POWERSHELL_DYNAMIC_PATTERN.test(trimmed)) {
+    return { allowed: false, reason: "dynamic command evaluation is not read-only" };
+  }
+  if (POWERSHELL_ASSIGNMENT_PATTERN.test(trimmed)) {
+    return { allowed: false, reason: "variable assignment is not read-only" };
+  }
+  if (/[<>]/.test(trimmed)) {
+    return { allowed: false, reason: "redirection is not read-only" };
+  }
+  if (/&/.test(trimmed)) {
+    return { allowed: false, reason: "background and call operators are not read-only" };
+  }
+  if (/\|\|/.test(trimmed)) {
+    return { allowed: false, reason: "conditional chaining is not read-only" };
+  }
+  const segments = splitPowerShellSegments(trimmed);
+  if (!segments) return { allowed: false, reason: "unbalanced quotes" };
+  if (segments.length === 0) return { allowed: false, reason: "empty command" };
+  for (const segment of segments) {
+    if (!isReadOnlyPowerShellSegment(segment)) {
+      return { allowed: false, reason: `not a read-only command: ${segment}` };
+    }
+  }
+  return { allowed: true };
+}
+
+function splitPowerShellSegments(command: string): string[] | undefined {
+  const segments: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) {
+      current += char;
+      if (quote === "'" && char === "'") {
+        if (command[index + 1] === "'") {
+          current += command[index + 1];
+          index += 1;
+        } else {
+          quote = undefined;
+        }
+      } else if (quote === '"' && char === "`") {
+        current += command[index + 1] ?? "";
+        index += 1;
+      } else if (quote === '"' && char === '"') {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === ";" || char === "|") {
+      if (char === "|" && command[index + 1] === "|") return undefined;
+      if (current.trim()) segments.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (quote) return undefined;
+  if (current.trim()) segments.push(current.trim());
+  return segments;
+}
+
+function isReadOnlyPowerShellSegment(segment: string): boolean {
+  const tokens = splitPowerShellTokens(segment);
+  if (tokens.length === 0) return false;
+  const first = tokens[0]?.toLowerCase() ?? "";
+  if (POWERSHELL_DANGEROUS_COMMANDS.has(first)) return false;
+  for (const token of tokens.slice(1)) {
+    if (POWERSHELL_DANGEROUS_COMMANDS.has(token.toLowerCase())) return false;
+    if (token.toLowerCase() === "-wait") return false;
+  }
+  if (first === "git") {
+    const sub = tokens[1]?.toLowerCase();
+    return Boolean(sub && PLAN_READ_ONLY_GIT_COMMANDS.has(sub));
+  }
+  return POWERSHELL_READ_ONLY_COMMANDS.has(first);
+}
+
+function splitPowerShellTokens(segment: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < segment.length; index += 1) {
+    const char = segment[index];
+    if (quote) {
+      current += char;
+      if (quote === "'" && char === "'") {
+        if (segment[index + 1] === "'") {
+          current += segment[index + 1];
+          index += 1;
+        } else {
+          quote = undefined;
+        }
+      } else if (quote === '"' && char === "`") {
+        current += segment[index + 1] ?? "";
+        index += 1;
+      } else if (quote === '"' && char === '"') {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (current) tokens.push(current);
+  return tokens;
 }
 
 function isReadOnlyShellSegment(segment: string): boolean {
@@ -598,18 +880,48 @@ export class GranularPermissionEngine extends EventEmitter {
   private readonly repoRoot: string;
   private readonly rules: ToolRulePattern[] = [];
   private readonly sessionAllowlist = new Set<string>();
+  private shellAdapter: ShellAdapter | undefined;
+  private shellResolved: boolean;
   private approvalHandler?: (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
   constructor(options: GranularPermissionEngineOptions = {}) {
     super();
     this.repoRoot = options.repoRoot ?? globalThis.process.cwd();
+    this.shellAdapter = options.shellAdapter;
+    this.shellResolved = options.shellAdapter !== undefined;
     for (const rule of options.rules ?? []) {
       this.rules.push(parseToolRule(rule));
     }
   }
 
+  private resolvedShell(): ShellAdapter | undefined {
+    if (this.shellResolved) return this.shellAdapter;
+    this.shellResolved = true;
+    try {
+      this.shellAdapter = detectShell({ env: globalThis.process.env });
+    } catch {
+      this.shellAdapter = undefined;
+    }
+    return this.shellAdapter;
+  }
+
+  private isPowerShellShell(): boolean {
+    const adapter = this.resolvedShell();
+    return adapter?.kind === "pwsh" || adapter?.kind === "powershell";
+  }
+
+  private shellLabel(): string | undefined {
+    return this.resolvedShell()?.label;
+  }
+
   addRule(rule: ToolRulePattern | string): void {
     this.rules.push(parseToolRule(rule));
+  }
+
+  /** Replace the rule set after a settings change. */
+  setRules(rules: readonly (ToolRulePattern | string)[]): void {
+    this.rules.length = 0;
+    for (const rule of rules) this.rules.push(parseToolRule(rule));
   }
 
   setApprovalHandler(handler: (request: ApprovalRequest) => Promise<ApprovalDecision>): void {
@@ -674,7 +986,7 @@ export class GranularPermissionEngine extends EventEmitter {
     if (SHELL_TOOL_NAMES.has(toolName) && typeof args.command === "string") {
       const signatures = shellCommandSignatures(args.command);
       if (!signatures || signatures.length === 0) return undefined;
-      return `${signatures.join(" + ")} in this workspace`;
+      return signatures.join(" + ");
     }
     if (EDIT_TOOL_NAMES.has(toolName)) {
       const filePath = typeof args.filePath === "string" ? args.filePath : undefined;
@@ -702,10 +1014,10 @@ export class GranularPermissionEngine extends EventEmitter {
     toolCallId = `call-${Date.now()}`,
     extraRules: readonly ToolRulePattern[] = [],
   ): Promise<{ allowed: boolean; reason?: string; feedback?: string }> {
-    const cwd = typeof args.cwd === "string" ? args.cwd : this.repoRoot;
+    const cwd = this.permissionCwd(args);
     const shellRisk =
       SHELL_TOOL_NAMES.has(tool.name) && typeof args.command === "string"
-        ? evaluateShellRisk(args.command, cwd)
+        ? { ...evaluateShellRisk(args.command, cwd), shellLabel: this.shellLabel() }
         : undefined;
 
     let externalAsk = false;
@@ -725,8 +1037,10 @@ export class GranularPermissionEngine extends EventEmitter {
       if (!externalAsk && (tool.readOnly || tool.name === "write_plan" || tool.name === "spawn_subagents")) {
         return { allowed: true };
       }
-      if (tool.name === "bash" && typeof args.command === "string") {
-        const scan = scanReadOnlyShellCommand(args.command);
+      if ((tool.name === "shell" || tool.name === "bash") && typeof args.command === "string") {
+        const scan = this.isPowerShellShell()
+          ? scanReadOnlyPowerShellCommand(args.command)
+          : scanReadOnlyShellCommand(args.command);
         if (!externalAsk && scan.allowed && shellRisk?.riskLevel === "low") {
           return { allowed: true };
         }
@@ -839,8 +1153,7 @@ export class GranularPermissionEngine extends EventEmitter {
     request: ApprovalRequest,
     allowSession = true,
   ): Promise<ApprovalDecision> {
-    const cwd =
-      typeof request.args.cwd === "string" ? request.args.cwd : this.repoRoot;
+    const cwd = this.permissionCwd(request.args);
     const outsideWorkspace =
       SHELL_TOOL_NAMES.has(request.toolName) &&
       typeof request.args.command === "string" &&
@@ -874,6 +1187,16 @@ export class GranularPermissionEngine extends EventEmitter {
     return decision;
   }
 
+  private permissionCwd(args: Record<string, unknown>): string {
+    const raw =
+      typeof args.workdir === "string"
+        ? args.workdir
+        : typeof args.cwd === "string"
+          ? args.cwd
+          : ".";
+    return resolve(this.repoRoot, raw);
+  }
+
   private externalTarget(
     toolName: string,
     args: Record<string, unknown>,
@@ -897,7 +1220,7 @@ export class GranularPermissionEngine extends EventEmitter {
   }
 
   private extractTargetKey(toolName: string, args: Record<string, unknown>): string {
-    if ((toolName === "bash" || toolName === "bg_start") && typeof args.command === "string") {
+    if (SHELL_TOOL_NAMES.has(toolName) && typeof args.command === "string") {
       return args.command.trim();
     }
     if (typeof args.filePath === "string") {
@@ -912,10 +1235,16 @@ export class GranularPermissionEngine extends EventEmitter {
     extraRules: readonly ToolRulePattern[] = [],
   ): ToolRulePattern | undefined {
     const shellTarget = SHELL_TOOL_NAMES.has(toolName) || toolName === "bg_start";
+    const sameShellTool = (left: string, right: string): boolean =>
+      (left === "shell" || left === "bash") && (right === "shell" || right === "bash");
     const match = (rules: readonly ToolRulePattern[]): ToolRulePattern | undefined => {
       for (let index = rules.length - 1; index >= 0; index -= 1) {
         const rule = rules[index];
-        if (rule.toolName !== "*" && rule.toolName !== toolName) {
+        if (
+          rule.toolName !== "*" &&
+          rule.toolName !== toolName &&
+          !sameShellTool(rule.toolName, toolName)
+        ) {
           continue;
         }
         if (shellTarget) {
@@ -924,13 +1253,14 @@ export class GranularPermissionEngine extends EventEmitter {
           if (matchCommandPattern(rule.pattern, targetKey)) return rule;
           continue;
         }
+        const pathTarget = targetKey.replace(/\\/g, "/");
         try {
           const glob = new Bun.Glob(rule.pattern);
-          if (glob.match(targetKey)) {
+          if (glob.match(pathTarget)) {
             return rule;
           }
         } catch {
-          if (targetKey.startsWith(rule.pattern.replace(/\*+$/, ""))) {
+          if (pathTarget.startsWith(rule.pattern.replace(/\*+$/, ""))) {
             return rule;
           }
         }

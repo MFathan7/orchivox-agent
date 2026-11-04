@@ -82,6 +82,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/theme", requiresArgs: false, description: "Change or inspect the terminal theme" },
   { name: "/reasoning", requiresArgs: false, description: "Set thinking effort" },
   { name: "/palette", description: "Search actions and settings" },
+  { name: "/settings", description: "Configure approvals, safety, and step limits" },
   { name: "/sessions", description: "Open session manager and past conversation search" },
   { name: "/fork", description: "Fork active conversation from a specific turn" },
   { name: "/timeline", description: "Open VCS snapshot history timeline" },

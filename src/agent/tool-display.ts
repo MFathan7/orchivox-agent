@@ -15,6 +15,7 @@ const LABELS: Record<string, string> = {
   apply_unified_patch: "Applying patch",
   glob_files: "Finding files",
   grep_search: "Searching code",
+  shell: "Running command",
   bash: "Running command",
   web_search: "Searching the web",
   web_fetch: "Fetching page",
@@ -87,6 +88,7 @@ function detailFor(name: string, args: Record<string, unknown>): string | undefi
     case "glob_files":
     case "lsp_workspace_symbols":
       return stringArg(args, "pattern", "query");
+    case "shell":
     case "bash":
     case "run_sandbox_script":
       return stringArg(args, "command");

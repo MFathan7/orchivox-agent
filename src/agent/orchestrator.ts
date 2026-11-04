@@ -41,6 +41,7 @@ import {
 import { createSandboxScriptTool } from "../tools/sandbox-bridge";
 import { ToolRegistry } from "../tools/registry";
 import { PersistentShellTool } from "../tools/shell";
+import { detectShell, type ShellAdapter } from "../tools/shell-adapter";
 import { BackgroundProcessManager } from "../tools/bg-process";
 import { createInspectImageTool } from "../tools/vision";
 import { createReadDocumentTool } from "../tools/read-document";
@@ -84,7 +85,11 @@ import { ReadFileCache, ToolCallTracker, toolCallSignature } from "./tool-call-t
 import { filterToolsForMode, isConcurrentSafeTool } from "./tool-set";
 import { CustomCommandEngine } from "./custom-commands";
 import { HookRunner, type PluginLoadReport } from "./hooks";
-import { GranularPermissionEngine, permissionRulesFromConfig } from "./permissions";
+import {
+  GranularPermissionEngine,
+  permissionRulesFromConfig,
+  resolvePermissionRules,
+} from "./permissions";
 import { SpecialistAgentRegistry, type SpecialistAgentProfile } from "./specialist-agents";
 import {
   loadProjectContext,
@@ -338,6 +343,8 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly maxTurnTokens: number | undefined;
   private readonly maxRequestBytes: number;
   private readonly skillMaxBodyChars: number;
+  private readonly shellAdapter: ShellAdapter | undefined;
+  private readonly shellLabel: string;
   private branch: string | undefined;
   private globalRules = "";
   private projectContext: ProjectContext | undefined;
@@ -354,6 +361,8 @@ export class AgentOrchestrator implements IAgentRunner {
     this.lsp = options.lsp;
     this.hashEditLifecycle = options.hashEditLifecycle;
     this.root = options.repoRoot ?? globalThis.process.cwd();
+    this.shellAdapter = resolveShellAdapter();
+    this.shellLabel = this.shellAdapter?.label ?? globalThis.process.env.SHELL ?? "unknown";
     this.maxTurns = options.maxTurns ?? 0;
     this.contextTokenBudget = options.contextTokenBudget ?? 200_000;
     this.compactionConfig =
@@ -379,16 +388,32 @@ export class AgentOrchestrator implements IAgentRunner {
     this.maxTurnTokens = options.config?.limits?.turn_tokens;
     this.maxRequestBytes = options.config?.limits?.max_request_bytes ?? 0;
     this.skillMaxBodyChars = options.config?.skills?.max_body_chars ?? 0;
-    this.permissions = options.permissions ?? new GranularPermissionEngine({ repoRoot: this.root });
+    this.permissions =
+      options.permissions ??
+      new GranularPermissionEngine({
+        repoRoot: this.root,
+        shellAdapter: this.shellAdapter,
+        rules: resolvePermissionRules(this.config ?? {}),
+      });
     this.questionHandler = options.onQuestion;
     this.registry = new ToolRegistry({ permissions: this.permissions });
     this.hindsight = new HindsightMemory(options.database);
-    this.hooks = new HookRunner({ hooks: options.config?.hooks, cwd: this.root });
+    this.hooks = new HookRunner({
+      hooks: options.config?.hooks,
+      cwd: this.root,
+      adapter: this.shellAdapter,
+    });
     this.advisor = new AdvisorReviewer({ router: options.router, repoRoot: this.root });
-    this.customCommands = new CustomCommandEngine({ repoRoot: this.root });
+    this.customCommands = new CustomCommandEngine({
+      repoRoot: this.root,
+      adapter: this.shellAdapter,
+    });
     this.specialistAgents = new SpecialistAgentRegistry({ repoRoot: this.root });
     this.skills = new SkillRegistry({ repoRoot: this.root, maxBodyChars: this.skillMaxBodyChars });
-    this.bgProcesses = new BackgroundProcessManager({ defaultCwd: this.root });
+    this.bgProcesses = new BackgroundProcessManager({
+      defaultCwd: this.root,
+      adapter: this.shellAdapter,
+    });
     this.subagents = new SubagentManager({
       worktrees: options.worktrees,
       executor: (input) => this.executeSubagent(input),
@@ -538,6 +563,7 @@ export class AgentOrchestrator implements IAgentRunner {
       modelName: providerRef?.model,
       repoRoot: this.root,
       branch: this.branch,
+      shell: this.shellLabel,
       agentInstructions: this.globalRules,
       projectSummary: this.projectContext?.summary,
       skillsIndex: this.skills.buildIndexPrompt({ compact }),
@@ -683,7 +709,10 @@ export class AgentOrchestrator implements IAgentRunner {
     }
     this.registry.register(createDiffViewTool());
     this.registry.register(createJsonQueryTool());
-    this.registry.register(new PersistentShellTool({ cwd: this.root }));
+    this.registry.register(
+      new PersistentShellTool({ cwd: this.root, adapter: this.shellAdapter }),
+    );
+    this.registry.registerAlias("bash", "shell");
     registerAstTools(this.registry);
     this.todos.registerTools(this.registry);
     this.subagents.registerTools(this.registry);
@@ -977,6 +1006,7 @@ export class AgentOrchestrator implements IAgentRunner {
       modelName: providerRef?.model,
       repoRoot: this.root,
       branch: this.branch,
+      shell: this.shellLabel,
       agentInstructions: this.globalRules,
       specialistPrompt: activeSpecialist?.systemPrompt,
       projectSummary: this.projectContext?.summary,
@@ -2642,6 +2672,7 @@ export class AgentOrchestrator implements IAgentRunner {
         (role ? this.router.getRole(role)?.model : this.router.getModeModel(mode)?.model),
       repoRoot: input.worktreePath ?? this.root,
       branch: this.branch,
+      shell: this.shellLabel,
       agentInstructions: this.globalRules,
       specialistPrompt: specialist?.systemPrompt,
       projectSummary: this.projectContext?.summary,
@@ -3027,7 +3058,14 @@ function countLineChanges(before: string, after: string): { additions: number; d
   return { additions, deletions };
 }
 
-const COMMAND_OUTPUT_TOOLS = new Set(["bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"]);
+const COMMAND_OUTPUT_TOOLS = new Set([
+  "shell",
+  "bash",
+  "run_sandbox_script",
+  "execute",
+  "bg_start",
+  "bg_logs",
+]);
 const CONTENT_OUTPUT_TOOLS = new Set([
   "read_file",
   "read_skeleton",
@@ -3131,6 +3169,14 @@ function clampReasoningEffort(
     if (fallback) return fallback;
   }
   return undefined;
+}
+
+function resolveShellAdapter(): ShellAdapter | undefined {
+  try {
+    return detectShell({ env: globalThis.process.env });
+  } catch {
+    return undefined;
+  }
 }
 
 function zeroUsage(): Usage {

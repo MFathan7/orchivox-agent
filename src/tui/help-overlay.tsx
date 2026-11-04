@@ -35,6 +35,7 @@ export const HELP_SECTIONS: HelpSection[] = [
       { keys: "/hub", description: "Inspect subagent workers" },
       { keys: "/tasks", description: "Open the multi-agent task board" },
       { keys: "/skills", description: "Inspect installed skills" },
+      { keys: "/settings", description: "Configure approvals, safety, and step limits" },
       { keys: "/undo, /redo", description: "Step through snapshots" },
       { keys: "/commit", description: "Split changes into atomic commits" },
       { keys: "/compact", description: "Compact the context window" },

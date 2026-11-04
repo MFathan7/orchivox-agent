@@ -117,6 +117,7 @@ Useful commands:
 - `/sessions` opens past sessions.
 - `/undo` and `/redo` move through file changes.
 - `/commit` splits the current diff into commits.
+- `/settings` changes approvals, safety presets, and step limits.
 - `/help` shows all commands and shortcuts.
 
 ## Context and compaction
@@ -126,6 +127,25 @@ Orchivox budgets by tokens first. It keeps a buffer for the reply and summarizes
 Step, tool call, wall clock, repeated call, and web search caps are off by default. A turn continues until the model stops or you interrupt it. Set `modes.<mode>.steps` or the matching `limits.*` key to opt into a cap. When a step cap is reached, Orchivox keeps the tool definitions for the final request, disables tool choice, and asks for a summary instead of reporting an error.
 
 Prune is off by default. When on, it removes old tool output without writing a summary, which can save context but can also increase how often the conversation needs a full summary. To opt in, set `compaction.prune: true` in `.agent/config.yaml`. The default budgets protect the most recent 40K tokens and only prune when the change frees at least 20K.
+
+## Shells and platforms
+
+The `shell` tool uses the platform shell:
+
+- Linux and macOS: bash when available, then the login shell, then zsh or sh.
+- Windows: PowerShell 7 (`pwsh`) when available, otherwise Windows PowerShell 5.1. Bash is not required.
+
+Background processes, hooks, and custom-command inline shell use the same shell. Set `ORCHIVOX_SHELL` to `bash`, `zsh`, `sh`, `pwsh`, or `powershell` when you need an explicit override. The `shell` tool accepts `workdir`, and `bg_start` accepts `cwd`.
+
+Plan mode only allows read-only inspection commands. On Windows this uses a PowerShell allowlist; commands that change state or evaluate code are rejected.
+
+If Windows cannot find PowerShell, install PowerShell 7 or enable Windows PowerShell. On macOS, Orchivox does not depend on an `env -0` extension that older releases lack. For WSL, run Orchivox inside the Linux filesystem instead of mixing `C:\` paths with a WSL shell.
+
+## Approvals and plan files
+
+Build and Ultrawork use the **Safer Build** approval preset by default. Credential reads, destructive file and database actions, database CLI commands, and `execute` ask first. Approval offers once, allow for session, deny, and deny with feedback. `/settings` switches between Safer Build, Env-only, Permissive, and Custom, and sets per-mode step limits.
+
+Plan mode writes plans to `~/.orchivox/plan` (`ORCHIVOX_PLAN_HOME` overrides it). Build and Ultrawork write plan files to the active project root. `.agent` is reserved for configuration and is never a plan directory.
 
 ## Features
 
@@ -139,6 +159,8 @@ Prune is off by default. When on, it removes old tool output without writing a s
 - Seven color themes, including a light preset, saved with your settings.
 - Optional per-turn step, tool, and time caps, off by default, for when you want to bound a turn.
 - Token-first compaction with a configurable context buffer; session spend and total tokens survive compaction.
+- Platform-aware shell execution on Linux, macOS, and Windows, including background processes, hooks, and custom commands.
+- Safer Build and Ultrawork approvals for credentials, destructive actions, database tools, and code execution.
 - Optional repeated-call detection and a per-turn read cache.
 - Model-aware edit tools and bounded code search.
 - Optional code mode for batching tool calls in one sandboxed script.
@@ -203,4 +225,4 @@ If the installer added Orchivox to your PATH, remove the block between `# >>> or
 
 ## Status
 
-Orchivox is at version `0.5.3`. For long tasks, use a model with strong tool calling and a context window that matches the repository size.
+Orchivox is at version `0.5.4`. For long tasks, use a model with strong tool calling and a context window that matches the repository size.

@@ -8,6 +8,7 @@ export const PLAN_TOOL_NAMES: ReadonlySet<string> = new Set([
   "grep_search",
   "diff_view",
   "json_query",
+  "shell",
   "bash",
   "todo_read",
   "web_search",
@@ -32,6 +33,7 @@ export const BUILD_TOOL_NAMES: ReadonlySet<string> = new Set([
   "apply_unified_patch",
   "glob_files",
   "grep_search",
+  "shell",
   "bash",
   "todo_write",
   "todo_read",
@@ -74,7 +76,7 @@ export const PLAN_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["write_plan"])
 /**
  * Read-only tools that depend on nothing another tool in the same turn writes.
  * Interactive or stateful reads stay out: `question` waits for the user, and
- * `bash` can leave side effects behind even when its intent is read-only.
+ * `shell` can leave side effects behind even when its intent is read-only.
  */
 export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "read_file",

@@ -11,6 +11,7 @@ import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import type { ProviderRouter } from "../provider/router";
 import type { MemoryDatabase, SessionRecord } from "../memory/sqlite";
 import type { RestoreResult, SnapshotManager } from "../vcs/snapshot";
+import type { ApprovalPreset } from "../config/loader";
 import type { ConfigMode, ConfigRole } from "../config/writer";
 import { AgentHub, type AgentHubTab } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
@@ -24,6 +25,7 @@ import { QuestionModal, type PendingQuestion } from "./question-modal";
 import type { QuestionAnswer } from "../tools/question";
 import { ModelConfigModal } from "./model-modal";
 import { SessionTimeTravelModal, type SessionModalTab } from "./session-modal";
+import { SettingsModal, type SettingsMode } from "./settings-modal";
 import { SkillsModal } from "./skills-modal";
 import { WorkspaceTrustPrompt } from "./trust-modal";
 import {
@@ -233,6 +235,13 @@ export interface OrchivoxAppProps {
   skillsOpen?: boolean;
   onSkillsOpenChange?: (open: boolean) => void;
   onReloadSkills?: () => void;
+  settingsOpen?: boolean;
+  onSettingsOpenChange?: (open: boolean) => void;
+  approvalsPreset?: ApprovalPreset;
+  modeSteps?: Record<SettingsMode, number>;
+  configSource?: string;
+  onApprovalsPresetChange?: (preset: ApprovalPreset) => void;
+  onModeStepsChange?: (mode: SettingsMode, steps: number) => void;
   paletteOpen?: boolean;
   onPaletteOpenChange?: (open: boolean) => void;
   sessionTab?: SessionModalTab | null;
@@ -382,7 +391,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     onStatusMessage,
     onRoleChange,
     configPath = `${globalThis.process.cwd()}/.agent/config.yaml`,
+    configSource = "project",
     secretsPath = `${globalThis.process.cwd()}/.agent/secrets.yaml`,
+    approvalsPreset = "safer",
+    modeSteps = { plan: 0, build: 0, ultrawork: 0 },
   } = props;
 
   const [internalMode, setInternalMode] = React.useState<AgentMode>("build");
@@ -394,6 +406,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     "models",
   );
   const [internalSkillsOpen, setInternalSkillsOpen] = React.useState(false);
+  const [internalSettingsOpen, setInternalSettingsOpen] = React.useState(false);
   const [internalHubOpen, setInternalHubOpen] = React.useState(false);
   const [internalHubTab, setInternalHubTab] = React.useState<AgentHubTab>("workers");
   const [internalPaletteOpen, setInternalPaletteOpen] = React.useState(false);
@@ -435,6 +448,12 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const setSkillsOpen = (open: boolean) => {
     if (props.skillsOpen === undefined) setInternalSkillsOpen(open);
     props.onSkillsOpenChange?.(open);
+  };
+
+  const settingsOpen = props.settingsOpen ?? internalSettingsOpen;
+  const setSettingsOpen = (open: boolean) => {
+    if (props.settingsOpen === undefined) setInternalSettingsOpen(open);
+    props.onSettingsOpenChange?.(open);
   };
 
   const paletteOpen = props.paletteOpen ?? internalPaletteOpen;
@@ -549,6 +568,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     reportOpen ||
     modelsOpen ||
     skillsOpen ||
+    settingsOpen ||
     paletteOpen ||
     Boolean(sessionTab) ||
     hubOpen ||
@@ -888,6 +908,18 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             }}
             onCancel={() => setReasoningPickerOpen(false)}
           />
+        ) : settingsOpen ? (
+          <SettingsModal
+            preset={approvalsPreset}
+            steps={modeSteps}
+            configPath={configPath}
+            configSource={configSource}
+            width={innerWidth}
+            theme={theme}
+            onPresetChange={(next) => props.onApprovalsPresetChange?.(next)}
+            onStepsChange={(nextMode, steps) => props.onModeStepsChange?.(nextMode, steps)}
+            onClose={() => setSettingsOpen(false)}
+          />
         ) : skillsOpen ? (
           <SkillsModal
             skills={props.skills ?? []}
@@ -938,6 +970,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               } else if (action === "open_skills") {
                 props.onReloadSkills?.();
                 setSkillsOpen(true);
+              } else if (action === "open_settings") {
+                setSettingsOpen(true);
               } else if (action === "open_tasks") {
                 setHubTab("tasks");
                 setHubOpen(true);

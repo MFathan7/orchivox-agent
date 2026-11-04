@@ -30,17 +30,24 @@ import { generateSessionTitle, isPlaceholderTitle, messageText } from "./agent/s
 import type { SkillDocument } from "./agent/skills";
 import {
   GranularPermissionEngine,
-  permissionRulesFromConfig,
+  resolvePermissionRules,
   type ApprovalDecision,
   type ApprovalRequest,
 } from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
-import { loadConfig, sharedModeModel, type AppConfig } from "./config/loader";
+import {
+  loadConfig,
+  sharedModeModel,
+  type AppConfig,
+  type ApprovalPreset,
+} from "./config/loader";
 import { resolveConfigPaths, type ConfigSource } from "./config/paths";
 import {
   clearModeModelSelections,
   saveActiveMode,
+  saveApprovalsPreset,
   saveModeReasoning,
+  saveModeSteps,
   saveRoleSelection,
   saveTheme,
   type ConfigMode,
@@ -72,6 +79,7 @@ import {
   type ThinkingSegmentView,
 } from "./tui/app";
 import { applyCompactionMeter, applyContextEstimate } from "./tui/session-meter";
+import type { SettingsMode } from "./tui/settings-modal";
 import { formatStatsReport } from "./tui/stats-report";
 import { buildTranscriptEntries } from "./tui/transcript";
 import { finalizeToolCalls } from "./tui/tool-state";
@@ -339,7 +347,7 @@ export async function bootstrap(
   const lifecycle = buildHashEditLifecycle({ snapshots, lsp });
   const permissions = new GranularPermissionEngine({
     repoRoot: root,
-    rules: permissionRulesFromConfig(config.permissions),
+    rules: resolvePermissionRules(config),
   });
 
   const orchestrator = new AgentOrchestrator({
@@ -592,6 +600,7 @@ async function runTuiSession(
     modelsOpen: false,
     modelsView: "models" as "models" | "providers",
     skillsOpen: false,
+    settingsOpen: false,
     skills: runtime.orchestrator.skills.listDocuments() as SkillDocument[],
     activeSkills: [] as string[],
     hubTab: "workers" as "workers" | "tasks",
@@ -1016,6 +1025,38 @@ async function runTuiSession(
     },
     onReloadSkills: () => {
       void reloadSkills();
+    },
+    settingsOpen: state.settingsOpen,
+    onSettingsOpenChange: (open: boolean) => {
+      state.settingsOpen = open;
+      rerender();
+    },
+    approvalsPreset: runtime.config.approvals.preset ?? "safer",
+    modeSteps: {
+      plan: runtime.config.modes.plan.steps ?? 0,
+      build: runtime.config.modes.build.steps ?? 0,
+      ultrawork: runtime.config.modes.ultrawork.steps ?? 0,
+    },
+    configSource: runtime.configSource,
+    onApprovalsPresetChange: (preset: ApprovalPreset) => {
+      runtime.config.approvals.preset = preset;
+      runtime.orchestrator.permissions.setRules(resolvePermissionRules(runtime.config));
+      void saveApprovalsPreset(runtime.configPath, preset).catch((error) => {
+        setNotice(`could not save approval preset: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      });
+      setNotice(`Approval preset: ${preset}`, 6000);
+      rerender();
+    },
+    onModeStepsChange: (mode: SettingsMode, steps: number) => {
+      runtime.config.modes[mode].steps = steps;
+      void saveModeSteps(runtime.configPath, mode, steps).catch((error) => {
+        setNotice(`could not save ${mode} steps: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      });
+      setNotice(
+        `${mode} steps: ${steps === 0 ? "unlimited" : String(steps)}`,
+        6000,
+      );
+      rerender();
     },
     tasks: runtime.orchestrator.tasks.list(),
     hubTab: state.hubTab,
@@ -2052,6 +2093,11 @@ async function runTuiSession(
       }
       case "/palette": {
         state.paletteOpen = true;
+        rerender();
+        break;
+      }
+      case "/settings": {
+        state.settingsOpen = true;
         rerender();
         break;
       }

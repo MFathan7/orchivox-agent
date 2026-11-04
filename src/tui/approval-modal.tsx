@@ -18,7 +18,7 @@ export interface ToolApprovalModalProps {
 
 const ACTIONS = [
   { id: "approve_once", label: "Approve once", short: "Approve" },
-  { id: "always_allow", label: "Always allow", short: "Always" },
+  { id: "always_allow", label: "Allow for session", short: "Session" },
   { id: "deny", label: "Deny", short: "Deny" },
   { id: "deny_with_feedback", label: "Deny with feedback", short: "Feedback" },
 ] as const;
@@ -51,9 +51,9 @@ function previewTextRows(
 
 function alwaysAllowScope(request: ApprovalRequest): string {
   if (request.alwaysAllowLabel) return request.alwaysAllowLabel;
-  if (request.shellDetails) return "this command family in this workspace";
-  if (request.diffPreview) return "edits in this workspace";
-  return "this tool";
+  if (request.shellDetails) return "this command family in this session";
+  if (request.diffPreview) return "edits in this workspace for this session";
+  return "this tool for this session";
 }
 
 export function ToolApprovalModal(props: ToolApprovalModalProps) {
@@ -293,7 +293,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
   const targetLine = fitDisplayText(
     `${target}${stats ? ` +${stats.additions} -${stats.deletions}` : ""}${
       request.shellDetails ? ` · ${request.shellDetails.riskLevel.toUpperCase()}` : ""
-    }`,
+    }${request.shellDetails?.shellLabel ? ` · ${request.shellDetails.shellLabel}` : ""}`,
     contentWidth,
   );
 
@@ -325,7 +325,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
   );
   const alwaysLabel =
     request.shellDetails || request.diffPreview
-      ? `Always allow ${alwaysAllowScope(request)}`
+      ? `Allow for session: ${alwaysAllowScope(request)}`
       : ACTIONS[1].label;
 
   const footer = feedbackMode ? (

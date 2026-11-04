@@ -265,6 +265,7 @@ export class SpecialistAgentRegistry {
           "move_file",
           "apply_unified_patch",
           "shell_execute",
+          "shell",
           "bash",
           "bg_start",
           "bg_stop",

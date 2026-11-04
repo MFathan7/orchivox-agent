@@ -494,6 +494,25 @@ export const ModesConfigSchema = z.object({
 });
 export type ModesConfig = z.infer<typeof ModesConfigSchema>;
 
+export const ApprovalPresetSchema = z.enum([
+  "safer",
+  "env-only",
+  "permissive",
+  "custom",
+]);
+export type ApprovalPreset = z.infer<typeof ApprovalPresetSchema>;
+
+export const ApprovalsConfigSchema = z.object({
+  /**
+   * safer: credential reads and dangerous shell/database actions ask.
+   * env-only: only .env reads ask.
+   * permissive: no default approval rules.
+   * custom: use only the explicit permissions list.
+   */
+  preset: ApprovalPresetSchema.default("safer"),
+});
+export type ApprovalsConfig = z.infer<typeof ApprovalsConfigSchema>;
+
 export const AppConfigSchema = z.object({
   version: z.number().int().positive().default(1),
   providers: z.record(z.string().min(1), ProviderProfileSchema).default({}),
@@ -517,6 +536,7 @@ export const AppConfigSchema = z.object({
     })
     .prefault({}),
   hooks: HooksConfigSchema.prefault({}),
+  approvals: ApprovalsConfigSchema.prefault({}),
   permissions: z.array(PermissionRuleSchema).default([]),
   sandbox: SandboxConfigSchema.prefault({}),
   compaction: CompactionConfigSchema.prefault({}),

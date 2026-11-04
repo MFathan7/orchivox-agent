@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import { applyPatch } from "diff";
 import { z } from "zod";
 
-import { currentTurnContext } from "../agent/turn-context";
+import { currentMode, currentTurnContext } from "../agent/turn-context";
 import type { AgentTool } from "./registry";
 import { truncateHead } from "./output-budget";
 import { redirectPlanPath } from "./plan-path";
@@ -336,7 +336,7 @@ export function createCreateFileTool(
   return {
     name: "create_file",
     description:
-      "Create a new file with specified content. Creates any missing parent directories. Fails if the file exists unless overwrite is true. Plan files named PLAN*.md default to PLAN.md at the project root unless the user names another path.",
+      "Create a file with content. Creates parent directories. Fails if it exists unless overwrite is true. Plan files go to the plan directory in Plan mode and the project root in Build/Ultrawork.",
     parameters: CreateFileArgsSchema,
     readOnly: false,
     async execute(args) {
@@ -346,6 +346,7 @@ export function createCreateFileTool(
         path: args.filePath,
         userText: turnContext?.userText,
         root,
+        mode: currentMode(),
       });
       const filePath = redirect.path;
       const file = Bun.file(filePath);

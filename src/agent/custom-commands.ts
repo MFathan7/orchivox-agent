@@ -3,6 +3,8 @@ import { readdir, readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
+import { detectShell, ShellAdapterError, type ShellAdapter } from "../tools/shell-adapter";
+
 export interface CustomCommandFrontmatter {
   description?: string;
   agent?: string;
@@ -133,11 +135,13 @@ export function parseFrontmatter(rawContent: string): { frontmatter: CustomComma
 export class CustomCommandEngine {
   private readonly repoRoot: string;
   private readonly commandsDir: string;
+  private readonly adapter: ShellAdapter | undefined;
   private cachedCommands = new Map<string, CustomCommand>();
 
-  constructor(options?: { repoRoot?: string }) {
+  constructor(options?: { repoRoot?: string; adapter?: ShellAdapter }) {
     this.repoRoot = options?.repoRoot ?? globalThis.process.cwd();
     this.commandsDir = resolve(this.repoRoot, ".agent", "commands");
+    this.adapter = options?.adapter;
   }
 
   async ensureDefaults(): Promise<void> {
@@ -251,10 +255,14 @@ export class CustomCommandEngine {
 
   private async executeInlineShell(command: string): Promise<string> {
     try {
-      const proc = Bun.spawn(["bash", "-c", command], {
+      const adapter =
+        this.adapter ?? detectShell({ env: collectEnv(globalThis.process.env) });
+      const [program, ...programArgs] = adapter.command(command);
+      const proc = Bun.spawn([program, ...programArgs], {
         cwd: this.repoRoot,
         stdout: "pipe",
         stderr: "pipe",
+        detached: process.platform !== "win32",
       });
 
       const [stdout, stderr] = await Promise.all([
@@ -274,7 +282,13 @@ export class CustomCommandEngine {
       }
       return exitCode === 0 ? "" : `[exit code: ${exitCode}]`;
     } catch (error) {
-      return `[shell error: ${error instanceof Error ? error.message : String(error)}]`;
+      const detail =
+        error instanceof ShellAdapterError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      return `[shell error: ${detail}]`;
     }
   }
 
@@ -323,4 +337,12 @@ export class CustomCommandEngine {
       return null;
     }
   }
+}
+
+function collectEnv(source: NodeJS.ProcessEnv): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
 }

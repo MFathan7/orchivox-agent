@@ -1,9 +1,17 @@
+import { statSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 
 import { ensureRuntimeTempDir } from "../runtime-temp";
+import { killProcessTree } from "./process-tree";
 import type { AgentTool, ToolRegistry } from "./registry";
+import {
+  detectShell,
+  ShellAdapterError,
+  ShellExecutionError,
+  type ShellAdapter,
+} from "./shell-adapter";
 import { workspaceRoot } from "./workspace";
 
 export interface BgProcessLine {
@@ -77,13 +85,33 @@ interface ManagedProcess {
   resolveReady?: (ready: boolean) => void;
 }
 
+export interface BackgroundProcessManagerOptions {
+  defaultCwd?: string;
+  /** Injectable shell adapter for tests. */
+  adapter?: ShellAdapter;
+}
+
 export class BackgroundProcessManager {
   private readonly processes = new Map<string, ManagedProcess>();
   private readonly defaultCwd: string;
+  private readonly adapter: ShellAdapter | undefined;
   private idCounter = 0;
 
-  constructor(options?: { defaultCwd?: string }) {
+  constructor(options?: BackgroundProcessManagerOptions) {
     this.defaultCwd = options?.defaultCwd ?? globalThis.process.cwd();
+    this.adapter = options?.adapter;
+  }
+
+  private resolveAdapter(env: Record<string, string>): ShellAdapter {
+    if (this.adapter) return this.adapter;
+    try {
+      return detectShell({ env });
+    } catch (error) {
+      if (error instanceof ShellAdapterError) {
+        throw new ShellExecutionError(error.code, error.message);
+      }
+      throw error;
+    }
   }
 
   async start(options: BgStartOptions): Promise<BgProcessInfo> {
@@ -97,17 +125,16 @@ export class BackgroundProcessManager {
       }
     }
 
-    const cwd = options.cwd ?? workspaceRoot(this.defaultCwd);
+    const cwd = resolve(this.defaultCwd, options.cwd ?? workspaceRoot(this.defaultCwd));
+    assertDirectory(cwd);
     const tempRoot = await ensureRuntimeTempDir(this.defaultCwd).catch(() => undefined);
     const tempDir = tempRoot
       ? join(tempRoot, `bg-${process.pid}-${crypto.randomUUID().slice(0, 8)}`)
       : undefined;
     if (tempDir) await mkdir(tempDir, { recursive: true, mode: 0o700 }).catch(() => undefined);
-    const env = {
-      ...globalThis.process.env,
-      ...(tempDir ? { TMPDIR: tempDir } : {}),
-      ...options.env,
-    };
+    const env = collectEnv({ ...globalThis.process.env, ...options.env });
+    if (tempDir) env.TMPDIR = tempDir;
+    const adapter = this.resolveAdapter(env);
 
     let resolveReady: ((ready: boolean) => void) | undefined;
     let readyPromise: Promise<boolean> | undefined;
@@ -127,17 +154,24 @@ export class BackgroundProcessManager {
       }
     }
 
+    const [program, ...programArgs] = adapter.command(options.command);
     let proc: ReturnType<typeof Bun.spawn>;
     try {
-      proc = Bun.spawn(["bash", "-c", options.command], {
+      proc = Bun.spawn([program, ...programArgs], {
         cwd,
         env,
         stdout: "pipe",
         stderr: "pipe",
+        detached: process.platform !== "win32",
       });
     } catch (error) {
       if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-      throw error;
+      throw new ShellExecutionError(
+        "shell_start_failed",
+        `shell_start_failed: could not start ${adapter.label}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
     if (tempDir) {
       await writeFile(join(tempDir, "owner.pid"), String(proc.pid)).catch(() => undefined);
@@ -297,15 +331,15 @@ export class BackgroundProcessManager {
 
     try {
       if (force) {
-        managed.proc.kill(9);
+        killProcessTree(managed.proc, { force: true });
       } else {
-        managed.proc.kill(15);
+        killProcessTree(managed.proc, { force: false });
         await Promise.race([
           managed.proc.exited,
           new Promise((resolve) => setTimeout(resolve, 800)),
         ]);
         if (managed.info.status === "running" || managed.info.status === "ready") {
-          managed.proc.kill(9);
+          killProcessTree(managed.proc, { force: true });
         }
       }
     } catch {
@@ -508,4 +542,25 @@ export class BackgroundProcessManager {
       }
     }
   }
+}
+
+function assertDirectory(path: string): void {
+  try {
+    if (!statSync(path).isDirectory()) {
+      throw new Error("not a directory");
+    }
+  } catch {
+    throw new ShellExecutionError(
+      "workdir_not_found",
+      `workdir_not_found: ${path} is not a directory`,
+    );
+  }
+}
+
+function collectEnv(source: NodeJS.ProcessEnv): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
 }

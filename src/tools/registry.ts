@@ -59,6 +59,7 @@ export class ToolPermissionManager implements IToolPermissionChecker {
 
 export class ToolRegistry {
   private readonly tools = new Map<string, AgentTool>();
+  private readonly aliases = new Map<string, string>();
   private readonly permissions: IToolPermissionChecker;
 
   constructor(options: { permissions?: IToolPermissionChecker } = {}) {
@@ -70,12 +71,21 @@ export class ToolRegistry {
     this.tools.set(tool.name, tool);
   }
 
+  /** Map an old tool name to a canonical tool without exposing it to the model. */
+  registerAlias(alias: string, target: string): void {
+    if (this.tools.has(alias) || this.aliases.has(alias)) {
+      throw new Error(`tool alias "${alias}" collides with a tool or alias`);
+    }
+    if (!this.tools.has(target)) throw new Error(`tool alias "${alias}" targets unknown tool "${target}"`);
+    this.aliases.set(alias, target);
+  }
+
   get(name: string): AgentTool | undefined {
-    return this.tools.get(name);
+    return this.tools.get(this.aliases.get(name) ?? name);
   }
 
   has(name: string): boolean {
-    return this.tools.has(name);
+    return this.get(name) !== undefined;
   }
 
   list(): AgentTool[] {
@@ -98,7 +108,7 @@ export class ToolRegistry {
     signal?: AbortSignal,
     permissionRules: readonly ToolRulePattern[] = [],
   ): Promise<ToolResult> {
-    const tool = this.tools.get(call.name);
+    const tool = this.get(call.name);
     if (!tool) {
       return { tool_call_id: call.id, content: `unknown tool "${call.name}"`, is_error: true };
     }

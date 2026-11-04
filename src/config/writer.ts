@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { isMap, isSeq, parseDocument, type Document } from "yaml";
 
 import type { ThemeSelection } from "../types/theme";
-import type { ModelCapabilitiesPatch, ProviderProfile } from "./loader";
+import type { ApprovalPreset, ModelCapabilitiesPatch, ProviderProfile } from "./loader";
 
 export type ConfigRole = "main" | "fast" | "advisor";
 export type ConfigMode = "plan" | "build" | "ultrawork";
@@ -134,6 +134,27 @@ export async function saveModeReasoning(
   const document = await readDocument(configPath);
   ensureMap(document, "modes");
   document.setIn(["modes", mode, "reasoning"], reasoning);
+  await writeDocument(configPath, document);
+}
+
+export async function saveModeSteps(
+  configPath: string,
+  mode: ConfigMode,
+  steps: number,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "modes");
+  document.setIn(["modes", mode, "steps"], steps);
+  await writeDocument(configPath, document);
+}
+
+export async function saveApprovalsPreset(
+  configPath: string,
+  preset: ApprovalPreset,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "approvals");
+  document.setIn(["approvals", "preset"], preset);
   await writeDocument(configPath, document);
 }
 

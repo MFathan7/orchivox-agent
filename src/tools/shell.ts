@@ -1,12 +1,19 @@
-import { closeSync, openSync } from "node:fs";
+import { closeSync, openSync, statSync } from "node:fs";
 import { unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 
 import { currentTurnContext } from "../agent/turn-context";
 import { ensureRuntimeTempDir } from "../runtime-temp";
 import { DEFAULT_MAX_BYTES, spillToolOutput, truncateTail } from "./output-budget";
+import { killProcessTree } from "./process-tree";
 import type { AgentTool, ToolExecutionContext } from "./registry";
+import {
+  detectShell,
+  ShellAdapterError,
+  ShellExecutionError,
+  type ShellAdapter,
+} from "./shell-adapter";
 
 export interface CommandCheck {
   allowed: boolean;
@@ -20,11 +27,17 @@ export interface PersistentShellToolOptions {
   env?: Record<string, string>;
   timeoutMs?: number;
   interceptor?: CommandInterceptor;
+  /** Tool name shown to the model. Defaults to the canonical "shell". */
+  name?: string;
+  /** Injectable adapter for tests. */
+  adapter?: ShellAdapter;
 }
 
 export const ShellArgsSchema = z.object({
   command: z.string().min(1),
   timeoutMs: z.number().int().positive().max(600_000).optional(),
+  /** Working directory for this call, relative to the current shell directory. */
+  workdir: z.string().min(1).optional(),
 });
 export type ShellArgs = z.infer<typeof ShellArgsSchema>;
 
@@ -36,10 +49,16 @@ interface ShellState {
   env: Record<string, string>;
 }
 
+export interface ShellMeta {
+  pwd?: string;
+  env: Record<string, string>;
+  envCaptured: boolean;
+}
+
 export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
-  readonly name = "bash";
+  readonly name: string;
   readonly description =
-    "Run a bash command. The working directory and exported environment variables persist between calls. For a dev server or another long-running process, use bg_start instead of backgrounding the command with &. Use curl --max-time or --connect-timeout for HTTP probes.";
+    "Run a shell command. The working directory and exported environment persist between calls. Use workdir instead of cd. For a dev server or long-running process, use bg_start. Use curl --max-time or --connect-timeout for HTTP probes.";
   readonly parameters = ShellArgsSchema;
   readonly readOnly = false;
 
@@ -48,15 +67,18 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
   private readonly inheritedTmpDir: string | undefined;
   private readonly defaultTimeoutMs: number;
   private readonly interceptor: CommandInterceptor | undefined;
+  private adapter: ShellAdapter | undefined;
   /** One persistent shell per workspace, so parallel workers keep separate cwd and env. */
   private readonly states = new Map<string, ShellState>();
 
   constructor(options: PersistentShellToolOptions = {}) {
+    this.name = options.name ?? "shell";
     this.defaultDir = options.cwd ?? process.cwd();
     this.baseEnv = { ...collectEnv(), ...options.env };
     this.inheritedTmpDir = globalThis.process.env.TMPDIR;
     this.defaultTimeoutMs = options.timeoutMs ?? 60_000;
     this.interceptor = options.interceptor;
+    this.adapter = options.adapter;
   }
 
   get workingDirectory(): string {
@@ -67,6 +89,10 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
     return { ...this.stateFor(this.defaultDir).env };
   }
 
+  get shell(): ShellAdapter {
+    return this.resolveAdapter();
+  }
+
   async execute(args: ShellArgs, context?: ToolExecutionContext): Promise<string> {
     if (this.interceptor) {
       const decision = await this.interceptor(args.command);
@@ -75,12 +101,31 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       }
     }
     const root = currentTurnContext()?.workspaceRoot ?? this.defaultDir;
-    return this.runBash(
+    const state = this.stateFor(root);
+    const adapter = this.resolveAdapter();
+    const workdir = args.workdir ? resolve(state.dir, args.workdir) : state.dir;
+    assertWorkdir(workdir);
+    return this.runCommand(
       args.command,
       args.timeoutMs ?? this.defaultTimeoutMs,
-      this.stateFor(root),
+      state,
+      workdir,
+      adapter,
       context?.signal,
     );
+  }
+
+  private resolveAdapter(): ShellAdapter {
+    if (this.adapter) return this.adapter;
+    try {
+      this.adapter = detectShell({ env: this.baseEnv });
+      return this.adapter;
+    } catch (error) {
+      if (error instanceof ShellAdapterError) {
+        throw new ShellExecutionError(error.code, error.message);
+      }
+      throw error;
+    }
   }
 
   private stateFor(root: string): ShellState {
@@ -95,10 +140,12 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
     return state;
   }
 
-  private async runBash(
+  private async runCommand(
     command: string,
     timeoutMs: number,
     state: ShellState,
+    workdir: string,
+    adapter: ShellAdapter,
     signal?: AbortSignal,
   ): Promise<string> {
     const tempDir = await ensureRuntimeTempDir(this.defaultDir).catch(
@@ -111,13 +158,9 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
     const metaPath = join(tempDir, `shell-${nonce}.meta`);
     const stdoutPath = join(tempDir, `shell-${nonce}.stdout`);
     const stderrPath = join(tempDir, `shell-${nonce}.stderr`);
-    const script = [
-      `cd ${shellQuote(state.dir)} || exit 97`,
-      command,
-      `__orchivox_exit=$?`,
-      `{ printf '%s\\0' "$__orchivox_exit" "$PWD"; env -0; } > ${shellQuote(metaPath)}`,
-      `exit $__orchivox_exit`,
-    ].join("\n");
+    const script = isPowerShell(adapter)
+      ? buildPowerShellScript(command, workdir, metaPath, adapter)
+      : buildPosixScript(command, workdir, metaPath, adapter);
 
     const stdoutFd = openSync(stdoutPath, "w");
     let stderrFd: number;
@@ -129,9 +172,10 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       throw error;
     }
 
+    const [program, ...programArgs] = adapter.command(script);
     const spawn = () =>
-      Bun.spawn(["bash", "-c", script], {
-        cwd: state.dir,
+      Bun.spawn([program, ...programArgs], {
+        cwd: workdir,
         env: state.env,
         stdin: "ignore",
         stdout: stdoutFd,
@@ -144,7 +188,12 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       proc = spawn();
     } catch (error) {
       await Promise.all([removeOutputFile(stdoutPath), removeOutputFile(stderrPath)]);
-      throw error;
+      throw new ShellExecutionError(
+        "shell_start_failed",
+        `shell_start_failed: could not start ${adapter.label}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     } finally {
       closeSync(stdoutFd);
       closeSync(stderrFd);
@@ -156,14 +205,14 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
     const onAbort = (): void => {
       if (settled) return;
       aborted = true;
-      killProcessTree(proc);
+      killProcessTree(proc, { force: true });
     };
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
     const timeoutTimer = setTimeout(() => {
       if (settled) return;
       timedOut = true;
-      killProcessTree(proc);
+      killProcessTree(proc, { force: true });
     }, timeoutMs);
 
     let stdout = "";
@@ -180,18 +229,22 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       await Promise.all([removeOutputFile(stdoutPath), removeOutputFile(stderrPath)]);
     }
 
-    const meta = await readAndClearMeta(metaPath);
+    const meta = await readAndClearMeta(metaPath, adapter);
     if (meta) {
-      state.dir = meta.pwd;
-      state.env = meta.env;
+      if (meta.pwd) state.dir = meta.pwd;
+      if (meta.envCaptured) state.env = meta.env;
     }
 
     const captured = `--- stdout ---\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`;
     if (aborted) {
-      throw new Error(`Command cancelled\n${truncateTail(captured).text}`);
+      throw new ShellExecutionError(
+        "command_cancelled",
+        `Command cancelled\n${truncateTail(captured).text}`,
+      );
     }
     if (timedOut) {
-      throw new Error(
+      throw new ShellExecutionError(
+        "command_timeout",
         `command timed out after ${timeoutMs}ms and was killed\n${truncateTail(captured).text}`,
       );
     }
@@ -201,35 +254,85 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       : "";
     const full = `exit ${exitCode}\n${captured}${backgroundNote}`;
     if (Buffer.byteLength(full, "utf8") <= DEFAULT_MAX_BYTES) return full;
-    const logPath = await spillToolOutput(full, "bash");
+    const logPath = await spillToolOutput(full, "shell");
     return truncateTail(full, {
       detail: logPath ? `Full output: ${logPath}` : "",
     }).text;
   }
 }
 
-function killProcessTree(proc: ReturnType<typeof Bun.spawn>): void {
-  if (process.platform === "win32") {
-    try {
-      Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)]);
-    } catch {
-      // Fall back to the shell process itself.
-    }
-    try {
-      proc.kill();
-    } catch {
-      // The process already exited.
-    }
-    return;
-  }
+function isPowerShell(adapter: ShellAdapter): boolean {
+  return adapter.kind === "pwsh" || adapter.kind === "powershell";
+}
+
+export function buildPosixScript(
+  command: string,
+  workdir: string,
+  metaPath: string,
+  adapter: ShellAdapter,
+): string {
+  const quote = (value: string): string => adapter.quote(value);
+  const capture =
+    adapter.kind === "bash"
+      ? [
+          `{ printf '%s\\0' "$__orchivox_exit" "$PWD" "nul";`,
+          `  for __orchivox_name in $(compgen -e); do`,
+          `    case "$__orchivox_name" in`,
+          `      [A-Za-z_]*) printf '%s\\0' "$__orchivox_name=\${!__orchivox_name}" ;;`,
+          `    esac`,
+          `  done`,
+          `} > ${quote(metaPath)}`,
+        ].join("\n")
+      : [`{ printf '%s\\0' "$__orchivox_exit" "$PWD" "lines"; env; } > ${quote(metaPath)}`].join(
+          "\n",
+        );
+  return [
+    `cd ${quote(workdir)} || exit 97`,
+    command,
+    `__orchivox_exit=$?`,
+    capture,
+    `exit $__orchivox_exit`,
+  ].join("\n");
+}
+
+export function buildPowerShellScript(
+  command: string,
+  workdir: string,
+  metaPath: string,
+  adapter: ShellAdapter,
+): string {
+  const quote = (value: string): string => adapter.quote(value);
+  return [
+    `$ErrorActionPreference = 'Continue'`,
+    `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `Set-Location -LiteralPath ${quote(workdir)}`,
+    `$global:LASTEXITCODE = 0`,
+    `try {`,
+    command,
+    `  if ($LASTEXITCODE -ne 0) { $__orchivox_exit = $LASTEXITCODE } elseif ($?) { $__orchivox_exit = 0 } else { $__orchivox_exit = 1 }`,
+    `} catch {`,
+    `  Write-Error $_`,
+    `  $__orchivox_exit = 1`,
+    `}`,
+    `$__orchivox_env = @{}`,
+    `Get-ChildItem Env: | ForEach-Object { $__orchivox_env[$_.Name] = $_.Value }`,
+    `$__orchivox_json = [ordered]@{ exit = $__orchivox_exit; pwd = (Get-Location).Path; env = $__orchivox_env } | ConvertTo-Json -Compress -Depth 4`,
+    `[System.IO.File]::WriteAllText(${quote(metaPath)}, $__orchivox_json, [System.Text.UTF8Encoding]::new($false))`,
+    `exit $__orchivox_exit`,
+  ].join("\n");
+}
+
+function assertWorkdir(path: string): void {
   try {
-    process.kill(-proc.pid, "SIGKILL");
-  } catch {
-    try {
-      proc.kill();
-    } catch {
-      // The process already exited.
+    if (!statSync(path).isDirectory()) {
+      throw new Error("not a directory");
     }
+  } catch {
+    throw new ShellExecutionError(
+      "workdir_not_found",
+      `workdir_not_found: ${path} is not a directory`,
+    );
   }
 }
 
@@ -257,32 +360,82 @@ function collectEnv(): Record<string, string> {
   return env;
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-interface ShellMeta {
-  pwd: string;
-  env: Record<string, string>;
-}
-
-async function readAndClearMeta(metaPath: string): Promise<ShellMeta | undefined> {
+async function readAndClearMeta(
+  metaPath: string,
+  adapter: ShellAdapter,
+): Promise<ShellMeta | undefined> {
   const file = Bun.file(metaPath);
   try {
     if (!(await file.exists())) return undefined;
     const raw = await file.text();
-    const parts = raw.split("\0");
-    if (parts.length < 2) return undefined;
-    const env: Record<string, string> = {};
-    for (const entry of parts.slice(2)) {
-      if (!entry) continue;
-      const separator = entry.indexOf("=");
-      if (separator > 0) env[entry.slice(0, separator)] = entry.slice(separator + 1);
+    if (isPowerShell(adapter)) {
+      return parsePowerShellMeta(raw);
     }
-    return { pwd: parts[1], env };
+    return parsePosixMeta(raw);
   } catch {
     return undefined;
   } finally {
     await file.delete().catch(() => undefined);
+  }
+}
+
+function parsePosixMeta(raw: string): ShellMeta | undefined {
+  const parts = raw.split("\0");
+  if (parts.length < 3) return undefined;
+  const pwd = parts[1] || undefined;
+  const format = parts[2];
+  const entries =
+    format === "nul"
+      ? parts.slice(3)
+      : parseEnvLines(parts.slice(3).join("\0"));
+  const env: Record<string, string> = {};
+  for (const entry of entries) {
+    const separator = entry.indexOf("=");
+    if (separator > 0) env[entry.slice(0, separator)] = entry.slice(separator + 1);
+  }
+  return { pwd, env, envCaptured: envEntriesPresent(format, entries) };
+}
+
+function envEntriesPresent(format: string, entries: string[]): boolean {
+  if (format === "nul") return entries.some((entry) => entry.length > 0);
+  return entries.length > 0;
+}
+
+function parseEnvLines(raw: string): string[] {
+  if (raw.length === 0) return [];
+  const normalized = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+  const entries: string[] = [];
+  let current: string | undefined;
+  for (const line of normalized.split("\n")) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(line)) {
+      if (current !== undefined) entries.push(current);
+      current = line;
+    } else if (current !== undefined) {
+      current += `\n${line}`;
+    }
+  }
+  if (current !== undefined) entries.push(current);
+  return entries;
+}
+
+export function parsePowerShellMeta(raw: string): ShellMeta | undefined {
+  try {
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, "")) as {
+      pwd?: unknown;
+      env?: unknown;
+    };
+    const env: Record<string, string> = {};
+    if (parsed.env && typeof parsed.env === "object" && !Array.isArray(parsed.env)) {
+      for (const [key, value] of Object.entries(parsed.env)) {
+        if (typeof value === "string") env[key] = value;
+      }
+    }
+    return {
+      pwd: typeof parsed.pwd === "string" ? parsed.pwd : undefined,
+      env,
+      envCaptured: Object.keys(env).length > 0,
+    };
+  } catch {
+    return undefined;
   }
 }

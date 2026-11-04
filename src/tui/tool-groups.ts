@@ -18,7 +18,7 @@ const SEARCH_TOOLS = new Set([
   "repo_architecture_map",
 ]);
 
-const COMMAND_TOOLS = new Set(["bash", "run_sandbox_script", "execute"]);
+const COMMAND_TOOLS = new Set(["shell", "bash", "run_sandbox_script", "execute"]);
 
 export interface ToolActivity {
   reads: ChatToolCallView[];
