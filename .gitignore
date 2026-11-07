@@ -9,6 +9,9 @@ FIX*.md
 !/docs/
 /docs/*
 !/docs/releasing.md
+!/docs/orchestration.md
+!/docs/evals/
+!/docs/evals/**
 dist/
 build/
 artifacts/

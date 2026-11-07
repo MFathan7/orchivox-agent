@@ -1,0 +1,7 @@
+{"run_id":"self-test","task_id":"self-open","arm":"off","agent":"programmer","state":"completed","mode":"plan","output":"See `src/agent/coordinator.ts:165`.","calls":[{"name":"read_file","args":{"filePath":"src/agent/coordinator.ts"}}]}
+{"run_id":"self-test","task_id":"self-unopened","arm":"off","agent":"programmer","state":"completed","mode":"plan","output":"See `src/agent/coordinator.ts:165`.","calls":[{"name":"glob_files","args":{"pattern":"src/**/*.ts"}}]}
+{"run_id":"self-test","task_id":"self-missing","arm":"off","agent":"programmer","state":"completed","mode":"plan","output":"See `src/agent/nope.ts:10`.","calls":[]}
+{"run_id":"self-test","task_id":"self-false-read","arm":"off","agent":"programmer","state":"completed","mode":"plan","output":"Everything below is verified by reading the code. See `src/agent/coordinator.ts`.","calls":[]}
+{"run_id":"self-test","task_id":"self-grep","arm":"off","agent":"programmer","state":"completed","mode":"plan","output":"See `src/agent/coordinator.ts:165`.","calls":[{"name":"grep_search","args":{"include":"src/agent/coordinator.ts","pattern":"requestPlan"}}]}
+{"run_id":"self-test","task_id":"self-result","arm":"off","agent":"programmer","state":"completed","mode":"build","output":"All tests pass.","calls":[]}
+{"run_id":"self-test","task_id":"self-stopped","arm":"off","agent":"programmer","state":"completed","mode":"build","output":"subagent stopped after 40 turns","calls":[]}
