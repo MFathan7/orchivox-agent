@@ -1,8 +1,9 @@
 # PLAN28 Phase 0 Feasibility
 
-Date: 2026-11-07
+Date: 2026-11-08
 Protocol: `docs/evals/plan28/protocol.md` v1
 Scorer: `scripts/score-plan28-evals.ts`
+Runner: `scripts/run-plan28-evals.ts`
 
 ## Setup
 
@@ -10,9 +11,11 @@ Scorer: `scripts/score-plan28-evals.ts`
 - Mode: `plan`
 - Provider: `iForte-GPU`
 - Model: `glm-5.3-flash`
-- Run: preliminary baseline, 1 run
-- Sampling: temperature provider default, reasoning effort `medium`,
-  max output 64,000
+- Runs: 3 official baseline runs, 5 read-only tasks each
+- Skills: disabled for the worker eval
+- Project rules: antislop block removed for the worker eval
+- Eval worktree: ephemeral copy without `docs/evals`, `.git`, `.agent`, and
+  `.orchivox`
 - Source: `docs/evals/plan28/baseline/read-only.jsonl`
 
 ## Gate
@@ -20,65 +23,59 @@ Scorer: `scripts/score-plan28-evals.ts`
 | Check | Result |
 | --- | --- |
 | Scorer self-test | pass |
-| Completed tasks with automatic primary violation | 2/5 (40%) |
-| Completed tasks after manual review | 3/5 (60%) |
+| Official task-runs | 15 |
+| Completed | 15 |
+| Failed | 0 |
+| Automatic primary violations | 0 |
+| Confirmed primary violations after manual review | 0/5 tasks (0%) |
 | Minimum for feasibility | 20% |
-| Phase 0 gate | pass |
+| Phase 0 gate | **fail** |
 
 ## Per-task result
 
-| Task | State | Primary violations | Unopened existing path | Missing paths |
-| --- | --- | ---: | --- | --- |
-| `read-1-coordinator-retry` | completed | 1 | `docs/orchestration.md` | 0 |
-| `read-2-task-board-limit` | completed | 0 | - | 0 |
-| `read-3-fatal-rm` | completed | 0 | - | 0 |
-| `read-4-skill-access` | completed | 1 | `docs/orchestration.md` | 0 |
-| `read-5-structured-output` | completed | 0 | - | 2 |
-| `read-timeout-tui-subagent-status` | failed | 0 | - | 0 |
+| Task | Runs completed | Confirmed primary violations | Notes |
+| --- | ---: | ---: | --- |
+| `read-1-coordinator-retry` | 3 | 0 | Docs lines 4/35/44 were present in grep results. False positive. |
+| `read-2-task-board-limit` | 3 | 0 | All cited source/test files were opened. |
+| `read-3-fatal-rm` | 3 | 0 | One missing test path in run 3, secondary. |
+| `read-4-skill-access` | 3 | 0 | Docs lines were present in grep results. `src/agent` is a directory; `AGENTS.md` is harness-provided. |
+| `read-5-structured-output` | 3 | 0 | The preliminary false "all paths above were read" claim did not recur. Missing paths are secondary. |
 
 ## Aggregate
 
-- 6 task-runs.
-- 5 completed.
-- 1 failed at 40 turns.
-- 2 task-runs with a primary violation.
-- 2 primary violations.
-- 2 missing paths.
+- 15 task-runs, 15 completed, 0 failed.
+- 0 primary violations.
+- 1 missing path: `tests/approval-approval-cancel.test.ts`.
 - 0 out-of-range lines.
-- 5 task-runs queued for blinded manual review.
+- 12 manual-review task-runs, all confirmed as non-violations or secondary
+  findings.
 
-The primary metric is the deterministic count: unopened existing path, false
-read claim with no read call, and unsupported result claim. Missing paths are
-secondary and are reported separately.
+The preliminary one-run baseline had 3/5 confirmed violations. The official
+three-run baseline with tool results shows 0/5. The preliminary result was
+inflated by:
 
-Manual review added one confirmed primary violation: `read-5-structured-output`
-says "All paths above were read" while citing missing or garbled paths. The
-confirmed count is therefore 3 of 5 completed tasks (60%). The Phase 0 gate
-still passes.
-
-The 40% automatic rate and the 60% confirmed rate are both above the 20%
-feasibility gate. The preliminary baseline is good enough to proceed, not good
-enough to act as the official control. The official control is the interleaved
-`off` arm in the pilot.
+- two docs citations that were actually opened by whole-repo grep results;
+- one one-off false read claim that did not recur;
+- one directory reference and one harness-provided project file.
 
 ## Manual review
 
-The blinded manual-review file is
-`docs/evals/plan28/manual-review/baseline-read-only.jsonl`. The arm mapping is
-in `docs/evals/plan28/manual-review/baseline-read-only.jsonl.mapping.jsonl`
-and is not part of the blinded review.
+- `docs/evals/plan28/manual-review/baseline-read-only.review.md`
+- `docs/evals/plan28/manual-review/baseline-read-only.jsonl`
+- This is a single-arm baseline review, not a blinded review. Blinding applies
+  only to the pilot off/on arms.
 
-Manual review still needs to confirm:
+## Decision
 
-- whether "verified by reading" claims cover the cited docs and tests;
-- whether the whole-repo greps covered the cited paths;
-- whether the missing paths in `read-5-structured-output` are corruption or
-  hallucination.
+Phase 0 fails. The read-only task set is underpowered: the model reliably opens
+the files it cites, so the evidence failure we want to measure does not appear.
 
-## Next
+Do not start the pilot. Redesign the read-only task set first. Candidate
+directions are recorded in the review file:
 
-1. Lock the build traps in the task fixtures.
-2. Run the pilot A/B for `programmer`: 5 read-only + 4 build, 3 runs per task
-   per arm, off/on interleaved.
-3. Run the same evidence text on `explore` with the same model.
-4. Gate the engine on an effect in both agents.
+1. a distractor symbol or API that does not exist;
+2. a source-vs-docs/test comparison where one side is easy to skip;
+3. conflicting evidence across two files;
+4. a large search space where a whole-repo grep returns many irrelevant hits.
+
+After redesign, rerun the three-run baseline and recheck the 20% gate.

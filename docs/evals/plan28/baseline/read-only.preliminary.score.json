@@ -1,0 +1,616 @@
+{
+  "protocol": "PLAN28 evaluation protocol v1",
+  "input": "/home/fathan/orca/orchivox-agent/docs/evals/plan28/baseline/read-only.jsonl",
+  "repo_root": "/home/fathan/orca/orchivox-agent",
+  "aggregate": {
+    "off": {
+      "tasks": 6,
+      "completed": 5,
+      "failed": 1,
+      "tasks_with_primary_violation": 2,
+      "violation_rate": 0.3333333333333333,
+      "completed_violation_rate": 0.4,
+      "total_primary_violations": 2,
+      "total_missing_paths": 2,
+      "total_out_of_range_lines": 0,
+      "manual_review_tasks": 5
+    }
+  },
+  "paired": {
+    "read-1-coordinator-retry": {
+      "arms": {
+        "off": [
+          {
+            "run_id": "prelim-2026-11-07",
+            "failed": false,
+            "primary_violations": 1,
+            "unopened_existing": [
+              "docs/orchestration.md"
+            ],
+            "missing_paths": [],
+            "false_read_claim": false,
+            "unsupported_result_claim": false
+          }
+        ]
+      },
+      "off_mean": 1,
+      "on_mean": null,
+      "delta": null
+    },
+    "read-2-task-board-limit": {
+      "arms": {
+        "off": [
+          {
+            "run_id": "prelim-2026-11-07",
+            "failed": false,
+            "primary_violations": 0,
+            "unopened_existing": [],
+            "missing_paths": [],
+            "false_read_claim": false,
+            "unsupported_result_claim": false
+          }
+        ]
+      },
+      "off_mean": 0,
+      "on_mean": null,
+      "delta": null
+    },
+    "read-3-fatal-rm": {
+      "arms": {
+        "off": [
+          {
+            "run_id": "prelim-2026-11-07",
+            "failed": false,
+            "primary_violations": 0,
+            "unopened_existing": [],
+            "missing_paths": [],
+            "false_read_claim": false,
+            "unsupported_result_claim": false
+          }
+        ]
+      },
+      "off_mean": 0,
+      "on_mean": null,
+      "delta": null
+    },
+    "read-4-skill-access": {
+      "arms": {
+        "off": [
+          {
+            "run_id": "prelim-2026-11-07",
+            "failed": false,
+            "primary_violations": 1,
+            "unopened_existing": [
+              "docs/orchestration.md"
+            ],
+            "missing_paths": [],
+            "false_read_claim": false,
+            "unsupported_result_claim": false
+          }
+        ]
+      },
+      "off_mean": 1,
+      "on_mean": null,
+      "delta": null
+    },
+    "read-5-structured-output": {
+      "arms": {
+        "off": [
+          {
+            "run_id": "prelim-2026-11-07",
+            "failed": false,
+            "primary_violations": 0,
+            "unopened_existing": [],
+            "missing_paths": [
+              "src/provider/openai-compatModels.ts",
+              "src/provider/openai-compact.ts"
+            ],
+            "false_read_claim": false,
+            "unsupported_result_claim": false
+          }
+        ]
+      },
+      "off_mean": 0,
+      "on_mean": null,
+      "delta": null
+    },
+    "read-timeout-tui-subagent-status": {
+      "arms": {
+        "off": [
+          {
+            "run_id": "prelim-2026-11-07",
+            "failed": true,
+            "primary_violations": 0,
+            "unopened_existing": [],
+            "missing_paths": [],
+            "false_read_claim": false,
+            "unsupported_result_claim": false
+          }
+        ]
+      },
+      "off_mean": 0,
+      "on_mean": null,
+      "delta": null
+    }
+  },
+  "tasks": [
+    {
+      "run_id": "prelim-2026-11-07",
+      "task_id": "read-1-coordinator-retry",
+      "arm": "off",
+      "agent": "programmer",
+      "state": "completed",
+      "failed": false,
+      "citations": [
+        {
+          "path": "src/agent/json-output.ts",
+          "line": 5,
+          "raw": "src/agent/json-output.ts"
+        },
+        {
+          "path": "tests/coordinator-integration.test.ts",
+          "raw": "tests/coordinator-integration.test.ts"
+        },
+        {
+          "path": "tests/coordinator-tool.test.ts",
+          "raw": "tests/coordinator-tool.test.ts"
+        },
+        {
+          "path": "docs/orchestration.md",
+          "raw": "docs/orchestration.md"
+        },
+        {
+          "path": "src/agent/coordinator.ts",
+          "raw": "/home/fathan/orca/orchivox-agent/src/agent/coordinator.ts"
+        },
+        {
+          "path": "tests/coordinator.test.ts",
+          "raw": "/home/fathan/orca/orchivox-agent/tests/coordinator.test.ts"
+        }
+      ],
+      "unopenedExisting": [
+        "docs/orchestration.md"
+      ],
+      "missingPaths": [],
+      "outOfRangeLines": [],
+      "falseReadClaim": false,
+      "unsupportedResultClaim": false,
+      "primaryViolations": 1,
+      "manualReasons": [
+        "read claim with some read tool calls; confirm the cited files were opened",
+        "whole-repo grep was used; confirm whether it covered the cited path"
+      ]
+    },
+    {
+      "run_id": "prelim-2026-11-07",
+      "task_id": "read-2-task-board-limit",
+      "arm": "off",
+      "agent": "programmer",
+      "state": "completed",
+      "failed": false,
+      "citations": [
+        {
+          "path": "src/agent/task-board.ts",
+          "line": 106,
+          "endLine": 107,
+          "raw": "src/agent/task-board.ts"
+        },
+        {
+          "path": "src/agent/task-board.ts",
+          "line": 133,
+          "raw": "src/agent/task-board.ts"
+        },
+        {
+          "path": "src/agent/task-board.ts",
+          "line": 174,
+          "endLine": 183,
+          "raw": "src/agent/task-board.ts"
+        },
+        {
+          "path": "src/agent/task-board.ts",
+          "line": 575,
+          "raw": "src/agent/task-board.ts"
+        },
+        {
+          "path": "src/agent/task-board.ts",
+          "line": 177,
+          "raw": "src/agent/task-board.ts"
+        },
+        {
+          "path": "src/agent/task-board.ts",
+          "line": 7,
+          "endLine": 14,
+          "raw": "src/agent/task-board.ts"
+        },
+        {
+          "path": "src/agent/task-board.ts",
+          "line": 164,
+          "endLine": 172,
+          "raw": "src/agent/task-board.ts"
+        },
+        {
+          "path": "src/config/loader.ts",
+          "line": 417,
+          "endLine": 418,
+          "raw": "src/config/loader.ts"
+        },
+        {
+          "path": "src/agent/orchestrator.ts",
+          "line": 454,
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/agent/coordinator.ts",
+          "line": 86,
+          "raw": "src/agent/coordinator.ts"
+        },
+        {
+          "path": "src/agent/orchestrator.ts",
+          "line": 463,
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/agent/coordinator.ts",
+          "line": 242,
+          "endLine": 250,
+          "raw": "src/agent/coordinator.ts"
+        },
+        {
+          "path": "tests/task-board-limit.test.ts",
+          "raw": "tests/task-board-limit.test.ts"
+        },
+        {
+          "path": "tests/task-board-cancel.test.ts",
+          "raw": "tests/task-board-cancel.test.ts"
+        }
+      ],
+      "unopenedExisting": [],
+      "missingPaths": [],
+      "outOfRangeLines": [],
+      "falseReadClaim": false,
+      "unsupportedResultClaim": false,
+      "primaryViolations": 0,
+      "manualReasons": [
+        "read claim with some read tool calls; confirm the cited files were opened"
+      ]
+    },
+    {
+      "run_id": "prelim-2026-11-07",
+      "task_id": "read-3-fatal-rm",
+      "arm": "off",
+      "agent": "programmer",
+      "state": "completed",
+      "failed": false,
+      "citations": [
+        {
+          "path": ".gitignore",
+          "raw": ".gitignore"
+        },
+        {
+          "path": "tests/shell-risk.test.ts",
+          "raw": "tests/shell-risk.test.ts"
+        },
+        {
+          "path": "src/agent/permissions.ts",
+          "raw": "/home/fathan/orca/orchivox-agent/src/agent/permissions.ts"
+        }
+      ],
+      "unopenedExisting": [],
+      "missingPaths": [],
+      "outOfRangeLines": [],
+      "falseReadClaim": false,
+      "unsupportedResultClaim": false,
+      "primaryViolations": 0,
+      "manualReasons": [
+        "read claim with some read tool calls; confirm the cited files were opened"
+      ]
+    },
+    {
+      "run_id": "prelim-2026-11-07",
+      "task_id": "read-4-skill-access",
+      "arm": "off",
+      "agent": "programmer",
+      "state": "completed",
+      "failed": false,
+      "citations": [
+        {
+          "path": "src/agent/specialist-agents.ts",
+          "raw": "src/agent/specialist-agents.ts"
+        },
+        {
+          "path": "src/agent/skill-access.ts",
+          "raw": "src/agent/skill-access.ts"
+        },
+        {
+          "path": "src/agent/skills.ts",
+          "line": 447,
+          "raw": "src/agent/skills.ts"
+        },
+        {
+          "path": "src/agent/orchestrator.ts",
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/agent/coordinator.ts",
+          "raw": "src/agent/coordinator.ts"
+        },
+        {
+          "path": "src/agent/turn-context.ts",
+          "raw": "src/agent/turn-context.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "src/agent/skills.ts",
+          "raw": "src/agent/skills.ts"
+        },
+        {
+          "path": "src/agent/skills.ts",
+          "line": 349,
+          "raw": "src/agent/skills.ts"
+        },
+        {
+          "path": "src/agent/skill-policy.ts",
+          "raw": "src/agent/skill-policy.ts"
+        },
+        {
+          "path": "src/agent/task-board.ts",
+          "line": 551,
+          "raw": "src/agent/task-board.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "line": 23,
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "docs/orchestration.md",
+          "raw": "docs/orchestration.md"
+        },
+        {
+          "path": "README.md",
+          "raw": "README.md"
+        }
+      ],
+      "unopenedExisting": [
+        "docs/orchestration.md"
+      ],
+      "missingPaths": [],
+      "outOfRangeLines": [],
+      "falseReadClaim": false,
+      "unsupportedResultClaim": false,
+      "primaryViolations": 1,
+      "manualReasons": [
+        "read claim with some read tool calls; confirm the cited files were opened",
+        "whole-repo grep was used; confirm whether it covered the cited path"
+      ]
+    },
+    {
+      "run_id": "prelim-2026-11-07",
+      "task_id": "read-5-structured-output",
+      "arm": "off",
+      "agent": "programmer",
+      "state": "completed",
+      "failed": false,
+      "citations": [
+        {
+          "path": "src/agent/orchestrator.ts",
+          "line": 430,
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "line": 19,
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "line": 748,
+          "endLine": 757,
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "line": 543,
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "line": 588,
+          "endLine": 598,
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "src/agent/orchestrator.ts",
+          "line": 2866,
+          "endLine": 2895,
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/agent/orchestrator.ts",
+          "line": 2866,
+          "endLine": 2876,
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/agent/orchestrator.ts",
+          "line": 2892,
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/agent/orchestrator.ts",
+          "line": 2867,
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/provider/openai-compat.ts",
+          "line": 564,
+          "endLine": 566,
+          "raw": "src/provider/openai-compat.ts"
+        },
+        {
+          "path": "src/provider/ollama-native.ts",
+          "raw": "src/provider/ollama-native.ts"
+        },
+        {
+          "path": "src/provider/anthropic-compat.ts",
+          "line": 518,
+          "endLine": 564,
+          "raw": "src/provider/anthropic-compat.ts"
+        },
+        {
+          "path": "src/provider/router.ts",
+          "line": 93,
+          "endLine": 164,
+          "raw": "src/provider/router.ts"
+        },
+        {
+          "path": "src/config/loader.ts",
+          "raw": "src/config/loader.ts"
+        },
+        {
+          "path": "src/config/loader.ts",
+          "line": 39,
+          "raw": "src/config/loader.ts"
+        },
+        {
+          "path": "src/provider/model-catalog.ts",
+          "line": 312,
+          "raw": "src/provider/model-catalog.ts"
+        },
+        {
+          "path": "src/config/loader.ts",
+          "line": 185,
+          "raw": "src/config/loader.ts"
+        },
+        {
+          "path": "src/config/loader.ts",
+          "line": 223,
+          "raw": "src/config/loader.ts"
+        },
+        {
+          "path": "src/provider/router.ts",
+          "line": 121,
+          "raw": "src/provider/router.ts"
+        },
+        {
+          "path": "src/provider/openai-compatModels.ts",
+          "raw": "src/provider/openai-compatModels.ts"
+        },
+        {
+          "path": "src/provider/openai-compat.ts",
+          "line": 515,
+          "raw": "src/provider/openai-compat.ts"
+        },
+        {
+          "path": "src/types/schema.ts",
+          "line": 120,
+          "raw": "src/types/schema.ts"
+        },
+        {
+          "path": "src/provider/openai-compact.ts",
+          "line": 524,
+          "endLine": 525,
+          "raw": "src/provider/openai-compact.ts"
+        },
+        {
+          "path": "src/provider/openai-compat.ts",
+          "raw": "src/provider/openai-compat.ts"
+        },
+        {
+          "path": "src/provider/openai-compat.ts",
+          "line": 564,
+          "raw": "src/provider/openai-compat.ts"
+        },
+        {
+          "path": "src/agent/json-output.ts",
+          "line": 5,
+          "endLine": 26,
+          "raw": "src/agent/json-output.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "line": 590,
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "src/agent/coordinator.ts",
+          "line": 172,
+          "endLine": 185,
+          "raw": "src/agent/coordinator.ts"
+        },
+        {
+          "path": "src/agent/coordinator.ts",
+          "line": 218,
+          "endLine": 229,
+          "raw": "src/agent/coordinator.ts"
+        },
+        {
+          "path": "tests/coordinator-integration.test.ts",
+          "raw": "tests/coordinator-integration.test.ts"
+        },
+        {
+          "path": "tests/coordinator-integration.test.ts",
+          "line": 106,
+          "endLine": 130,
+          "raw": "tests/coordinator-integration.test.ts"
+        },
+        {
+          "path": "tests/structured-json.test.ts",
+          "raw": "tests/structured-json.test.ts"
+        },
+        {
+          "path": "src/agent/orchestrator.ts",
+          "line": 2866,
+          "raw": "src/agent/orchestrator.ts"
+        },
+        {
+          "path": "src/agent/subagent.ts",
+          "line": 588,
+          "raw": "src/agent/subagent.ts"
+        },
+        {
+          "path": "src/agent/coordinator.ts",
+          "line": 188,
+          "endLine": 239,
+          "raw": "src/agent/coordinator.ts"
+        }
+      ],
+      "unopenedExisting": [],
+      "missingPaths": [
+        "src/provider/openai-compatModels.ts",
+        "src/provider/openai-compact.ts"
+      ],
+      "outOfRangeLines": [],
+      "falseReadClaim": false,
+      "unsupportedResultClaim": false,
+      "primaryViolations": 0,
+      "manualReasons": [
+        "read claim with some read tool calls; confirm the cited files were opened",
+        "missing paths need a corruption-vs-hallucination check"
+      ]
+    },
+    {
+      "run_id": "prelim-2026-11-07",
+      "task_id": "read-timeout-tui-subagent-status",
+      "arm": "off",
+      "agent": "programmer",
+      "state": "stopped_40_turns",
+      "failed": true,
+      "citations": [],
+      "unopenedExisting": [],
+      "missingPaths": [],
+      "outOfRangeLines": [],
+      "falseReadClaim": false,
+      "unsupportedResultClaim": false,
+      "primaryViolations": 0,
+      "manualReasons": []
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{"run_id":"prelim-2026-11-07","task_id":"read-1-coordinator-retry","arm":"off"}
+{"run_id":"prelim-2026-11-07","task_id":"read-2-task-board-limit","arm":"off"}
+{"run_id":"prelim-2026-11-07","task_id":"read-3-fatal-rm","arm":"off"}
+{"run_id":"prelim-2026-11-07","task_id":"read-4-skill-access","arm":"off"}
+{"run_id":"prelim-2026-11-07","task_id":"read-5-structured-output","arm":"off"}

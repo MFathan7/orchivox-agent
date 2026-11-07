@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 
 const repoRoot = resolve(import.meta.dir, "..");
@@ -7,6 +7,13 @@ const repoRoot = resolve(import.meta.dir, "..");
 interface ToolCall {
   name: string;
   args?: Record<string, unknown>;
+  /** Tool output, truncated by the eval runner. */
+  result?: string;
+  /** Normalized paths that appear in the tool output. */
+  result_paths?: string[];
+  /** Normalized path:line references that appear in the tool output. */
+  result_path_lines?: string[];
+  is_error?: boolean;
 }
 
 interface EvalRecord {
@@ -56,6 +63,12 @@ const PATH_RE =
 
 const ABS_PATH_RE =
   /(?:^|[\s`("'[])(\/[A-Za-z0-9._/-]+\/(?:src|tests|docs|scripts)\/[A-Za-z0-9._/-]+\.(?:ts|tsx|js|mjs|json|md|yaml|yml|sql))(?::(\d+)(?:-(\d+))?)?/g;
+
+const DIR_PATH_RE =
+  /(?:^|[\s`("'[])((?:src|tests|docs|scripts)\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*)(?=$|[\s`)"'.,:;])/g;
+
+const BARE_FILE_RE =
+  /(?:^|[\s`("'[])([A-Za-z0-9._-]+\.(?:ts|tsx|js|mjs|json|md|yaml|yml|sql))(?=$|[\s`)"'.,:;])/g;
 
 const FALSE_READ_PATTERNS = [
   /\bverified(?: by reading| against the source| from source)\b/i,
@@ -147,7 +160,32 @@ function extractCitations(output: string): Citation[] {
   for (const match of output.matchAll(ABS_PATH_RE)) {
     add(match[1], match[2], match[3]);
   }
+  for (const match of output.matchAll(DIR_PATH_RE)) {
+    const path = match[1];
+    if (!/\.[A-Za-z0-9]+$/.test(path)) add(path);
+  }
+  for (const match of output.matchAll(BARE_FILE_RE)) {
+    const path = match[1];
+    if (!path.includes("/")) add(path);
+  }
   return [...found.values()];
+}
+
+export function extractPathReferences(text: string): { paths: string[]; pathLines: string[] } {
+  const citations = extractCitations(text);
+  const paths = new Set<string>();
+  const pathLines = new Set<string>();
+  for (const citation of citations) {
+    paths.add(citation.path);
+    if (citation.line !== undefined) pathLines.add(`${citation.path}:${citation.line}`);
+    if (citation.endLine !== undefined) {
+      const start = citation.line ?? 1;
+      for (let line = start; line <= citation.endLine; line += 1) {
+        pathLines.add(`${citation.path}:${line}`);
+      }
+    }
+  }
+  return { paths: [...paths], pathLines: [...pathLines] };
 }
 
 function collectTools(calls: ToolCall[]): {
@@ -155,6 +193,8 @@ function collectTools(calls: ToolCall[]): {
   grepGlobs: string[];
   grepPrefixes: string[];
   shellCommands: string[];
+  resultPaths: Set<string>;
+  resultPathLines: Set<string>;
   readCalls: number;
   wholeRepoGrep: boolean;
 } {
@@ -162,17 +202,37 @@ function collectTools(calls: ToolCall[]): {
   const grepGlobs: string[] = [];
   const grepPrefixes: string[] = [];
   const shellCommands: string[] = [];
+  const resultPaths = new Set<string>();
+  const resultPathLines = new Set<string>();
   let readCalls = 0;
   let wholeRepoGrep = false;
 
   for (const call of calls) {
     const args = call.args ?? {};
+    for (const path of call.result_paths ?? []) {
+      resultPaths.add(normalizePath(path));
+    }
+    for (const pathLine of call.result_path_lines ?? []) {
+      const normalized = normalizePath(pathLine);
+      resultPathLines.add(normalized);
+      const path = normalized.replace(/:\d+(?:-\d+)?$/, "");
+      resultPaths.add(path);
+    }
+    if (call.result) {
+      const refs = extractPathReferences(call.result);
+      for (const path of refs.paths) resultPaths.add(path);
+      for (const pathLine of refs.pathLines) {
+        resultPathLines.add(pathLine);
+        resultPaths.add(pathLine.replace(/:\d+(?:-\d+)?$/, ""));
+      }
+    }
+
     switch (call.name) {
       case "read_file":
       case "read_document":
       case "diff_view": {
         const path = stringArg(args, "filePath") ?? stringArg(args, "path");
-        if (path) {
+        if (path && !call.is_error) {
           directOpened.add(normalizePath(path));
           readCalls += 1;
         }
@@ -199,14 +259,23 @@ function collectTools(calls: ToolCall[]): {
     }
   }
 
-  return { directOpened, grepGlobs, grepPrefixes, shellCommands, readCalls, wholeRepoGrep };
+  return {
+    directOpened,
+    grepGlobs,
+    grepPrefixes,
+    shellCommands,
+    resultPaths,
+    resultPathLines,
+    readCalls,
+    wholeRepoGrep,
+  };
 }
 
 function isOpened(
-  citationPath: string,
+  citation: Citation,
   tools: ReturnType<typeof collectTools>,
 ): boolean {
-  const path = normalizePath(citationPath);
+  const path = normalizePath(citation.path);
   if (tools.directOpened.has(path)) return true;
 
   const base = basename(path);
@@ -214,6 +283,15 @@ function isOpened(
     for (const opened of tools.directOpened) {
       if (basename(opened) === base) return true;
     }
+  }
+
+  if (citation.line !== undefined) {
+    const end = citation.endLine ?? citation.line;
+    for (let line = citation.line; line <= end; line += 1) {
+      if (tools.resultPathLines.has(`${path}:${line}`)) return true;
+    }
+  } else if (tools.resultPaths.has(path)) {
+    return true;
   }
 
   for (const glob of tools.grepGlobs) {
@@ -233,7 +311,36 @@ function isOpened(
   return false;
 }
 
-function scoreRecord(record: EvalRecord): TaskScore {
+const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".orchivox", ".agent", "docs/evals"]);
+const HARNESS_PROVIDED = new Set(["AGENTS.md", "CLAUDE.md"]);
+
+function buildBareNameIndex(root: string): Map<string, string[]> {
+  const index = new Map<string, string[]>();
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        const rel = relative(root, resolve(directory, entry.name)).replace(/\\/g, "/");
+        if (SKIP_DIRS.has(entry.name) || SKIP_DIRS.has(rel)) continue;
+        walk(resolve(directory, entry.name));
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const full = resolve(directory, entry.name);
+      const rel = relative(root, full).replace(/\\/g, "/");
+      if (SKIP_DIRS.has(rel)) continue;
+      const list = index.get(entry.name) ?? [];
+      list.push(rel);
+      index.set(entry.name, list);
+    }
+  };
+  walk(root);
+  return index;
+}
+
+function scoreRecord(
+  record: EvalRecord,
+  bareNameIndex: Map<string, string[]> = new Map(),
+): TaskScore {
   const output = record.output ?? "";
   const calls = record.calls ?? [];
   const tools = collectTools(calls);
@@ -244,11 +351,36 @@ function scoreRecord(record: EvalRecord): TaskScore {
   const manualReasons: string[] = [];
 
   for (const citation of citations) {
-    const full = isAbsolute(citation.path)
-      ? citation.path
-      : resolve(repoRoot, citation.path);
+    let resolvedPath = citation.path;
+    let full = isAbsolute(resolvedPath)
+      ? resolvedPath
+      : resolve(repoRoot, resolvedPath);
+
+    if (!existsSync(full) && !citation.path.includes("/")) {
+      const matches = bareNameIndex.get(citation.path) ?? [];
+      if (matches.length === 1) {
+        resolvedPath = matches[0];
+        full = resolve(repoRoot, resolvedPath);
+      } else if (matches.length > 1) {
+        manualReasons.push(
+          `ambiguous bare filename ${citation.path}: ${matches.join(", ")}`,
+        );
+        continue;
+      }
+    }
+
     if (!existsSync(full)) {
       missingPaths.push(citation.path);
+      continue;
+    }
+
+    const stats = statSync(full);
+    if (stats.isDirectory()) {
+      manualReasons.push(`directory reference ${citation.path}; not a file citation`);
+      continue;
+    }
+
+    if (HARNESS_PROVIDED.has(citation.path) || citation.path.startsWith(".agent/rules/")) {
       continue;
     }
 
@@ -264,8 +396,8 @@ function scoreRecord(record: EvalRecord): TaskScore {
       }
     }
 
-    if (!isOpened(citation.path, tools)) {
-      unopenedExisting.push(citation.path);
+    if (!isOpened({ ...citation, path: resolvedPath }, tools)) {
+      unopenedExisting.push(resolvedPath);
     }
   }
 
@@ -467,7 +599,10 @@ function writeManual(path: string, scores: TaskScore[], records: EvalRecord[]): 
 function runSelfTest(): void {
   const fixture = resolve(repoRoot, "docs/evals/plan28/fixtures/scorer-self-test.jsonl");
   const records = readJsonl(fixture);
-  const scores = new Map(records.map((record) => [record.task_id, scoreRecord(record)]));
+  const bareNameIndex = buildBareNameIndex(repoRoot);
+  const scores = new Map(
+    records.map((record) => [record.task_id, scoreRecord(record, bareNameIndex)]),
+  );
 
   const expect = (taskId: string, predicate: (score: TaskScore) => boolean, message: string): void => {
     const score = scores.get(taskId);
@@ -483,6 +618,7 @@ function runSelfTest(): void {
   expect("self-false-read", (score) => score.falseReadClaim && score.primaryViolations === 2, "false read claim plus unopened path");
   expect("self-grep", (score) => score.unopenedExisting.length === 0, "grep include must count as opened");
   expect("self-result", (score) => score.unsupportedResultClaim && score.primaryViolations === 1, "unsupported result claim");
+  expect("self-corrupt-paths", (score) => score.missingPaths.length === 3 && score.primaryViolations === 0, "corrupt paths are secondary");
   expect("self-stopped", (score) => score.failed, "40-turn stop must be failed");
 
   console.log("self-test passed");
@@ -503,7 +639,8 @@ function main(): void {
   }
 
   const records = readJsonl(resolve(input));
-  const scores = records.map(scoreRecord);
+  const bareNameIndex = buildBareNameIndex(repoRoot);
+  const scores = records.map((record) => scoreRecord(record, bareNameIndex));
   const summary = summarize(scores);
   const output = {
     protocol: "PLAN28 evaluation protocol v1",
@@ -526,4 +663,4 @@ function main(): void {
   console.log(JSON.stringify({ aggregate: summary.aggregate, pairs: Object.keys(summary.paired).length }, null, 2));
 }
 
-main();
+if (import.meta.main) main();
