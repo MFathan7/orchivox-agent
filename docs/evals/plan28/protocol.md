@@ -3,7 +3,7 @@
 Version: 1
 Status: locked before the first official run
 Date: 2026-11-07
-Commit: 49fe0c8
+Commit: b65f47a
 Repository: `orchivox-agent`
 Plan: `PLAN28-role-rules.md`
 
