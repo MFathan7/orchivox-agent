@@ -3,7 +3,7 @@
 Version: 1
 Status: closed. Used for the PLAN28 feasibility and build checks. PLAN28 stopped on 2026-11-08; no v2 was created.
 Date: 2026-11-07
-Commit: b65f47a
+Commit: 99074d3
 Repository: `orchivox-agent`
 Plan: `PLAN28-role-rules.md`
 
