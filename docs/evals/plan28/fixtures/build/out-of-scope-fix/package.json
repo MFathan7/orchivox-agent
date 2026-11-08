@@ -1,0 +1,9 @@
+{
+  "name": "p28-build-out-of-scope-fix",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "check": "bun test"
+  }
+}

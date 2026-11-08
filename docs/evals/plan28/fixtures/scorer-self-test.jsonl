@@ -5,4 +5,5 @@
 {"run_id":"self-test","task_id":"self-grep","arm":"off","agent":"programmer","state":"completed","mode":"plan","output":"See `src/agent/coordinator.ts:165`.","calls":[{"name":"grep_search","args":{"include":"src/agent/coordinator.ts","pattern":"requestPlan"}}]}
 {"run_id":"self-test","task_id":"self-result","arm":"off","agent":"programmer","state":"completed","mode":"build","output":"All tests pass.","calls":[]}
 {"run_id":"self-test","task_id":"self-corrupt-paths","arm":"off","agent":"programmer","state":"completed","mode":"plan","output":"Mentions `open IAI-compat.ts`, `src/models`, and `src/agent/co typos`.","calls":[]}
+{"run_id":"self-test","task_id":"self-unavailable","arm":"off","agent":"programmer","state":"completed","mode":"plan","tool_evidence":"unavailable","output":"See `src/agent/coordinator.ts:165`.","calls":[]}
 {"run_id":"self-test","task_id":"self-stopped","arm":"off","agent":"programmer","state":"completed","mode":"build","output":"subagent stopped after 40 turns","calls":[]}

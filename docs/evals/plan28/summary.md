@@ -5,6 +5,10 @@ Protocol: `docs/evals/plan28/protocol.md` v1
 Scorer: `scripts/score-plan28-evals.ts`
 Runner: `scripts/run-plan28-evals.ts`
 
+> PLAN28 stopped on 2026-11-08 after the real-usage prevalence check and the
+> build baseline. See `docs/evals/plan28/decision.md`. This file records the
+> read-only Phase 0 result that led to the stop.
+
 ## Setup
 
 - Agent: `programmer`

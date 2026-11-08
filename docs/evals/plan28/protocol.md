@@ -1,7 +1,7 @@
 # PLAN28 Evaluation Protocol
 
 Version: 1
-Status: locked before the first official run
+Status: closed. Used for the PLAN28 feasibility and build checks. PLAN28 stopped on 2026-11-08; no v2 was created.
 Date: 2026-11-07
 Commit: b65f47a
 Repository: `orchivox-agent`

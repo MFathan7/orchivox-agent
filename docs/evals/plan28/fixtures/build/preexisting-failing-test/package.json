@@ -1,0 +1,9 @@
+{
+  "name": "p28-build-preexisting-failing-test",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "check": "bun test"
+  }
+}

@@ -4,6 +4,8 @@ AGENTS*.md
 DESIGN*.md
 PLAN*.md
 FIX*.md
+REVISION_*.md
+agent_audit*.md
 
 # Build and release output
 !/docs/
@@ -12,8 +14,12 @@ FIX*.md
 !/docs/orchestration.md
 !/docs/evals/
 !/docs/evals/**
+!/docs/evals/plan28/fixtures/build/
+!/docs/evals/plan28/fixtures/build/**
 dist/
 build/
+!/docs/evals/plan28/fixtures/build/
+!/docs/evals/plan28/fixtures/build/**
 artifacts/
 /release/
 *.tsbuildinfo
