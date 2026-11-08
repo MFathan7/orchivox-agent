@@ -37,6 +37,7 @@ export interface IToolPermissionChecker {
     mode: AgentMode,
     args?: Record<string, unknown>,
     rules?: readonly ToolRulePattern[],
+    signal?: AbortSignal,
   ): Promise<PermissionDecision> | PermissionDecision;
 }
 
@@ -108,6 +109,9 @@ export class ToolRegistry {
     signal?: AbortSignal,
     permissionRules: readonly ToolRulePattern[] = [],
   ): Promise<ToolResult> {
+    if (signal?.aborted) {
+      return { tool_call_id: call.id, content: "tool cancelled", is_error: true };
+    }
     const tool = this.get(call.name);
     if (!tool) {
       return { tool_call_id: call.id, content: `unknown tool "${call.name}"`, is_error: true };
@@ -117,7 +121,10 @@ export class ToolRegistry {
     // Resolve path arguments against the worker workspace, but let permission
     // rules match the path the model wrote.
     const args = resolveWorkspaceArguments(rawArgs);
-    const decision = await this.permissions.check(tool, mode, rawArgs, permissionRules);
+    const decision = await this.permissions.check(tool, mode, rawArgs, permissionRules, signal);
+    if (signal?.aborted) {
+      return { tool_call_id: call.id, content: "tool cancelled", is_error: true };
+    }
     if (!decision.allowed) {
       const feedbackPart = decision.feedback ? ` User feedback: ${decision.feedback}` : "";
       return {
@@ -139,6 +146,9 @@ export class ToolRegistry {
     const startedAt = freezeDebugEnabled() ? performance.now() : 0;
     try {
       const content = await tool.execute(resolveWorkspaceArguments(parsed.data), { signal });
+      if (signal?.aborted) {
+        return { tool_call_id: call.id, content: "tool cancelled", is_error: true };
+      }
       if (startedAt > 0) {
         logFreeze("tool", {
           name: call.name,

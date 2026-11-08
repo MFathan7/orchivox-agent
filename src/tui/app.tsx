@@ -11,7 +11,7 @@ import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import type { ProviderRouter } from "../provider/router";
 import type { MemoryDatabase, SessionRecord } from "../memory/sqlite";
 import type { RestoreResult, SnapshotManager } from "../vcs/snapshot";
-import type { ApprovalPreset } from "../config/loader";
+import type { ApprovalPreset, AutoDelegateMode } from "../config/loader";
 import type { ConfigMode, ConfigRole } from "../config/writer";
 import { AgentHub, type AgentHubTab } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
@@ -35,11 +35,13 @@ import {
   formatContextWindow,
   formatCost,
   formatTokenCount,
+  summarizeSubagents,
   truncateText,
   type DisplaySegment,
 } from "./format";
 import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { LiveStatus } from "./spinner";
+import { SubagentStatus } from "./subagent-status";
 import {
   AUTO_THEME,
   DEFAULT_THEME,
@@ -187,6 +189,7 @@ export interface OrchivoxAppProps {
   workers?: SubagentWorkerState[];
   onSteer?: (workerId: string, instruction: string) => void;
   onKill?: (workerId: string) => void;
+  onKillAll?: () => void;
   pendingApproval?: ApprovalRequest;
   onApprovalDecision?: (decision: ApprovalDecision) => void;
   pendingQuestion?: PendingQuestion;
@@ -238,9 +241,11 @@ export interface OrchivoxAppProps {
   settingsOpen?: boolean;
   onSettingsOpenChange?: (open: boolean) => void;
   approvalsPreset?: ApprovalPreset;
+  autoDelegate?: AutoDelegateMode;
   modeSteps?: Record<SettingsMode, number>;
   configSource?: string;
   onApprovalsPresetChange?: (preset: ApprovalPreset) => void;
+  onAutoDelegateChange?: (mode: AutoDelegateMode) => void;
   onModeStepsChange?: (mode: SettingsMode, steps: number) => void;
   paletteOpen?: boolean;
   onPaletteOpenChange?: (open: boolean) => void;
@@ -394,6 +399,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     configSource = "project",
     secretsPath = `${globalThis.process.cwd()}/.agent/secrets.yaml`,
     approvalsPreset = "safer",
+    autoDelegate = "off",
     modeSteps = { plan: 0, build: 0, ultrawork: 0 },
   } = props;
 
@@ -622,6 +628,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     status: worker.status,
     task: worker.task,
   }));
+  const subagentSummary = summarizeSubagents(workers);
 
   const innerWidth = Math.max(1, terminalSize.columns - 2);
   const headerProjectLimit =
@@ -634,7 +641,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const statusText = escArmed ? "Press Esc again to stop the current turn" : statusMessage;
   const statusRows = statusText ? countWrappedLines(statusText, innerWidth) : 0;
   const liveStatusRows = streaming && !hasModalOpen && !statusText ? 1 : 0;
-  const chromeRows = 2 + statusRows + liveStatusRows;
+  const subagentLineRows = !hasModalOpen && subagentSummary.active > 0 ? 1 : 0;
+  const chromeRows = 2 + statusRows + liveStatusRows + subagentLineRows;
   const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
   const chatWheelStep = 3;
   const chatPageStep = Math.max(1, viewportHeight - 2);
@@ -768,6 +776,21 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
       </React.Fragment>
     ),
   });
+  if (subagentSummary.active > 0) {
+    headerParts.push({
+      key: "agents",
+      text: ` · agents ${subagentSummary.active}`,
+      dropOrder: 4,
+      node: (
+        <React.Fragment key="agents">
+          <Text color={theme.muted}> · </Text>
+          <Text color={subagentSummary.failed > 0 ? theme.status.error : theme.badge.running}>
+            agents {subagentSummary.active}
+          </Text>
+        </React.Fragment>
+      ),
+    });
+  }
   if (requestLabel) {
     headerParts.push({
       key: "request",
@@ -911,12 +934,14 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         ) : settingsOpen ? (
           <SettingsModal
             preset={approvalsPreset}
+            autoDelegate={autoDelegate}
             steps={modeSteps}
             configPath={configPath}
             configSource={configSource}
             width={innerWidth}
             theme={theme}
             onPresetChange={(next) => props.onApprovalsPresetChange?.(next)}
+            onAutoDelegateChange={(next) => props.onAutoDelegateChange?.(next)}
             onStepsChange={(nextMode, steps) => props.onModeStepsChange?.(nextMode, steps)}
             onClose={() => setSettingsOpen(false)}
           />
@@ -1023,6 +1048,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onTabChange={setHubTab}
             onSteer={(workerId, instruction) => onSteer(workerId, instruction)}
             onKill={onKill}
+            onKillAll={props.onKillAll}
             onCancelTask={props.onCancelTask}
             onDispatchTasks={props.onDispatchTasks}
             onMergeTask={props.onMergeTask}
@@ -1066,6 +1092,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             ) : null}
           </Box>
         )}
+
+        {!hasModalOpen ? <SubagentStatus workers={workers} width={innerWidth} /> : null}
 
         {escArmed ? (
           <Text color={theme.badge.running}>Press Esc again to stop the current turn</Text>

@@ -5,12 +5,18 @@ import type { AgentMode } from "../types/schema";
 export interface TurnContext {
   mode: AgentMode;
   sessionId?: string;
+  /** Worker id when this turn runs inside a subagent. */
+  workerId?: string;
   /** Directory tools should treat as the project root, set for isolated workers. */
   workspaceRoot?: string;
   /** Last user text for this turn, used by tools that need the request. */
   userText?: string;
   /** Skills the user invoked explicitly with /skill:<name>. */
   forcedSkills?: string[];
+  /** Skills this agent may load. Undefined means every installed skill. */
+  allowedSkills?: string[];
+  /** all: every skill, listed: allowedSkills only, none: skill tools disabled. */
+  skillPolicy?: "all" | "listed" | "none";
 }
 
 const storage = new AsyncLocalStorage<TurnContext>();

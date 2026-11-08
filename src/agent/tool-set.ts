@@ -56,6 +56,7 @@ export const BUILD_TOOL_NAMES: ReadonlySet<string> = new Set([
   "task_cancel",
   "task_merge",
   "execute",
+  "coordinate",
 ]);
 
 export function filterToolsForMode<T extends { name: string }>(

@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { z } from "zod";
 
 import { ensureRuntimeTempDir } from "../runtime-temp";
+import { currentTurnContext } from "../agent/turn-context";
 import { killProcessTree } from "./process-tree";
 import type { AgentTool, ToolRegistry } from "./registry";
 import {
@@ -93,6 +94,8 @@ export interface BackgroundProcessManagerOptions {
 
 export class BackgroundProcessManager {
   private readonly processes = new Map<string, ManagedProcess>();
+  /** Background processes started by a subagent, grouped by worker id. */
+  private readonly workerProcesses = new Map<string, Set<string>>();
   private readonly defaultCwd: string;
   private readonly adapter: ShellAdapter | undefined;
   private idCounter = 0;
@@ -351,12 +354,29 @@ export class BackgroundProcessManager {
     return true;
   }
 
+  associateWorker(processId: string, workerId: string): void {
+    const existing = this.workerProcesses.get(workerId) ?? new Set<string>();
+    existing.add(processId);
+    this.workerProcesses.set(workerId, existing);
+  }
+
+  async stopForWorker(workerId: string, force = true): Promise<number> {
+    const ids = [...(this.workerProcesses.get(workerId) ?? [])];
+    this.workerProcesses.delete(workerId);
+    let stopped = 0;
+    for (const id of ids) {
+      if (await this.stop(id, force)) stopped += 1;
+    }
+    return stopped;
+  }
+
   async stopAll(): Promise<void> {
     const activeIds = Array.from(this.processes.entries())
       .filter(([_, p]) => p.info.status === "running" || p.info.status === "ready")
       .map(([id]) => id);
 
     await Promise.all(activeIds.map((id) => this.stop(id, false)));
+    this.workerProcesses.clear();
   }
 
   registerTools(registry: ToolRegistry): void {
@@ -387,9 +407,18 @@ export class BackgroundProcessManager {
           .describe("Maximum milliseconds to wait for waitForReadyRegex."),
       }),
       readOnly: false,
-      execute: async (args) => {
+      execute: async (args, context) => {
         const input = args as BgStartOptions;
         const info = await this.start(input);
+        const workerId = currentTurnContext()?.workerId;
+        if (workerId) this.associateWorker(info.id, workerId);
+        if (context?.signal) {
+          const stopOnAbort = (): void => {
+            void this.stop(info.id, true);
+          };
+          if (context.signal.aborted) stopOnAbort();
+          else context.signal.addEventListener("abort", stopOnAbort, { once: true });
+        }
         const logs = this.getLogs(info.id, { lines: 10 });
 
         const urlSection =

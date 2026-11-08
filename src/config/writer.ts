@@ -4,7 +4,12 @@ import { dirname } from "node:path";
 import { isMap, isSeq, parseDocument, type Document } from "yaml";
 
 import type { ThemeSelection } from "../types/theme";
-import type { ApprovalPreset, ModelCapabilitiesPatch, ProviderProfile } from "./loader";
+import type {
+  ApprovalPreset,
+  AutoDelegateMode,
+  ModelCapabilitiesPatch,
+  ProviderProfile,
+} from "./loader";
 
 export type ConfigRole = "main" | "fast" | "advisor";
 export type ConfigMode = "plan" | "build" | "ultrawork";
@@ -155,6 +160,16 @@ export async function saveApprovalsPreset(
   const document = await readDocument(configPath);
   ensureMap(document, "approvals");
   document.setIn(["approvals", "preset"], preset);
+  await writeDocument(configPath, document);
+}
+
+export async function saveAutoDelegate(
+  configPath: string,
+  value: AutoDelegateMode,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "orchestration");
+  document.setIn(["orchestration", "auto_delegate"], value);
   await writeDocument(configPath, document);
 }
 

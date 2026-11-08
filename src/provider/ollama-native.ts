@@ -377,7 +377,7 @@ export class OllamaNativeProvider implements LLMProvider {
               total_tokens: promptTokens + completionTokens,
               cache_read_input_tokens: 0,
               cache_creation_input_tokens: 0,
-              cost_usd: computeCostUsd(promptTokens, completionTokens, this.pricing),
+              cost_usd: computeCostUsd({ promptTokens, completionTokens }, this.pricing),
             };
             yield { type: "done", finish_reason: finishReasonOf(chunk.done_reason) };
             finished = true;

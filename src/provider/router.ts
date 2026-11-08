@@ -1,5 +1,5 @@
 import { resolveModelCapabilities, type AppConfig, type ModeSettings, type ModelCapabilities, type ModelCapabilitiesPatch, type ProviderProfile } from "../config/loader";
-import type { AgentMode, ChatRequest, StreamEvent } from "../types/schema";
+import type { AgentMode, ChatRequest, StreamEvent, TokenPricing } from "../types/schema";
 import { AnthropicCompatProvider } from "./anthropic-compat";
 import { OllamaNativeProvider } from "./ollama-native";
 import {
@@ -11,6 +11,7 @@ import {
 } from "./model-catalog";
 import { getLearnedLimits } from "./limit-cache";
 import { OpenAICompatProvider } from "./openai-compat";
+import { resolveProviderPricing } from "./pricing";
 import { getRuntimeMetadata } from "./runtime-metadata";
 
 export interface LLMProvider {
@@ -220,6 +221,12 @@ export class ProviderRouter {
     return findCatalogModel(this.catalog, catalogProviderForProfile(profile), model);
   }
 
+  private pricingForProfile(profile: ProviderProfile, model?: string): TokenPricing | undefined {
+    const key = model ?? profile.models[0] ?? "";
+    const catalogModel = findCatalogModel(this.catalog, catalogProviderForProfile(profile), key);
+    return resolveProviderPricing(profile, catalogModel?.cost);
+  }
+
   listCatalogModels(providerName: string): CatalogModel[] {
     const profile = this.config.providers[providerName];
     if (!profile) return [];
@@ -369,7 +376,12 @@ export class ProviderRouter {
 
   async testProvider(profile: ProviderProfile): Promise<string[]> {
     const model = profile.models[0];
-    const provider = createProvider(profile, model, this.capabilitiesForProfile(profile, model));
+    const provider = createProvider(
+      profile,
+      model,
+      this.capabilitiesForProfile(profile, model),
+      this.pricingForProfile(profile, model),
+    );
     return provider.listModels(AbortSignal.timeout(8000));
   }
 
@@ -386,7 +398,12 @@ export class ProviderRouter {
     const key = `${profileName}\u0000${boundModel ?? ""}`;
     const cached = this.instances.get(key);
     if (cached) return cached;
-    const created = createProvider(profile, boundModel, this.capabilitiesForProfile(profile, boundModel));
+    const created = createProvider(
+      profile,
+      boundModel,
+      this.capabilitiesForProfile(profile, boundModel),
+      this.pricingForProfile(profile, boundModel),
+    );
     this.instances.set(key, created);
     return created;
   }
@@ -396,13 +413,14 @@ function createProvider(
   profile: ProviderProfile,
   model: string | undefined,
   capabilities: ModelCapabilities,
+  pricing: TokenPricing | undefined,
 ): LLMProvider {
   const options = {
     baseUrl: profile.base_url,
     apiKey: profile.api_key,
     headers: profile.headers,
     model,
-    pricing: profile.pricing,
+    pricing,
     kind: profile.kind,
     capabilities,
     timeoutMs: profile.timeout_ms,

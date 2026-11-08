@@ -2,9 +2,11 @@ export type TerminalWriter = (chunk: string) => unknown;
 
 export const ENTER_ALTERNATE_SCREEN =
   "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1006h";
-export const LEAVE_ALTERNATE_SCREEN = "\x1b[?1000l\x1b[?1006l\x1b[?1049l";
+export const LEAVE_ALTERNATE_SCREEN = "\x1b[?1049l\x1b[?25h";
 export const ENABLE_KEYBOARD_PROTOCOL = "\x1b[>1u\x1b[>4;2m";
 export const DISABLE_KEYBOARD_PROTOCOL = "\x1b[>4;0m\x1b[<u";
+
+const DISABLE_MOUSE = "\x1b[?1000l\x1b[?1006l";
 
 let entered = false;
 
@@ -32,13 +34,38 @@ export function enterTerminal(write: TerminalWriter = defaultWrite): void {
 export function leaveTerminal(write: TerminalWriter = defaultWrite): void {
   if (!entered) return;
   entered = false;
-  write("\x1b[?1000l\x1b[?1006l");
+  write(DISABLE_MOUSE);
   write(DISABLE_KEYBOARD_PROTOCOL);
-  write("\x1b[?1049l");
+  write(LEAVE_ALTERNATE_SCREEN);
 }
 
 export function resetTerminalProtocolForTests(): void {
   entered = false;
+}
+
+export type FatalSignal = "uncaughtException" | "unhandledRejection";
+
+export interface FatalEventTarget {
+  on(event: string, listener: (value: unknown) => void): unknown;
+  removeListener(event: string, listener: (value: unknown) => void): unknown;
+}
+
+/**
+ * Registers the fatal process handlers and returns an uninstall function.
+ * The caller owns the terminal restore step inside `onFatal`.
+ */
+export function installFatalHandlers(
+  onFatal: (error: unknown, signal: FatalSignal) => void,
+  target: FatalEventTarget = globalThis.process as unknown as FatalEventTarget,
+): () => void {
+  const uncaught = (error: unknown): void => onFatal(error, "uncaughtException");
+  const rejection = (reason: unknown): void => onFatal(reason, "unhandledRejection");
+  target.on("uncaughtException", uncaught);
+  target.on("unhandledRejection", rejection);
+  return () => {
+    target.removeListener("uncaughtException", uncaught);
+    target.removeListener("unhandledRejection", rejection);
+  };
 }
 
 /** Set the window or pane title without touching the screen buffer. */

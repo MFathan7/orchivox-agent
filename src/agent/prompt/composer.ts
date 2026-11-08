@@ -1,5 +1,5 @@
 import { agentPromptPart } from "./agent-prompt";
-import { closingPart, modeAdditionPart, specialistPart } from "./base";
+import { closingPart, coordinatorPart, modeAdditionPart, specialistPart } from "./base";
 import {
   environmentPart,
   extraPart,
@@ -29,6 +29,7 @@ export function composePromptParts(options: SystemPromptOptions): PromptPart[] {
       includeInstructions ? rulesPart(options) : undefined,
       specialistPart(options),
       modeAdditionPart(options),
+      coordinatorPart(options),
       includeInstructions ? skillsPart(options) : undefined,
       extraPart(options),
       options.includeClosing === false ? undefined : closingPart(options),

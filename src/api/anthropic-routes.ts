@@ -360,12 +360,15 @@ function toAnthropicStopReason(reason: AgentRunResult["finish_reason"]): string 
   }
 }
 
-function toAnthropicUsage(usage: Usage | undefined): z.infer<typeof MessagesResponseSchema>["usage"] {
+export function toAnthropicUsage(usage: Usage | undefined): z.infer<typeof MessagesResponseSchema>["usage"] {
+  const cacheRead = usage?.cache_read_input_tokens ?? 0;
+  const cacheCreation = usage?.cache_creation_input_tokens ?? 0;
+  const promptTokens = usage?.prompt_tokens ?? 0;
   return {
-    input_tokens: usage?.prompt_tokens ?? 0,
+    input_tokens: Math.max(0, promptTokens - cacheRead - cacheCreation),
     output_tokens: usage?.completion_tokens ?? 0,
-    cache_creation_input_tokens: usage?.cache_creation_input_tokens ?? 0,
-    cache_read_input_tokens: usage?.cache_read_input_tokens ?? 0,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
   };
 }
 

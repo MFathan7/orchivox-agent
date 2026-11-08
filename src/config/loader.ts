@@ -494,6 +494,16 @@ export const ModesConfigSchema = z.object({
 });
 export type ModesConfig = z.infer<typeof ModesConfigSchema>;
 
+export const AutoDelegateModeSchema = z.enum(["off", "ultrawork", "always"]);
+export type AutoDelegateMode = z.infer<typeof AutoDelegateModeSchema>;
+
+export const OrchestrationConfigSchema = z.object({
+  /** off: no automatic coordinator. ultrawork: only in Ultrawork. always: Build and Ultrawork. */
+  auto_delegate: AutoDelegateModeSchema.default("off"),
+  coordinator_agent: z.string().min(1).default("polaris"),
+});
+export type OrchestrationConfig = z.infer<typeof OrchestrationConfigSchema>;
+
 export const ApprovalPresetSchema = z.enum([
   "safer",
   "env-only",
@@ -518,6 +528,7 @@ export const AppConfigSchema = z.object({
   providers: z.record(z.string().min(1), ProviderProfileSchema).default({}),
   roles: RolesConfigSchema.default({}),
   modes: ModesConfigSchema.prefault({}),
+  orchestration: OrchestrationConfigSchema.prefault({}),
   active_mode: z.enum(["plan", "build", "ultrawork"]).default("build"),
   theme: z
     .string()

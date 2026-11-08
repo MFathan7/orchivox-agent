@@ -14,6 +14,7 @@ export function workspaceRoot(fallback: string): string {
 const PATH_ARGUMENT_KEYS = new Set([
   "filePath",
   "basePath",
+  "sourcePath",
   "destinationPath",
   "imagePath",
   "rootPath",

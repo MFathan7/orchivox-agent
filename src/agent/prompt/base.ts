@@ -52,6 +52,35 @@ export function modeAdditionPart(options: SystemPromptOptions): PromptPart | und
   };
 }
 
+const ULTRAWORK_COORDINATOR_PROMPT = [
+  "# Coordinator",
+  "This session can delegate work. For multi-step implementation, start by calling",
+  "the coordinate tool with the user's goal and the context a worker needs. The",
+  "tool returns a plan and creates tasks. Wait for the tasks with task_wait, review",
+  "their results, and merge only what passes. For a single read-only question, answer",
+  "directly.",
+].join(" ");
+
+const ALWAYS_COORDINATOR_PROMPT = [
+  "# Coordinator",
+  "A coordinator plan is already in this conversation. Follow it: wait for the",
+  "created tasks with task_wait, review their results, and merge only what passes.",
+  "If the plan is wrong, say why and continue manually.",
+].join(" ");
+
+export function coordinatorPart(options: SystemPromptOptions): PromptPart | undefined {
+  const policy = options.autoDelegate ?? "off";
+  if (policy === "off" || options.mode === "plan" || options.task) return undefined;
+  if (policy === "ultrawork" && options.mode !== "ultrawork") return undefined;
+  if (policy === "always" && options.coordinatorPlan === false) return undefined;
+  return {
+    kind: "coordinator",
+    key: "coordinator",
+    text: policy === "always" ? ALWAYS_COORDINATOR_PROMPT : ULTRAWORK_COORDINATOR_PROMPT,
+    stable: true,
+  };
+}
+
 export function closingReminder(options: Pick<SystemPromptOptions, "task">): string {
   return options.task ? TASK_REMINDERS[options.task] : "";
 }

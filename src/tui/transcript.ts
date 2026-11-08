@@ -126,6 +126,7 @@ export function buildTranscriptEntries(
     // Instruction updates and plan reminders are context for the model, not user chat.
     if (message.metadata?.instruction !== undefined) return;
     if (message.metadata?.planReminder !== undefined) return;
+    if (message.metadata?.coordinatorPlan !== undefined) return;
     const hasToolUse = message.content.some((block) => block.type === "tool_use");
     if (message.role === "assistant" && hasToolUse && messageEntryText(message).trim().length === 0) return;
     const metadata = message.metadata;

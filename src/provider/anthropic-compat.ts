@@ -290,7 +290,7 @@ export class AnthropicCompatProvider implements LLMProvider {
       const body = response.body;
       const blocks = new Map<number, { type: string; id: string; name: string; argumentsText: string }>();
       const thinkParser = new ThinkTagStreamParser();
-      let promptTokens = 0;
+      let uncachedInputTokens = 0;
       let completionTokens = 0;
       let cacheRead = 0;
       let cacheCreation = 0;
@@ -311,7 +311,7 @@ export class AnthropicCompatProvider implements LLMProvider {
               const usage = parsed.data.message.usage;
               if (usage) {
                 usageSeen = true;
-                promptTokens = usage.input_tokens ?? 0;
+                uncachedInputTokens = usage.input_tokens ?? 0;
                 cacheRead = usage.cache_read_input_tokens ?? 0;
                 cacheCreation = usage.cache_creation_input_tokens ?? 0;
               }
@@ -453,14 +453,13 @@ export class AnthropicCompatProvider implements LLMProvider {
       }
 
       if (usageSeen) {
-        yield {
-          type: "usage",
-          prompt_tokens: promptTokens,
-          completion_tokens: completionTokens,
-          cost_usd: computeCostUsd(promptTokens, completionTokens, this.pricing),
-          cache_read_input_tokens: cacheRead,
-          cache_creation_input_tokens: cacheCreation,
-        };
+        yield buildAnthropicUsageEvent(
+          uncachedInputTokens,
+          completionTokens,
+          cacheRead,
+          cacheCreation,
+          this.pricing,
+        );
       }
       yield { type: "done", finish_reason: stopReason ? (STOP_REASONS[stopReason] ?? "stop") : "stop" };
     } finally {
@@ -487,6 +486,33 @@ export class AnthropicCompatProvider implements LLMProvider {
       ...this.extraHeaders,
     };
   }
+}
+
+export function buildAnthropicUsageEvent(
+  uncachedInputTokens: number,
+  completionTokens: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number,
+  pricing: TokenPricing | undefined,
+): StreamEvent {
+  const promptTokens = uncachedInputTokens + cacheReadTokens + cacheCreationTokens;
+  return {
+    type: "usage",
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+    cost_usd: computeCostUsd(
+      {
+        promptTokens,
+        completionTokens,
+        cacheReadTokens,
+        cacheCreationTokens,
+      },
+      pricing,
+    ),
+    cache_read_input_tokens: cacheReadTokens,
+    cache_creation_input_tokens: cacheCreationTokens,
+  };
 }
 
 export function buildMessagesPayload(
@@ -612,6 +638,15 @@ export function toAnthropicMessages(req: ChatRequest): { system: AnthropicTextBl
       }
     }
   }
+
+  // Anthropic rejects an empty messages array after system extraction.
+  if (messages.length === 0) {
+    messages.push({
+      role: "user",
+      content: [{ type: "text", text: "Continue from the provided context." }],
+    });
+  }
+
   return { system, messages };
 }
 

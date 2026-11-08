@@ -186,3 +186,49 @@ export function truncateText(text: string, maxWidth: number): string {
   if (maxWidth <= 3) return text.slice(0, maxWidth);
   return `${text.slice(0, maxWidth - 3)}...`;
 }
+
+export interface SubagentSummary {
+  active: number;
+  running: number;
+  queued: number;
+  failed: number;
+}
+
+export function summarizeSubagents(
+  workers: ReadonlyArray<{ status: string }>,
+): SubagentSummary {
+  let running = 0;
+  let queued = 0;
+  let failed = 0;
+  for (const worker of workers) {
+    switch (worker.status) {
+      case "queued":
+        queued += 1;
+        break;
+      case "preparing":
+      case "running":
+      case "finalizing":
+        running += 1;
+        break;
+      case "failed":
+      case "timed_out":
+        failed += 1;
+        break;
+      default:
+        break;
+    }
+  }
+  return { active: running + queued, running, queued, failed };
+}
+
+export function subagentStatusText(summary: SubagentSummary, width: number): string {
+  if (summary.active <= 0) return "";
+  const parts: string[] = [];
+  if (summary.running > 0) parts.push(`${summary.running} running`);
+  if (summary.queued > 0) parts.push(`${summary.queued} queued`);
+  if (summary.failed > 0) parts.push(`${summary.failed} failed`);
+  const base = `Agents ${parts.join(" · ")}`;
+  if (width >= 90) return `${base} · /hub details`;
+  if (width >= 40) return base;
+  return `Agents ${summary.active}`;
+}

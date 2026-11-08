@@ -6,6 +6,7 @@ import type { ToolDefinition } from "../types/schema";
 import type { PermissionAction, PermissionConfigRule } from "./permissions";
 
 export type SpecialistAgentRoleModel = "main" | "advisor" | "fast" | string;
+export type SpecialistSkillPolicy = "all" | "listed" | "none";
 
 export interface SpecialistAgentProfile {
   name: string;
@@ -14,6 +15,12 @@ export interface SpecialistAgentProfile {
   readOnly?: boolean;
   thinkingBudget?: number;
   allowedTools?: string[];
+  /** Skills this agent may load when skillPolicy is "listed". */
+  skills?: string[];
+  /** all: every skill, listed: only `skills`, none: hide skill tools. */
+  skillPolicy?: SpecialistSkillPolicy;
+  /** Skill bodies loaded before the first model call. Keep this small. */
+  preloadSkills?: string[];
   permissions?: PermissionConfigRule[];
   systemPrompt: string;
   source: "builtin" | "custom";
@@ -111,6 +118,50 @@ Key principles:
 2. Layout robustness: Ensure layouts reflow cleanly, handle overflow gracefully, and honor responsive constraints.
 3. State and accessibility: Ensure keyboard focus, contrast ratios, and loading/error states are clearly communicated to users.`,
   },
+  polaris: {
+    name: "polaris",
+    description: "Read-only planning coordinator that turns a goal into a structured WorkPlan for other workers.",
+    roleModel: "main",
+    readOnly: true,
+    thinkingBudget: 16000,
+    allowedTools: [
+      "read_file",
+      "read_document",
+      "glob_files",
+      "grep_search",
+      "diff_view",
+      "json_query",
+      "read_skeleton",
+      "repo_map",
+      "repo_architecture_map",
+      "lsp_workspace_symbols",
+      "lsp_hover_type",
+      "symbol_impact_analysis",
+      "diagnostics_check",
+      "skill",
+      "skill_list",
+    ],
+    skills: [],
+    skillPolicy: "all",
+    systemPrompt: `You are Polaris, the read-only planning coordinator.
+Your job is to turn a goal into a WorkPlan that other workers can execute without seeing this conversation.
+Read the codebase when it helps you ground the plan. Never edit files.
+Each task must name a suitable agent, include exact file paths and constraints, and state acceptance criteria.
+Prefer the smallest number of independent tasks. Mark read-only tasks with mode "plan" and write_isolation false.
+Do not include raw reasoning, hidden thoughts, or a narrative. Return only the WorkPlan JSON.`,
+  },
+  programmer: {
+    name: "programmer",
+    description: "Implementation worker for focused code changes, tests, and verification inside an assigned scope.",
+    roleModel: "main",
+    readOnly: false,
+    skills: [],
+    skillPolicy: "all",
+    systemPrompt: `You are the implementation worker.
+Work only inside the scope you were given. Read the relevant files before editing, keep the diff focused, and follow the project conventions.
+Run the relevant checks before you claim success. Report the exact files changed and the verification you ran.
+Do not spawn subagents and do not expand the scope beyond the task.`,
+  },
 };
 
 export function parseSpecialistMention(
@@ -130,6 +181,22 @@ export function parseSpecialistMention(
     agentName: candidate,
     query: (match[2] ?? "").trim(),
   };
+}
+
+function stringList(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const entries = value.map((entry) => String(entry).trim()).filter(Boolean);
+    return entries.length > 0 ? entries : undefined;
+  }
+  if (typeof value === "string") {
+    const entries = value.split(/[\s,]+/).map((entry) => entry.trim()).filter(Boolean);
+    return entries.length > 0 ? entries : undefined;
+  }
+  return undefined;
+}
+
+function skillPolicy(value: unknown): SpecialistSkillPolicy | undefined {
+  return value === "all" || value === "listed" || value === "none" ? value : undefined;
 }
 
 export class SpecialistAgentRegistry {
@@ -174,6 +241,11 @@ export class SpecialistAgentRegistry {
           const allowedTools = Array.isArray(parsed?.allowedTools)
             ? parsed.allowedTools.map(String)
             : undefined;
+          const skills = stringList(parsed?.skills);
+          const preloadSkills = stringList(
+            parsed?.preloadSkills ?? parsed?.preload_skills,
+          );
+          const policy = skillPolicy(parsed?.skillPolicy ?? parsed?.skill_policy);
           const permissions = Array.isArray(parsed?.permissions)
             ? parsed.permissions.flatMap((entry) => {
                 if (!entry || typeof entry !== "object") return [];
@@ -198,6 +270,9 @@ export class SpecialistAgentRegistry {
             readOnly,
             thinkingBudget,
             allowedTools,
+            skills,
+            skillPolicy: policy,
+            preloadSkills,
             permissions,
             systemPrompt,
             source: "custom",
@@ -280,6 +355,10 @@ export class SpecialistAgentRegistry {
         ]);
         filtered = filtered.filter((tool) => !mutatingToolNames.has(tool.name));
       }
+    }
+
+    if (agent.skillPolicy === "none") {
+      filtered = filtered.filter((tool) => tool.name !== "skill" && tool.name !== "skill_list");
     }
 
     return filtered;

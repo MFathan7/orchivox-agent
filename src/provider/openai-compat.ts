@@ -91,7 +91,7 @@ const OpenAiModelsSchema = z.object({
 });
 
 type OpenAiChunk = z.infer<typeof OpenAiChunkSchema>;
-type OpenAiUsage = OpenAiChunk["usage"];
+export type OpenAiUsage = OpenAiChunk["usage"];
 type OpenAiToolCall = {
   id: string;
   type: "function";
@@ -672,19 +672,29 @@ function toolResultText(content: string | TextBlock[]): string {
   return content.map((block) => block.text).join("\n");
 }
 
-function buildUsageEvent(usage: OpenAiUsage, pricing: TokenPricing | undefined): StreamEvent | undefined {
+export function buildUsageEvent(
+  usage: OpenAiUsage,
+  pricing: TokenPricing | undefined,
+): StreamEvent | undefined {
   if (!usage) return undefined;
   if (usage.prompt_tokens == null && usage.completion_tokens == null) return undefined;
   const promptTokens = usage.prompt_tokens ?? 0;
   const completionTokens = usage.completion_tokens ?? 0;
+  const cacheReadTokens = usage.prompt_tokens_details?.cached_tokens ?? 0;
+  const cacheCreationTokens = 0;
   return {
     type: "usage",
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
-    total_tokens: usage.total_tokens ?? undefined,
-    cost_usd: usage.cost ?? computeCostUsd(promptTokens, completionTokens, pricing),
-    cache_read_input_tokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
-    cache_creation_input_tokens: 0,
+    total_tokens: usage.total_tokens ?? promptTokens + completionTokens,
+    cost_usd:
+      usage.cost ??
+      computeCostUsd(
+        { promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens },
+        pricing,
+      ),
+    cache_read_input_tokens: cacheReadTokens,
+    cache_creation_input_tokens: cacheCreationTokens,
   };
 }
 

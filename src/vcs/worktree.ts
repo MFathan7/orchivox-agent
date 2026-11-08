@@ -40,6 +40,23 @@ export class WorktreeManager {
     return target;
   }
 
+  /** Discards a failed worker's worktree and branch. Returns false when the worktree remains. */
+  async removeWorktree(workerId: string): Promise<boolean> {
+    assertWorkerId(workerId);
+    const target = this.worktreePath(workerId);
+    const branch = this.branchName(workerId);
+    let removed = true;
+    if (await pathExists(target)) {
+      const result = await runGit(this.root, ["worktree", "remove", "--force", target], {
+        allowFailure: true,
+      });
+      removed = result.exitCode === 0 || !(await pathExists(target));
+    }
+    await runGit(this.root, ["branch", "-D", branch], { allowFailure: true });
+    await runGit(this.root, ["worktree", "prune"], { allowFailure: true });
+    return removed;
+  }
+
   async mergeAndCleanup(workerId: string): Promise<MergeResult> {
     assertWorkerId(workerId);
     const target = this.worktreePath(workerId);
@@ -64,6 +81,8 @@ export class WorktreeManager {
       const diffSummary = (
         await runGit(this.root, ["diff", "--stat", oldHead, branch], { allowFailure: true })
       ).stdout.trim();
+      // Leave the main checkout clean even when the worker branch cannot merge.
+      await runGit(this.root, ["merge", "--abort"], { allowFailure: true });
       return { success: false, diffSummary, conflicts };
     }
 

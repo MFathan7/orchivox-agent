@@ -125,15 +125,26 @@ export interface SkillIndexOptions {
   compact?: boolean;
   limit?: number;
   descriptionLimit?: number;
+  /** all: every skill, listed: only `allowed`, none: no skill index. */
+  policy?: "all" | "listed" | "none";
+  allowed?: readonly string[];
 }
 
 export function formatAvailableSkills(
   documents: SkillDocument[],
   options: SkillIndexOptions = {},
 ): string {
-  const autoDocuments = documents.filter((document) => document.autoinvoke !== false);
+  const policy = options.policy ?? "all";
+  const allowed = new Set((options.allowed ?? []).map(normalizeSkillName));
+  const autoDocuments = documents.filter((document) => {
+    if (document.autoinvoke === false) return false;
+    if (policy === "none") return false;
+    if (policy === "listed") return allowed.has(normalizeSkillName(document.name));
+    return true;
+  });
   if (autoDocuments.length === 0) {
-    return [SKILL_GUIDANCE, "No skills are currently available."].join("\n");
+    if (policy === "none") return "Skills are disabled for this agent.";
+    return [SKILL_GUIDANCE, "No skills are currently available for this agent."].join("\n");
   }
 
   const limit = options.limit ?? (options.compact ? 12 : 1000);
@@ -362,6 +373,17 @@ export class SkillRegistry {
       readOnly: true,
       execute: async (args) => {
         const { id } = args as { id: string };
+        const context = currentTurnContext();
+        const policy = context?.skillPolicy ?? "all";
+        if (policy === "none") {
+          throw new Error("skills are disabled for this agent");
+        }
+        if (policy === "listed") {
+          const allowed = new Set((context?.allowedSkills ?? []).map(normalizeSkillName));
+          if (!allowed.has(normalizeSkillName(id))) {
+            throw new Error(`skill "${id}" is not allowed for this agent`);
+          }
+        }
         const document = this.get(id);
         if (document?.autoinvoke === false) {
           const context = currentTurnContext();
@@ -379,11 +401,16 @@ export class SkillRegistry {
           }
         }
         if (!document) {
-          const available = this.listDocuments().map((entry) => entry.name);
+          const allowed = new Set((context?.allowedSkills ?? []).map(normalizeSkillName));
+          const available = this.listDocuments()
+            .filter(
+              (entry) => policy === "all" || allowed.has(normalizeSkillName(entry.name)),
+            )
+            .map((entry) => entry.name);
           throw new Error(
             available.length === 0
-              ? `unknown skill "${id}": no skills are installed`
-              : `unknown skill "${id}". Available skills: ${available.join(", ")}`,
+              ? `unknown skill "${id}": no skills are installed for this agent`
+              : `unknown skill "${id}". Available skills for this agent: ${available.join(", ")}`,
           );
         }
 
@@ -400,8 +427,15 @@ export class SkillRegistry {
       parameters: z.object({}),
       readOnly: true,
       execute: () => {
-        const documents = this.listDocuments();
-        if (documents.length === 0) return "no skills are installed";
+        const context = currentTurnContext();
+        const policy = context?.skillPolicy ?? "all";
+        if (policy === "none") return "skills are disabled for this agent";
+        const allowed = new Set((context?.allowedSkills ?? []).map(normalizeSkillName));
+        const documents = this.listDocuments().filter(
+          (document) =>
+            policy === "all" || allowed.has(normalizeSkillName(document.name)),
+        );
+        if (documents.length === 0) return "no skills are available for this agent";
         return documents
           .map((document) => `- ${document.name}: ${document.description} (${document.scope})`)
           .join("\n");

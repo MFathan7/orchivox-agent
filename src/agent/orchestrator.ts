@@ -65,6 +65,12 @@ import type { SnapshotManager } from "../vcs/snapshot";
 import type { WorktreeManager } from "../vcs/worktree";
 import { AdvisorReviewer } from "./advisor";
 import {
+  Coordinator,
+  createCoordinateTool,
+  formatCoordinatorPlan,
+  type CoordinatorResult,
+} from "./coordinator";
+import {
   compactMessages,
   computeInputBudget,
   estimateTextTokens,
@@ -104,9 +110,11 @@ import {
 import { toolDisplay } from "./tool-display";
 import {
   buildSkillHint,
+  formatSkillContent,
   formatSkillReload,
   loadedSkillIds,
   matchSkillNames,
+  normalizeSkillName,
   parseSkillMentions,
   SkillRegistry,
   type SkillDocument,
@@ -131,6 +139,7 @@ import {
   isUnsupportedParamsError,
 } from "../provider/errors";
 import { modeContract, modeStepLimit, modeTransitionReminder } from "./modes";
+import { resolveSubagentSkillAccess } from "./skill-access";
 import { SKILL_ALWAYS_ALLOWED_TOOLS, SkillToolPolicy } from "./skill-policy";
 import { TodoEngine } from "./todo";
 import { runGit } from "../vcs/git";
@@ -226,6 +235,7 @@ const MIN_STUDY_ANSWER_CHARS = 40;
 
 const SUBAGENT_BLOCKED_TOOLS = new Set([
   "spawn_subagents",
+  "coordinate",
   "task_create",
   "task_dispatch",
   "task_cancel",
@@ -315,6 +325,7 @@ export class AgentOrchestrator implements IAgentRunner {
   readonly bgProcesses: BackgroundProcessManager;
   readonly skills: SkillRegistry;
   readonly tasks: TaskBoard;
+  readonly coordinator: Coordinator;
 
   private readonly router: ProviderRouter;
   private readonly snapshots: SnapshotManager;
@@ -417,14 +428,39 @@ export class AgentOrchestrator implements IAgentRunner {
     this.subagents = new SubagentManager({
       worktrees: options.worktrees,
       executor: (input) => this.executeSubagent(input),
+      onUsage: (worker, usage) => {
+        const sessionId = worker.parentSessionId;
+        if (!sessionId) return;
+        try {
+          this.database.addSessionUsage(
+            sessionId,
+            usage.prompt_tokens + usage.completion_tokens,
+            usage.cost_usd ?? 0,
+          );
+        } catch {
+          // Usage accounting is best effort and must not break a worker.
+        }
+      },
     });
     this.tasks = new TaskBoard({
       spawner: (input) => this.spawnTaskWorker(input),
-      canceller: (workerId) => this.subagents.kill(workerId),
+      canceller: (workerId) => {
+        const stopped = this.subagents.stop(workerId);
+        void this.bgProcesses.stopForWorker(workerId, true);
+        return stopped;
+      },
       merger: (workerId) => options.worktrees.mergeAndCleanup(workerId),
       maxConcurrent: 3,
       maxTasks: options.config?.limits?.max_workers_per_turn ?? 10,
       store: options.database,
+    });
+    this.coordinator = new Coordinator({
+      subagents: this.subagents,
+      tasks: this.tasks,
+      agents: this.specialistAgents,
+      skills: this.skills,
+      coordinatorAgent: options.config?.orchestration?.coordinator_agent ?? "polaris",
+      maxTasks: options.config?.limits?.max_workers_per_turn ?? 10,
     });
     this.registerDefaultTools();
   }
@@ -553,7 +589,9 @@ export class AgentOrchestrator implements IAgentRunner {
     const providerRef = this.router.getModeModel(mode);
     const capabilities = providerRef ? this.router.capabilitiesForMode(mode) : undefined;
     const tools = this.filterToolsForCapabilities(
-      filterToolsForMode(this.registry.listDefinitions(), mode),
+      filterToolsForMode(this.registry.listDefinitions(), mode).filter((tool) =>
+        this.toolVisible(tool.name, mode),
+      ),
       capabilities,
     );
     const promptBase = {
@@ -567,6 +605,8 @@ export class AgentOrchestrator implements IAgentRunner {
       agentInstructions: this.globalRules,
       projectSummary: this.projectContext?.summary,
       skillsIndex: this.skills.buildIndexPrompt({ compact }),
+      autoDelegate: this.config?.orchestration?.auto_delegate ?? "off",
+      coordinatorPlan: true,
       compact,
       includeInstructions: false,
       includeClosing: false,
@@ -651,6 +691,28 @@ export class AgentOrchestrator implements IAgentRunner {
     return this.toAgentTask(worker, this.taskRequests.get(id));
   }
 
+  /**
+   * Stops one worker and everything attached to it: task board entry, pending
+   * approvals are cancelled by the client, and background processes it started.
+   */
+  async stopWorker(workerId: string): Promise<boolean> {
+    const stopped = this.subagents.stop(workerId);
+    this.tasks.cancelByWorker(workerId);
+    await this.bgProcesses.stopForWorker(workerId, true);
+    return stopped;
+  }
+
+  /** Stops every worker and cancels the board. Used when the app closes. */
+  async stopAllWorkers(): Promise<void> {
+    const workerIds = this.subagents
+      .listWorkers()
+      .filter((worker) => worker.status === "queued" || worker.status === "preparing" || worker.status === "running" || worker.status === "finalizing")
+      .map((worker) => worker.id);
+    this.tasks.cancelAll();
+    await this.subagents.stopAll();
+    await Promise.all(workerIds.map((id) => this.bgProcesses.stopForWorker(id, true)));
+  }
+
   private registerDefaultTools(): void {
     const lifecycle: HashlineLifecycle = {
       onBeforeModify: async (filePath) => {
@@ -718,6 +780,12 @@ export class AgentOrchestrator implements IAgentRunner {
     this.subagents.registerTools(this.registry);
     this.skills.registerTools(this.registry);
     this.tasks.registerTools(this.registry);
+    this.registry.register(
+      createCoordinateTool({
+        coordinator: this.coordinator,
+        enabled: () => (this.config?.orchestration?.auto_delegate ?? "off") !== "off",
+      }),
+    );
     this.hindsight.registerTools(this.registry);
     this.registry.register(createDiagnosticsCheckTool({ lsp: this.lsp, repoRoot: this.root }));
     this.bgProcesses.registerTools(this.registry);
@@ -915,6 +983,51 @@ export class AgentOrchestrator implements IAgentRunner {
       }
     }
 
+    const skillAccess = resolveSubagentSkillAccess(activeSpecialist, undefined);
+    const turnSkillContext = currentTurnContext();
+    if (turnSkillContext) {
+      turnSkillContext.skillPolicy = skillAccess.policy;
+      turnSkillContext.allowedSkills = skillAccess.allowed;
+    }
+
+    const autoDelegate = this.config?.orchestration?.auto_delegate ?? "off";
+    let coordinatorPrepass: CoordinatorResult | undefined;
+    let coordinatorPrepassError: string | undefined;
+    if (
+      autoDelegate === "always" &&
+      mode !== "plan" &&
+      !request.task &&
+      lastText.trim().length > 0
+    ) {
+      try {
+        coordinatorPrepass = await this.coordinator.coordinate(
+          { goal: lastText, context: request.context },
+          signal,
+        );
+        sink({
+          type: "advisor_note",
+          note: `Polaris planned ${coordinatorPrepass.tasks.length} task(s).`,
+          severity: "info",
+        });
+      } catch (error) {
+        coordinatorPrepassError = error instanceof Error ? error.message : String(error);
+        sink({
+          type: "advisor_note",
+          note: `Polaris planning failed: ${coordinatorPrepassError}. Continuing without a coordinator plan.`,
+          severity: "warning",
+        });
+      }
+      if (signal?.aborted) {
+        sink(usageEvent(totals, true));
+        sink({ type: "done", finish_reason: "aborted" });
+        return {
+          message: makeMessage(`${runId}-coordinator-aborted`, "assistant", ""),
+          usage: totals,
+          finish_reason: "aborted",
+        };
+      }
+    }
+
     const requestedRole: "main" | "fast" | "advisor" | undefined =
       activeSpecialist?.roleModel === "advisor" ||
       activeSpecialist?.roleModel === "fast" ||
@@ -1010,8 +1123,14 @@ export class AgentOrchestrator implements IAgentRunner {
       agentInstructions: this.globalRules,
       specialistPrompt: activeSpecialist?.systemPrompt,
       projectSummary: this.projectContext?.summary,
-      skillsIndex: this.skills.buildIndexPrompt({ compact }),
+      skillsIndex: this.skills.buildIndexPrompt({
+        compact,
+        policy: skillAccess.policy,
+        allowed: skillAccess.allowed,
+      }),
       extra: request.system,
+      autoDelegate,
+      coordinatorPlan: coordinatorPrepass !== undefined,
       compact,
       includeInstructions: !useInstructionState,
       includeClosing: false,
@@ -1082,6 +1201,29 @@ export class AgentOrchestrator implements IAgentRunner {
       `${runId}-closing`,
       closingReminder({ task: request.task }),
     );
+    if (coordinatorPrepass) {
+      insertBeforeLastUser(messages, [
+        {
+          ...makeMessage(
+            `${runId}-coordinator`,
+            "system",
+            formatCoordinatorPlan(coordinatorPrepass),
+          ),
+          metadata: { synthetic: true, coordinatorPlan: true },
+        },
+      ]);
+    } else if (coordinatorPrepassError) {
+      insertBeforeLastUser(messages, [
+        {
+          ...makeMessage(
+            `${runId}-coordinator-failed`,
+            "system",
+            `Polaris planning failed: ${coordinatorPrepassError}. Continue manually without a coordinator plan.`,
+          ),
+          metadata: { synthetic: true, coordinatorPlan: true },
+        },
+      ]);
+    }
     const overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
     const availableSkillCount = this.skills.listAvailableDocuments().length;
     const mentionedSkillNames = turnSkills.map((document) => document.name);
@@ -2571,6 +2713,8 @@ export class AgentOrchestrator implements IAgentRunner {
       provider: input.provider,
       model: input.model,
       writeIsolation: input.writeIsolation,
+      skills: input.skills,
+      parentSessionId: input.parentSessionId,
       onComplete: (finished) => {
         void this.captureWorkerOutcome(finished).then(resolveDone);
       },
@@ -2607,6 +2751,7 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 
   private async executeSubagent(input: SubagentTaskInput): Promise<SubagentTaskResult> {
+    if (input.signal.aborted) throw new Error("worker aborted");
     let specialist: SpecialistAgentProfile | undefined;
     if (input.agent) {
       specialist = await this.specialistAgents.getAgent(input.agent);
@@ -2616,6 +2761,16 @@ export class AgentOrchestrator implements IAgentRunner {
       if (mention?.profile) {
         specialist = mention.profile;
       }
+    }
+
+    const skillAccess = resolveSubagentSkillAccess(specialist, input.skills);
+    const turnContext = currentTurnContext();
+    if (turnContext) {
+      turnContext.skillPolicy = skillAccess.policy;
+      turnContext.allowedSkills = skillAccess.allowed;
+    }
+    if (skillAccess.dropped.length > 0) {
+      input.onTranscript(`[skills] not allowed: ${skillAccess.dropped.join(", ")}`);
     }
 
     const requestedRole = input.roleModel ?? specialist?.roleModel;
@@ -2645,6 +2800,28 @@ export class AgentOrchestrator implements IAgentRunner {
       : "";
     messages.push(makeMessage("subagent-task", "user", `${scope}${input.task}`));
     const totals = zeroUsage();
+
+    if (skillAccess.preload.length > 0) {
+      const preloaded: Message[] = [];
+      for (const name of skillAccess.preload) {
+        const document = this.skills.get(name);
+        if (!document) continue;
+        try {
+          preloaded.push(
+            makeMessage(
+              `subagent-skill-${normalizeSkillName(name)}`,
+              "system",
+              await formatSkillContent(document, this.skillMaxBodyChars),
+            ),
+          );
+        } catch (error) {
+          input.onTranscript(
+            `[skills] preload failed for ${name}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (preloaded.length > 0) messages.unshift(...preloaded);
+    }
 
     const effectiveMode = input.mode ?? (specialist?.readOnly ? "plan" : "build");
     let tools = this.filterToolsForCapabilities(
@@ -2676,13 +2853,29 @@ export class AgentOrchestrator implements IAgentRunner {
       agentInstructions: this.globalRules,
       specialistPrompt: specialist?.systemPrompt,
       projectSummary: this.projectContext?.summary,
-      skillsIndex: this.skills.buildIndexPrompt({ compact: compactPrompt }),
+      skillsIndex: this.skills.buildIndexPrompt({
+        compact: compactPrompt,
+        policy: skillAccess.policy,
+        allowed: skillAccess.allowed,
+      }),
       compact: compactPrompt,
       includeClosing: false,
       tools: tools.map((tool) => tool.name),
     });
     const subagentSystem = subagentSystemParts.map((part) => part.text).join("\n\n");
+    const structuredResponseFormat =
+      input.outputJsonSchema && capabilities.structured_output
+        ? {
+            type: "json_schema",
+            json_schema: {
+              name: "structured_output",
+              strict: false,
+              schema: input.outputJsonSchema,
+            },
+          }
+        : undefined;
     for (let turn = 0; turn < MAX_SUBAGENT_TURNS; turn += 1) {
+      if (input.signal.aborted) throw new Error("worker aborted");
       for (const instruction of input.drainSteerings()) {
         messages.push(makeMessage(`subagent-steer-${turn}`, "user", `Steering instruction: ${instruction}`));
         input.onTranscript(`steering: ${instruction}`);
@@ -2696,6 +2889,8 @@ export class AgentOrchestrator implements IAgentRunner {
         tools,
         tool_choice: tools.length > 0 ? "auto" : "none",
         max_tokens: subagentMaxTokens,
+        temperature: structuredResponseFormat ? 0 : undefined,
+        response_format: structuredResponseFormat,
         reasoning_effort: capabilities.reasoning ? "medium" : undefined,
       });
       for await (const event of provider.streamChat(chatRequest, input.signal)) {
@@ -2716,6 +2911,7 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
 
+      if (input.signal.aborted) throw new Error("worker aborted");
       const assistantMessage = accumulator.toMessage(`subagent-turn-${turn}`);
       messages.push(assistantMessage);
       const toolUses = assistantMessage.content.filter((block) => block.type === "tool_use");
@@ -2723,6 +2919,7 @@ export class AgentOrchestrator implements IAgentRunner {
         return this.finishSubagent(input, accumulator.textOutput(), totals);
       }
       for (const block of toolUses) {
+        if (input.signal.aborted) throw new Error("worker aborted");
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         input.onTranscript(`[tool] ${call.name}`);
         const specialistRules = specialist?.permissions?.length
@@ -2732,6 +2929,7 @@ export class AgentOrchestrator implements IAgentRunner {
         messages.push(
           toolResultMessage(call, typeof result.content === "string" ? result.content : JSON.stringify(result.content), result.is_error),
         );
+        if (input.signal.aborted) throw new Error("worker aborted");
       }
     }
     return this.finishSubagent(input, `subagent stopped after ${MAX_SUBAGENT_TURNS} turns`, totals);
@@ -2796,7 +2994,15 @@ export class AgentOrchestrator implements IAgentRunner {
       if (existing >= 0) combined[existing] = tool;
       else combined.push(tool);
     }
-    return combined;
+    return combined.filter((tool) => this.toolVisible(tool.name, mode));
+  }
+
+  private toolVisible(name: string, mode: AgentMode): boolean {
+    if (name !== "coordinate") return true;
+    const policy = this.config?.orchestration?.auto_delegate ?? "off";
+    if (policy === "off" || mode === "plan") return false;
+    if (policy === "ultrawork") return mode === "ultrawork";
+    return true;
   }
 
   private async collectDiagnostics(filePath: string, newContent: string): Promise<string | undefined> {

@@ -5,6 +5,7 @@ import type { JsonSchemaObject, SubagentResult, SubagentState, Usage } from "../
 import { SubagentResultSchema } from "../types/schema";
 import type { AgentMode } from "../types/schema";
 import type { WorktreeManager } from "../vcs/worktree";
+import { parseStructuredJson } from "./json-output";
 import { currentTurnContext, runWithTurnContext } from "./turn-context";
 
 export interface SubagentTaskInput {
@@ -18,6 +19,8 @@ export interface SubagentTaskInput {
   outputJsonSchema?: JsonSchemaObject;
   writeIsolation: boolean;
   worktreePath?: string;
+  /** Skills assigned to this worker. The specialist profile can narrow them. */
+  skills?: string[];
   signal: AbortSignal;
   onTranscript: (line: string) => void;
   onUsage: (usage: Usage) => void;
@@ -44,8 +47,11 @@ export interface SubagentWorkerState {
   provider?: string;
   model?: string;
   status: SubagentState;
+  detail?: string;
   transcript: string[];
   usage?: Usage;
+  /** Session that spawned this worker, used for session cost accounting. */
+  parentSessionId?: string;
   worktreePath?: string;
   outputJsonSchema?: JsonSchemaObject;
   structuredOutput?: unknown;
@@ -68,6 +74,8 @@ export interface SubagentSpawnTask {
   model?: string;
   outputJsonSchema?: JsonSchemaObject;
   writeIsolation?: boolean;
+  /** Skill allowlist for this task, narrowed by the specialist profile. */
+  skills?: string[];
   continueFrom?: string;
 }
 
@@ -81,6 +89,12 @@ const WORKER_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 /** Upper bound for one parallel batch, so a single call cannot flood the machine. */
 const MAX_PARALLEL_SUBAGENTS = 8;
+
+/** How long a worker gets to unwind after an abort before it is marked stopped. */
+const STOP_TIMEOUT_MS = 5_000;
+
+/** How long stopping waits for worktree cleanup before releasing the worker. */
+const CLEANUP_TIMEOUT_MS = 3_000;
 
 /** How much of the previous worker output a chain step receives. */
 const PREVIOUS_RESULT_LIMIT = 12_000;
@@ -98,15 +112,33 @@ const TRANSCRIPT_LIMIT = 500;
 export class SubagentManager {
   private readonly executor: SubagentExecutor;
   private readonly worktrees: WorktreeManager;
+  private readonly onUsage?: (worker: SubagentWorkerState, usage: Usage) => void;
+  private readonly stopTimeoutMs: number;
+  private readonly cleanupTimeoutMs: number;
   private readonly workers = new Map<string, SubagentWorkerState>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly steerings = new Map<string, string[]>();
   private readonly completions = new Map<string, Promise<void>>();
+  private readonly completionResolvers = new Map<string, () => void>();
+  private readonly completionCallbacks = new Map<string, (worker: SubagentWorkerState) => void>();
+  private readonly stopTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly parentAbortCleanup = new Map<string, () => void>();
+  private readonly cleanupPromises = new Map<string, Promise<void>>();
+  private readonly finished = new Set<string>();
   private counter = 0;
 
-  constructor(options: { executor: SubagentExecutor; worktrees: WorktreeManager }) {
+  constructor(options: {
+    executor: SubagentExecutor;
+    worktrees: WorktreeManager;
+    onUsage?: (worker: SubagentWorkerState, usage: Usage) => void;
+    stopTimeoutMs?: number;
+    cleanupTimeoutMs?: number;
+  }) {
     this.executor = options.executor;
     this.worktrees = options.worktrees;
+    this.onUsage = options.onUsage;
+    this.stopTimeoutMs = options.stopTimeoutMs ?? STOP_TIMEOUT_MS;
+    this.cleanupTimeoutMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS;
   }
 
   registerTools(registry: ToolRegistry): void {
@@ -132,6 +164,12 @@ export class SubagentManager {
     model?: string;
     outputJsonSchema?: JsonSchemaObject;
     writeIsolation?: boolean;
+    /** Skill allowlist for this worker, narrowed by the specialist profile. */
+    skills?: string[];
+    /** Session to bill for this worker. Defaults to the active turn session. */
+    parentSessionId?: string;
+    /** Parent turn signal; aborting it stops this worker too. */
+    signal?: AbortSignal;
     onComplete?: (worker: SubagentWorkerState) => void;
   }): SubagentWorkerState {
     this.counter += 1;
@@ -160,6 +198,7 @@ export class SubagentManager {
       model: input.model,
       status: "queued",
       transcript: [],
+      parentSessionId: input.parentSessionId ?? currentTurnContext()?.sessionId,
       outputJsonSchema: input.outputJsonSchema,
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -167,19 +206,131 @@ export class SubagentManager {
     this.workers.set(id, worker);
     this.controllers.set(id, controller);
     this.steerings.set(id, []);
-    const completion = this.runWorker(
+    this.completionCallbacks.set(id, input.onComplete ?? (() => undefined));
+
+    if (input.signal) {
+      const parentSignal = input.signal;
+      const abortFromParent = (): void => {
+        controller.abort(parentSignal.reason);
+        this.stop(worker.id);
+      };
+      if (parentSignal.aborted) abortFromParent();
+      else parentSignal.addEventListener("abort", abortFromParent, { once: true });
+      this.parentAbortCleanup.set(id, () =>
+        parentSignal.removeEventListener("abort", abortFromParent),
+      );
+    }
+
+    const completion = new Promise<void>((resolve) => {
+      this.completionResolvers.set(id, resolve);
+    });
+    this.completions.set(id, completion);
+
+    void this.runWorker(
       worker,
       { ...input, mode: input.mode ?? currentTurnContext()?.mode ?? "build" },
       controller,
     )
       .catch(() => {
-        // runWorker records failures on the worker state
+        // runWorker records failures on the worker state.
       })
       .finally(() => {
-        input.onComplete?.(worker);
+        this.finishCompletion(worker);
       });
-    this.completions.set(id, completion);
+
     return worker;
+  }
+
+  /**
+   * Stops a worker without waiting for its underlying operation to finish.
+   * A timeout marks it stopped even when a provider or tool ignores the abort.
+   */
+  stop(workerId: string): boolean {
+    const worker = this.workers.get(workerId);
+    if (!worker) return false;
+    if (isTerminalStatus(worker.status) || this.finished.has(workerId)) return false;
+
+    const controller = this.controllers.get(workerId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort(new Error("worker stopped by user"));
+    } else if (!controller) {
+      void this.forceStop(worker);
+      return true;
+    }
+
+    worker.detail = "stop requested";
+    worker.updatedAt = Date.now();
+    if (!this.stopTimers.has(workerId)) {
+      const timer = setTimeout(() => {
+        void this.forceStop(worker);
+      }, this.stopTimeoutMs);
+      this.stopTimers.set(workerId, timer);
+    }
+    return true;
+  }
+
+  /** Backwards-compatible alias used by the task board and older callers. */
+  kill(workerId: string): boolean {
+    return this.stop(workerId);
+  }
+
+  async stopAll(): Promise<void> {
+    const ids = [...this.controllers.keys()];
+    for (const id of ids) this.stop(id);
+    await Promise.all(ids.map((id) => this.completions.get(id) ?? Promise.resolve()));
+  }
+
+  private async forceStop(worker: SubagentWorkerState): Promise<void> {
+    if (isTerminalStatus(worker.status) || this.finished.has(worker.id)) return;
+    worker.status = "aborted";
+    worker.detail = "stopped after timeout";
+    worker.error = { code: "aborted", message: "worker stopped by user" };
+    if (!worker.result) {
+      worker.result = SubagentResultSchema.parse({
+        id: worker.id,
+        state: "aborted",
+        output: worker.transcript.slice(-10).join("\n"),
+        error: worker.error,
+        started_at: worker.createdAt,
+        finished_at: Date.now(),
+      });
+    } else {
+      worker.result.state = "aborted";
+      worker.result.error = worker.error;
+    }
+
+    this.finishCompletion(worker);
+    void withTimeout(this.discardFailedWorktree(worker), this.cleanupTimeoutMs).catch(() => {
+      worker.detail = "stopped; worktree cleanup failed";
+    });
+  }
+
+  private finishCompletion(worker: SubagentWorkerState): void {
+    if (this.finished.has(worker.id)) return;
+    this.finished.add(worker.id);
+
+    const timer = this.stopTimers.get(worker.id);
+    if (timer) clearTimeout(timer);
+    this.parentAbortCleanup.get(worker.id)?.();
+
+    const callback = this.completionCallbacks.get(worker.id);
+    const resolve = this.completionResolvers.get(worker.id);
+
+    this.stopTimers.delete(worker.id);
+    this.parentAbortCleanup.delete(worker.id);
+    this.completionCallbacks.delete(worker.id);
+    this.completionResolvers.delete(worker.id);
+    this.completions.delete(worker.id);
+    this.controllers.delete(worker.id);
+    this.steerings.delete(worker.id);
+    worker.updatedAt = Date.now();
+
+    try {
+      callback?.(worker);
+    } catch {
+      // A broken completion callback must not keep the worker alive.
+    }
+    resolve?.();
   }
 
   async spawn(tasks: SubagentSpawnTask[]): Promise<SubagentResult[]> {
@@ -195,7 +346,7 @@ export class SubagentManager {
    */
   async spawnBatch(
     tasks: SubagentSpawnTask[],
-    options: { mode?: SubagentBatchMode; merge?: boolean } = {},
+    options: { mode?: SubagentBatchMode; merge?: boolean; signal?: AbortSignal } = {},
   ): Promise<{ results: SubagentResult[]; merged: SubagentMergeReport[] }> {
     const mode = options.mode ?? "parallel";
     const resolvedTasks = tasks.map((task) => this.withContinuation(task));
@@ -208,8 +359,9 @@ export class SubagentManager {
           ...task,
           task: index === 0 ? task.task : interpolatePrevious(task.task, previous),
           writeIsolation: task.writeIsolation ?? false,
+          signal: options.signal,
         });
-        await this.completions.get(worker.id);
+        await (this.completions.get(worker.id) ?? Promise.resolve());
         const result = this.resultOf(worker);
         results.push(result);
         previous = result.output;
@@ -221,8 +373,12 @@ export class SubagentManager {
           `too many parallel subagents (${resolvedTasks.length}). The limit is ${MAX_PARALLEL_SUBAGENTS}; split the batch or use chain mode.`,
         );
       }
-      const workers = resolvedTasks.map((task) => this.spawnOne(task));
-      await Promise.all(workers.map((worker) => this.completions.get(worker.id)));
+      const workers = resolvedTasks.map((task) =>
+        this.spawnOne({ ...task, signal: options.signal }),
+      );
+      await Promise.all(
+        workers.map((worker) => this.completions.get(worker.id) ?? Promise.resolve()),
+      );
       results.push(...workers.map((worker) => this.resultOf(worker)));
     }
 
@@ -301,21 +457,56 @@ export class SubagentManager {
     this.steerings.get(workerId)?.push(instruction);
   }
 
-  kill(workerId: string): boolean {
-    const worker = this.workers.get(workerId);
-    const controller = this.controllers.get(workerId);
-    if (!worker || !controller) return false;
-    controller.abort();
-    return true;
+  private discardFailedWorktree(worker: SubagentWorkerState): Promise<void> {
+    if (!worker.worktreePath) return Promise.resolve();
+    const existing = this.cleanupPromises.get(worker.id);
+    if (existing) return existing;
+    const cleanup = (async () => {
+      try {
+        if (!(await this.worktrees.removeWorktree(worker.id))) return;
+        worker.worktreePath = undefined;
+        if (worker.result) worker.result.worktree_path = undefined;
+      } catch {
+        // Keep the path when cleanup fails so the user can inspect it.
+      }
+    })().finally(() => {
+      this.cleanupPromises.delete(worker.id);
+    });
+    this.cleanupPromises.set(worker.id, cleanup);
+    return cleanup;
   }
 
   private async runWorker(
     worker: SubagentWorkerState,
-    input: { task: string; mode?: AgentMode; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean; onComplete?: (worker: SubagentWorkerState) => void },
+    input: { task: string; mode?: AgentMode; outputJsonSchema?: JsonSchemaObject; writeIsolation?: boolean; skills?: string[]; onComplete?: (worker: SubagentWorkerState) => void },
     controller: AbortController,
-  ): Promise<void> {    const startedAt = Date.now();
+  ): Promise<void> {
+    const startedAt = Date.now();
     const planWorker = (input.mode ?? "build") === "plan";
     const writeIsolation = planWorker ? false : input.writeIsolation ?? true;
+
+    const finishAborted = async (message = "worker stopped by user"): Promise<void> => {
+      worker.status = "aborted";
+      worker.error = { code: "aborted", message };
+      if (!worker.result) {
+        worker.result = SubagentResultSchema.parse({
+          id: worker.id,
+          state: "aborted",
+          output: worker.transcript.slice(-10).join("\n"),
+          error: worker.error,
+          started_at: startedAt,
+          finished_at: Date.now(),
+        });
+      }
+      await this.discardFailedWorktree(worker);
+      worker.updatedAt = Date.now();
+    };
+
+    if (controller.signal.aborted) {
+      await finishAborted();
+      return;
+    }
+
     if (writeIsolation) {
       worker.status = "preparing";
       try {
@@ -326,6 +517,10 @@ export class SubagentManager {
         worker.updatedAt = Date.now();
         return;
       }
+      if (controller.signal.aborted) {
+        await finishAborted();
+        return;
+      }
     }
 
     worker.status = "running";
@@ -334,7 +529,13 @@ export class SubagentManager {
       // The worker runs inside its own turn context so every tool resolves
       // paths and the shell against the worktree instead of the main checkout.
       const result = await runWithTurnContext(
-        { mode: input.mode ?? "build", workspaceRoot: worker.worktreePath },
+        {
+          mode: input.mode ?? "build",
+          sessionId: worker.parentSessionId,
+          workerId: worker.id,
+          workspaceRoot: worker.worktreePath,
+          allowedSkills: input.skills,
+        },
         () =>
           this.executor({
             workerId: worker.id,
@@ -347,6 +548,7 @@ export class SubagentManager {
             outputJsonSchema: input.outputJsonSchema,
             writeIsolation,
             worktreePath: worker.worktreePath,
+            skills: input.skills,
             signal: controller.signal,
             onTranscript: (line) => {
               worker.transcript.push(line);
@@ -368,6 +570,7 @@ export class SubagentManager {
                 cache_read_input_tokens: current.cache_read_input_tokens + usage.cache_read_input_tokens,
                 cache_creation_input_tokens: current.cache_creation_input_tokens + usage.cache_creation_input_tokens,
               };
+              this.onUsage?.(worker, usage);
             },
             drainSteerings: () => {
               const queued = this.steerings.get(worker.id) ?? [];
@@ -377,10 +580,14 @@ export class SubagentManager {
           }),
       );
 
+      if (controller.signal.aborted) {
+        throw new Error("worker aborted");
+      }
+
       worker.status = "finalizing";
       if (input.outputJsonSchema) {
         try {
-          worker.structuredOutput = JSON.parse(result.output) as unknown;
+          worker.structuredOutput = parseStructuredJson(result.output);
         } catch (error) {
           worker.status = "failed";
           worker.error = {
@@ -388,6 +595,9 @@ export class SubagentManager {
             message: error instanceof Error ? error.message : String(error),
           };
         }
+      }
+      if (controller.signal.aborted) {
+        throw new Error("worker aborted");
       }
       if (worker.status === "finalizing") worker.status = "completed";
       worker.result = SubagentResultSchema.parse({
@@ -404,22 +614,28 @@ export class SubagentManager {
         finished_at: Date.now(),
       });
     } catch (error) {
-      const aborted = controller.signal.aborted;
+      const aborted = controller.signal.aborted || (worker.status as string) === "aborted";
       worker.status = aborted ? "aborted" : "failed";
       worker.error = {
         code: aborted ? "aborted" : "executor_failed",
         message: error instanceof Error ? error.message : String(error),
       };
-      worker.result = SubagentResultSchema.parse({
-        id: worker.id,
-        state: aborted ? "aborted" : "failed",
-        output: worker.transcript.slice(-10).join("\n"),
-        error: worker.error,
-        started_at: startedAt,
-        finished_at: Date.now(),
-      });
+      if (!worker.result) {
+        worker.result = SubagentResultSchema.parse({
+          id: worker.id,
+          state: aborted ? "aborted" : "failed",
+          output: worker.transcript.slice(-10).join("\n"),
+          error: worker.error,
+          started_at: startedAt,
+          finished_at: Date.now(),
+        });
+      }
+    } finally {
+      if (worker.status === "failed" || worker.status === "aborted") {
+        await this.discardFailedWorktree(worker);
+      }
+      worker.updatedAt = Date.now();
     }
-    worker.updatedAt = Date.now();
   }
 
   private spawnTool(): AgentTool {
@@ -448,6 +664,7 @@ export class SubagentManager {
               model: z.string().min(1).optional(),
               outputJsonSchema: z.record(z.string(), z.unknown()).optional(),
               writeIsolation: z.boolean().optional(),
+              skills: z.array(z.string().min(1)).optional(),
               continue_from: z.string().min(1).optional(),
             }),
           )
@@ -456,7 +673,7 @@ export class SubagentManager {
         merge: z.boolean().default(false),
       }),
       readOnly: false,
-      execute: async (args) => {
+      execute: async (args, context) => {
         const request = args as {
           tasks: Array<{
             id?: string;
@@ -468,6 +685,7 @@ export class SubagentManager {
             model?: string;
             outputJsonSchema?: JsonSchemaObject;
             writeIsolation?: boolean;
+            skills?: string[];
             continue_from?: string;
           }>;
           mode: SubagentBatchMode;
@@ -484,9 +702,10 @@ export class SubagentManager {
             model: entry.model,
             outputJsonSchema: entry.outputJsonSchema,
             writeIsolation: entry.writeIsolation,
+            skills: entry.skills,
             continueFrom: entry.continue_from,
           })),
-          { mode: request.mode, merge: request.merge },
+          { mode: request.mode, merge: request.merge, signal: context?.signal },
         );
 
         const sections = batch.results.map((result) => {
@@ -528,5 +747,30 @@ export class SubagentManager {
 
 function buildTaskText(task: string, outputJsonSchema: JsonSchemaObject | undefined): string {
   if (!outputJsonSchema) return task;
-  return `${task}\n\nRespond with a single JSON value that matches this JSON Schema:\n${JSON.stringify(outputJsonSchema)}`;
+  return [
+    task,
+    "Respond with a single raw JSON value that matches this JSON Schema.",
+    "Do not wrap the JSON in Markdown code fences or add prose around it.",
+    "Do not use trailing commas. Return one complete JSON object.",
+    JSON.stringify(outputJsonSchema),
+  ].join("\n\n");
+}
+
+function isTerminalStatus(status: SubagentState): boolean {
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "aborted" ||
+    status === "timed_out"
+  );
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }

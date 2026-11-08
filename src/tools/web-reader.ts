@@ -14,6 +14,8 @@ export interface WebSearchSession {
 
 export interface WebReaderOptions {
   fetchImpl?: typeof fetch;
+  /** Abort signal from the calling tool, so stopping a worker cancels its request. */
+  signal?: AbortSignal;
   env?: Record<string, string | undefined>;
   endpoints?: {
     tavily?: string;
@@ -90,11 +92,11 @@ export function createWebSearchTool(options: WebReaderOptions = {}): AgentTool {
       query: z.string().min(1).describe("Web search query."),
     }),
     readOnly: true,
-    execute: async (args) => {
+    execute: async (args, context) => {
       const request = args as { query: string };
       const result = await webSearch(
         { ...request, maxResults: options.search?.max_results },
-        options,
+        { ...options, signal: context?.signal },
       );
       return formatSearchResults(request.query, result);
     },
@@ -121,9 +123,14 @@ export function createWebFetchTool(options: WebReaderOptions = {}): AgentTool {
         .describe(`Optional timeout in seconds (maximum: ${MAX_FETCH_TIMEOUT_SECONDS}).`),
     }),
     readOnly: true,
-    execute: async (args) => {
+    execute: async (args, context) => {
       const request = args as { url: string; format: WebFetchFormat; timeout?: number };
-      return webFetch(request.url, { ...options, format: request.format, timeout: request.timeout });
+      return webFetch(request.url, {
+        ...options,
+        format: request.format,
+        timeout: request.timeout,
+        signal: context?.signal,
+      });
     },
   };
 }
@@ -222,8 +229,13 @@ function parseRetryAfter(value: string | null): number {
   return 60_000;
 }
 
-function searchInit(init: RequestInit): RequestInit {
-  return { ...init, signal: AbortSignal.timeout(30_000) };
+function requestSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([timeout, signal]) : timeout;
+}
+
+function searchInit(init: RequestInit, signal?: AbortSignal): RequestInit {
+  return { ...init, signal: requestSignal(30_000, signal) };
 }
 
 function assertSearchResponse(response: Response, provider: WebSearchProvider): void {
@@ -251,7 +263,7 @@ async function searchWith(
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
         body: JSON.stringify({ query, max_results: maxResults }),
-      }),
+      }, options.signal),
     );
     assertSearchResponse(response, provider);
     const body = (await readJson(response)) as {
@@ -269,7 +281,7 @@ async function searchWith(
     const key = requireKey(env, "BRAVE_API_KEY");
     const response = await fetchImpl(
       `${endpoints.brave}?q=${encodeURIComponent(query)}&count=${maxResults}`,
-      searchInit({ headers: { accept: "application/json", "x-subscription-token": key } }),
+      searchInit({ headers: { accept: "application/json", "x-subscription-token": key } }, options.signal),
     );
     assertSearchResponse(response, provider);
     const body = (await readJson(response)) as {
@@ -299,7 +311,7 @@ async function searchWith(
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": key },
         body: JSON.stringify({ query, numResults: maxResults }),
-      }),
+      }, options.signal),
     );
     assertSearchResponse(response, provider);
     const body = (await readJson(response)) as {
@@ -321,7 +333,7 @@ async function searchWith(
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
         body: JSON.stringify({ query, limit: maxResults }),
-      }),
+      }, options.signal),
     );
     assertSearchResponse(response, provider);
     const body = (await readJson(response)) as {
@@ -342,7 +354,7 @@ async function searchWith(
 
   const response = await fetchImpl(
     `${endpoints.duckduckgo}?q=${encodeURIComponent(query)}`,
-    searchInit({ headers: { accept: "text/html" } }),
+    searchInit({ headers: { accept: "text/html" } }, options.signal),
   );
   assertSearchResponse(response, provider);
   return parseDuckDuckGo(await response.text(), maxResults);
@@ -467,7 +479,7 @@ async function requestWithCloudflareRetry(
   const fetchImpl = options.fetchImpl ?? fetch;
   const init: RequestInit = {
     headers: fetchHeaders(format),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: requestSignal(timeoutMs, options.signal),
   };
   let response = await fetchImpl(url, init);
   if (response.status === 403 && response.headers.get("cf-mitigated") === "challenge") {
@@ -591,7 +603,7 @@ async function fetchGithub(
   const repo = parts[1] ?? "";
   const init = (headers: Record<string, string>): RequestInit => ({
     headers: { ...headers, "user-agent": DEFAULT_USER_AGENT },
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: requestSignal(timeoutMs, options.signal),
   });
 
   if (parts.length === 2) {
@@ -657,7 +669,7 @@ async function fetchPdf(url: string, options: WebFetchOptions, timeoutMs: number
   const fetchImpl = options.fetchImpl ?? fetch;
   const response = await fetchImpl(url, {
     headers: { "user-agent": DEFAULT_USER_AGENT },
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: requestSignal(timeoutMs, options.signal),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
   const bytes = new Uint8Array(await response.arrayBuffer());

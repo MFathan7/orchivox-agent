@@ -1,6 +1,7 @@
+import type { AutoDelegateMode } from "../../config/loader";
 import type { AgentMode } from "../../types/schema";
 
-export type PromptPartKind = "agent" | "tools" | "instructions" | "extra" | "closing";
+export type PromptPartKind = "agent" | "tools" | "instructions" | "coordinator" | "extra" | "closing";
 
 export interface PromptPart {
   kind: PromptPartKind;
@@ -32,6 +33,10 @@ export interface SystemPromptOptions {
   projectSummary?: string;
   skillsIndex?: string;
   extra?: string;
+  /** Automatic coordinator policy for this session. */
+  autoDelegate?: AutoDelegateMode;
+  /** True when an "always" turn already has a Polaris plan in the conversation. */
+  coordinatorPlan?: boolean;
   compact?: boolean;
   /** Include environment, project, rules, and skills in the system prompt. Defaults to true. */
   includeInstructions?: boolean;

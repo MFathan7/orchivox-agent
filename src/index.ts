@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import React from "react";
 import { render } from "ink";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, writeSync } from "node:fs";
 
 import {
   AgentGatewayServer,
@@ -32,7 +32,6 @@ import {
   GranularPermissionEngine,
   resolvePermissionRules,
   type ApprovalDecision,
-  type ApprovalRequest,
 } from "./agent/permissions";
 import { CollabRelay } from "./collab/relay";
 import {
@@ -40,12 +39,14 @@ import {
   sharedModeModel,
   type AppConfig,
   type ApprovalPreset,
+  type AutoDelegateMode,
 } from "./config/loader";
 import { resolveConfigPaths, type ConfigSource } from "./config/paths";
 import {
   clearModeModelSelections,
   saveActiveMode,
   saveApprovalsPreset,
+  saveAutoDelegate,
   saveModeReasoning,
   saveModeSteps,
   saveRoleSelection,
@@ -79,12 +80,18 @@ import {
   type ThinkingSegmentView,
 } from "./tui/app";
 import { applyCompactionMeter, applyContextEstimate } from "./tui/session-meter";
-import type { SettingsMode } from "./tui/settings-modal";
+import { AUTO_DELEGATE_LABELS, type SettingsMode } from "./tui/settings-modal";
 import { formatStatsReport } from "./tui/stats-report";
 import { buildTranscriptEntries } from "./tui/transcript";
 import { finalizeToolCalls } from "./tui/tool-state";
-import { enterTerminal, leaveTerminal, setTerminalTitle } from "./tui/terminal-protocol";
+import {
+  enterTerminal,
+  installFatalHandlers,
+  leaveTerminal,
+  setTerminalTitle,
+} from "./tui/terminal-protocol";
 import type { FileAttachmentRef } from "./tui/composer";
+import { ApprovalQueue } from "./tui/approval-queue";
 import type { PendingQuestion } from "./tui/question-modal";
 import type { QuestionAnswer } from "./tools/question";
 import type { HashlineLifecycle } from "./tools/hashline-edit";
@@ -382,6 +389,7 @@ export async function bootstrap(
     mcpServers: mcpReport.connected.map((entry) => entry.server),
     close: async () => {
       unsubscribeLearned();
+      await orchestrator.stopAllWorkers();
       await orchestrator.bgProcesses.stopAll();
       await mcpClient.close();
       await lsp?.dispose();
@@ -545,13 +553,31 @@ async function runTuiSession(
   options?: CliOptions,
   terminalAppearance: TerminalAppearance = "unknown",
 ): Promise<{ close: () => Promise<void> }> {
+  const projectName = basename(globalThis.process.cwd());
+  const root = globalThis.process.cwd();
   // Enter first, then push the keyboard flags. The composer must not push
   // again, otherwise the terminal keyboard stack is left dirty on exit.
   enterTerminal();
+  const writeFatal = (chunk: string): void => {
+    try {
+      writeSync(1, chunk);
+    } catch {
+      // stdout may already be closed during a fatal error.
+    }
+  };
+  const uninstallFatalHandlers = installFatalHandlers((error, signal) => {
+    setTerminalTitle(projectName, writeFatal);
+    leaveTerminal(writeFatal);
+    const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+    try {
+      writeSync(2, `orchivox: ${signal}: ${detail}\n`);
+    } catch {
+      // stderr may already be closed during a fatal error.
+    }
+    globalThis.process.exit(1);
+  });
   const stopFreezeMonitor = startEventLoopMonitor();
 
-  const projectName = basename(globalThis.process.cwd());
-  const root = globalThis.process.cwd();
   setTerminalTitle(`Orchivox - ${projectName}`);
   const trustManager = new WorkspaceTrustManager();
   let isWorkspaceTrusted = Boolean(options?.trust || trustManager.isTrusted(root));
@@ -564,6 +590,7 @@ async function runTuiSession(
     entries: [] as ChatEntryView[],
     messages: [] as Message[],
     mode: runtime.config.active_mode as AgentMode,
+    autoDelegate: runtime.config.orchestration.auto_delegate as AutoDelegateMode,
     currentTheme: themeChoice.theme,
     themeSelection: themeChoice.selection,
     terminalAppearance,
@@ -659,18 +686,15 @@ async function runTuiSession(
   };
   let relay: CollabRelay | undefined;
   let branch = "unknown";
-  let pendingApproval: ApprovalRequest | undefined;
-  let approvalResolver: ((decision: ApprovalDecision) => void) | undefined;
+  const approvals = new ApprovalQueue();
   let pendingQuestion: PendingQuestion | undefined;
   let questionResolver: ((answer: QuestionAnswer) => void) | undefined;
   let activeAbortController: AbortController | undefined;
 
   runtime.orchestrator.permissions.setApprovalHandler((request) => {
-    return new Promise<ApprovalDecision>((resolve) => {
-      pendingApproval = request;
-      approvalResolver = resolve;
-      rerender();
-    });
+    const decision = approvals.enqueue(request);
+    rerender();
+    return decision;
   });
   runtime.orchestrator.setQuestionHandler((request) => {
     return new Promise<QuestionAnswer>((resolve) => {
@@ -878,6 +902,39 @@ async function runTuiSession(
     rerender();
   };
 
+  /**
+   * Worker usage is persisted by the orchestrator. Reading the session back
+   * keeps the header cost and /stats accurate without double counting.
+   */
+  const refreshSessionUsage = (): void => {
+    if (!state.sessionId) return;
+    try {
+      const session = runtime.database.getSession(state.sessionId);
+      if (!session) return;
+      state.totalTokens = session.totalTokens;
+      state.totalCostUsd = session.totalCostUsd;
+    } catch {
+      // Usage refresh is best effort.
+    }
+  };
+
+  /** Drop approvals whose worker already stopped, including stops started by a tool. */
+  const pruneStoppedApprovals = (): void => {
+    for (const request of approvals.pendingRequests()) {
+      if (!request.workerId) continue;
+      const worker = runtime.orchestrator.subagents.getWorker(request.workerId);
+      if (
+        !worker ||
+        worker.status === "completed" ||
+        worker.status === "failed" ||
+        worker.status === "aborted" ||
+        worker.status === "timed_out"
+      ) {
+        approvals.cancelForWorker(request.workerId, "worker stopped");
+      }
+    }
+  };
+
   const applyThemeSelection = (next: ThemeSelection): void => {
     const choice = resolveThemeChoice(next, state.terminalAppearance);
     state.themeSelection = choice.selection;
@@ -1032,6 +1089,7 @@ async function runTuiSession(
       rerender();
     },
     approvalsPreset: runtime.config.approvals.preset ?? "safer",
+    autoDelegate: state.autoDelegate,
     modeSteps: {
       plan: runtime.config.modes.plan.steps ?? 0,
       build: runtime.config.modes.build.steps ?? 0,
@@ -1045,6 +1103,15 @@ async function runTuiSession(
         setNotice(`could not save approval preset: ${error instanceof Error ? error.message : String(error)}`, 8000);
       });
       setNotice(`Approval preset: ${preset}`, 6000);
+      rerender();
+    },
+    onAutoDelegateChange: (mode: AutoDelegateMode) => {
+      state.autoDelegate = mode;
+      runtime.config.orchestration.auto_delegate = mode;
+      void saveAutoDelegate(runtime.configPath, mode).catch((error) => {
+        setNotice(`could not save auto coordinator: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      });
+      setNotice(`Auto coordinator: ${AUTO_DELEGATE_LABELS[mode]}`, 6000);
       rerender();
     },
     onModeStepsChange: (mode: SettingsMode, steps: number) => {
@@ -1065,7 +1132,13 @@ async function runTuiSession(
       rerender();
     },
     onCancelTask: (id: string) => {
+      const task = runtime.orchestrator.tasks.get(id);
+      if (task?.workerId) {
+        approvals.cancelForWorker(task.workerId, "task cancelled");
+        void runtime.orchestrator.stopWorker(task.workerId);
+      }
       runtime.orchestrator.tasks.cancel(id);
+      refreshSessionUsage();
       rerender();
     },
     onDispatchTasks: () => {
@@ -1216,22 +1289,15 @@ async function runTuiSession(
         pendingQuestion = undefined;
         resolve({ selected: [], cancelled: true });
       }
-      if (approvalResolver) {
-        const resolve = approvalResolver;
-        approvalResolver = undefined;
-        pendingApproval = undefined;
-        resolve({ approved: false, choice: "deny", reason: "Active session deleted." });
-      }
+      approvals.cancelAll("Active session deleted.");
       resetToWelcome();
       setNotice("Session deleted. Starting a new draft.", 5000);
       rerender();
     },
-    pendingApproval,
+    pendingApproval: approvals.current(),
     onApprovalDecision: (decision: ApprovalDecision) => {
-      const resolver = approvalResolver;
-      pendingApproval = undefined;
-      approvalResolver = undefined;
-      resolver?.(decision);
+      const current = approvals.current();
+      if (current) approvals.resolve(current.id, decision);
       rerender();
     },
     pendingQuestion,
@@ -1273,8 +1339,26 @@ async function runTuiSession(
       rerender();
     },
     onKill: (workerId: string) => {
-      runtime.orchestrator.subagents.kill(workerId);
-      pushEntry("system", `kill sent to ${workerId}`);
+      approvals.cancelForWorker(workerId, "worker stopped");
+      setNotice(`stopping ${workerId}...`, 5000);
+      void runtime.orchestrator.stopWorker(workerId).then((stopped) => {
+        refreshSessionUsage();
+        pushEntry(
+          "system",
+          stopped ? `stopped ${workerId}` : `${workerId} was already finished`,
+        );
+        rerender();
+      });
+      rerender();
+    },
+    onKillAll: () => {
+      approvals.cancelAll("all workers stopped");
+      setNotice("stopping all workers...", 5000);
+      void runtime.orchestrator.stopAllWorkers().then(() => {
+        refreshSessionUsage();
+        pushEntry("system", "stopped all workers");
+        rerender();
+      });
       rerender();
     },
     onAbort: () => {
@@ -1284,12 +1368,7 @@ async function runTuiSession(
         pendingQuestion = undefined;
         resolve({ selected: [], cancelled: true });
       }
-      if (approvalResolver) {
-        const resolve = approvalResolver;
-        approvalResolver = undefined;
-        pendingApproval = undefined;
-        resolve({ approved: false, choice: "deny", reason: "Cancelled by user." });
-      }
+      approvals.cancelAll("Cancelled by user.");
       if (activeAbortController) {
         activeAbortController.abort();
         pushEntry("system", "process cancelled by user.");
@@ -1329,6 +1408,11 @@ async function runTuiSession(
   const unsubscribeCapabilities = runtime.router.onCapabilitiesChanged(rerender);
 
   const activityTimer = setInterval(() => {
+    pruneStoppedApprovals();
+    const tokensBefore = state.totalTokens;
+    const costBefore = state.totalCostUsd;
+    refreshSessionUsage();
+    const usageChanged = tokensBefore !== state.totalTokens || costBefore !== state.totalCostUsd;
     const workers = runtime.orchestrator.subagents.listWorkers();
     const tasks = runtime.orchestrator.tasks.list();
     const activeWorker = workers.some(
@@ -1339,7 +1423,7 @@ async function runTuiSession(
         worker.status === "finalizing",
     );
     const activeTask = tasks.some((task) => task.state === "pending" || task.state === "running");
-    if (activeWorker || activeTask) rerender();
+    if (activeWorker || activeTask || usageChanged) rerender();
   }, 750);
 
   const executeTurn = async (
@@ -1968,6 +2052,7 @@ async function runTuiSession(
       cancelCompaction();
       state.liveEntry = undefined;
       state.streamingText = "";
+      refreshSessionUsage();
       if (state.sessionId === sessionId) {
         try {
           state.messages = runtime.database.loadMessages(sessionId);
@@ -2530,6 +2615,9 @@ async function runTuiSession(
     synced.uninstall();
     setTerminalTitle(projectName);
     leaveTerminal();
+    process.removeListener("SIGINT", cleanupSignals);
+    process.removeListener("SIGTERM", cleanupSignals);
+    uninstallFatalHandlers();
     void runtime.close().then(() => {
       process.exit(0);
     });
@@ -2543,10 +2631,11 @@ async function runTuiSession(
   unsubscribeCapabilities();
   stopFreezeMonitor();
   synced.uninstall();
-  process.removeListener("SIGINT", cleanupSignals);
-  process.removeListener("SIGTERM", cleanupSignals);
   setTerminalTitle(projectName);
   leaveTerminal();
+  process.removeListener("SIGINT", cleanupSignals);
+  process.removeListener("SIGTERM", cleanupSignals);
+  uninstallFatalHandlers();
   await relay?.close();
   await runtime.close();
   print("session closed");

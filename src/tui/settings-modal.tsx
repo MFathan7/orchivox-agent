@@ -1,7 +1,7 @@
 import React from "react";
 import { Box, Text, useInput } from "ink";
 
-import type { ApprovalPreset } from "../config/loader";
+import type { ApprovalPreset, AutoDelegateMode } from "../config/loader";
 import { isMouseSequence } from "./mouse";
 import { useActiveTheme, type Theme } from "./theme";
 
@@ -9,12 +9,14 @@ export type SettingsMode = "plan" | "build" | "ultrawork";
 
 export interface SettingsModalProps {
   preset: ApprovalPreset;
+  autoDelegate: AutoDelegateMode;
   steps: Record<SettingsMode, number>;
   configPath: string;
   configSource: string;
   width?: number;
   theme?: Theme;
   onPresetChange: (preset: ApprovalPreset) => void;
+  onAutoDelegateChange: (mode: AutoDelegateMode) => void;
   onStepsChange: (mode: SettingsMode, steps: number) => void;
   onClose: () => void;
 }
@@ -37,12 +39,38 @@ const PRESET_DESCRIPTIONS: Record<ApprovalPreset, string> = {
   custom: "Use only the permissions list from this config.",
 };
 
+const AUTO_DELEGATE_VALUES: AutoDelegateMode[] = ["off", "ultrawork", "always"];
+
+export const AUTO_DELEGATE_LABELS: Record<AutoDelegateMode, string> = {
+  off: "Off",
+  ultrawork: "Ultrawork only",
+  always: "Always",
+};
+
+export const AUTO_DELEGATE_DESCRIPTIONS: Record<AutoDelegateMode, string> = {
+  off: "No automatic planning pass. Subagents still work when called.",
+  ultrawork: "Plan with Polaris in Ultrawork. Build stays direct.",
+  always: "Plan with Polaris in every Build and Ultrawork turn. This adds model calls.",
+};
+
 interface Row {
-  id: "preset" | SettingsMode | "config";
+  id: "preset" | "auto_delegate" | SettingsMode | "config";
   label: string;
   value: string;
   detail?: string;
   editable: boolean;
+}
+
+function nextAutoDelegate(
+  current: AutoDelegateMode,
+  direction: 1 | -1,
+): AutoDelegateMode {
+  const index = Math.max(0, AUTO_DELEGATE_VALUES.indexOf(current));
+  return (
+    AUTO_DELEGATE_VALUES[
+      (index + direction + AUTO_DELEGATE_VALUES.length) % AUTO_DELEGATE_VALUES.length
+    ] ?? "off"
+  );
 }
 
 function nextStep(current: number, direction: 1 | -1): number {
@@ -63,12 +91,14 @@ function nextPreset(current: ApprovalPreset, direction: 1 | -1): ApprovalPreset 
 export function SettingsModal(props: SettingsModalProps): React.ReactElement {
   const {
     preset,
+    autoDelegate,
     steps,
     configPath,
     configSource,
     width = 100,
     theme: themeProp,
     onPresetChange,
+    onAutoDelegateChange,
     onStepsChange,
     onClose,
   } = props;
@@ -80,6 +110,13 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
       label: "Approval preset",
       value: PRESET_LABELS[preset],
       detail: PRESET_DESCRIPTIONS[preset],
+      editable: true,
+    },
+    {
+      id: "auto_delegate",
+      label: "Auto coordinator",
+      value: AUTO_DELEGATE_LABELS[autoDelegate],
+      detail: AUTO_DELEGATE_DESCRIPTIONS[autoDelegate],
       editable: true,
     },
     ...MODES.map((mode) => ({
@@ -104,6 +141,10 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
     if (!row?.editable) return;
     if (row.id === "preset") {
       onPresetChange(nextPreset(preset, direction));
+      return;
+    }
+    if (row.id === "auto_delegate") {
+      onAutoDelegateChange(nextAutoDelegate(autoDelegate, direction));
       return;
     }
     if (row.id === "config") return;
@@ -142,7 +183,7 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
         </Text>
         <Text color={theme.muted}>Esc close</Text>
       </Box>
-      <Text color={theme.muted}>Safety and turn limits</Text>
+      <Text color={theme.muted}>Safety, limits, and orchestration</Text>
 
       <Box flexDirection="column">
         {rows.map((row, index) => {
@@ -172,6 +213,11 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
         })}
       </Box>
 
+      {autoDelegate === "always" ? (
+        <Text color={theme.badge.running} wrap="truncate">
+          Always adds a read-only Polaris planning pass to every Build and Ultrawork turn.
+        </Text>
+      ) : null}
       {preset === "permissive" ? (
         <Text color={theme.badge.running} wrap="truncate">
           Permissive allows credential reads and destructive commands unless an explicit deny rule exists.

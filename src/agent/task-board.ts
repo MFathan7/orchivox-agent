@@ -28,6 +28,10 @@ export interface TaskItem {
   model?: string;
   dependsOn: string[];
   writeIsolation: boolean;
+  /** Skill allowlist for this task, narrowed by the specialist profile. */
+  skills?: string[];
+  /** Session that created the task, used for worker cost accounting. */
+  parentSessionId?: string;
   state: TaskState;
   workerId?: string;
   result?: string;
@@ -51,6 +55,8 @@ export interface TaskCreateInput {
   model?: string;
   dependsOn?: string[];
   writeIsolation?: boolean;
+  skills?: string[];
+  parentSessionId?: string;
 }
 
 export interface TaskSpawnInput {
@@ -62,6 +68,8 @@ export interface TaskSpawnInput {
   provider?: string;
   model?: string;
   writeIsolation: boolean;
+  skills?: string[];
+  parentSessionId?: string;
 }
 
 export interface TaskWorkerOutcome {
@@ -165,9 +173,12 @@ export class TaskBoard {
 
   add(input: TaskCreateInput | TaskCreateInput[]): TaskItem[] {
     const requests = Array.isArray(input) ? input : [input];
-    if (this.tasks.size + requests.length > this.maxTasks) {
+    const held = [...this.tasks.values()].filter(
+      (task) => task.state !== "completed" && task.state !== "cancelled",
+    ).length;
+    if (held + requests.length > this.maxTasks) {
       throw new Error(
-        `too many tasks (${this.tasks.size + requests.length}). The limit is ${this.maxTasks}; complete or cancel existing tasks first.`,
+        `too many tasks (${held + requests.length}). The limit is ${this.maxTasks}; complete or cancel existing tasks first.`,
       );
     }
     const created: TaskItem[] = [];
@@ -191,6 +202,8 @@ export class TaskBoard {
         model: request.model,
         dependsOn: request.dependsOn ?? [],
         writeIsolation: request.writeIsolation ?? true,
+        skills: request.skills ?? [],
+        parentSessionId: request.parentSessionId ?? currentTurnContext()?.sessionId,
         state: "pending",
         filesChanged: [],
         createdAt: now,
@@ -297,17 +310,48 @@ export class TaskBoard {
     if (!task) return false;
     if (task.state === "completed" || task.state === "cancelled") return false;
 
-    if (task.state === "running" && task.workerId) {
-      this.canceller?.(task.workerId);
-    }
-
-    task.state = "cancelled";
-    task.updatedAt = Date.now();
-    this.onUpdate?.(task);
-    this.persist(task);
+    this.markCancelled(task);
     this.refreshBlocked();
     this.dispatch();
     return true;
+  }
+
+  cancelByWorker(workerId: string): number {
+    const tasks = this.list().filter(
+      (task) =>
+        task.workerId === workerId &&
+        task.state !== "completed" &&
+        task.state !== "cancelled",
+    );
+    for (const task of tasks) this.markCancelled(task);
+    if (tasks.length > 0) {
+      this.refreshBlocked();
+      this.dispatch();
+    }
+    return tasks.length;
+  }
+
+  cancelAll(): number {
+    const tasks = this.list().filter(
+      (task) => task.state !== "completed" && task.state !== "cancelled",
+    );
+    for (const task of tasks) this.markCancelled(task);
+    if (tasks.length > 0) {
+      this.refreshBlocked();
+      this.dispatch();
+    }
+    return tasks.length;
+  }
+
+  private markCancelled(task: TaskItem): void {
+    if (task.state === "running" && task.workerId) {
+      this.canceller?.(task.workerId);
+    }
+    task.state = "cancelled";
+    task.error = task.error ?? "cancelled by user";
+    task.updatedAt = Date.now();
+    this.onUpdate?.(task);
+    this.persist(task);
   }
 
   registerTools(registry: ToolRegistry): void {
@@ -319,11 +363,19 @@ export class TaskBoard {
     registry.register(this.waitTool());
   }
 
-  async waitForIdle(): Promise<void> {
+  async waitForIdle(signal?: AbortSignal): Promise<void> {
     this.dispatch();
-    if (this.active === 0) return;
+    if (this.active === 0 || signal?.aborted) return;
     await new Promise<void>((resolve) => {
-      this.idleWaiters.push(resolve);
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", finish);
+        resolve();
+      };
+      this.idleWaiters.push(finish);
+      signal?.addEventListener("abort", finish, { once: true });
     });
   }
 
@@ -425,6 +477,8 @@ export class TaskBoard {
         provider: task.provider,
         model: task.model,
         writeIsolation: task.writeIsolation,
+        skills: task.skills,
+        parentSessionId: task.parentSessionId,
       });
     } catch (error) {
       this.active = Math.max(0, this.active - 1);
@@ -494,6 +548,7 @@ export class TaskBoard {
               provider: z.string().min(1).optional(),
               model: z.string().min(1).optional(),
               write_isolation: z.boolean().default(true),
+              skills: z.array(z.string().min(1)).optional(),
             }),
           )
           .min(1),
@@ -512,6 +567,7 @@ export class TaskBoard {
             provider?: string;
             model?: string;
             write_isolation: boolean;
+            skills?: string[];
           }>;
           auto_start: boolean;
         };
@@ -527,6 +583,7 @@ export class TaskBoard {
             model: entry.model,
             dependsOn: entry.depends_on,
             writeIsolation: entry.write_isolation,
+            skills: entry.skills,
           })),
         );
 
@@ -556,6 +613,7 @@ export class TaskBoard {
       .map((task) => {
         const deps = task.dependsOn.length > 0 ? ` after ${task.dependsOn.join(", ")}` : "";
         const mode = task.mode ? ` mode=${task.mode}` : "";
+        const skills = task.skills && task.skills.length > 0 ? ` skills=${task.skills.join(",")}` : "";
         const worker = task.workerId ? ` worker=${task.workerId}` : "";
         const files = task.filesChanged.length > 0 ? ` files=${task.filesChanged.join(",")}` : "";
         const result = task.result
@@ -564,7 +622,7 @@ export class TaskBoard {
             ? `\n  error: ${task.error}`
             : "";
         const merged = task.merged === undefined ? "" : task.merged ? " merged" : " merge-failed";
-        return `- ${task.id} [${task.state}] ${task.title}${deps}${mode}${worker}${files}${merged}${result}`;
+        return `- ${task.id} [${task.state}] ${task.title}${deps}${mode}${skills}${worker}${files}${merged}${result}`;
       })
       .join("\n");
   }
@@ -576,8 +634,8 @@ export class TaskBoard {
         "Wait until no task is running, starting ready tasks as dependencies complete. Returns the final board with results.",
       parameters: z.object({}),
       readOnly: false,
-      execute: async () => {
-        await this.waitForIdle();
+      execute: async (_args, context) => {
+        await this.waitForIdle(context?.signal);
         return this.formatList();
       },
     };

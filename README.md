@@ -120,6 +120,44 @@ Useful commands:
 - `/settings` changes approvals, safety presets, and step limits.
 - `/help` shows all commands and shortcuts.
 
+## Coordinator and skills
+
+Orchivox can let a read-only coordinator named Polaris plan multi-step work
+before workers run. Enable it in `/settings` under **Auto coordinator**, or in
+`.agent/config.yaml`:
+
+```yaml
+orchestration:
+  # off | ultrawork | always
+  auto_delegate: off
+  coordinator_agent: polaris
+```
+
+- `off` keeps the current behavior. Subagents are still available when called.
+- `ultrawork` uses Polaris in Ultrawork only. Build stays direct.
+- `always` runs Polaris before every Build and Ultrawork turn. This adds model
+  calls and token cost.
+
+Polaris returns a structured WorkPlan and the agent creates task board work from
+it. Workers keep their own context, return results to the main agent, and still
+ask for approval when a rule requires it. While workers run, the header shows
+`agents N` and a status line above the composer points to `/hub` for transcripts
+and task detail. Stop one worker with `k` in Agent Hub, or stop all workers with
+`K`. Cancel a task with `x` on the task board.
+
+Specialist agents can restrict which skills they may load:
+
+```yaml
+skills: [planning, architecture]
+skillPolicy: listed
+preloadSkills: [planning]
+```
+
+A task can narrow those skills further through `task_create` or
+`spawn_subagents`. Skills can include instructions, scripts, and reference
+files that the agent runs with the existing tools. See
+[`docs/orchestration.md`](docs/orchestration.md) for the full flow.
+
 ## Context and compaction
 
 Orchivox budgets by tokens first. It keeps a buffer for the reply and summarizes older history near the model's input budget. `/stats` shows the context used, the request size, the input budget, and session spend.
@@ -145,11 +183,17 @@ If Windows cannot find PowerShell, install PowerShell 7 or enable Windows PowerS
 
 Build and Ultrawork use the **Safer Build** approval preset by default. Credential reads, destructive file and database actions, database CLI commands, and `execute` ask first. Approval offers once, allow for session, deny, and deny with feedback. `/settings` switches between Safer Build, Env-only, Permissive, and Custom, and sets per-mode step limits.
 
+The automatic fatal guard always rejects `rm -rf` against root, home, wildcard
+paths, parent traversal, and system roots. Other destructive paths follow the
+active approval preset. For example, `rm -rf /tmp/pw` is not treated as fatal.
+
 Plan mode writes plans to `~/.orchivox/plan` (`ORCHIVOX_PLAN_HOME` overrides it). Build and Ultrawork write plan files to the active project root. `.agent` is reserved for configuration and is never a plan directory.
 
 ## Features
 
 - Plan, build, and ultrawork modes.
+- Automatic Polaris coordinator with off, Ultrawork-only, and always modes.
+- Per-agent skill allowlists and per-task skill assignment.
 - Reads, searches, and edits files across the project.
 - Runs commands and tests.
 - Undo and redo changes.

@@ -7,6 +7,7 @@ import type { AgentMode, ToolCall } from "../types/schema";
 import { readText, splitLines } from "../tools/hashline-edit";
 import { detectShell, type ShellAdapter } from "../tools/shell-adapter";
 import { modeContract } from "./modes";
+import { currentTurnContext } from "./turn-context";
 
 export type PermissionAction = "allow" | "ask" | "deny";
 
@@ -36,6 +37,8 @@ export interface ApprovalRequest {
   args: Record<string, unknown>;
   mode: AgentMode;
   readOnly: boolean;
+  /** Worker that requested approval, when the call runs in a subagent. */
+  workerId?: string;
   filePath?: string;
   diffPreview?: DiffPreviewDetails;
   shellDetails?: ShellRiskDetails;
@@ -68,8 +71,6 @@ export interface GranularPermissionEngineOptions {
 }
 
 const FATAL_COMMAND_PATTERNS = [
-  /\brm\s+-[a-zA-Z0-9]*r[a-zA-Z0-9]*f\s+([/~*]|\.\.)/i,
-  /\brm\s+-[a-zA-Z0-9]*f[a-zA-Z0-9]*r\s+([/~*]|\.\.)/i,
   /\bgit\s+push\s+.*(--force|-f\b)/i,
   /\bmkfs\b/i,
   /\bdd\s+if=/i,
@@ -407,8 +408,107 @@ export function parseToolRule(ruleInput: ToolRulePattern | string): ToolRulePatt
   };
 }
 
+const FATAL_RM_SYSTEM_ROOTS = new Set([
+  "/etc",
+  "/usr",
+  "/bin",
+  "/sbin",
+  "/boot",
+  "/dev",
+  "/proc",
+  "/sys",
+  "/lib",
+  "/lib64",
+  "/var",
+  "/opt",
+  "/root",
+  "/home",
+]);
+
+const SHELL_INTERPRETERS = new Set(["sh", "bash", "zsh", "fish"]);
+
+function isFatalRmCommand(command: string): boolean {
+  for (const segment of splitShellSegments(command)) {
+    if (isFatalRmSegment(segment)) return true;
+  }
+  return false;
+}
+
+function isFatalRmSegment(segment: string): boolean {
+  const tokens = tokenizeShellSegment(segment);
+  if (tokens.length === 0) return false;
+
+  let index = 0;
+  while (index < tokens.length) {
+    const token = unquote(tokens[index] ?? "");
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      index += 1;
+      continue;
+    }
+    const name = token.split("/").pop() ?? token;
+    if (name === "rm") break;
+    if (SHELL_INTERPRETERS.has(name)) {
+      const commandFlag = tokens.findIndex(
+        (entry, entryIndex) => entryIndex > index && unquote(entry) === "-c",
+      );
+      const nested = commandFlag === -1 ? undefined : tokens[commandFlag + 1];
+      return nested ? isFatalRmCommand(unquote(nested)) : false;
+    }
+    if (SHELL_WRAPPER_COMMANDS.has(name)) {
+      index += 1;
+      continue;
+    }
+    return false;
+  }
+  if (index >= tokens.length) return false;
+
+  let recursive = false;
+  let force = false;
+  const targets: string[] = [];
+  let afterDoubleDash = false;
+  for (let cursor = index + 1; cursor < tokens.length; cursor += 1) {
+    const token = unquote(tokens[cursor] ?? "");
+    if (!afterDoubleDash && token === "--") {
+      afterDoubleDash = true;
+      continue;
+    }
+    if (!afterDoubleDash && token.startsWith("-") && token !== "-") {
+      if (token === "--recursive") recursive = true;
+      else if (token === "--force") force = true;
+      else {
+        const flags = token.replace(/^-+/, "");
+        if (/[rR]/.test(flags)) recursive = true;
+        if (/f/.test(flags)) force = true;
+      }
+      continue;
+    }
+    targets.push(token);
+  }
+
+  if (!recursive || !force || targets.length === 0) return false;
+  return targets.some(isFatalRmTarget);
+}
+
+function isFatalRmTarget(target: string): boolean {
+  let value = target.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (value.length === 0) value = "/";
+  if (value === "/" || value === "/*") return true;
+  if (value === "*" || value === "~" || value === "~/*") return true;
+  if (value === ".." || value === "../..") return true;
+  return FATAL_RM_SYSTEM_ROOTS.has(value);
+}
+
 export function evaluateShellRisk(command: string, cwd: string): ShellRiskDetails {
   const trimmed = command.trim();
+
+  if (isFatalRmCommand(trimmed)) {
+    return {
+      command: trimmed,
+      cwd,
+      riskLevel: "critical",
+      warning: "Fatal rm target may permanently damage the system or repository.",
+    };
+  }
 
   for (const pattern of FATAL_COMMAND_PATTERNS) {
     if (pattern.test(trimmed)) {
@@ -1003,8 +1103,9 @@ export class GranularPermissionEngine extends EventEmitter {
     mode: AgentMode,
     args?: Record<string, unknown>,
     rules: readonly ToolRulePattern[] = [],
+    signal?: AbortSignal,
   ): Promise<{ allowed: boolean; reason?: string; feedback?: string }> {
-    return this.checkPermission(tool, args ?? {}, mode, `call-${Date.now()}`, rules);
+    return this.checkPermission(tool, args ?? {}, mode, `call-${Date.now()}`, rules, signal);
   }
 
   async checkPermission(
@@ -1013,6 +1114,7 @@ export class GranularPermissionEngine extends EventEmitter {
     mode: AgentMode,
     toolCallId = `call-${Date.now()}`,
     extraRules: readonly ToolRulePattern[] = [],
+    signal?: AbortSignal,
   ): Promise<{ allowed: boolean; reason?: string; feedback?: string }> {
     const cwd = this.permissionCwd(args);
     const shellRisk =
@@ -1127,6 +1229,7 @@ export class GranularPermissionEngine extends EventEmitter {
       args,
       mode,
       readOnly: tool.readOnly,
+      workerId: currentTurnContext()?.workerId,
       filePath: typeof args.filePath === "string" ? args.filePath : undefined,
       diffPreview,
       shellDetails: shellRisk,
@@ -1136,7 +1239,7 @@ export class GranularPermissionEngine extends EventEmitter {
       alwaysAllowLabel: this.alwaysAllowLabel(tool.name, args),
     };
 
-    const decision = await this.requestApproval(request);
+    const decision = await this.requestApproval(request, true, signal);
 
     if (decision.approved) {
       return { allowed: true };
@@ -1152,6 +1255,7 @@ export class GranularPermissionEngine extends EventEmitter {
   async requestApproval(
     request: ApprovalRequest,
     allowSession = true,
+    signal?: AbortSignal,
   ): Promise<ApprovalDecision> {
     const cwd = this.permissionCwd(request.args);
     const outsideWorkspace =
@@ -1168,16 +1272,43 @@ export class GranularPermissionEngine extends EventEmitter {
 
     this.emit("approval_requested", request);
 
-    let decision: ApprovalDecision;
-    if (this.approvalHandler) {
-      decision = await this.approvalHandler(request);
-    } else {
-      decision = {
+    const handler = this.approvalHandler;
+    if (!handler) {
+      const decision: ApprovalDecision = {
         approved: false,
         choice: "deny",
         reason: "No interactive approval handler attached.",
       };
+      this.emit("approval_resolved", { request, decision });
+      return decision;
     }
+
+    const decision = await new Promise<ApprovalDecision>((resolve) => {
+      let settled = false;
+      const finish = (value: ApprovalDecision): void => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        resolve(value);
+      };
+      const onAbort = (): void => {
+        finish({ approved: false, choice: "deny", reason: "cancelled" });
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      void handler(request)
+        .then(finish)
+        .catch(() => {
+          finish({ approved: false, choice: "deny", reason: "approval handler failed" });
+        });
+    });
 
     if (decision.choice === "always_allow") {
       this.allowInSessionFor(request.toolName, request.args);

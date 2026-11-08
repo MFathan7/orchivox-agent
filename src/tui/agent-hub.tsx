@@ -15,6 +15,7 @@ export interface AgentHubProps {
   onTabChange?: (tab: AgentHubTab) => void;
   onSteer: (workerId: string, instruction: string) => void;
   onKill: (workerId: string) => void;
+  onKillAll?: () => void;
   onCancelTask?: (id: string) => void;
   onDispatchTasks?: () => void;
   onMergeTask?: (id: string) => void;
@@ -50,6 +51,7 @@ export function AgentHub(props: AgentHubProps) {
     onTabChange,
     onSteer,
     onKill,
+    onKillAll,
     onCancelTask,
     onDispatchTasks,
     onMergeTask,
@@ -127,6 +129,10 @@ export function AgentHub(props: AgentHubProps) {
           setSteering("");
           return;
         }
+        if (input === "K" && onKillAll) {
+          onKillAll();
+          return;
+        }
         if (input === "k" && currentWorker) {
           onKill(currentWorker.id);
         }
@@ -197,6 +203,12 @@ export function AgentHub(props: AgentHubProps) {
                 <Text bold color={theme.text}>{currentWorker.id}</Text>
                 <Text color={theme.muted}>task: {currentWorker.task.slice(0, textLimit)}</Text>
                 <Text color={workerStatusColor(currentWorker.status, theme)}>status: {currentWorker.status}</Text>
+                {currentWorker.detail ? (
+                  <Text color={theme.muted}>detail: {currentWorker.detail}</Text>
+                ) : null}
+                {currentWorker.error ? (
+                  <Text color={theme.status.error}>error: {currentWorker.error.message}</Text>
+                ) : null}
                 <Text color={theme.text}>
                   route: {currentWorker.provider && currentWorker.model
                     ? `${currentWorker.provider} / ${currentWorker.model}`
@@ -293,7 +305,7 @@ export function AgentHub(props: AgentHubProps) {
 
       <Text color={theme.muted}>
         {tab === "workers"
-          ? "Up/Down move · s steer · k kill · Tab tasks · Esc back"
+          ? "Up/Down move · s steer · k stop · K stop all · Tab tasks · Esc back"
           : "Up/Down move · d dispatch ready · m merge · x cancel · Tab workers · Esc back"}
       </Text>
       {steering !== null ? (

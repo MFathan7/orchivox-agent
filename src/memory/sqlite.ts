@@ -85,6 +85,8 @@ interface TaskRow {
   mode: string | null;
   depends_on: string;
   write_isolation: number;
+  parent_session_id: string | null;
+  skills_json: string;
   state: string;
   worker_id: string | null;
   result: string | null;
@@ -144,6 +146,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   mode TEXT,
   depends_on TEXT NOT NULL DEFAULT '[]',
   write_isolation INTEGER NOT NULL DEFAULT 1,
+  parent_session_id TEXT,
+  skills_json TEXT NOT NULL DEFAULT '[]',
   state TEXT NOT NULL,
   worker_id TEXT,
   result TEXT,
@@ -170,6 +174,12 @@ export class MemoryDatabase implements TaskStore {
     const taskColumns = this.db.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     if (!taskColumns.some((column) => column.name === "mode")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN mode TEXT;");
+    }
+    if (!taskColumns.some((column) => column.name === "parent_session_id")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN parent_session_id TEXT;");
+    }
+    if (!taskColumns.some((column) => column.name === "skills_json")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';");
     }
     const sessionColumns = this.db.query("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
     if (!sessionColumns.some((column) => column.name === "compaction_json")) {
@@ -500,8 +510,8 @@ export class MemoryDatabase implements TaskStore {
   saveTask(task: TaskItem): void {
     this.db
       .query(
-        `INSERT INTO tasks (id, title, task, agent, role_model, provider, model, mode, depends_on, write_isolation, state, worker_id, result, error, diff, files_changed, merged, merge_summary, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO tasks (id, title, task, agent, role_model, provider, model, mode, depends_on, write_isolation, parent_session_id, skills_json, state, worker_id, result, error, diff, files_changed, merged, merge_summary, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            title = excluded.title,
            task = excluded.task,
@@ -512,6 +522,8 @@ export class MemoryDatabase implements TaskStore {
            mode = excluded.mode,
            depends_on = excluded.depends_on,
            write_isolation = excluded.write_isolation,
+           parent_session_id = excluded.parent_session_id,
+           skills_json = excluded.skills_json,
            state = excluded.state,
            worker_id = excluded.worker_id,
            result = excluded.result,
@@ -533,6 +545,8 @@ export class MemoryDatabase implements TaskStore {
         task.mode ?? null,
         JSON.stringify(task.dependsOn),
         task.writeIsolation ? 1 : 0,
+        task.parentSessionId ?? null,
+        JSON.stringify(task.skills ?? []),
         task.state,
         task.workerId ?? null,
         task.result ?? null,
@@ -614,6 +628,8 @@ function toTaskItem(row: TaskRow): TaskItem {
     mode: (row.mode ?? undefined) as TaskItem["mode"],
     dependsOn: parseStringArray(row.depends_on),
     writeIsolation: row.write_isolation === 1,
+    parentSessionId: row.parent_session_id ?? undefined,
+    skills: parseStringArray(row.skills_json),
     state: row.state as TaskItem["state"],
     workerId: row.worker_id ?? undefined,
     result: row.result ?? undefined,

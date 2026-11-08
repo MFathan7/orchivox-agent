@@ -144,28 +144,46 @@ export type ToolResult = z.infer<typeof ToolResultSchema>;
 export const TokenPricingSchema = z.object({
   input_usd_per_million_tokens: z.number().nonnegative(),
   output_usd_per_million_tokens: z.number().nonnegative(),
+  cache_read_usd_per_million_tokens: z.number().nonnegative().optional(),
+  cache_creation_usd_per_million_tokens: z.number().nonnegative().optional(),
 });
 export type TokenPricing = z.infer<typeof TokenPricingSchema>;
 
 export const UsageSchema = z.object({
+  /** Total input tokens, including any cache read and cache creation tokens. */
   prompt_tokens: z.number().int().nonnegative(),
   completion_tokens: z.number().int().nonnegative(),
   total_tokens: z.number().int().nonnegative().optional(),
   cost_usd: z.number().nonnegative().optional(),
+  /** Input tokens served from cache. Included in `prompt_tokens`. */
   cache_read_input_tokens: z.number().int().nonnegative().default(0),
+  /** Input tokens written to cache. Included in `prompt_tokens`. */
   cache_creation_input_tokens: z.number().int().nonnegative().default(0),
 });
 export type Usage = z.infer<typeof UsageSchema>;
 
-export function computeCostUsd(
-  promptTokens: number,
-  completionTokens: number,
-  pricing: TokenPricing | undefined,
-): number | undefined {
+export interface CostTokens {
+  /** Total input tokens, including cache read and cache creation tokens. */
+  promptTokens: number;
+  completionTokens: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+}
+
+export function computeCostUsd(tokens: CostTokens, pricing: TokenPricing | undefined): number | undefined {
   if (!pricing) return undefined;
+  const cacheReadTokens = tokens.cacheReadTokens ?? 0;
+  const cacheCreationTokens = tokens.cacheCreationTokens ?? 0;
+  const uncachedPromptTokens = Math.max(0, tokens.promptTokens - cacheReadTokens - cacheCreationTokens);
+  const cacheReadPrice =
+    pricing.cache_read_usd_per_million_tokens ?? pricing.input_usd_per_million_tokens;
+  const cacheCreationPrice =
+    pricing.cache_creation_usd_per_million_tokens ?? pricing.input_usd_per_million_tokens;
   const cost =
-    (promptTokens / 1_000_000) * pricing.input_usd_per_million_tokens +
-    (completionTokens / 1_000_000) * pricing.output_usd_per_million_tokens;
+    (uncachedPromptTokens / 1_000_000) * pricing.input_usd_per_million_tokens +
+    (tokens.completionTokens / 1_000_000) * pricing.output_usd_per_million_tokens +
+    (cacheReadTokens / 1_000_000) * cacheReadPrice +
+    (cacheCreationTokens / 1_000_000) * cacheCreationPrice;
   return Math.round(cost * 10_000_000) / 10_000_000;
 }
 
@@ -362,6 +380,7 @@ export const ApprovalRequestSchema = z.object({
   args: z.record(z.string(), z.unknown()),
   mode: z.enum(["plan", "build", "ultrawork"]),
   readOnly: z.boolean(),
+  workerId: z.string().min(1).optional(),
   filePath: z.string().optional(),
   diffPreview: DiffPreviewDetailsSchema.optional(),
   shellDetails: ShellRiskDetailsSchema.optional(),
