@@ -120,10 +120,70 @@ Useful commands:
 - `/settings` changes approvals, safety presets, and step limits.
 - `/help` shows all commands and shortcuts.
 
-## Coordinator and skills
+## Sub-agents
 
-Orchivox can let a read-only coordinator named Polaris plan multi-step work
-before workers run. Enable it in `/settings` under **Auto coordinator**, or in
+Orchivox can hand focused work to a named sub-agent. The main agent keeps the
+conversation, chooses the worker, and reviews the result. Each worker gets its
+own context and tool policy. Workers cannot spawn other workers.
+
+### The team
+
+| Agent | Role | Access | Model role | Use it for |
+| --- | --- | --- | --- | --- |
+| `polaris` | Read-only planning coordinator. Returns a structured WorkPlan. | Read-only | main | Multi-step plans, task decomposition, acceptance criteria |
+| `sisyphus` | Primary orchestrator. Drives work to completion and verifies it. | Read and write | main | End-to-end execution, todos, verification, delegation |
+| `oracle` | Principal architect and deep debugger. | Read-only | advisor | Architecture, trade-offs, invariants, root-cause analysis |
+| `explore` | Fast codebase scout. | Read-only | fast | Repository maps, symbol search, entry points |
+| `librarian` | Documentation and research specialist. | Read-only | fast | External docs, libraries, papers, citations |
+| `frontend-ui` | UI, styling, and accessibility specialist. | Read and write | main | Terminal and web interfaces, layout, keyboard access |
+| `programmer` | Implementation worker. | Read and write | main | Focused code changes, tests, verification |
+
+Read-only is enforced by the tool policy, not just by the prompt. A read-only
+agent does not receive write, mutating shell, task board, or subagent tools.
+
+`main`, `fast`, and `advisor` are model roles. Configure
+`roles.fast_model` and `roles.advisor_model` in `/models` before using agents
+that request those roles. If a role is not configured, invoking that agent
+returns an error instead of silently using another model.
+
+### Invoke a specialist
+
+Prefix a message with `@name`:
+
+```text
+@oracle review the retry path in src/agent/coordinator.ts
+@explore map the TUI entry points and the files that own them
+@programmer fix the failing test in tests/task-board-limit.test.ts
+```
+
+`@sisyphus` is the primary orchestrator profile. Use it when you want a lead
+that tracks todos, verifies the result, and delegates independent work.
+`@polaris` is the planning coordinator; you can use it directly to produce a
+WorkPlan, or let the coordinator run it automatically.
+
+### Spawn workers
+
+Use the `spawn_subagents` tool for explicit workers. A batch can run in
+parallel or as a chain:
+
+- `parallel` starts independent workers together. The limit is 8 per batch.
+- `chain` runs them in order and passes the previous result through
+  `{previous}`.
+- `write_isolation: true` gives the worker its own Git worktree. Merge only
+  after reviewing the diff.
+- `write_isolation: false` runs in the current workspace. Use it for read-only
+  work or a pipeline that must share files.
+- `skills` per task narrows the specialist's skill allowlist. It cannot widen
+  it.
+- `continue_from` continues from a completed worker. Merge isolated work first
+  if its files matter.
+
+Every task should include the paths, constraints, acceptance criteria, and
+decisions the worker needs. Workers do not see the parent conversation.
+
+### Coordinator
+
+Enable Polaris in `/settings` under **Auto coordinator**, or in
 `.agent/config.yaml`:
 
 ```yaml
@@ -133,19 +193,34 @@ orchestration:
   coordinator_agent: polaris
 ```
 
-- `off` keeps the current behavior. Subagents are still available when called.
+- `off` keeps normal work direct. Manual subagents and task board tools stay
+  available.
 - `ultrawork` uses Polaris in Ultrawork only. Build stays direct.
-- `always` runs Polaris before every Build and Ultrawork turn. This adds model
-  calls and token cost.
+- `always` runs Polaris before every Build and Ultrawork turn with a user
+  message. This adds a planning request to every eligible turn and increases
+  token cost.
 
-Polaris returns a structured WorkPlan and the agent creates task board work from
-it. Workers keep their own context, return results to the main agent, and still
-ask for approval when a rule requires it. While workers run, the header shows
-`agents N` and a status line above the composer points to `/hub` for transcripts
-and task detail. Stop one worker with `k` in Agent Hub, or stop all workers with
-`K`. Cancel a task with `x` on the task board.
+Polaris reads the project and returns a WorkPlan JSON object. The orchestrator
+validates task ids, dependencies, cycles, task count, agent names, installed
+skills, and skill allowlists. The task board starts the workers, including
+dependency chains. The main agent waits for tasks, reviews results, and merges
+only what passes. A task can be cancelled with `x` on the task board.
 
-Specialist agents can restrict which skills they may load:
+### Visibility and control
+
+- The header shows `agents N` while workers are active.
+- A one-line status above the composer shows running, queued, and failed counts.
+- `/hub` opens Agent Hub for transcripts, task detail, skills, usage, and
+  stop/steer actions.
+- `k` stops the selected worker. `K` stops all workers.
+- Escape cancels the current main turn and its child workers.
+- Approval requests that belong to a stopped worker are denied automatically.
+- Worker usage is added to the session cost and appears in `/stats` and Agent
+  Hub.
+
+### Skills per agent
+
+Specialist files in `.agent/agents/*.md` accept:
 
 ```yaml
 skills: [planning, architecture]
@@ -153,10 +228,26 @@ skillPolicy: listed
 preloadSkills: [planning]
 ```
 
-A task can narrow those skills further through `task_create` or
-`spawn_subagents`. Skills can include instructions, scripts, and reference
-files that the agent runs with the existing tools. See
-[`docs/orchestration.md`](docs/orchestration.md) for the full flow.
+- `skillPolicy: all` shows every installed skill. This is the default.
+- `skillPolicy: listed` shows only `skills`.
+- `skillPolicy: none` hides the skill tools for that agent.
+- `preloadSkills` loads a small number of skill bodies before the first model
+  call. Keep the list short because it costs tokens.
+
+A task can narrow the allowlist with `skills` in `task_create` or
+`spawn_subagents`. A task cannot widen it. Skills are loaded on demand; they are
+not always-on role rules.
+
+### Custom agents
+
+Project agents live in `.agent/agents/<name>.md` with YAML frontmatter and a
+Markdown system prompt. A custom agent can override a built-in agent with the
+same name. Supported fields include `description`, `roleModel`, `readOnly`,
+`thinkingBudget`, `allowedTools`, `skills`, `skillPolicy`, `preloadSkills`, and
+`permissions`.
+
+See [`docs/orchestration.md`](docs/orchestration.md) for the full orchestration
+flow, WorkPlan example, and safety notes.
 
 ## Context and compaction
 
@@ -192,13 +283,15 @@ Plan mode writes plans to `~/.orchivox/plan` (`ORCHIVOX_PLAN_HOME` overrides it)
 ## Features
 
 - Plan, build, and ultrawork modes.
+- Named sub-agents: Polaris, Sisyphus, Oracle, Explore, Librarian, Frontend-UI, Programmer.
 - Automatic Polaris coordinator with off, Ultrawork-only, and always modes.
 - Per-agent skill allowlists and per-task skill assignment.
+- Custom sub-agents in `.agent/agents/*.md`.
 - Reads, searches, and edits files across the project.
 - Runs commands and tests.
 - Undo and redo changes.
 - Resumable sessions with search and branching.
-- Parallel workers for large tasks.
+- Parallel and chain workers with worktree isolation, review, and stop/steer.
 - Hosted and local model support.
 - Seven color themes, including a light preset, saved with your settings.
 - Optional per-turn step, tool, and time caps, off by default, for when you want to bound a turn.
