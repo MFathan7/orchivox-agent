@@ -10,6 +10,13 @@ export interface ErrorLogEntry {
   finish_reason: string;
   message: string;
   turn_tokens?: number;
+  worker_id?: string;
+  agent?: string;
+  provider?: string;
+  role?: string;
+  error_code?: string;
+  duration_ms?: number;
+  timeout_seconds?: number;
 }
 
 export function errorLogPath(): string {

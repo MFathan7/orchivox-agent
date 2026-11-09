@@ -41,6 +41,8 @@ import {
 } from "./format";
 import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { LiveStatus } from "./spinner";
+import { MotionProvider } from "./motion";
+import { agentActivityCounts, agentActivitySummary } from "./agent-activity";
 import { SubagentStatus } from "./subagent-status";
 import {
   AUTO_THEME,
@@ -169,6 +171,10 @@ export interface ChatEntryView {
 }
 
 export interface OrchivoxAppProps {
+  workerTimeoutSeconds?: number;
+  onWorkerTimeoutChange?: (seconds: number) => void;
+  animations?: boolean;
+  onAnimationsChange?: (enabled: boolean) => void;
   projectName?: string;
   branch?: string;
   mcpCount?: number;
@@ -382,7 +388,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     streamingText,
     liveEntry,
     busy = false,
-    workers = [],
+    workers: allWorkers = [],
     onSteer = () => undefined,
     onKill = () => undefined,
     onSubmit = () => undefined,
@@ -402,6 +408,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     autoDelegate = "off",
     modeSteps = { plan: 0, build: 0, ultrawork: 0 },
   } = props;
+  const workers = allWorkers.filter((worker) => worker.parentSessionId === props.activeSessionId);
+  const tasks = (props.tasks ?? []).filter((task) => task.parentSessionId === props.activeSessionId);
 
   const [internalMode, setInternalMode] = React.useState<AgentMode>("build");
   const mode = props.mode ?? internalMode;
@@ -641,8 +649,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const statusText = escArmed ? "Press Esc again to stop the current turn" : statusMessage;
   const statusRows = statusText ? countWrappedLines(statusText, innerWidth) : 0;
   const liveStatusRows = streaming && !hasModalOpen && !statusText ? 1 : 0;
-  const subagentLineRows = !hasModalOpen && subagentSummary.active > 0 ? 1 : 0;
-  const chromeRows = 2 + statusRows + liveStatusRows + subagentLineRows;
+  const liveStatusGapRows = liveStatusRows > 0 ? 1 : 0;
+  const showSubagentStatus = !hasModalOpen && liveStatusRows === 0;
+  const subagentLineRows = showSubagentStatus && agentActivitySummary(workers, tasks, innerWidth) ? 1 : 0;
+  const statusGapRows = statusRows + liveStatusRows + subagentLineRows > 0 ? 1 : 0;
+  const chromeRows = 2 + statusRows + liveStatusRows + liveStatusGapRows + subagentLineRows + statusGapRows;
   const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
   const chatWheelStep = 3;
   const chatPageStep = Math.max(1, viewportHeight - 2);
@@ -812,6 +823,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
 
   return (
     <ThemeProvider theme={props.currentTheme ?? DEFAULT_THEME}>
+      <MotionProvider enabled={props.animations !== false && !hasModalOpen}>
       <Box flexDirection="column" paddingX={1}>
         <Text wrap="truncate">
           {headerParts
@@ -933,6 +945,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           />
         ) : settingsOpen ? (
           <SettingsModal
+            workerTimeoutSeconds={props.workerTimeoutSeconds}
+            onWorkerTimeoutChange={props.onWorkerTimeoutChange}
+            height={viewportHeight}
+            animations={props.animations}
+            onAnimationsChange={props.onAnimationsChange}
             preset={approvalsPreset}
             autoDelegate={autoDelegate}
             steps={modeSteps}
@@ -1043,7 +1060,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         ) : hubOpen ? (
           <AgentHub
             workers={workers}
-            tasks={props.tasks ?? []}
+            tasks={tasks}
             initialTab={hubTab}
             onTabChange={setHubTab}
             onSteer={(workerId, instruction) => onSteer(workerId, instruction)}
@@ -1054,6 +1071,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onMergeTask={props.onMergeTask}
             onExit={() => setHubOpen(false)}
             width={innerWidth}
+            height={viewportHeight}
             theme={theme}
           />
         ) : null}
@@ -1093,7 +1111,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           </Box>
         )}
 
-        {!hasModalOpen ? <SubagentStatus workers={workers} width={innerWidth} /> : null}
+        {showSubagentStatus ? <SubagentStatus workers={workers} tasks={tasks} width={innerWidth} /> : null}
+
+        {liveStatusGapRows > 0 ? <Box height={1} /> : null}
 
         {escArmed ? (
           <Text color={theme.badge.running}>Press Esc again to stop the current turn</Text>
@@ -1101,6 +1121,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <Text color={theme.status.info}>{statusMessage}</Text>
         ) : streaming && !hasModalOpen ? (
           <LiveStatus
+            agentCounts={agentActivityCounts(workers, tasks)}
             active={streaming}
             answering={Boolean(streamingText)}
             startedAt={props.liveEntry?.startedAt}
@@ -1113,9 +1134,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             timeLimitSeconds={props.liveEntry?.timeLimitSeconds}
             contextPercent={contextPercent}
             requestLabel={requestLabel}
-            width={terminalSize.columns}
+            width={innerWidth}
           />
         ) : null}
+
+        {statusGapRows > 0 ? <Box height={1} /> : null}
 
         <PromptComposer
             mode={mode}
@@ -1207,6 +1230,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             }}
           />
       </Box>
+      </MotionProvider>
     </ThemeProvider>
   );
 }

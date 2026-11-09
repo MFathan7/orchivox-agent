@@ -103,6 +103,7 @@ export function formatBytes(bytes: number): string {
 }
 
 export function formatTurnStatus(input: {
+  activityFirst?: boolean;
   answering: boolean;
   elapsedSeconds: number;
   completedTools: number;
@@ -168,7 +169,9 @@ export function formatTurnStatus(input: {
       segments.length > 1 &&
       displayWidth(segments.map((segment) => segment.text).join(" · ")) > input.width
     ) {
-      const lowest = Math.min(...segments.map((segment) => segment.priority));
+      const lowest = Math.min(...segments
+        .filter((segment) => !input.activityFirst || segment.priority !== 4)
+        .map((segment) => segment.priority));
       const index = segments.findIndex((segment) => segment.priority === lowest);
       segments.splice(index, 1);
     }
@@ -176,6 +179,10 @@ export function formatTurnStatus(input: {
 
   if (segments.length === 0) {
     segments.push({ text: input.answering ? "Answering" : "Thinking", priority: 4 });
+  }
+  if (input.activityFirst) {
+    const activity = segments.findIndex((segment) => segment.priority === 4);
+    if (activity > 0) segments.unshift(...segments.splice(activity, 1));
   }
   return segments.map((segment) => segment.text).join(" · ");
 }

@@ -47,6 +47,8 @@ import {
   saveActiveMode,
   saveApprovalsPreset,
   saveAutoDelegate,
+  saveAnimations,
+  saveWorkerTimeout,
   saveModeReasoning,
   saveModeSteps,
   saveRoleSelection,
@@ -1090,6 +1092,22 @@ async function runTuiSession(
     },
     approvalsPreset: runtime.config.approvals.preset ?? "safer",
     autoDelegate: state.autoDelegate,
+    animations: runtime.config.ui.animations,
+    workerTimeoutSeconds: runtime.config.orchestration.worker_timeout_seconds,
+    onWorkerTimeoutChange: (seconds: number) => {
+      runtime.config.orchestration.worker_timeout_seconds = seconds;
+      void saveWorkerTimeout(runtime.configPath, seconds).catch((error) => {
+        setNotice(`Could not save worker time limit: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      });
+      rerender();
+    },
+    onAnimationsChange: (enabled: boolean) => {
+      runtime.config.ui.animations = enabled;
+      void saveAnimations(runtime.configPath, enabled).catch((error) => {
+        setNotice(`Could not save animations: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      });
+      rerender();
+    },
     modeSteps: {
       plan: runtime.config.modes.plan.steps ?? 0,
       build: runtime.config.modes.build.steps ?? 0,

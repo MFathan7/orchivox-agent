@@ -2,12 +2,14 @@ import React from "react";
 import { Text } from "ink";
 
 import type { SubagentWorkerState } from "../agent/subagent";
-import { summarizeSubagents, subagentStatusText } from "./format";
+import type { TaskItem } from "../agent/task-board";
+import { agentActivitySummary } from "./agent-activity";
 import { useActiveTheme } from "./theme";
 
 export interface SubagentStatusProps {
   workers: SubagentWorkerState[];
   width: number;
+  tasks?: TaskItem[];
 }
 
 /**
@@ -17,19 +19,14 @@ export interface SubagentStatusProps {
 export function SubagentStatus({
   workers,
   width,
+  tasks = [],
 }: SubagentStatusProps): React.ReactElement | null {
   const theme = useActiveTheme();
-  const summary = summarizeSubagents(workers);
-  if (summary.active === 0) return null;
-  const color =
-    summary.running > 0
-      ? theme.badge.running
-      : summary.failed > 0
-        ? theme.status.error
-        : theme.muted;
+  const summary = agentActivitySummary(workers, tasks, width);
+  if (!summary) return null;
   return (
-    <Text color={color} wrap="truncate">
-      {subagentStatusText(summary, width)}
+    <Text color={theme.text} wrap="truncate">
+      {summary}
     </Text>
   );
 }

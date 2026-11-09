@@ -1,5 +1,5 @@
 import React from "react";
-import { Box, Text, useInput, useStdin } from "ink";
+import { Box, Text, useInput, useStdin, useStdout } from "ink";
 
 import type { ChatEntryView, ChatToolCallView, WriteTarget } from "./app";
 import { DIFF_PREVIEW_LINES } from "./diff-view";
@@ -127,19 +127,20 @@ export class AlternateScreen {
 }
 
 export function useTerminalSize(): ScreenSize {
+  const { stdout } = useStdout();
   const [size, setSize] = React.useState<ScreenSize>(() => ({
-    columns: process.stdout.columns ?? 80,
-    rows: process.stdout.rows ?? 24,
+    columns: stdout.columns ?? 80,
+    rows: stdout.rows ?? 24,
   }));
   React.useEffect(() => {
     const listener = (): void => {
-      setSize({ columns: process.stdout.columns ?? 80, rows: process.stdout.rows ?? 24 });
+      setSize({ columns: stdout.columns ?? 80, rows: stdout.rows ?? 24 });
     };
-    process.stdout.on("resize", listener);
+    stdout.on("resize", listener);
     return () => {
-      process.stdout.removeListener("resize", listener);
+      stdout.removeListener("resize", listener);
     };
-  }, []);
+  }, [stdout]);
   return size;
 }
 
@@ -577,6 +578,9 @@ export function ScrollableChatViewport({
   const window = computeViewportWindow(rows.length, height, offsetFromBottom);
   const { start, contentHeight, maxOffset, showIndicator } = window;
   const visibleRows = rows.slice(start, start + contentHeight);
+  const hasChatMessages = allEntries.some((entry) => entry.role === "user" || entry.role === "assistant");
+  const showWelcome = !hasChatMessages && !streamingText && !liveEntry;
+  const leadingRows = showWelcome || showIndicator ? 0 : Math.max(0, height - visibleRows.length);
   const visibleRowsRef = React.useRef(visibleRows);
   visibleRowsRef.current = visibleRows;
 
@@ -591,7 +595,7 @@ export function ScrollableChatViewport({
       if (!click) return;
       const clickRow = click.y - (topOffset + 1);
       if (clickRow < 0 || clickRow >= height) return;
-      const contentRow = clickRow - (showIndicator ? 1 : 0);
+      const contentRow = clickRow - (showIndicator ? 1 : 0) - leadingRows;
       if (contentRow < 0) return;
       const target = visibleRowsRef.current[contentRow];
       const entryId = target?.entryId;
@@ -607,15 +611,12 @@ export function ScrollableChatViewport({
     return () => {
       stdin.off("data", onData);
     };
-  }, [active, stdin, topOffset, height, showIndicator]);
+  }, [active, stdin, topOffset, height, showIndicator, leadingRows]);
 
   React.useEffect(() => {
     setOffsetFromBottom(0);
     setDiffExpanded(false);
   }, [resetKey]);
-
-  const hasChatMessages = allEntries.some((e) => e.role === "user" || e.role === "assistant");
-  const showWelcome = !hasChatMessages && !streamingText && !liveEntry;
 
   return (
     <Box flexDirection="column" height={height} flexShrink={0} overflowY="hidden">
@@ -634,6 +635,7 @@ export function ScrollableChatViewport({
           {AUTO_SCROLL_PAUSED}
         </Text>
       ) : null}
+      {leadingRows > 0 ? <Box height={leadingRows} flexShrink={0} /> : null}
       {visibleRows.map((row) => (
         <React.Fragment key={row.key}>{row.node}</React.Fragment>
       ))}

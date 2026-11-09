@@ -4,27 +4,17 @@ import { Text } from "ink";
 import { formatTurnStatus } from "./format";
 import { fitDisplayText } from "./text-wrap";
 import { useTheme } from "./theme";
+import { ActivityText, useAnimationFrame, useMotion } from "./motion";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 export function useSpinner(active: boolean): string {
-  const [frame, setFrame] = React.useState(0);
-  React.useEffect(() => {
-    if (!active) {
-      setFrame(0);
-      return;
-    }
-    const timer = setInterval(() => setFrame((value) => (value + 1) % SPINNER_FRAMES.length), 110);
-    return () => clearInterval(timer);
-  }, [active]);
-  return SPINNER_FRAMES[frame % SPINNER_FRAMES.length];
+  const frame = useAnimationFrame(active, SPINNER_FRAMES.length);
+  const enabled = useMotion();
+  return active && enabled ? SPINNER_FRAMES[frame] : "●";
 }
 
-/**
- * The spinner owns its timer so it never forces the app or transcript to
- * re-render. It renders one glyph plus the trailing space used by the status
- * row and tool rows.
- */
+/** Animation ticks stay inside the indicator rather than re-rendering the transcript. */
 export function Spinner({
   active,
   color,
@@ -43,6 +33,7 @@ export function Spinner({
 }
 
 export interface LiveStatusProps {
+  agentCounts?: { active: number; failed: number };
   active: boolean;
   answering: boolean;
   startedAt?: number;
@@ -58,11 +49,7 @@ export interface LiveStatusProps {
   width?: number;
 }
 
-/**
- * The live turn status. The elapsed clock and spinner update inside this small
- * component, not in OrchivoxApp, so a long turn cannot re-render the transcript
- * just to animate the status line.
- */
+/** The clock updates independently of the transcript and animated label. */
 export function LiveStatus({
   active,
   answering,
@@ -77,9 +64,9 @@ export function LiveStatus({
   contextPercent,
   requestLabel,
   width,
+  agentCounts,
 }: LiveStatusProps): React.ReactElement | null {
   const theme = useTheme();
-  const frame = useSpinner(active);
   const [, refresh] = React.useState(0);
 
   React.useEffect(() => {
@@ -95,8 +82,14 @@ export function LiveStatus({
     ? Math.max(0, Math.floor((Date.now() - runningStartedAt) / 1000))
     : 0;
   const showHint = width === undefined || width >= 120;
-  const hint = showHint ? " · Esc twice to stop" : "";
-  const available = width !== undefined ? Math.max(8, width - 2 - hint.length) : undefined;
+  const agents = agentCounts
+    ? width !== undefined && width < 60
+      ? ` · agents ${agentCounts.active} · failed ${agentCounts.failed}`
+      : ` · agents ${agentCounts.active} active · ${agentCounts.failed} failed`
+    : "";
+  const hint = `${agents}${showHint ? " · Esc twice to stop" : ""}`;
+  const available = width !== undefined ? Math.max(1, width - hint.length) : undefined;
+  const label = runningLabel || (answering ? "Answering" : "Thinking");
   const status = formatTurnStatus({
     answering,
     elapsedSeconds,
@@ -110,17 +103,14 @@ export function LiveStatus({
     contextPercent,
     requestLabel,
     width: available,
+    activityFirst: true,
   });
   const display = available !== undefined ? fitDisplayText(status, available) : status;
 
   return (
     <Text>
-      <Text color={theme.badge.running} bold>
-        {frame}{" "}
-      </Text>
-      <Text color={theme.text} bold>
-        {display}
-      </Text>
+      <ActivityText text={display.slice(0, Math.min(label.length, display.length))} active={active} />
+      <Text color={theme.muted}>{display.slice(Math.min(label.length, display.length))}</Text>
       {hint ? <Text color={theme.muted}>{hint}</Text> : null}
     </Text>
   );

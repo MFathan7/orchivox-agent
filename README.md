@@ -118,6 +118,12 @@ Useful commands:
 - `/undo` and `/redo` move through file changes.
 - `/commit` splits the current diff into commits.
 - `/settings` changes approvals, safety presets, and step limits.
+- **Animations** in `/settings` turns the activity-text sweep and tool spinners
+  on or off. The preference is saved as `ui.animations` in your config. Static
+  status is used for non-TTY output, `TERM=dumb`, and `NO_COLOR`.
+- **Worker time limit** in `/settings` sets a total-time limit for new workers.
+  It defaults to Off. Hub shows the effective model and latest progress; missing
+  specialist model roles are reported before work begins.
 - `/help` shows all commands and shortcuts.
 
 ## Sub-agents
@@ -145,6 +151,11 @@ agent does not receive write, mutating shell, task board, or subagent tools.
 `roles.fast_model` and `roles.advisor_model` in `/models` before using agents
 that request those roles. If a role is not configured, invoking that agent
 returns an error instead of silently using another model.
+
+In `/models`, press `Ctrl+R` to open the target list. Choose **Fast** or
+**Advisor**, press Enter, then choose a model and press Enter to save it.
+You can assign the same model as the session model. Role assignments leave
+the Plan, Build, and Ultrawork mode models unchanged.
 
 ### Invoke a specialist
 
@@ -206,6 +217,11 @@ skills, and skill allowlists. The task board starts the workers, including
 dependency chains. The main agent waits for tasks, reviews results, and merges
 only what passes. A task can be cancelled with `x` on the task board.
 
+When a dependency has an isolated worktree, its dependents wait until the main
+agent reviews and merges it with `task_merge`. `task_wait` returns the pending
+merge ids rather than waiting indefinitely. Successful merges start ready
+dependents with the updated code.
+
 ### Visibility and control
 
 - The header shows `agents N` while workers are active.
@@ -246,8 +262,9 @@ same name. Supported fields include `description`, `roleModel`, `readOnly`,
 `thinkingBudget`, `allowedTools`, `skills`, `skillPolicy`, `preloadSkills`, and
 `permissions`.
 
-See [`docs/orchestration.md`](docs/orchestration.md) for the full orchestration
-flow, WorkPlan example, and safety notes.
+Orchestration is configured through `.agent/config.yaml` and driven from the
+task board. Workers keep separate context and return results for review before
+anything is merged.
 
 ## Context and compaction
 
@@ -362,4 +379,4 @@ If the installer added Orchivox to your PATH, remove the block between `# >>> or
 
 ## Status
 
-Orchivox is at version `0.5.4`. For long tasks, use a model with strong tool calling and a context window that matches the repository size.
+Orchivox is at version `0.6.0`. For long tasks, use a model with strong tool calling and a context window that matches the repository size.

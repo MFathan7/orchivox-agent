@@ -1,9 +1,0 @@
-{
-  "name": "p28-build-ambiguous-check",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "test": "bun test",
-    "check": "echo 'check is not configured'; exit 1"
-  }
-}

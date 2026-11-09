@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { AgentMode } from "../types/schema";
+import type { ToolRulePattern } from "./permissions";
 
 export interface TurnContext {
   mode: AgentMode;
@@ -17,6 +18,8 @@ export interface TurnContext {
   allowedSkills?: string[];
   /** all: every skill, listed: allowedSkills only, none: skill tools disabled. */
   skillPolicy?: "all" | "listed" | "none";
+  allowedToolNames?: ReadonlySet<string>;
+  toolPermissionRules?: readonly ToolRulePattern[];
 }
 
 const storage = new AsyncLocalStorage<TurnContext>();

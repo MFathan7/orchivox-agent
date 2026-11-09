@@ -1,0 +1,12 @@
+# Internal docs and release notes
+RELEASING.md
+docs/
+tests/
+
+# Local plans and agent notes
+AGENTS*.md
+DESIGN*.md
+PLAN*.md
+FIX*.md
+REVISION_*.md
+agent_audit*.md

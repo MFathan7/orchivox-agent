@@ -173,6 +173,20 @@ export async function saveAutoDelegate(
   await writeDocument(configPath, document);
 }
 
+export async function saveAnimations(configPath: string, enabled: boolean): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "ui");
+  document.setIn(["ui", "animations"], enabled);
+  await writeDocument(configPath, document);
+}
+
+export async function saveWorkerTimeout(configPath: string, seconds: number): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "orchestration");
+  document.setIn(["orchestration", "worker_timeout_seconds"], seconds);
+  await writeDocument(configPath, document);
+}
+
 export async function appendProviderModel(
   configPath: string,
   provider: string,

@@ -2,7 +2,11 @@ import React from "react";
 import { Box, Text, useInput } from "ink";
 
 import type { SubagentWorkerState } from "../agent/subagent";
-import type { TaskItem, TaskState } from "../agent/task-board";
+import type { TaskItem } from "../agent/task-board";
+import { taskActivity, taskNeedsMerge, workerActive, workerActivity, workerTitle, workerTranscript, workerModelLabel, type ActivityTone } from "./agent-activity";
+import { formatElapsed } from "./format";
+import { isMouseSequence } from "./mouse";
+import { displayWidth, fitDisplayText, graphemeClusters, wrapText } from "./text-wrap";
 import { useActiveTheme, type Theme } from "./theme";
 
 export type AgentHubTab = "workers" | "tasks";
@@ -22,297 +26,161 @@ export interface AgentHubProps {
   onExit: () => void;
   initialSelected?: number;
   width?: number;
+  height?: number;
   theme?: Theme;
 }
 
-function workerStatusColor(status: string, theme: Theme): string {
-  if (status === "running" || status === "preparing" || status === "finalizing" || status === "queued") {
-    return theme.badge.running;
-  }
-  if (status === "completed") return theme.status.success;
-  if (status === "failed" || status === "timed_out") return theme.status.error;
-  return theme.badge.idle;
+interface DetailRow { text: string; tone?: ActivityTone; bold?: boolean }
+
+function toneColor(tone: ActivityTone | undefined, theme: Theme): string {
+  if (tone === "running") return theme.badge.running;
+  if (tone === "muted") return theme.muted;
+  return tone ? theme.status[tone] : theme.text;
 }
 
-function taskStatusColor(state: TaskState, theme: Theme): string {
-  if (state === "running") return theme.badge.running;
-  if (state === "completed") return theme.status.success;
-  if (state === "failed" || state === "blocked") return theme.status.error;
-  if (state === "cancelled") return theme.badge.idle;
-  return theme.muted;
+function workerTone(worker: SubagentWorkerState): ActivityTone {
+  return workerActive(worker) ? "running" : worker.status === "completed" ? "success" :
+    worker.status === "failed" || worker.status === "timed_out" ? "error" : "muted";
 }
 
 export function AgentHub(props: AgentHubProps) {
-  const {
-    workers,
-    tasks = [],
-    active = true,
-    initialTab = "workers",
-    onTabChange,
-    onSteer,
-    onKill,
-    onKillAll,
-    onCancelTask,
-    onDispatchTasks,
-    onMergeTask,
-    onExit,
-    initialSelected = 0,
-    width = 100,
-    theme: themeProp,
-  } = props;
-  const theme = useActiveTheme(themeProp);
-  const textLimit = Math.max(30, Math.floor(width * 0.5));
-  const [tab, setTab] = React.useState<AgentHubTab>(initialTab);
-  const [workerSelected, setWorkerSelected] = React.useState(Math.min(initialSelected, Math.max(workers.length - 1, 0)));
-  const [taskSelected, setTaskSelected] = React.useState(0);
+  const { workers, tasks = [], active = true, width = 100, height = 24 } = props;
+  const theme = useActiveTheme(props.theme);
+  const [tab, setTab] = React.useState<AgentHubTab>(props.initialTab ?? "workers");
+  const [workerId, setWorkerId] = React.useState(workers[props.initialSelected ?? 0]?.id);
+  const [taskId, setTaskId] = React.useState(tasks[0]?.id);
   const [steering, setSteering] = React.useState<string | null>(null);
+  const [detailOffset, setDetailOffset] = React.useState(0);
+  const workerIndex = Math.max(0, workers.findIndex((worker) => worker.id === workerId));
+  const taskIndex = Math.max(0, tasks.findIndex((task) => task.id === taskId));
+  const currentWorker = workers[workerIndex];
+  const currentTask = tasks[taskIndex];
+  const canSteer = Boolean(currentWorker && workerActive(currentWorker));
+  const canCancel = Boolean(currentTask && ["pending", "running", "blocked"].includes(currentTask.state));
+  const canMerge = Boolean(currentTask && taskNeedsMerge(currentTask) && props.onMergeTask);
+  const safeWidth = Math.max(1, width);
+  const contentWidth = Math.max(1, safeWidth - 2);
+  const wide = safeWidth >= 100;
+  const listWidth = wide ? Math.floor(contentWidth * 0.4) : contentWidth;
+  const detailWidth = wide ? contentWidth - listWidth - 2 : contentWidth;
+  const actions = tab === "workers"
+    ? [canSteer ? "s steer · k stop" : "", workers.some(workerActive) && props.onKillAll ? "K stop all" : ""].filter(Boolean)
+    : [tasks.some((task) => task.state === "pending") && props.onDispatchTasks ? "d dispatch" : "", canMerge ? "m merge" : "", canCancel && props.onCancelTask ? "x cancel" : ""].filter(Boolean);
+  const footer = wrapText(["↑↓ select · Tab switch · Esc back", "PgUp/PgDn detail", ...actions].join(" · "), contentWidth);
+  const bodyHeight = Math.max(0, height - 2 - footer.length - (steering !== null ? 1 : 0));
+  const items = tab === "workers" ? workers : tasks;
+  const selectedIndex = tab === "workers" ? workerIndex : taskIndex;
+  const listHeight = wide ? bodyHeight : Math.min(Math.max(1, items.length), Math.max(1, Math.floor((bodyHeight - 1) * 0.4)));
+  const detailHeight = Math.max(0, wide ? bodyHeight : bodyHeight - listHeight - 1);
+  const listStart = Math.max(0, Math.min(selectedIndex - listHeight + 1, Math.max(0, items.length - listHeight)));
+  const details: DetailRow[] = [];
+  const add = (text: string, tone?: ActivityTone, bold?: boolean) => details.push({ text, tone, bold });
 
-  const workerIndex = workers.length === 0 ? -1 : Math.min(workerSelected, workers.length - 1);
-  const currentWorker = workerIndex >= 0 ? workers[workerIndex] : undefined;
-  const taskIndex = tasks.length === 0 ? -1 : Math.min(taskSelected, tasks.length - 1);
-  const currentTask = taskIndex >= 0 ? tasks[taskIndex] : undefined;
+  if (tab === "workers" && currentWorker) {
+    const worker = currentWorker;
+    add(workerTitle(worker), undefined, true);
+    const end = worker.result?.finished_at ?? (workerActive(worker) ? Date.now() : worker.updatedAt);
+    add(`${worker.status} · ${formatElapsed(Math.max(0, (end - worker.createdAt) / 1000))}`, workerTone(worker));
+    add(`Activity: ${workerActivity(worker)}`);
+    if (worker.lastProgressAt !== undefined) add(`Last progress: ${formatElapsed((Date.now() - worker.lastProgressAt) / 1000)} ago`, "muted");
+    add(`Time limit: ${worker.timeoutSeconds ? `${worker.timeoutSeconds}s` : "Off"}`, "muted");
+    if (worker.agent) add(`Agent: @${worker.agent}`);
+    if (worker.error) add(`Error: ${worker.error.message}`, "error");
+    if (worker.result?.output) { add("Result", undefined, true); add(worker.result.output); }
+    add("Transcript", undefined, true);
+    add(workerTranscript(worker.transcript) || "No activity recorded yet.", "muted");
+    add("Technical details", undefined, true);
+    add(`ID: ${worker.id}`, "muted");
+    add(`Model: ${workerModelLabel(worker)}`, "muted");
+    add(`Worktree: ${worker.worktreePath ?? "Shared workspace"}`, "muted");
+    if (worker.usage) add(`Tokens: ${worker.usage.prompt_tokens + worker.usage.completion_tokens}${worker.usage.cost_usd === undefined ? "" : ` · $${worker.usage.cost_usd.toFixed(4)}`}`, "muted");
+  } else if (tab === "tasks" && currentTask) {
+    const task = currentTask;
+    const activity = taskActivity(task, tasks);
+    add(task.title, undefined, true);
+    add(activity.label, activity.tone);
+    if (activity.waitingOn.length) add(`Review and merge: ${activity.waitingOn.join(", ")}`, "warning");
+    else if (taskNeedsMerge(task)) add("Review this result, then press m to merge.", "warning");
+    if (task.agent) add(`Agent: @${task.agent}`);
+    if (task.error) add(`Error: ${task.error}`, "error");
+    if (task.mergeSummary) add(`Merge: ${task.mergeSummary}`, task.merged ? "success" : "error");
+    if (task.result) { add("Result", undefined, true); add(task.result); }
+    if (task.filesChanged.length) add(`Files: ${task.filesChanged.join(", ")}`);
+    if (task.diff) { add("Diff", undefined, true); add(task.diff, "muted"); }
+    add("Technical details", undefined, true);
+    add(`ID: ${task.id}`, "muted");
+    add(`Dependencies: ${task.dependsOn.join(", ") || "None"}`, "muted");
+    add(`Worker: ${task.workerId ?? "Not started"}`, "muted");
+    add(`Model: ${workerModelLabel(workers.find((worker) => worker.id === task.workerId) ?? task)}`, "muted");
+  } else {
+    add(tab === "workers" ? "No workers yet." : "No tasks yet.", "muted");
+    add("Delegated work will appear here.", "muted");
+  }
+  const detailLines = details.flatMap((row) => wrapText(row.text, Math.max(1, detailWidth)).map((text) => ({ ...row, text })));
+  const offset = Math.min(detailOffset, Math.max(0, detailLines.length - detailHeight));
+  const selectTab = (next: AgentHubTab) => { setTab(next); setDetailOffset(0); setSteering(null); props.onTabChange?.(next); };
 
-  const selectTab = (next: AgentHubTab): void => {
-    setTab(next);
-    onTabChange?.(next);
-  };
+  useInput((input, key) => {
+    if (isMouseSequence(input)) return;
+    if (steering !== null) {
+      if (key.escape) { setSteering(null); return; }
+      if (key.return) {
+        if (canSteer && steering.trim()) props.onSteer(currentWorker!.id, steering.trim());
+        setSteering(null); return;
+      }
+      if (key.backspace || key.delete) setSteering((value) => graphemeClusters(value ?? "").slice(0, -1).join(""));
+      else if (!key.ctrl && !key.meta) setSteering((value) => (value ?? "") + input);
+      return;
+    }
+    if (key.escape) { props.onExit(); return; }
+    if (key.tab) { selectTab(tab === "workers" ? "tasks" : "workers"); return; }
+    if (input === "w" || input === "t") { selectTab(input === "w" ? "workers" : "tasks"); return; }
+    if (key.pageUp || key.pageDown) {
+      setDetailOffset(Math.max(0, Math.min(detailLines.length - detailHeight, offset + (key.pageUp ? -1 : 1) * Math.max(1, detailHeight - 1))));
+      return;
+    }
+    if (key.upArrow || key.downArrow) {
+      const index = Math.max(0, Math.min(items.length - 1, selectedIndex + (key.upArrow ? -1 : 1)));
+      if (tab === "workers") setWorkerId(workers[index]?.id);
+      else setTaskId(tasks[index]?.id);
+      setDetailOffset(0); return;
+    }
+    if (tab === "workers") {
+      if (input === "s" && canSteer) setSteering("");
+      if (input === "k" && canSteer) props.onKill(currentWorker!.id);
+      if (input === "K" && workers.some(workerActive)) props.onKillAll?.();
+    } else {
+      if (input === "d" && tasks.some((task) => task.state === "pending")) props.onDispatchTasks?.();
+      if (input === "m" && canMerge) props.onMergeTask?.(currentTask!.id);
+      if (input === "x" && canCancel) props.onCancelTask?.(currentTask!.id);
+    }
+  }, { isActive: active });
 
-  useInput(
-    (input, key) => {
-      if (steering !== null) {
-        if (key.return) {
-          if (currentWorker && steering.trim().length > 0) onSteer(currentWorker.id, steering.trim());
-          setSteering(null);
-          return;
-        }
-        if (key.escape) {
-          setSteering(null);
-          return;
-        }
-        if (key.backspace || key.delete) {
-          setSteering((value) => (value ?? "").slice(0, -1));
-          return;
-        }
-        if (!key.ctrl && !key.meta && input.length > 0) {
-          setSteering((value) => (value ?? "") + input);
-        }
-        return;
-      }
-
-      if (key.escape) {
-        onExit();
-        return;
-      }
-      if (key.tab) {
-        selectTab(tab === "workers" ? "tasks" : "workers");
-        return;
-      }
-      if (input === "w") {
-        selectTab("workers");
-        return;
-      }
-      if (input === "t") {
-        selectTab("tasks");
-        return;
-      }
-
-      if (tab === "workers") {
-        if (key.upArrow) {
-          setWorkerSelected((index) => Math.max(0, index - 1));
-          return;
-        }
-        if (key.downArrow) {
-          setWorkerSelected((index) => Math.min(Math.max(workers.length - 1, 0), index + 1));
-          return;
-        }
-        if (input === "s" && currentWorker) {
-          setSteering("");
-          return;
-        }
-        if (input === "K" && onKillAll) {
-          onKillAll();
-          return;
-        }
-        if (input === "k" && currentWorker) {
-          onKill(currentWorker.id);
-        }
-        return;
-      }
-
-      if (key.upArrow) {
-        setTaskSelected((index) => Math.max(0, index - 1));
-        return;
-      }
-      if (key.downArrow) {
-        setTaskSelected((index) => Math.min(Math.max(tasks.length - 1, 0), index + 1));
-        return;
-      }
-      if (input === "d") {
-        onDispatchTasks?.();
-        return;
-      }
-      if (input === "m" && currentTask) {
-        onMergeTask?.(currentTask.id);
-        return;
-      }
-      if (input === "x" && currentTask) {
-        onCancelTask?.(currentTask.id);
-      }
-    },
-    { isActive: active },
-  );
-
-  return (
-    <Box flexDirection="column" paddingX={1}>
-      <Box justifyContent="space-between">
-        <Box gap={2}>
-          <Text
-            bold={tab === "workers"}
-            color={tab === "workers" ? theme.accent : theme.muted}
-          >
-            Workers ({workers.length})
-          </Text>
-          <Text
-            bold={tab === "tasks"}
-            color={tab === "tasks" ? theme.accent : theme.muted}
-          >
-            Tasks ({tasks.length})
-          </Text>
-        </Box>
-        <Text color={theme.muted}>Tab switch · Esc back</Text>
-      </Box>
-      <Text color={theme.border.passive}>{"─".repeat(48)}</Text>
-
-      {tab === "workers" ? (
-        <Box>
-          <Box width="40%" flexDirection="column" paddingRight={1}>
-            {workers.length === 0 ? <Text color={theme.muted}>(no workers yet)</Text> : null}
-            {workers.map((worker, index) => {
-              const color = workerStatusColor(worker.status, theme);
-              const marker = index === workerIndex ? "❯" : " ";
-              return (
-                <Text key={worker.id} color={color} bold={index === workerIndex}>
-                  {marker} {worker.id} [{worker.status}]
-                </Text>
-              );
-            })}
-          </Box>
-          <Box width="60%" flexDirection="column" paddingLeft={1}>
-            {currentWorker ? (
-              <>
-                <Text bold color={theme.text}>{currentWorker.id}</Text>
-                <Text color={theme.muted}>task: {currentWorker.task.slice(0, textLimit)}</Text>
-                <Text color={workerStatusColor(currentWorker.status, theme)}>status: {currentWorker.status}</Text>
-                {currentWorker.detail ? (
-                  <Text color={theme.muted}>detail: {currentWorker.detail}</Text>
-                ) : null}
-                {currentWorker.error ? (
-                  <Text color={theme.status.error}>error: {currentWorker.error.message}</Text>
-                ) : null}
-                <Text color={theme.text}>
-                  route: {currentWorker.provider && currentWorker.model
-                    ? `${currentWorker.provider} / ${currentWorker.model}`
-                    : currentWorker.roleModel ?? "main"}
-                </Text>
-                <Text color={theme.text}>worktree: {currentWorker.worktreePath ?? "(none)"}</Text>
-                <Text color={theme.text}>
-                  tokens: {currentWorker.usage
-                    ? `${currentWorker.usage.prompt_tokens + currentWorker.usage.completion_tokens}`
-                    : "0"}
-                  {currentWorker.usage?.cost_usd !== undefined ? ` ($${currentWorker.usage.cost_usd.toFixed(4)})` : ""}
-                </Text>
-                <Text bold color={theme.accent}>Live transcript</Text>
-                {currentWorker.transcript.length === 0 ? <Text color={theme.muted}>(empty)</Text> : null}
-                {currentWorker.transcript.slice(-8).map((line, index) => (
-                  <Text key={index} color={theme.muted}>
-                    {line.length > textLimit ? `${line.slice(0, textLimit - 3)}...` : line}
-                  </Text>
-                ))}
-              </>
-            ) : (
-              <Text color={theme.muted}>Select a subagent to inspect it.</Text>
-            )}
-          </Box>
-        </Box>
-      ) : (
-        <Box>
-          <Box width="45%" flexDirection="column" paddingRight={1}>
-            {tasks.length === 0 ? (
-              <Box flexDirection="column">
-                <Text color={theme.muted}>No tasks yet.</Text>
-                <Text color={theme.muted}>The agent creates them with task_create.</Text>
-              </Box>
-            ) : null}
-            {tasks.map((task, index) => {
-              const marker = index === taskIndex ? "❯" : " ";
-              return (
-                <Text key={task.id} color={taskStatusColor(task.state, theme)} bold={index === taskIndex}>
-                  {marker} [{task.state}] {task.title.length > textLimit ? `${task.title.slice(0, textLimit - 3)}...` : task.title}
-                </Text>
-              );
-            })}
-          </Box>
-          <Box width="55%" flexDirection="column" paddingLeft={1}>
-            {currentTask ? (
-              <>
-                <Text bold color={theme.text}>{currentTask.title}</Text>
-                <Text color={taskStatusColor(currentTask.state, theme)}>state: {currentTask.state}</Text>
-                <Text color={theme.muted}>id: {currentTask.id}</Text>
-                {currentTask.agent ? <Text color={theme.text}>agent: @{currentTask.agent}</Text> : null}
-                <Text color={theme.text}>
-                  route: {currentTask.provider && currentTask.model
-                    ? `${currentTask.provider} / ${currentTask.model}`
-                    : currentTask.roleModel ?? "main"}
-                </Text>
-                <Text color={theme.text}>deps: {currentTask.dependsOn.length > 0 ? currentTask.dependsOn.join(", ") : "none"}</Text>
-                <Text color={theme.text}>worker: {currentTask.workerId ?? "not started"}</Text>
-                {currentTask.error ? <Text color={theme.status.error}>error: {currentTask.error}</Text> : null}
-                {currentTask.filesChanged.length > 0 ? (
-                  <Text color={theme.text}>files: {currentTask.filesChanged.join(", ")}</Text>
-                ) : null}
-                {currentTask.merged !== undefined ? (
-                  <Text color={currentTask.merged ? theme.status.success : theme.status.error}>
-                    {currentTask.merged ? `merged: ${currentTask.mergeSummary ?? "ok"}` : `merge failed: ${currentTask.mergeSummary ?? "conflict"}`}
-                  </Text>
-                ) : null}
-                {currentTask.result ? (
-                  <>
-                    <Text bold color={theme.accent}>Result</Text>
-                    {currentTask.result.split("\n").slice(0, 6).map((line, index) => (
-                      <Text key={index} color={theme.text}>
-                        {line.length > textLimit ? `${line.slice(0, textLimit - 3)}...` : line}
-                      </Text>
-                    ))}
-                  </>
-                ) : null}
-                {currentTask.diff ? (
-                  <>
-                    <Text bold color={theme.accent}>Diff</Text>
-                    {currentTask.diff.split("\n").slice(0, 8).map((line, index) => (
-                      <Text key={index} color={line.startsWith("+") ? theme.diff.added : line.startsWith("-") ? theme.diff.removed : theme.muted}>
-                        {line.length > textLimit ? `${line.slice(0, textLimit - 3)}...` : line}
-                      </Text>
-                    ))}
-                  </>
-                ) : null}
-              </>
-            ) : (
-              <Text color={theme.muted}>Select a task to inspect it.</Text>
-            )}
-          </Box>
-        </Box>
-      )}
-
-      <Text color={theme.muted}>
-        {tab === "workers"
-          ? "Up/Down move · s steer · k stop · K stop all · Tab tasks · Esc back"
-          : "Up/Down move · d dispatch ready · m merge · x cancel · Tab workers · Esc back"}
-      </Text>
-      {steering !== null ? (
-        <Text color={theme.badge.running}>
-          Steering {currentWorker?.id ?? ""} ❯ {steering} (Enter send, Esc cancel)
-        </Text>
-      ) : null}
+  const list = <Box width={listWidth} height={listHeight} overflow="hidden" flexDirection="column">
+    {!items.length ? <Text color={theme.muted}>{tab === "workers" ? "No workers yet." : "No tasks yet."}</Text> : null}
+    {items.slice(listStart, listStart + listHeight).map((item, index) => {
+      const selected = listStart + index === selectedIndex;
+      const worker = tab === "workers" ? item as SubagentWorkerState : undefined;
+      const task = tab === "tasks" ? item as TaskItem : undefined;
+      const status = task ? taskActivity(task, tasks) : { label: worker!.status, tone: workerTone(worker!) };
+      const title = worker ? `${worker.agent ? `@${worker.agent} ` : ""}${workerTitle(worker)}` : task!.title;
+      const statusWidth = Math.min(displayWidth(status.label), Math.floor(listWidth * 0.6));
+      const label = fitDisplayText(status.label, statusWidth);
+      return <Text key={item.id} wrap="truncate"><Text color={selected ? theme.focus : theme.muted}>{selected ? "❯ " : "  "}</Text><Text color={selected ? theme.selection : theme.text} bold={selected}>{fitDisplayText(title, Math.max(1, listWidth - statusWidth - 3))}</Text><Text color={toneColor(status.tone, theme)}> {label}</Text></Text>;
+    })}
+  </Box>;
+  const detail = <Box width={detailWidth} height={detailHeight} overflow="hidden" flexDirection="column">
+    {detailLines.slice(offset, offset + detailHeight).map((line, index) => <Text key={index} color={toneColor(line.tone, theme)} bold={line.bold} wrap="truncate">{line.text}</Text>)}
+  </Box>;
+  return <Box width={safeWidth} height={height} paddingX={safeWidth > 2 ? 1 : 0} overflow="hidden" flexDirection="column">
+    <Text wrap="truncate"><Text bold color={tab === "workers" ? theme.selection : theme.muted}>{tab === "workers" ? "❯ " : "  "}Workers {workers.length}</Text>{"   "}<Text bold color={tab === "tasks" ? theme.selection : theme.muted}>{tab === "tasks" ? "❯ " : "  "}Tasks {tasks.length}</Text></Text>
+    <Text color={theme.border.passive}>{"─".repeat(contentWidth)}</Text>
+    <Box height={bodyHeight} flexDirection={wide ? "row" : "column"} overflow="hidden">
+      {list}
+      {wide ? <Box width={2} /> : <Box height={1} />}
+      {detail}
     </Box>
-  );
+    {footer.map((line, index) => <Text key={index} color={theme.muted} wrap="truncate">{line}</Text>)}
+    {steering !== null ? <Text color={theme.text} wrap="truncate">{fitDisplayText(`Steer: ${steering} (Enter send, Esc cancel)`, contentWidth)}</Text> : null}
+  </Box>;
 }

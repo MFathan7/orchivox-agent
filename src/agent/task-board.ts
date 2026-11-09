@@ -39,6 +39,7 @@ export interface TaskItem {
   diff?: string;
   filesChanged: string[];
   merged?: boolean;
+  requiresMerge?: boolean;
   mergeSummary?: string;
   createdAt: number;
   updatedAt: number;
@@ -60,6 +61,7 @@ export interface TaskCreateInput {
 }
 
 export interface TaskSpawnInput {
+  signal?: AbortSignal;
   id: string;
   task: string;
   agent?: string;
@@ -73,6 +75,7 @@ export interface TaskSpawnInput {
 }
 
 export interface TaskWorkerOutcome {
+  requiresMerge?: boolean;
   output?: string;
   error?: string;
   diff?: string;
@@ -112,6 +115,12 @@ export interface TaskBoardOptions {
 const RESULT_EXCERPT = 400;
 const CHAIN_RESULT_LIMIT = 12_000;
 
+interface TaskCancellationGroup {
+  signal: AbortSignal;
+  ids: Set<string>;
+  abort: () => void;
+}
+
 export class TaskBoard {
   private readonly tasks = new Map<string, TaskItem>();
   private readonly spawner: TaskSpawner;
@@ -124,6 +133,7 @@ export class TaskBoard {
   private active = 0;
   private counter = 0;
   private readonly idleWaiters: Array<() => void> = [];
+  private readonly cancellationGroups = new Map<string, TaskCancellationGroup>();
 
   constructor(options: TaskBoardOptions) {
     this.spawner = options.spawner;
@@ -166,12 +176,14 @@ export class TaskBoard {
     if (!task) return false;
     if (task.state === "running" && task.workerId) this.canceller?.(task.workerId);
     this.tasks.delete(id);
+    this.releaseCancellation(id);
     this.store?.deleteTask(id);
     this.refreshBlocked();
     return true;
   }
 
-  add(input: TaskCreateInput | TaskCreateInput[]): TaskItem[] {
+  add(input: TaskCreateInput | TaskCreateInput[], signal?: AbortSignal): TaskItem[] {
+    signal?.throwIfAborted();
     const requests = Array.isArray(input) ? input : [input];
     const held = [...this.tasks.values()].filter(
       (task) => task.state !== "completed" && task.state !== "cancelled",
@@ -228,7 +240,41 @@ export class TaskBoard {
     this.blockCycles(created);
 
     for (const item of created) this.persist(item);
+    if (signal) this.bindCancellation(created, signal);
     return created;
+  }
+
+  private bindCancellation(tasks: TaskItem[], signal: AbortSignal): void {
+    const group: TaskCancellationGroup = {
+      signal,
+      ids: new Set(tasks.filter((task) => task.state === "pending").map((task) => task.id)),
+      abort: () => {
+        // One turn can create several groups; cancel them before dispatching again.
+        const ownedIds = [...this.cancellationGroups]
+          .filter(([, owner]) => owner.signal === signal)
+          .map(([id]) => id);
+        for (const id of ownedIds) {
+          const task = this.tasks.get(id);
+          if (task && task.state !== "completed" && task.state !== "cancelled") {
+            this.markCancelled(task);
+          }
+        }
+        this.refreshBlocked();
+        this.dispatch();
+      },
+    };
+    for (const id of group.ids) this.cancellationGroups.set(id, group);
+    if (group.ids.size === 0) return;
+    signal.addEventListener("abort", group.abort, { once: true });
+    if (signal.aborted) group.abort();
+  }
+
+  private releaseCancellation(id: string): void {
+    const group = this.cancellationGroups.get(id);
+    if (!group) return;
+    this.cancellationGroups.delete(id);
+    group.ids.delete(id);
+    if (group.ids.size === 0) group.signal.removeEventListener("abort", group.abort);
   }
 
   /** Blocks tasks that depend on each other in a loop, which would never start. */
@@ -348,6 +394,7 @@ export class TaskBoard {
       this.canceller?.(task.workerId);
     }
     task.state = "cancelled";
+    this.releaseCancellation(task.id);
     task.error = task.error ?? "cancelled by user";
     task.updatedAt = Date.now();
     this.onUpdate?.(task);
@@ -372,6 +419,8 @@ export class TaskBoard {
         if (settled) return;
         settled = true;
         signal?.removeEventListener("abort", finish);
+        const index = this.idleWaiters.indexOf(finish);
+        if (index >= 0) this.idleWaiters.splice(index, 1);
         resolve();
       };
       this.idleWaiters.push(finish);
@@ -393,6 +442,7 @@ export class TaskBoard {
       task.updatedAt = Date.now();
       this.onUpdate?.(task);
       this.persist(task);
+      if (result.success) this.dispatch();
       return result.success
         ? `merged ${id}: ${result.diffSummary.length > 0 ? result.diffSummary : "no changes"}`
         : `merge failed for ${id}: ${result.conflicts.length > 0 ? result.conflicts.join(", ") : "unknown conflict"}`;
@@ -402,7 +452,15 @@ export class TaskBoard {
   }
 
   private dependenciesComplete(task: TaskItem): boolean {
-    return task.dependsOn.every((dependency) => this.tasks.get(dependency)?.state === "completed");
+    return task.dependsOn.every((id) => {
+      const dependency = this.tasks.get(id);
+      return dependency?.state === "completed" &&
+        (!this.requiresMerge(dependency) || dependency.merged === true);
+    });
+  }
+
+  private requiresMerge(task: TaskItem): boolean {
+    return task.requiresMerge ?? (task.writeIsolation && task.mode !== "plan");
   }
 
   private refreshBlocked(): void {
@@ -422,6 +480,7 @@ export class TaskBoard {
         });
         if (broken) {
           task.state = "blocked";
+          this.releaseCancellation(task.id);
           task.error = `dependency "${broken}" did not complete`;
           task.updatedAt = Date.now();
           this.onUpdate?.(task);
@@ -479,10 +538,12 @@ export class TaskBoard {
         writeIsolation: task.writeIsolation,
         skills: task.skills,
         parentSessionId: task.parentSessionId,
+        signal: this.cancellationGroups.get(task.id)?.signal,
       });
     } catch (error) {
       this.active = Math.max(0, this.active - 1);
       task.state = "failed";
+      this.releaseCancellation(task.id);
       task.error = error instanceof Error ? error.message : String(error);
       task.updatedAt = Date.now();
       this.onUpdate?.(task);
@@ -502,6 +563,7 @@ export class TaskBoard {
           task.error = outcome.error;
           task.diff = outcome.diff;
           task.filesChanged = outcome.filesChanged ?? [];
+          task.requiresMerge = outcome.requiresMerge;
         }
         task.updatedAt = Date.now();
         this.onUpdate?.(task);
@@ -517,6 +579,7 @@ export class TaskBoard {
         this.persist(task);
       })
       .finally(() => {
+        this.releaseCancellation(task.id);
         this.active = Math.max(0, this.active - 1);
         this.dispatch();
         if (this.active === 0) {
@@ -532,7 +595,7 @@ export class TaskBoard {
         [
           "Create tasks on the multi-agent board. Each task becomes a subagent worker with its own context, optionally isolated in a git worktree and routed to a model role or provider/model.",
           "Use depends_on to build a DAG, and write {previous} or {result:<task-id>} inside a task to hand a dependency result to it, which turns a chain of tasks into a pipeline.",
-          "Chain steps see each other's files only when write_isolation is false, which is the right choice for a pipeline that edits the same files.",
+          "Dependents of isolated workers wait for you to review and task_merge their dependencies. Shared-workspace tasks see earlier writes directly.",
           "Include every file path and decision the worker needs. Tasks start automatically unless auto_start is false.",
         ].join(" "),
       parameters: z.object({
@@ -555,7 +618,7 @@ export class TaskBoard {
         auto_start: z.boolean().default(true),
       }),
       readOnly: false,
-      execute: (args) => {
+      execute: (args, context) => {
         const request = args as {
           tasks: Array<{
             id?: string;
@@ -585,6 +648,7 @@ export class TaskBoard {
             writeIsolation: entry.write_isolation,
             skills: entry.skills,
           })),
+          context?.signal,
         );
 
         const started = request.auto_start ? this.dispatch() : 0;
@@ -622,7 +686,14 @@ export class TaskBoard {
             ? `\n  error: ${task.error}`
             : "";
         const merged = task.merged === undefined ? "" : task.merged ? " merged" : " merge-failed";
-        return `- ${task.id} [${task.state}] ${task.title}${deps}${mode}${skills}${worker}${files}${merged}${result}`;
+        const waiting = task.state === "pending" ? task.dependsOn.filter((id) => {
+          const dependency = this.tasks.get(id);
+          return dependency?.state === "completed" && this.requiresMerge(dependency) && dependency.merged !== true;
+        }) : [];
+        const mergeWait = waiting.length > 0
+          ? `\n  waiting for review and task_merge: ${waiting.join(", ")}`
+          : "";
+        return `- ${task.id} [${task.state}] ${task.title}${deps}${mode}${skills}${worker}${files}${merged}${result}${mergeWait}`;
       })
       .join("\n");
   }
@@ -631,7 +702,7 @@ export class TaskBoard {
     return {
       name: "task_wait",
       description:
-        "Wait until no task is running, starting ready tasks as dependencies complete. Returns the final board with results.",
+        "Wait until no task is running. Dependents of isolated workers stay pending until you review and task_merge their dependencies. Returns results and pending merge ids; merge reviewed work, then wait again.",
       parameters: z.object({}),
       readOnly: false,
       execute: async (_args, context) => {
@@ -645,7 +716,7 @@ export class TaskBoard {
     return {
       name: "task_dispatch",
       description:
-        "Start every pending task whose dependencies are complete, up to the concurrency limit. Call again after finishing partial work.",
+        "Start pending tasks whose dependencies are complete and, for isolated work, merged after review, up to the concurrency limit.",
       parameters: z.object({}),
       readOnly: false,
       execute: () => {
@@ -676,7 +747,7 @@ export class TaskBoard {
     return {
       name: "task_merge",
       description:
-        "Merge a completed task's worker branch into the current branch, then remove its worktree. Returns the diff summary or the conflicting files.",
+        "After reviewing a completed task, merge its worker branch into the current branch and remove its worktree. A successful merge starts ready dependents. Returns the diff summary or conflicting files.",
       parameters: z.object({
         id: z.string().min(1),
       }),

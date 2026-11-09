@@ -294,6 +294,11 @@ export class SpecialistAgentRegistry {
     return Array.from(map.values());
   }
 
+  listLoadedAgents(): SpecialistAgentProfile[] {
+    return this.cachedAgents.size > 0 ? [...this.cachedAgents.values()]
+      : Object.values(BUILTIN_SPECIALISTS).map((profile) => ({ ...profile, source: "builtin" }));
+  }
+
   async getAgent(name: string): Promise<SpecialistAgentProfile | undefined> {
     const clean = name.startsWith("@") ? name.slice(1).toLowerCase() : name.toLowerCase();
     if (this.cachedAgents.size === 0) {

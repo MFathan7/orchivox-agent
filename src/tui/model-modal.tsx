@@ -1,5 +1,5 @@
 import React from "react";
-import { Box, Text, useInput, useStdin } from "ink";
+import { Box, Text, useInput, useStdin, useStdout } from "ink";
 
 import {
   ProviderKindSchema,
@@ -49,10 +49,27 @@ import {
   isWordDeleteSequence,
 } from "./text-edit";
 import { useActiveTheme, type Theme } from "./theme";
+import { fitDisplayText } from "./text-wrap";
 
 const PROVIDER_KINDS = ProviderKindSchema.options;
 type ModelTarget = ConfigRole | ConfigMode;
 const TARGET_ORDER: ModelTarget[] = ["main", "fast", "advisor", "plan", "build", "ultrawork"];
+const TARGET_LABELS: Record<ModelTarget, string> = {
+  main: "Session",
+  fast: "Fast",
+  advisor: "Advisor",
+  plan: "Plan mode",
+  build: "Build mode",
+  ultrawork: "Ultrawork mode",
+};
+const TARGET_DESCRIPTIONS: Record<ModelTarget, string> = {
+  main: "Main agent and specialists using the main role. Clears mode overrides.",
+  fast: "Explore and Librarian workers. Does not change mode models.",
+  advisor: "Oracle architecture and debugging worker. Does not change mode models.",
+  plan: "Override the model for Plan mode only.",
+  build: "Override the model for Build mode only.",
+  ultrawork: "Override the model for Ultrawork mode only.",
+};
 
 function isModeTarget(target: ModelTarget): target is ConfigMode {
   return target === "plan" || target === "build" || target === "ultrawork";
@@ -274,6 +291,7 @@ interface ModelGroup {
 
 type ModalView =
   | "models"
+  | "targets"
   | "providers"
   | "providerAdd"
   | "providerModels"
@@ -349,13 +367,16 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     height = 24,
   } = props;
   const theme = useActiveTheme(themeProp);
-  const compact = (process.stdout.columns ?? 80) < 72 || height < 20;
+  const { stdout } = useStdout();
+  const columns = stdout.columns ?? 80;
+  const compact = columns < 72 || height < 20;
   const veryCompact = height < 10;
 
   const [view, setView] = React.useState<ModalView>(
     initialView === "providers" ? "providers" : "models",
   );
   const [targetRole, setTargetRole] = React.useState<ModelTarget>(initialTarget ?? "main");
+  const [targetIndex, setTargetIndex] = React.useState(TARGET_ORDER.indexOf(initialTarget ?? "main"));
   const [query, setQuery] = React.useState("");
   const [queryCursor, setQueryCursor] = React.useState(0);
   const [selectedIndex, setSelectedIndex] = React.useState(0);
@@ -823,6 +844,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
   };
 
   const assignModel = async (provider: string, model: string): Promise<void> => {
+    setBusy(true);
     try {
       const configured = router
         .listAllConfiguredModels()
@@ -833,12 +855,12 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       }
 
       if (isModeTarget(targetRole)) {
-        router.setModeModel(targetRole, provider, model);
         await saveModeSelection(configPath, targetRole, provider, model);
+        router.setModeModel(targetRole, provider, model);
         onModeModelChange?.(targetRole, provider, model);
       } else {
-        router.setRole(targetRole, provider, model);
         await saveRoleSelection(configPath, targetRole, provider, model);
+        router.setRole(targetRole, provider, model);
         onRoleChange?.(targetRole, provider, model);
         // The main model is the session model: drop per-mode pins so a model
         // change applies everywhere instead of staying tied to one mode.
@@ -871,6 +893,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -1082,9 +1106,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     }
   };
 
-  const cycleTarget = (): void => {
-    const index = TARGET_ORDER.indexOf(targetRole);
-    const next = TARGET_ORDER[(index + 1) % TARGET_ORDER.length];
+  const selectTarget = (next: ModelTarget): void => {
     setTargetRole(next);
     const ref = isModeTarget(next) ? router.getModeModel(next) : router.getRole(next);
     if (ref) {
@@ -1094,6 +1116,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       if (modelIndex >= 0) setSelectedIndex(modelIndex);
     }
     didSelectTarget.current = true;
+    setView("models");
   };
 
   const clearSearch = (): void => {
@@ -1281,6 +1304,23 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
       return;
     }
 
+    if (view === "targets") {
+      if (key.escape) {
+        setView("models");
+        return;
+      }
+      if (key.upArrow) {
+        setTargetIndex((index) => (index + TARGET_ORDER.length - 1) % TARGET_ORDER.length);
+        return;
+      }
+      if (key.downArrow) {
+        setTargetIndex((index) => (index + 1) % TARGET_ORDER.length);
+        return;
+      }
+      if (key.return) selectTarget(TARGET_ORDER[targetIndex]);
+      return;
+    }
+
     if (view === "reasoning") {
       const levels = levelOptions(targetRole);
       if (key.escape) {
@@ -1323,7 +1363,8 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         return;
       }
       if (key.ctrl && input === "r") {
-        cycleTarget();
+        setTargetIndex(TARGET_ORDER.indexOf(targetRole));
+        setView("targets");
         return;
       }
       if (key.ctrl && input === "e") {
@@ -1828,6 +1869,35 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
     );
   }
 
+  if (view === "targets") {
+    const visibleCount = Math.min(TARGET_ORDER.length, Math.max(1, height - 3));
+    const start = Math.max(0, Math.min(targetIndex - visibleCount + 1, TARGET_ORDER.length - visibleCount));
+    const contentWidth = Math.max(1, columns - 4);
+    return (
+      <Box flexDirection="column" paddingX={1} height={height} overflow="hidden">
+        <Text bold color={theme.text} wrap="truncate">Model target · Esc back</Text>
+        {TARGET_ORDER.slice(start, start + visibleCount).map((target, index) => {
+          const selected = start + index === targetIndex;
+          const ref = isModeTarget(target) ? router.getModeSettings(target).model : router.getRole(target);
+          const value = ref ? `${ref.provider} / ${ref.model}` : isModeTarget(target) ? "Inherits session" : "Not configured";
+          return (
+            <Text key={target} wrap="truncate">
+              <Text color={selected ? theme.focus : theme.muted}>{selected ? "❯ " : "  "}</Text>
+              <Text bold={selected} color={selected ? theme.selection : theme.text}>
+                {TARGET_LABELS[target].padEnd(15)}
+              </Text>
+              <Text color={ref || isModeTarget(target) ? theme.muted : theme.status.warning}>
+                {fitDisplayText(value, Math.max(1, contentWidth - 17))}
+              </Text>
+            </Text>
+          );
+        })}
+        <Text color={theme.muted} wrap="truncate">{TARGET_DESCRIPTIONS[TARGET_ORDER[targetIndex]]}</Text>
+        <Text color={theme.muted} wrap="truncate">Up/Down select · Enter choose target</Text>
+      </Box>
+    );
+  }
+
   if (view === "models") {
     const activeModel = isModeTarget(targetRole)
       ? router.getModeModel(targetRole)
@@ -1862,19 +1932,21 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         <Text wrap="truncate">
           <Text color={theme.muted}>Target </Text>
           <Text bold color={theme.text}>
-            {targetRole === "main" ? "session" : targetRole}
+            {TARGET_LABELS[targetRole]}
           </Text>
-          <Text color={theme.muted}>
-            {" · "}
-            {activeModel
-              ? truncateText(
-                  `${activeModel.provider} / ${activeModel.model}`,
-                  Math.max(8, (process.stdout.columns ?? 80) - (compact ? 16 : 24)),
-                )
-              : "not configured"}
-            {activeMissing ? " · not installed" : ""}
-            {!compact ? "  (Ctrl+R cycle)" : ""}
-          </Text>
+          <Text color={theme.muted}> · Ctrl+R target</Text>
+          {!compact ? (
+            <Text color={theme.muted}>
+              {" · "}
+              {activeModel
+                ? truncateText(
+                    `${activeModel.provider} / ${activeModel.model}`,
+                    Math.max(8, columns - 24),
+                  )
+                : "not configured"}
+              {activeMissing ? " · not installed" : ""}
+            </Text>
+          ) : null}
         </Text>
         {!compact ? (
           <Text wrap="truncate" color={theme.muted}>
@@ -1884,7 +1956,7 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
                     .map((entry) => `${entry.mode} ${entry.model}`)
                     .join(", ")}`
                 : "All modes use this model."
-              : `Override for ${targetRole} only. Select session to change every mode.`}
+              : TARGET_DESCRIPTIONS[targetRole]}
           </Text>
         ) : null}
 
@@ -2028,10 +2100,10 @@ export function ModelConfigModal(props: ModelConfigModalProps) {
         {status ? <Text color={theme.status.success}>{status}</Text> : null}
         {error ? <Text color={theme.status.error}>{error}</Text> : null}
         <Text color={theme.muted} wrap="truncate">
-          {compact
+          {busy ? "Saving model assignment..." : compact
             ? veryCompact
-              ? "Enter assign · Esc close"
-              : "Enter assign · Ctrl+E · Esc close"
+              ? "Enter assign · Ctrl+R target · Esc"
+              : "Enter assign · Ctrl+R target · Esc close"
             : "Type to search · Enter assign · Ctrl+E capabilities"}
         </Text>
         {!compact ? (

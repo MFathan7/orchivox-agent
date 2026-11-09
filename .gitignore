@@ -7,19 +7,13 @@ FIX*.md
 REVISION_*.md
 agent_audit*.md
 
+# Internal docs and release notes stay local
+RELEASING.md
+/docs/
+
 # Build and release output
-!/docs/
-/docs/*
-!/docs/releasing.md
-!/docs/orchestration.md
-!/docs/evals/
-!/docs/evals/**
-!/docs/evals/plan28/fixtures/build/
-!/docs/evals/plan28/fixtures/build/**
 dist/
 build/
-!/docs/evals/plan28/fixtures/build/
-!/docs/evals/plan28/fixtures/build/**
 artifacts/
 /release/
 *.tsbuildinfo

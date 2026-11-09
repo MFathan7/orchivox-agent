@@ -75,6 +75,7 @@ interface NoteRow {
 }
 
 interface TaskRow {
+  requires_merge: number | null;
   id: string;
   title: string;
   task: string;
@@ -155,6 +156,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   diff TEXT,
   files_changed TEXT NOT NULL DEFAULT '[]',
   merged INTEGER,
+  requires_merge INTEGER,
   merge_summary TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -180,6 +182,9 @@ export class MemoryDatabase implements TaskStore {
     }
     if (!taskColumns.some((column) => column.name === "skills_json")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';");
+    }
+    if (!taskColumns.some((column) => column.name === "requires_merge")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN requires_merge INTEGER;");
     }
     const sessionColumns = this.db.query("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
     if (!sessionColumns.some((column) => column.name === "compaction_json")) {
@@ -510,8 +515,8 @@ export class MemoryDatabase implements TaskStore {
   saveTask(task: TaskItem): void {
     this.db
       .query(
-        `INSERT INTO tasks (id, title, task, agent, role_model, provider, model, mode, depends_on, write_isolation, parent_session_id, skills_json, state, worker_id, result, error, diff, files_changed, merged, merge_summary, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO tasks (id, title, task, agent, role_model, provider, model, mode, depends_on, write_isolation, parent_session_id, skills_json, state, worker_id, result, error, diff, files_changed, merged, merge_summary, created_at, updated_at, requires_merge)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            title = excluded.title,
            task = excluded.task,
@@ -531,6 +536,7 @@ export class MemoryDatabase implements TaskStore {
            diff = excluded.diff,
            files_changed = excluded.files_changed,
            merged = excluded.merged,
+           requires_merge = excluded.requires_merge,
            merge_summary = excluded.merge_summary,
            updated_at = excluded.updated_at`,
       )
@@ -557,6 +563,7 @@ export class MemoryDatabase implements TaskStore {
         task.mergeSummary ?? null,
         task.createdAt,
         task.updatedAt,
+        task.requiresMerge === undefined ? null : task.requiresMerge ? 1 : 0,
       );
   }
 
@@ -637,6 +644,7 @@ function toTaskItem(row: TaskRow): TaskItem {
     diff: row.diff ?? undefined,
     filesChanged: parseStringArray(row.files_changed),
     merged: row.merged === null ? undefined : row.merged === 1,
+    requiresMerge: row.requires_merge === null ? undefined : row.requires_merge === 1,
     mergeSummary: row.merge_summary ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

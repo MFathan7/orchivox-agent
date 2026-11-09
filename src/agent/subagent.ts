@@ -25,6 +25,7 @@ export interface SubagentTaskInput {
   onTranscript: (line: string) => void;
   onUsage: (usage: Usage) => void;
   drainSteerings: () => string[];
+  onProgress?: (phase: string) => void;
 }
 
 export interface SubagentTaskResult {
@@ -37,6 +38,24 @@ export interface SubagentTaskResult {
 }
 
 export type SubagentExecutor = (input: SubagentTaskInput) => Promise<SubagentTaskResult>;
+
+export class SubagentTurnLimitError extends Error {
+  constructor(limit: number) {
+    super(`subagent reached the ${limit}-turn limit; the task is not complete`);
+    this.name = "SubagentTurnLimitError";
+  }
+}
+
+export class SubagentReadinessError extends Error {
+  constructor(readonly code: string, message: string, readonly route?: Partial<SubagentSpawnTask>) {
+    super(message);
+    this.name = "SubagentReadinessError";
+  }
+}
+
+class WorkerDeadlineError extends Error {
+  constructor() { super("Worker total-time limit reached."); }
+}
 
 export interface SubagentWorkerState {
   id: string;
@@ -59,6 +78,10 @@ export interface SubagentWorkerState {
   result?: SubagentResult;
   createdAt: number;
   updatedAt: number;
+  mode?: AgentMode;
+  phase?: string;
+  lastProgressAt?: number;
+  timeoutSeconds?: number;
 }
 
 export type SubagentBatchMode = "parallel" | "chain";
@@ -126,6 +149,11 @@ export class SubagentManager {
   private readonly cleanupPromises = new Map<string, Promise<void>>();
   private readonly finished = new Set<string>();
   private counter = 0;
+  private readonly prepare?: (task: SubagentSpawnTask) => Promise<SubagentSpawnTask>;
+  private readonly onFinished?: (worker: SubagentWorkerState) => void;
+  private readonly timeoutSeconds: () => number;
+  private readonly routingGuidance?: () => string;
+  private readonly deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(options: {
     executor: SubagentExecutor;
@@ -133,12 +161,20 @@ export class SubagentManager {
     onUsage?: (worker: SubagentWorkerState, usage: Usage) => void;
     stopTimeoutMs?: number;
     cleanupTimeoutMs?: number;
+    prepare?: (task: SubagentSpawnTask) => Promise<SubagentSpawnTask>;
+    onFinished?: (worker: SubagentWorkerState) => void;
+    timeoutSeconds?: () => number;
+    routingGuidance?: () => string;
   }) {
     this.executor = options.executor;
     this.worktrees = options.worktrees;
     this.onUsage = options.onUsage;
     this.stopTimeoutMs = options.stopTimeoutMs ?? STOP_TIMEOUT_MS;
     this.cleanupTimeoutMs = options.cleanupTimeoutMs ?? CLEANUP_TIMEOUT_MS;
+    this.prepare = options.prepare;
+    this.onFinished = options.onFinished;
+    this.timeoutSeconds = options.timeoutSeconds ?? (() => 0);
+    this.routingGuidance = options.routingGuidance;
   }
 
   registerTools(registry: ToolRegistry): void {
@@ -202,6 +238,10 @@ export class SubagentManager {
       outputJsonSchema: input.outputJsonSchema,
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      mode: input.mode ?? currentTurnContext()?.mode ?? "build",
+      phase: "Checking model route",
+      lastProgressAt: Date.now(),
+      timeoutSeconds: this.timeoutSeconds(),
     };
     this.workers.set(id, worker);
     this.controllers.set(id, controller);
@@ -225,6 +265,12 @@ export class SubagentManager {
       this.completionResolvers.set(id, resolve);
     });
     this.completions.set(id, completion);
+    if (worker.timeoutSeconds && !controller.signal.aborted) {
+      this.deadlineTimers.set(id, setTimeout(() => {
+        controller.abort(new WorkerDeadlineError());
+        void this.forceStop(worker);
+      }, worker.timeoutSeconds * 1000));
+    }
 
     void this.runWorker(
       worker,
@@ -281,21 +327,23 @@ export class SubagentManager {
   }
 
   private async forceStop(worker: SubagentWorkerState): Promise<void> {
-    if (isTerminalStatus(worker.status) || this.finished.has(worker.id)) return;
-    worker.status = "aborted";
-    worker.detail = "stopped after timeout";
-    worker.error = { code: "aborted", message: "worker stopped by user" };
+    if (this.finished.has(worker.id)) return;
+    const timedOut = this.controllers.get(worker.id)?.signal.reason instanceof WorkerDeadlineError;
+    worker.status = timedOut ? "timed_out" : "aborted";
+    worker.detail = timedOut ? `Total-time limit reached (${worker.timeoutSeconds}s)` : "stopped after timeout";
+    worker.error = { code: timedOut ? "worker_timeout" : "aborted", message: timedOut ? worker.detail : "worker stopped by user" };
     if (!worker.result) {
       worker.result = SubagentResultSchema.parse({
         id: worker.id,
-        state: "aborted",
+        state: worker.status,
         output: worker.transcript.slice(-10).join("\n"),
         error: worker.error,
+        usage: worker.usage,
         started_at: worker.createdAt,
         finished_at: Date.now(),
       });
     } else {
-      worker.result.state = "aborted";
+      worker.result.state = worker.status;
       worker.result.error = worker.error;
     }
 
@@ -311,6 +359,9 @@ export class SubagentManager {
 
     const timer = this.stopTimers.get(worker.id);
     if (timer) clearTimeout(timer);
+    const deadline = this.deadlineTimers.get(worker.id);
+    if (deadline) clearTimeout(deadline);
+    this.deadlineTimers.delete(worker.id);
     this.parentAbortCleanup.get(worker.id)?.();
 
     const callback = this.completionCallbacks.get(worker.id);
@@ -330,6 +381,7 @@ export class SubagentManager {
     } catch {
       // A broken completion callback must not keep the worker alive.
     }
+    try { this.onFinished?.(worker); } catch { /* Completion must not depend on diagnostics. */ }
     resolve?.();
   }
 
@@ -482,8 +534,6 @@ export class SubagentManager {
     controller: AbortController,
   ): Promise<void> {
     const startedAt = Date.now();
-    const planWorker = (input.mode ?? "build") === "plan";
-    const writeIsolation = planWorker ? false : input.writeIsolation ?? true;
 
     const finishAborted = async (message = "worker stopped by user"): Promise<void> => {
       worker.status = "aborted";
@@ -503,27 +553,61 @@ export class SubagentManager {
     };
 
     if (controller.signal.aborted) {
+      if (this.finished.has(worker.id)) return;
       await finishAborted();
       return;
     }
 
+    if (this.prepare) {
+      try {
+        const prepared = await this.prepare({ ...input, agent: worker.agent, roleModel: worker.roleModel,
+          provider: worker.provider, model: worker.model });
+        if (controller.signal.aborted) {
+          if (!this.finished.has(worker.id)) await finishAborted();
+          return;
+        }
+        input = { ...input, ...prepared };
+        Object.assign(worker, { agent: prepared.agent, roleModel: prepared.roleModel,
+          provider: prepared.provider, model: prepared.model, mode: prepared.mode });
+      } catch (error) {
+        if (this.finished.has(worker.id)) return;
+        if (controller.signal.aborted) { await finishAborted(); return; }
+        if (error instanceof SubagentReadinessError && error.route) {
+          const { agent, roleModel, provider, model, mode } = error.route;
+          Object.assign(worker, { agent, roleModel, provider, model, mode });
+        }
+        worker.status = "failed";
+        worker.error = { code: error instanceof SubagentReadinessError ? error.code : "model_route_unavailable",
+          message: error instanceof Error ? error.message : String(error) };
+        worker.result = SubagentResultSchema.parse({ id: worker.id, state: "failed", output: "",
+          error: worker.error, started_at: startedAt, finished_at: Date.now() });
+        return;
+      }
+    }
+    const planWorker = (input.mode ?? "build") === "plan";
+    const writeIsolation = planWorker ? false : input.writeIsolation ?? true;
+
     if (writeIsolation) {
       worker.status = "preparing";
+      worker.phase = "Preparing worktree";
       try {
         worker.worktreePath = await this.worktrees.createWorktree(worker.id);
       } catch (error) {
+        if (this.finished.has(worker.id)) return;
         worker.status = "failed";
         worker.error = { code: "worktree_failed", message: error instanceof Error ? error.message : String(error) };
         worker.updatedAt = Date.now();
         return;
       }
       if (controller.signal.aborted) {
+        if (this.finished.has(worker.id)) { await this.discardFailedWorktree(worker); return; }
         await finishAborted();
         return;
       }
     }
 
     worker.status = "running";
+    worker.phase = "Starting worker";
     worker.updatedAt = Date.now();
     try {
       // The worker runs inside its own turn context so every tool resolves
@@ -551,6 +635,7 @@ export class SubagentManager {
             skills: input.skills,
             signal: controller.signal,
             onTranscript: (line) => {
+              if (this.finished.has(worker.id) || controller.signal.aborted) return;
               worker.transcript.push(line);
               if (worker.transcript.length > TRANSCRIPT_LIMIT) worker.transcript.shift();
               worker.updatedAt = Date.now();
@@ -576,6 +661,12 @@ export class SubagentManager {
               const queued = this.steerings.get(worker.id) ?? [];
               this.steerings.set(worker.id, []);
               return queued;
+            },
+            onProgress: (phase) => {
+              if (this.finished.has(worker.id) || controller.signal.aborted) return;
+              worker.phase = phase;
+              worker.lastProgressAt = Date.now();
+              worker.updatedAt = Date.now();
             },
           }),
       );
@@ -614,10 +705,11 @@ export class SubagentManager {
         finished_at: Date.now(),
       });
     } catch (error) {
+      if (this.finished.has(worker.id)) return;
       const aborted = controller.signal.aborted || (worker.status as string) === "aborted";
       worker.status = aborted ? "aborted" : "failed";
       worker.error = {
-        code: aborted ? "aborted" : "executor_failed",
+        code: aborted ? "aborted" : error instanceof SubagentTurnLimitError ? "turn_limit_exceeded" : "executor_failed",
         message: error instanceof Error ? error.message : String(error),
       };
       if (!worker.result) {
@@ -626,6 +718,7 @@ export class SubagentManager {
           state: aborted ? "aborted" : "failed",
           output: worker.transcript.slice(-10).join("\n"),
           error: worker.error,
+          usage: worker.usage,
           started_at: startedAt,
           finished_at: Date.now(),
         });
@@ -634,15 +727,16 @@ export class SubagentManager {
       if (worker.status === "failed" || worker.status === "aborted") {
         await this.discardFailedWorktree(worker);
       }
-      worker.updatedAt = Date.now();
+      if (!this.finished.has(worker.id)) worker.updatedAt = Date.now();
     }
   }
 
   private spawnTool(): AgentTool {
+    const manager = this;
     return {
       name: "spawn_subagents",
-      description:
-        [
+      get description() {
+        return [
           "Run tasks in isolated worker contexts.",
           'mode "parallel" (default) starts every task at once; mode "chain" runs them in order and replaces {previous} in each later task with the earlier worker output.',
           "Each task can set agent, a model role or provider/model route, a JSON output schema, and write isolation (a git worktree per worker).",
@@ -650,7 +744,9 @@ export class SubagentManager {
           "Set merge to merge each completed isolated worker back into the current branch afterwards.",
           "Set continue_from to a completed worker id to continue from its output. Merge an isolated worker first if its files matter.",
           "Each worker has its own context, so include every file path and decision it needs.",
-        ].join(" "),
+          manager.routingGuidance?.(),
+        ].filter(Boolean).join(" ");
+      },
       parameters: z.object({
         tasks: z
           .array(

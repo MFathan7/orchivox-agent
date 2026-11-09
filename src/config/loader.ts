@@ -498,6 +498,7 @@ export const AutoDelegateModeSchema = z.enum(["off", "ultrawork", "always"]);
 export type AutoDelegateMode = z.infer<typeof AutoDelegateModeSchema>;
 
 export const OrchestrationConfigSchema = z.object({
+  worker_timeout_seconds: z.number().int().nonnegative().default(0),
   /** off: no automatic coordinator. ultrawork: only in Ultrawork. always: Build and Ultrawork. */
   auto_delegate: AutoDelegateModeSchema.default("off"),
   coordinator_agent: z.string().min(1).default("polaris"),
@@ -524,6 +525,7 @@ export const ApprovalsConfigSchema = z.object({
 export type ApprovalsConfig = z.infer<typeof ApprovalsConfigSchema>;
 
 export const AppConfigSchema = z.object({
+  ui: z.object({ animations: z.boolean().default(true) }).prefault({}),
   version: z.number().int().positive().default(1),
   providers: z.record(z.string().min(1), ProviderProfileSchema).default({}),
   roles: RolesConfigSchema.default({}),

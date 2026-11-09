@@ -7,7 +7,7 @@ import type { SpecialistAgentProfile, SpecialistAgentRegistry } from "./speciali
 import { resolveSubagentSkillAccess } from "./skill-access";
 import type { SkillRegistry } from "./skills";
 import { normalizeSkillName } from "./skills";
-import type { SubagentManager } from "./subagent";
+import type { SubagentManager, SubagentSpawnTask } from "./subagent";
 import type { TaskBoard, TaskItem } from "./task-board";
 
 export const WorkPlanTaskSchema = z.object({
@@ -52,6 +52,7 @@ export interface CoordinatorResult {
 }
 
 export interface CoordinatorOptions {
+  checkTask?: (task: SubagentSpawnTask) => Promise<void>;
   subagents: SubagentManager;
   tasks: TaskBoard;
   agents: SpecialistAgentRegistry;
@@ -76,6 +77,7 @@ export class Coordinator {
   private readonly skills: SkillRegistry;
   private readonly coordinatorAgent: string;
   private readonly maxTasks: number;
+  private readonly checkTask?: CoordinatorOptions["checkTask"];
 
   constructor(options: CoordinatorOptions) {
     this.subagents = options.subagents;
@@ -84,6 +86,7 @@ export class Coordinator {
     this.skills = options.skills;
     this.coordinatorAgent = options.coordinatorAgent ?? "polaris";
     this.maxTasks = Math.max(1, options.maxTasks ?? 10);
+    this.checkTask = options.checkTask;
   }
 
   async coordinate(input: CoordinatorInput, signal?: AbortSignal): Promise<CoordinatorResult> {
@@ -94,8 +97,13 @@ export class Coordinator {
     if (!profileByName.has(this.coordinatorAgent.toLowerCase())) {
       throw new Error(`coordinator agent "${this.coordinatorAgent}" is not registered`);
     }
+    await this.checkTask?.({ agent: this.coordinatorAgent, task: input.goal, mode: "plan" });
 
     const plan = await this.requestPlan(input, profiles, profileByName, signal);
+    for (const task of plan.tasks) {
+      signal?.throwIfAborted();
+      await this.checkTask?.({ agent: task.agent, task: task.task, mode: task.mode ?? "build" });
+    }
 
     const installedSkills = new Map(
       this.skills.listDocuments().map((document) => [
@@ -157,7 +165,7 @@ export class Coordinator {
       id: idMap.get(task.id) ?? task.id,
       dependsOn: task.dependsOn.map((dependency) => idMap.get(dependency) ?? dependency),
     }));
-    const created = this.tasks.add(namespaced);
+    const created = this.tasks.add(namespaced, signal);
     const started = this.tasks.dispatch();
     return { plan, tasks: created, warnings, started };
   }

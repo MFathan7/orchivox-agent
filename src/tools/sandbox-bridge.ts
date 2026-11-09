@@ -2,7 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 
+import { currentTurnContext, runWithTurnContext } from "../agent/turn-context";
 import { ensureRuntimeTempDir } from "../runtime-temp";
+import { workspaceRoot } from "./workspace";
 import { truncateHead } from "./output-budget";
 import type { AgentTool, ToolRegistry } from "./registry";
 
@@ -52,9 +54,11 @@ export function createSandboxScriptTool(registry: ToolRegistry, options: Sandbox
       timeoutMs: z.number().int().positive().max(120_000).optional(),
     }),
     readOnly: mode === "read-only",
-    execute: async (args) => {
+    execute: async (args, context) => {
       const request = args as { language: "typescript" | "python"; code: string; timeoutMs?: number };
-      return runSandboxScript(registry, request, { ...options, mode, allowed });
+      return runSandboxScript(registry, request, {
+        ...options, root: workspaceRoot(options.root ?? globalThis.process.cwd()), mode, allowed,
+      }, context?.signal);
     },
   };
 }
@@ -63,7 +67,10 @@ async function runSandboxScript(
   registry: ToolRegistry,
   request: { language: "typescript" | "python"; code: string; timeoutMs?: number },
   options: SandboxBridgeOptions & { mode: CodeMode; allowed: Set<string> },
+  signal?: AbortSignal,
 ): Promise<string> {
+  signal?.throwIfAborted();
+  const turnContext = currentTurnContext();
   const token = `${crypto.randomUUID()}${crypto.randomUUID()}`;
   const toolAbort = new AbortController();
   let callCounter = 0;
@@ -96,15 +103,17 @@ async function runSandboxScript(
         );
       }
       callCounter += 1;
-      const result = await registry.run(
+      const toolName = body.name;
+      const invoke = () => registry.run(
         {
           id: `sandbox-${callCounter}`,
-          name: body.name,
+          name: toolName,
           arguments: (body.arguments ?? {}) as Record<string, unknown>,
         },
-        options.mode === "read-only" ? "plan" : "build",
+        turnContext?.mode === "plan" || options.mode === "read-only" ? "plan" : turnContext?.mode ?? "build",
         toolAbort.signal,
       );
+      const result = await (turnContext ? runWithTurnContext(turnContext, invoke) : invoke());
       return Response.json({ result: { content: result.content, is_error: result.is_error } });
     },
   });
@@ -132,15 +141,24 @@ async function runSandboxScript(
     });
     const timeoutMs = request.timeoutMs ?? options.timeoutMs ?? 30_000;
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
-    const kill = (): void => proc.kill();
-    const abortTools = (): void => toolAbort.abort();
-    timeoutSignal.addEventListener("abort", kill, { once: true });
-    timeoutSignal.addEventListener("abort", abortTools, { once: true });
-    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    const exitCode = await proc.exited;
-    timeoutSignal.removeEventListener("abort", kill);
-    timeoutSignal.removeEventListener("abort", abortTools);
+    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    const abort = (): void => {
+      toolAbort.abort(combinedSignal.reason);
+      proc.kill();
+    };
+    combinedSignal.addEventListener("abort", abort, { once: true });
+    if (combinedSignal.aborted) abort();
+    let stdout: string;
+    let stderr: string;
+    let exitCode: number;
+    try {
+      [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      exitCode = await proc.exited;
+    } finally {
+      combinedSignal.removeEventListener("abort", abort);
+    }
 
+    signal?.throwIfAborted();
     if (timeoutSignal.aborted) {
       throw new Error(`sandbox script timed out after ${timeoutMs}ms\n${stdout}\n${stderr}`);
     }

@@ -8,12 +8,17 @@ import { useActiveTheme, type Theme } from "./theme";
 export type SettingsMode = "plan" | "build" | "ultrawork";
 
 export interface SettingsModalProps {
+  workerTimeoutSeconds?: number;
+  onWorkerTimeoutChange?: (seconds: number) => void;
+  animations?: boolean;
+  onAnimationsChange?: (enabled: boolean) => void;
   preset: ApprovalPreset;
   autoDelegate: AutoDelegateMode;
   steps: Record<SettingsMode, number>;
   configPath: string;
   configSource: string;
   width?: number;
+  height?: number;
   theme?: Theme;
   onPresetChange: (preset: ApprovalPreset) => void;
   onAutoDelegateChange: (mode: AutoDelegateMode) => void;
@@ -54,7 +59,7 @@ export const AUTO_DELEGATE_DESCRIPTIONS: Record<AutoDelegateMode, string> = {
 };
 
 interface Row {
-  id: "preset" | "auto_delegate" | SettingsMode | "config";
+  id: "preset" | "auto_delegate" | "animations" | "worker_timeout" | SettingsMode | "config";
   label: string;
   value: string;
   detail?: string;
@@ -106,6 +111,11 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
   const [selected, setSelected] = React.useState(0);
   const rows: Row[] = [
     {
+      id: "animations", label: "Animations", value: props.animations === false ? "Off" : "On",
+      detail: "Animate activity text and tool indicators. Turn off to keep them still.",
+      editable: Boolean(props.onAnimationsChange),
+    },
+    {
       id: "preset",
       label: "Approval preset",
       value: PRESET_LABELS[preset],
@@ -118,6 +128,12 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
       value: AUTO_DELEGATE_LABELS[autoDelegate],
       detail: AUTO_DELEGATE_DESCRIPTIONS[autoDelegate],
       editable: true,
+    },
+    {
+      id: "worker_timeout", label: "Worker time limit",
+      value: props.workerTimeoutSeconds ? `${props.workerTimeoutSeconds}s` : "Off",
+      detail: "Total time per new worker, including preparation. 0 disables this limit.",
+      editable: Boolean(props.onWorkerTimeoutChange),
     },
     ...MODES.map((mode) => ({
       id: mode,
@@ -135,10 +151,25 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
     },
   ];
   const clamped = Math.max(0, Math.min(selected, rows.length - 1));
+  const notes = Number(autoDelegate === "always") + Number(preset === "permissive");
+  const visibleRows = Math.max(1, (props.height ?? 24) - 5 - notes);
+  const start = Math.max(0, Math.min(clamped - visibleRows + 1, rows.length - visibleRows));
 
   const change = (direction: 1 | -1): void => {
     const row = rows[clamped];
     if (!row?.editable) return;
+    if (row.id === "worker_timeout") {
+      const current = props.workerTimeoutSeconds ?? 0;
+      const values = [0, 60, 120, 300, 600, 1200];
+      const next = direction === 1 ? values.find((value) => value > current) ?? 0
+        : [...values].reverse().find((value) => value < current) ?? 1200;
+      props.onWorkerTimeoutChange?.(next);
+      return;
+    }
+    if (row.id === "animations") {
+      props.onAnimationsChange?.(props.animations === false);
+      return;
+    }
     if (row.id === "preset") {
       onPresetChange(nextPreset(preset, direction));
       return;
@@ -176,20 +207,20 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
 
   const contentWidth = Math.max(24, width - 2);
   return (
-    <Box flexDirection="column" width={Math.max(24, width)} paddingX={1}>
-      <Box justifyContent="space-between">
+    <Box flexDirection="column" width={Math.max(24, width)} height={props.height} overflow="hidden" paddingX={1}>
+      <Box justifyContent="space-between" height={1} flexShrink={0}>
         <Text bold color={theme.text}>
           Settings
         </Text>
         <Text color={theme.muted}>Esc close</Text>
       </Box>
-      <Text color={theme.muted}>Safety, limits, and orchestration</Text>
+      <Text color={theme.muted} wrap="truncate">Appearance, safety, and orchestration</Text>
 
-      <Box flexDirection="column">
-        {rows.map((row, index) => {
-          const isSelected = index === clamped;
+      <Box flexDirection="column" flexShrink={0}>
+        {rows.slice(start, start + visibleRows).map((row, index) => {
+          const isSelected = start + index === clamped;
           return (
-            <Box key={row.id} flexDirection="column">
+            <Box key={row.id} flexDirection="column" flexShrink={0}>
               <Text wrap="truncate">
                 <Text color={isSelected ? theme.accent : theme.muted}>
                   {isSelected ? "❯ " : "  "}

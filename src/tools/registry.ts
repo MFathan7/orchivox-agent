@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { freezeDebugEnabled, logFreeze } from "../agent/freeze-debug";
 import type { ToolRulePattern } from "../agent/permissions";
+import { currentTurnContext } from "../agent/turn-context";
 import {
   toolParametersToJsonSchema,
   type AgentMode,
@@ -107,7 +108,7 @@ export class ToolRegistry {
     call: ToolCall,
     mode: AgentMode,
     signal?: AbortSignal,
-    permissionRules: readonly ToolRulePattern[] = [],
+    permissionRules: readonly ToolRulePattern[] = currentTurnContext()?.toolPermissionRules ?? [],
   ): Promise<ToolResult> {
     if (signal?.aborted) {
       return { tool_call_id: call.id, content: "tool cancelled", is_error: true };
@@ -115,6 +116,15 @@ export class ToolRegistry {
     const tool = this.get(call.name);
     if (!tool) {
       return { tool_call_id: call.id, content: `unknown tool "${call.name}"`, is_error: true };
+    }
+
+    const allowedTools = currentTurnContext()?.allowedToolNames;
+    if (allowedTools && !allowedTools.has(tool.name)) {
+      return {
+        tool_call_id: call.id,
+        content: `tool "${tool.name}" is not allowed for this worker`,
+        is_error: true,
+      };
     }
 
     const rawArgs = (call.arguments ?? {}) as Record<string, unknown>;
