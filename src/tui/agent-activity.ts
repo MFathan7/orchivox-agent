@@ -1,4 +1,4 @@
-import type { SubagentWorkerState } from "../agent/subagent";
+import { workerIsStalled, type SubagentWorkerState } from "../agent/subagent";
 import type { TaskItem } from "../agent/task-board";
 import { fitDisplayText, singleLine } from "./text-wrap";
 
@@ -43,7 +43,12 @@ export function workerActivity(worker: SubagentWorkerState): string {
   return tool ? tool.slice(7) : worker.status === "running" ? "Thinking" : worker.status;
 }
 
-export function workerModelLabel(worker: Pick<SubagentWorkerState, "provider" | "model" | "roleModel">): string {
+export function workerModelLabel(
+  worker: Pick<SubagentWorkerState, "provider" | "model" | "roleModel" | "route">,
+): string {
+  if (worker.route) {
+    return `${worker.route.provider} / ${worker.route.model}${worker.route.fallback ? " (fallback)" : ""}`;
+  }
   if (worker.provider && worker.model) return `${worker.provider} / ${worker.model}`;
   return worker.roleModel ? `${worker.roleModel} (unresolved)` : "Unresolved";
 }
@@ -59,9 +64,14 @@ export function agentActivityCounts(workers: SubagentWorkerState[], tasks: TaskI
 
 export function agentActivitySummary(workers: SubagentWorkerState[], tasks: TaskItem[], width: number): string {
   const { active, failed } = agentActivityCounts(workers, tasks);
+  const stalled = workers.filter((worker) => workerIsStalled(worker)).length;
   const merge = tasks.filter(taskNeedsMerge).length;
   if (active + failed + merge === 0) return "";
-  const parts = [active ? `${active} active` : "", merge ? `${merge} ${width < 60 ? "merge" : "awaiting merge"}` : "", failed ? `${failed} failed` : ""].filter(Boolean);
+  const parts = [
+    active ? `${active} active${stalled ? ` (${stalled} stalled)` : ""}` : "",
+    merge ? `${merge} ${width < 60 ? "merge" : "awaiting merge"}` : "",
+    failed ? `${failed} failed` : "",
+  ].filter(Boolean);
   const hint = width >= 70 ? " · /hub details" : "";
   return fitDisplayText(`Agents ${parts.join(" · ")}${hint}`, width);
 }

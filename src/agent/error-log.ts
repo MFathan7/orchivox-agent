@@ -14,6 +14,9 @@ export interface ErrorLogEntry {
   agent?: string;
   provider?: string;
   role?: string;
+  phase?: string;
+  fallback?: boolean;
+  last_progress_at?: number;
   error_code?: string;
   duration_ms?: number;
   timeout_seconds?: number;

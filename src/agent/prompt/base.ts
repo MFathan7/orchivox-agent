@@ -52,31 +52,26 @@ export function modeAdditionPart(options: SystemPromptOptions): PromptPart | und
   };
 }
 
-const ULTRAWORK_COORDINATOR_PROMPT = [
+const COORDINATOR_PROMPT = [
   "# Coordinator",
-  "This session can delegate work. For multi-step implementation, start by calling",
-  "the coordinate tool with the user's goal and the context a worker needs. The",
-  "tool returns a plan and creates tasks. Wait for the tasks with task_wait, review",
-  "their results, and merge only what passes. For a single read-only question, answer",
-  "directly.",
-].join(" ");
-
-const ALWAYS_COORDINATOR_PROMPT = [
-  "# Coordinator",
-  "A coordinator plan is already in this conversation. Follow it: wait for the",
-  "created tasks with task_wait, review their results, and merge only what passes.",
-  "If the plan is wrong, say why and continue manually.",
+  "You lead the work directly. The coordinate tool is optional: use it only when",
+  "a substantial task needs a separate dependency plan. Do not call it for a direct",
+  "answer, routine project study, or independent slices you can assign yourself.",
+  "It runs Polaris, validates its plan, and starts ready tasks. Continue with",
+  "independent work; use task_wait only when blocked. Review results and merge only what passes.",
+  "For a study, review, or planning request, do not create edit tasks and do not",
+  "edit files yourself. Report findings and wait for an explicit implementation request.",
 ].join(" ");
 
 export function coordinatorPart(options: SystemPromptOptions): PromptPart | undefined {
   const policy = options.autoDelegate ?? "off";
   if (policy === "off" || options.mode === "plan" || options.task) return undefined;
   if (policy === "ultrawork" && options.mode !== "ultrawork") return undefined;
-  if (policy === "always" && options.coordinatorPlan === false) return undefined;
+  if (options.tools && !options.tools.includes("coordinate")) return undefined;
   return {
     kind: "coordinator",
     key: "coordinator",
-    text: policy === "always" ? ALWAYS_COORDINATOR_PROMPT : ULTRAWORK_COORDINATOR_PROMPT,
+    text: COORDINATOR_PROMPT,
     stable: true,
   };
 }

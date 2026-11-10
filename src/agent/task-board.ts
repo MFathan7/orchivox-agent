@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { AgentMode } from "../types/schema";
 import type { AgentTool, ToolRegistry } from "../tools/registry";
 import { currentTurnContext } from "./turn-context";
+import { formatSubagentResult, type SubagentManager } from "./subagent";
 
 export const TaskStateSchema = z.enum([
   "pending",
@@ -108,6 +109,9 @@ export interface TaskBoardOptions {
   maxConcurrent?: number;
   /** Upper bound for tasks held by the board at once. */
   maxTasks?: number;
+  /** Wait for background subagents that are not board tasks. */
+  waitForSubagents?: (signal?: AbortSignal) => Promise<void>;
+  subagents?: SubagentManager;
   onUpdate?: (task: TaskItem) => void;
   store?: TaskStore;
 }
@@ -128,6 +132,8 @@ export class TaskBoard {
   private readonly merger: TaskMerger | undefined;
   private readonly maxConcurrent: number;
   private readonly maxTasks: number;
+  private readonly waitForSubagents: ((signal?: AbortSignal) => Promise<void>) | undefined;
+  private readonly subagents?: SubagentManager;
   private readonly onUpdate: ((task: TaskItem) => void) | undefined;
   private readonly store: TaskStore | undefined;
   private active = 0;
@@ -141,6 +147,8 @@ export class TaskBoard {
     this.merger = options.merger;
     this.maxConcurrent = Math.max(1, options.maxConcurrent ?? 3);
     this.maxTasks = Math.max(1, options.maxTasks ?? 10);
+    this.waitForSubagents = options.waitForSubagents;
+    this.subagents = options.subagents;
     this.onUpdate = options.onUpdate;
     this.store = options.store;
     if (this.store) this.hydrate(this.store.loadTasks());
@@ -430,7 +438,8 @@ export class TaskBoard {
 
   async merge(id: string): Promise<string> {
     const task = this.tasks.get(id);
-    if (!task) return `unknown task "${id}"`;
+    if (!task) return this.subagents ? this.subagents.mergeWorker(id) : `unknown task "${id}"`;
+    if (!this.ownsTask(task)) return `unknown task "${id}" in this session`;
     if (!task.workerId) return `task "${id}" has no worker to merge`;
     if (task.state !== "completed") return `task "${id}" is ${task.state}; only completed tasks can be merged`;
     if (!this.merger) return "merging is not configured";
@@ -663,15 +672,15 @@ export class TaskBoard {
   private listTool(): AgentTool {
     return {
       name: "task_list",
-      description: "List the multi-agent task board with state, dependencies, worker ids, and short results.",
+      description: "List this session's tasks and background workers, including state, dependencies, worker ids, worktrees, and output artifacts.",
       parameters: z.object({}),
       readOnly: true,
-      execute: () => this.formatList(),
+      execute: () => this.formatActivity(),
     };
   }
 
   private formatList(): string {
-    const items = this.list();
+    const items = this.list().filter((task) => this.ownsTask(task));
     if (items.length === 0) return "task board is empty";
     return items
       .map((task) => {
@@ -698,16 +707,73 @@ export class TaskBoard {
       .join("\n");
   }
 
+  private formatActivity(): string {
+    const boardWorkers = new Set(this.list().map((task) => task.workerId));
+    const workers = this.subagents?.listOwnedWorkers().filter((worker) => !boardWorkers.has(worker.id)) ?? [];
+    return [this.formatList(), ...workers.map((worker) =>
+      `- ${worker.id} [${worker.status}] ${worker.description ?? worker.agent ?? "worker"}${worker.phase ? ` (${worker.phase})` : ""}${worker.worktreePath ? ` worktree=${worker.worktreePath}` : ""}${worker.result?.output_path ? ` output=${worker.result.output_path}` : ""}${worker.error ? ` error=${worker.error.message}` : ""}`,
+    )].join("\n");
+  }
+
+  private ownsTask(task: TaskItem): boolean {
+    const context = currentTurnContext();
+    return !context || task.parentSessionId === context.sessionId;
+  }
+
+  private formatWaitResults(workers: ReturnType<SubagentManager["listWorkers"]>): string {
+    const runId = currentTurnContext()?.runId;
+    return workers.map((worker) => worker.background && runId && worker.parentRunId === runId
+      ? `${worker.id} [${worker.status}]: result delivered to this turn.`
+      : formatSubagentResult(worker)).join("\n\n");
+  }
+
   private waitTool(): AgentTool {
     return {
       name: "task_wait",
       description:
-        "Wait until no task is running. Dependents of isolated workers stay pending until you review and task_merge their dependencies. Returns results and pending merge ids; merge reviewed work, then wait again.",
-      parameters: z.object({}),
-      readOnly: false,
-      execute: async (_args, context) => {
-        await this.waitForIdle(context?.signal);
-        return this.formatList();
+        "Wait only when blocked. ids selects worker or task ids in this session. wait_for=any (default) returns the first result; all waits for every selected result. Returns after timeout_seconds (default 30, max 60) without stopping workers. Pending isolated dependencies require review and task_merge before they can run.",
+      parameters: z.object({
+        ids: z.array(z.string().min(1)).min(1).optional(),
+        wait_for: z.enum(["any", "all"]).default("any"),
+        timeout_seconds: z.number().positive().max(60).default(30),
+      }),
+      readOnly: true,
+      execute: async (args, context) => {
+        const request = args as { ids?: string[]; wait_for: "any" | "all"; timeout_seconds: number };
+        const deadline = new AbortController();
+        const timer = setTimeout(() => deadline.abort(), request.timeout_seconds * 1000);
+        const signal = context?.signal
+          ? AbortSignal.any([context.signal, deadline.signal]) : deadline.signal;
+        try {
+          let output = "";
+          if (this.subagents) {
+            const ids = request.ids?.flatMap((id) => {
+              const task = this.tasks.get(id);
+              if (task && !this.ownsTask(task)) throw new Error(`unknown task "${id}" in this session`);
+              return task ? (task.workerId ? [task.workerId] : []) : [id];
+            });
+            if (request.wait_for === "all" && !ids && currentTurnContext()?.mode !== "plan") {
+              await Promise.all([
+                this.waitForIdle(signal),
+                this.subagents.waitForWorkers({ waitFor: "all", signal }).then((workers) => {
+                  output = this.formatWaitResults(workers);
+                }),
+              ]);
+            } else {
+              const workers = await this.subagents.waitForWorkers({ ids, waitFor: request.wait_for, signal });
+              output = this.formatWaitResults(workers);
+            }
+          } else {
+            await Promise.all([
+              this.waitForIdle(signal),
+              this.waitForSubagents?.(signal) ?? Promise.resolve(),
+            ]);
+          }
+          return [deadline.signal.aborted ? "Wait timed out; workers keep running." : "", output, this.formatActivity()]
+            .filter(Boolean).join("\n\n");
+        } finally {
+          clearTimeout(timer);
+        }
       },
     };
   }
@@ -737,7 +803,10 @@ export class TaskBoard {
       readOnly: false,
       execute: (args) => {
         const { id } = args as { id: string };
-        const cancelled = this.cancel(id);
+        const worker = this.subagents?.listOwnedWorkers().find((entry) => entry.id === id);
+        const task = this.tasks.get(id);
+        const cancelled = task ? this.ownsTask(task) && this.cancel(id)
+          : worker ? this.canceller?.(id) ?? this.subagents!.stop(id) : false;
         return cancelled ? `cancelled task ${id}` : `task ${id} was not running or does not exist`;
       },
     };
@@ -747,7 +816,7 @@ export class TaskBoard {
     return {
       name: "task_merge",
       description:
-        "After reviewing a completed task, merge its worker branch into the current branch and remove its worktree. A successful merge starts ready dependents. Returns the diff summary or conflicting files.",
+        "After reviewing a completed task or background worker, merge its branch and remove its worktree. id accepts a task id or worker id. A successful task merge starts ready dependents. Returns the diff summary or conflicting files.",
       parameters: z.object({
         id: z.string().min(1),
       }),

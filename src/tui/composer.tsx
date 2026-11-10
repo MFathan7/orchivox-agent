@@ -139,6 +139,7 @@ export interface PromptComposerProps {
   onOpenSessions?: () => void;
   onOpenHelp?: () => void;
   onLayoutRows?: (rows: number) => void;
+  onDraftChange?: (hasDraft: boolean) => void;
   onScrollLine?: (delta: number) => void;
   onScrollPage?: (delta: number) => void;
   onScrollToBottom?: () => void;
@@ -566,6 +567,10 @@ export function PromptComposer(props: PromptComposerProps) {
 
   const theme = useActiveTheme(themeProp);
   const [text, setText] = React.useState("");
+  const hasDraft = text.length > 0;
+  const draftCallback = React.useRef(props.onDraftChange);
+  draftCallback.current = props.onDraftChange;
+  React.useEffect(() => { draftCallback.current?.(hasDraft); }, [hasDraft]);
   const [cursorPos, setCursorPos] = React.useState(0);
   const [attachedFiles, setAttachedFiles] = React.useState<FileAttachmentRef[]>([]);
   const [historyManager] = React.useState(() => new PersistentCommandHistory(historyFilePath, repoRoot));

@@ -1,5 +1,7 @@
 import { agentPromptPart } from "./agent-prompt";
 import { closingPart, coordinatorPart, modeAdditionPart, specialistPart } from "./base";
+import { delegationPart } from "./delegation";
+import { workerContractPart } from "./worker";
 import {
   environmentPart,
   extraPart,
@@ -24,10 +26,12 @@ export function composePromptParts(options: SystemPromptOptions): PromptPart[] {
   return applyPromptProfile(
     clean([
       agentPromptPart(options, profile),
+      delegationPart(options),
       includeInstructions ? environmentPart(options) : undefined,
       includeInstructions ? projectPart(options) : undefined,
       includeInstructions ? rulesPart(options) : undefined,
       specialistPart(options),
+      workerContractPart(options),
       modeAdditionPart(options),
       coordinatorPart(options),
       includeInstructions ? skillsPart(options) : undefined,

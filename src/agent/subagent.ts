@@ -28,6 +28,13 @@ export interface SubagentTaskInput {
   onProgress?: (phase: string) => void;
 }
 
+export interface SubagentRouteInfo {
+  provider: string;
+  model: string;
+  /** True when the worker retried on the session's main model. */
+  fallback: boolean;
+}
+
 export interface SubagentTaskResult {
   output: string;
   usage?: Usage;
@@ -35,6 +42,7 @@ export interface SubagentTaskResult {
   diff?: string;
   filesChanged?: string[];
   branch?: string;
+  route?: SubagentRouteInfo;
 }
 
 export type SubagentExecutor = (input: SubagentTaskInput) => Promise<SubagentTaskResult>;
@@ -43,6 +51,13 @@ export class SubagentTurnLimitError extends Error {
   constructor(limit: number) {
     super(`subagent reached the ${limit}-turn limit; the task is not complete`);
     this.name = "SubagentTurnLimitError";
+  }
+}
+
+export class SubagentTokenBudgetError extends Error {
+  constructor(limit: number) {
+    super(`worker reached the limits.worker_tokens budget of ${limit} tokens; the task is not complete`);
+    this.name = "SubagentTokenBudgetError";
   }
 }
 
@@ -62,15 +77,21 @@ export interface SubagentWorkerState {
   agent?: string;
   description?: string;
   task: string;
+  /** True when the worker was started in background mode and delivers a result. */
+  background?: boolean;
   roleModel?: "main" | "fast" | "advisor";
   provider?: string;
   model?: string;
+  /** Route that actually ran, including a fallback after a provider failure. */
+  route?: SubagentRouteInfo;
   status: SubagentState;
   detail?: string;
   transcript: string[];
   usage?: Usage;
   /** Session that spawned this worker, used for session cost accounting. */
   parentSessionId?: string;
+  parentRunId?: string;
+  executionStartedAt?: number;
   worktreePath?: string;
   outputJsonSchema?: JsonSchemaObject;
   structuredOutput?: unknown;
@@ -147,6 +168,7 @@ export class SubagentManager {
   private readonly stopTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly parentAbortCleanup = new Map<string, () => void>();
   private readonly cleanupPromises = new Map<string, Promise<void>>();
+  private readonly settledListeners = new Set<(worker: SubagentWorkerState) => void>();
   private readonly finished = new Set<string>();
   private counter = 0;
   private readonly prepare?: (task: SubagentSpawnTask) => Promise<SubagentSpawnTask>;
@@ -154,6 +176,9 @@ export class SubagentManager {
   private readonly timeoutSeconds: () => number;
   private readonly routingGuidance?: () => string;
   private readonly deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly queuedStarts = new Map<string, () => void>();
+  private readonly running = new Set<string>();
+  private readonly maxConcurrent: () => number;
 
   constructor(options: {
     executor: SubagentExecutor;
@@ -165,6 +190,7 @@ export class SubagentManager {
     onFinished?: (worker: SubagentWorkerState) => void;
     timeoutSeconds?: () => number;
     routingGuidance?: () => string;
+    maxConcurrent?: () => number;
   }) {
     this.executor = options.executor;
     this.worktrees = options.worktrees;
@@ -175,6 +201,7 @@ export class SubagentManager {
     this.onFinished = options.onFinished;
     this.timeoutSeconds = options.timeoutSeconds ?? (() => 0);
     this.routingGuidance = options.routingGuidance;
+    this.maxConcurrent = options.maxConcurrent ?? (() => 4);
   }
 
   registerTools(registry: ToolRegistry): void {
@@ -189,11 +216,19 @@ export class SubagentManager {
     return this.workers.get(workerId);
   }
 
+  /** Notifies a listener once when a worker reaches a terminal state. */
+  onSettled(listener: (worker: SubagentWorkerState) => void): () => void {
+    this.settledListeners.add(listener);
+    return () => this.settledListeners.delete(listener);
+  }
+
   spawnOne(input: {
     id?: string;
     agent?: string;
     description?: string;
     task: string;
+    /** Start the worker without waiting for it and deliver its result later. */
+    background?: boolean;
     mode?: AgentMode;
     roleModel?: "main" | "fast" | "advisor";
     provider?: string;
@@ -229,12 +264,14 @@ export class SubagentManager {
       agent: resolvedAgent,
       description: input.description,
       task: input.task,
+      background: input.background === true,
       roleModel: input.roleModel,
       provider: input.provider,
       model: input.model,
       status: "queued",
       transcript: [],
       parentSessionId: input.parentSessionId ?? currentTurnContext()?.sessionId,
+      parentRunId: currentTurnContext()?.runId,
       outputJsonSchema: input.outputJsonSchema,
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -247,6 +284,11 @@ export class SubagentManager {
     this.controllers.set(id, controller);
     this.steerings.set(id, []);
     this.completionCallbacks.set(id, input.onComplete ?? (() => undefined));
+
+    const completion = new Promise<void>((resolve) => {
+      this.completionResolvers.set(id, resolve);
+    });
+    this.completions.set(id, completion);
 
     if (input.signal) {
       const parentSignal = input.signal;
@@ -261,10 +303,6 @@ export class SubagentManager {
       );
     }
 
-    const completion = new Promise<void>((resolve) => {
-      this.completionResolvers.set(id, resolve);
-    });
-    this.completions.set(id, completion);
     if (worker.timeoutSeconds && !controller.signal.aborted) {
       this.deadlineTimers.set(id, setTimeout(() => {
         controller.abort(new WorkerDeadlineError());
@@ -272,19 +310,93 @@ export class SubagentManager {
       }, worker.timeoutSeconds * 1000));
     }
 
-    void this.runWorker(
-      worker,
-      { ...input, mode: input.mode ?? currentTurnContext()?.mode ?? "build" },
-      controller,
-    )
-      .catch(() => {
+    if (this.finished.has(id)) return worker;
+    worker.phase = "Waiting for worker slot";
+    const turnContext = currentTurnContext();
+    this.queuedStarts.set(id, () => {
+      worker.phase = "Checking model route";
+      const run = () => this.runWorker(worker, { ...input, mode: worker.mode }, controller);
+      const pending = turnContext ? runWithTurnContext(turnContext, run) : run();
+      void pending.catch(() => {
         // runWorker records failures on the worker state.
-      })
-      .finally(() => {
-        this.finishCompletion(worker);
-      });
+      }).finally(() => this.finishCompletion(worker));
+    });
+    this.drainQueue();
 
     return worker;
+  }
+
+  private drainQueue(): void {
+    const limit = Math.max(1, Math.min(8, this.maxConcurrent()));
+    while (this.running.size < limit && this.queuedStarts.size > 0) {
+      const [id, start] = this.queuedStarts.entries().next().value!;
+      this.queuedStarts.delete(id);
+      if (this.finished.has(id)) continue;
+      if (this.controllers.get(id)?.signal.aborted) {
+        void this.forceStop(this.workers.get(id)!);
+        continue;
+      }
+      this.running.add(id);
+      this.workers.get(id)!.executionStartedAt = Date.now();
+      start();
+    }
+  }
+
+  listOwnedWorkers(): SubagentWorkerState[] {
+    const context = currentTurnContext();
+    return this.listWorkers().filter((worker) => !context || (context.sessionId
+      ? worker.parentSessionId === context.sessionId
+      : worker.parentSessionId === undefined && worker.parentRunId === context.runId));
+  }
+
+  async waitForWorkers(options: {
+    ids?: string[];
+    waitFor?: "any" | "all";
+    signal?: AbortSignal;
+  } = {}): Promise<SubagentWorkerState[]> {
+    const owned = this.listOwnedWorkers();
+    const byId = new Map(owned.map((worker) => [worker.id, worker]));
+    const selected = options.ids
+      ? [...new Set(options.ids)].map((id) => {
+          const worker = byId.get(id);
+          if (!worker) throw new Error(`unknown worker "${id}" in this session`);
+          return worker;
+        })
+      : owned.filter((worker) => !isTerminalStatus(worker.status));
+    const done = selected.filter((worker) => isTerminalStatus(worker.status));
+    if (options.waitFor === "any" && done.length > 0) return done;
+    const pending = selected.flatMap((worker) => {
+      const completion = this.completions.get(worker.id);
+      return completion ? [completion] : [];
+    });
+    if (pending.length > 0 && !options.signal?.aborted) {
+      let onAbort: (() => void) | undefined;
+      const aborted = new Promise<void>((resolve) => {
+        onAbort = resolve;
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      try {
+        await Promise.race([
+          options.waitFor === "any" ? Promise.race(pending) : Promise.all(pending),
+          aborted,
+        ]);
+      } finally {
+        if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+      }
+    }
+    return selected.filter((worker) => isTerminalStatus(worker.status));
+  }
+
+  async mergeWorker(id: string): Promise<string> {
+    const worker = this.listOwnedWorkers().find((entry) => entry.id === id);
+    if (!worker) return `unknown worker "${id}" in this session`;
+    if (worker.status !== "completed") return `worker "${id}" is ${worker.status}; only completed workers can be merged`;
+    if (!worker.worktreePath) return `worker "${id}" has no isolated changes to merge`;
+    const result = await this.worktrees.mergeAndCleanup(id);
+    if (!result.success) return `merge failed for ${id}: ${result.conflicts.join(", ")}`;
+    worker.worktreePath = undefined;
+    if (worker.result) worker.result.worktree_path = undefined;
+    return `merged ${id}: ${result.diffSummary || "no changes"}`;
   }
 
   /**
@@ -295,6 +407,12 @@ export class SubagentManager {
     const worker = this.workers.get(workerId);
     if (!worker) return false;
     if (isTerminalStatus(worker.status) || this.finished.has(workerId)) return false;
+
+    if (this.queuedStarts.has(workerId)) {
+      this.controllers.get(workerId)?.abort(new Error("worker stopped by user"));
+      void this.forceStop(worker);
+      return true;
+    }
 
     const controller = this.controllers.get(workerId);
     if (controller && !controller.signal.aborted) {
@@ -322,6 +440,7 @@ export class SubagentManager {
 
   async stopAll(): Promise<void> {
     const ids = [...this.controllers.keys()];
+    for (const controller of this.controllers.values()) controller.abort(new Error("all workers stopped by user"));
     for (const id of ids) this.stop(id);
     await Promise.all(ids.map((id) => this.completions.get(id) ?? Promise.resolve()));
   }
@@ -356,6 +475,8 @@ export class SubagentManager {
   private finishCompletion(worker: SubagentWorkerState): void {
     if (this.finished.has(worker.id)) return;
     this.finished.add(worker.id);
+    this.queuedStarts.delete(worker.id);
+    this.running.delete(worker.id);
 
     const timer = this.stopTimers.get(worker.id);
     if (timer) clearTimeout(timer);
@@ -382,12 +503,76 @@ export class SubagentManager {
       // A broken completion callback must not keep the worker alive.
     }
     try { this.onFinished?.(worker); } catch { /* Completion must not depend on diagnostics. */ }
+    for (const listener of this.settledListeners) {
+      try {
+        listener(worker);
+      } catch {
+        // A listener must not block completion or another listener.
+      }
+    }
     resolve?.();
+    this.drainQueue();
   }
 
   async spawn(tasks: SubagentSpawnTask[]): Promise<SubagentResult[]> {
     const batch = await this.spawnBatch(tasks, { mode: "parallel" });
     return batch.results;
+  }
+
+  /**
+   * Starts background workers without waiting for them. A settled worker is
+   * reported through onSettled/onFinished, not through this return value.
+   */
+  spawnBackground(
+    tasks: SubagentSpawnTask[],
+    options: { signal?: AbortSignal } = {},
+  ): SubagentWorkerState[] {
+    if (tasks.length > MAX_PARALLEL_SUBAGENTS) {
+      throw new Error(
+        `too many background subagents (${tasks.length}). The limit is ${MAX_PARALLEL_SUBAGENTS}; split the batch.`,
+      );
+    }
+    const resolvedTasks = tasks.map((task) => this.withContinuation(task));
+    this.validateBatchIds(resolvedTasks);
+    return resolvedTasks.map((task) =>
+      this.spawnOne({
+        ...task,
+        background: true,
+        signal: options.signal,
+      }),
+    );
+  }
+
+  /** Waits for background workers that belong to the given session. */
+  async waitForBackground(signal?: AbortSignal, sessionId?: string): Promise<void> {
+    if (signal?.aborted) return;
+    const ids = [...this.workers.values()]
+      .filter(
+        (worker) =>
+          worker.background === true &&
+          (sessionId ? worker.parentSessionId === sessionId : worker.parentSessionId === undefined) &&
+          !isTerminalStatus(worker.status) &&
+          this.completions.has(worker.id),
+      )
+      .map((worker) => worker.id);
+    if (ids.length === 0) return;
+    const completions = Promise.all(
+      ids.map((id) => this.completions.get(id) ?? Promise.resolve()),
+    );
+    if (!signal) {
+      await completions;
+      return;
+    }
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<void>((resolve) => {
+      onAbort = resolve;
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([completions, aborted]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
   }
 
   /**
@@ -402,6 +587,7 @@ export class SubagentManager {
   ): Promise<{ results: SubagentResult[]; merged: SubagentMergeReport[] }> {
     const mode = options.mode ?? "parallel";
     const resolvedTasks = tasks.map((task) => this.withContinuation(task));
+    this.validateBatchIds(resolvedTasks);
     const results: SubagentResult[] = [];
 
     if (mode === "chain") {
@@ -461,6 +647,16 @@ export class SubagentManager {
     return { results, merged };
   }
 
+  private validateBatchIds(tasks: SubagentSpawnTask[]): void {
+    const seen = new Set<string>();
+    for (const task of tasks) {
+      if (!task.id) continue;
+      if (!WORKER_ID_PATTERN.test(task.id)) throw new Error(`invalid worker id "${task.id}"`);
+      if (seen.has(task.id) || this.workers.has(task.id)) throw new Error(`worker "${task.id}" already exists`);
+      seen.add(task.id);
+    }
+  }
+
   /**
    * Resolves `continueFrom` against a completed worker. A continuation runs in
    * the current checkout by default; an isolated worker must be merged first if
@@ -468,7 +664,7 @@ export class SubagentManager {
    */
   private withContinuation(task: SubagentSpawnTask): SubagentSpawnTask {
     if (!task.continueFrom) return task;
-    const previous = this.workers.get(task.continueFrom);
+    const previous = this.listOwnedWorkers().find((worker) => worker.id === task.continueFrom);
     if (!previous) throw new Error(`unknown subagent "${task.continueFrom}"`);
     if (previous.status !== "completed") {
       throw new Error(`subagent "${task.continueFrom}" is ${previous.status}, not completed`);
@@ -675,6 +871,7 @@ export class SubagentManager {
         throw new Error("worker aborted");
       }
 
+      worker.route = result.route;
       worker.status = "finalizing";
       if (input.outputJsonSchema) {
         try {
@@ -707,9 +904,17 @@ export class SubagentManager {
     } catch (error) {
       if (this.finished.has(worker.id)) return;
       const aborted = controller.signal.aborted || (worker.status as string) === "aborted";
+      const route = (error as { route?: SubagentRouteInfo } | undefined)?.route;
+      if (route) worker.route = route;
       worker.status = aborted ? "aborted" : "failed";
       worker.error = {
-        code: aborted ? "aborted" : error instanceof SubagentTurnLimitError ? "turn_limit_exceeded" : "executor_failed",
+        code: aborted
+          ? "aborted"
+          : error instanceof SubagentTurnLimitError
+            ? "turn_limit_exceeded"
+            : error instanceof SubagentTokenBudgetError
+              ? "token_budget_exceeded"
+              : "executor_failed",
         message: error instanceof Error ? error.message : String(error),
       };
       if (!worker.result) {
@@ -737,13 +942,12 @@ export class SubagentManager {
       name: "spawn_subagents",
       get description() {
         return [
-          "Run tasks in isolated worker contexts.",
-          'mode "parallel" (default) starts every task at once; mode "chain" runs them in order and replaces {previous} in each later task with the earlier worker output.',
-          "Each task can set agent, a model role or provider/model route, a JSON output schema, and write isolation (a git worktree per worker).",
-          "Chain steps share the working tree by default because a later step depends on the files the earlier one wrote; parallel workers are isolated by default.",
-          "Set merge to merge each completed isolated worker back into the current branch afterwards.",
-          "Set continue_from to a completed worker id to continue from its output. Merge an isolated worker first if its files matter.",
-          "Each worker has its own context, so include every file path and decision it needs.",
+          "Delegate self-contained tasks to separate worker contexts (max 8 per batch).",
+          "background (default) returns ids immediately; results arrive at the next model step or persist for the next turn. Excess workers queue at the shared concurrency limit.",
+          "parallel waits for the batch; chain runs dependencies in order, substituting {previous} with the prior result.",
+          "Use task_list for status, task_wait with ids when blocked, task_cancel to stop, and task_merge with worker id after reviewing isolated changes.",
+          "Writes default to isolated worktrees; chain defaults to shared files. Read-only specialists skip worktrees. Background never auto-merges; merge applies only to blocking modes.",
+          "Give each task paths, acceptance, and constraints: workers do not see this conversation. continue_from resumes a completed worker's result; merge its isolated files first if needed.",
           manager.routingGuidance?.(),
         ].filter(Boolean).join(" ");
       },
@@ -755,6 +959,7 @@ export class SubagentManager {
               agent: z.string().min(1).optional(),
               description: z.string().min(1).optional(),
               task: z.string().min(1),
+              mode: z.enum(["plan", "build", "ultrawork"]).optional(),
               role_model: z.enum(["main", "fast", "advisor"]).optional(),
               provider: z.string().min(1).optional(),
               model: z.string().min(1).optional(),
@@ -765,7 +970,7 @@ export class SubagentManager {
             }),
           )
           .min(1),
-        mode: z.enum(["parallel", "chain"]).default("parallel"),
+        mode: z.enum(["parallel", "chain", "background"]).default("background"),
         merge: z.boolean().default(false),
       }),
       readOnly: false,
@@ -776,6 +981,7 @@ export class SubagentManager {
             agent?: string;
             description?: string;
             task: string;
+            mode?: AgentMode;
             role_model?: "main" | "fast" | "advisor";
             provider?: string;
             model?: string;
@@ -784,43 +990,50 @@ export class SubagentManager {
             skills?: string[];
             continue_from?: string;
           }>;
-          mode: SubagentBatchMode;
+          mode: SubagentBatchMode | "background";
           merge: boolean;
         };
-        const batch = await this.spawnBatch(
-          request.tasks.map((entry) => ({
-            id: entry.id,
-            agent: entry.agent,
-            description: entry.description,
-            task: entry.task,
-            roleModel: entry.role_model,
-            provider: entry.provider,
-            model: entry.model,
-            outputJsonSchema: entry.outputJsonSchema,
-            writeIsolation: entry.writeIsolation,
-            skills: entry.skills,
-            continueFrom: entry.continue_from,
-          })),
-          { mode: request.mode, merge: request.merge, signal: context?.signal },
-        );
+        const tasks = request.tasks.map((entry) => ({
+          id: entry.id,
+          agent: entry.agent,
+          description: entry.description,
+          task: entry.task,
+          mode: entry.mode,
+          roleModel: entry.role_model,
+          provider: entry.provider,
+          model: entry.model,
+          outputJsonSchema: entry.outputJsonSchema,
+          writeIsolation: entry.writeIsolation,
+          skills: entry.skills,
+          continueFrom: entry.continue_from,
+        }));
+        if (request.mode === "background") {
+          if (request.merge) {
+            throw new Error(
+              "background mode does not merge automatically. Use parallel mode or the task board when the work needs review and task_merge.",
+            );
+          }
+          const workers = this.spawnBackground(tasks, { signal: context?.signal });
+          return [
+            `started ${workers.length} background worker(s):`,
+            ...workers.map(
+              (worker) =>
+                `- ${worker.id} (${worker.agent ?? "default"}) ${worker.status}${worker.description ? `: ${worker.description}` : ""}`,
+            ),
+            "Continue independent work. Use task_wait with these ids only when blocked, and review required results before your final answer. Isolated changes require task_merge after review.",
+          ].join("\n");
+        }
+        const batch = await this.spawnBatch(tasks, {
+          mode: request.mode,
+          merge: request.merge,
+          signal: context?.signal,
+        });
 
         const sections = batch.results.map((result) => {
           const worker = this.workers.get(result.id);
-          const lines = [
-            `# subagent ${result.id} (${result.state})${worker?.description ? `: ${worker.description}` : ""}`,
-          ];
+          if (worker) return formatSubagentResult(worker);
+          const lines = [`# subagent ${result.id} (${result.state})`];
           lines.push(result.error ? `${result.output}\nerror: ${result.error.message}` : result.output);
-          if (result.files_changed.length > 0) {
-            lines.push(`files: ${result.files_changed.join(", ")}`);
-          }
-          if (result.worktree_path) {
-            lines.push(
-              `worktree: ${result.worktree_path}${result.branch ? ` (branch ${result.branch})` : ""}`,
-            );
-          }
-          if (result.diff) {
-            lines.push(`diff:\n${result.diff.slice(0, 1500)}`);
-          }
           return lines.join("\n");
         });
         const mergeReport =
@@ -850,6 +1063,66 @@ function buildTaskText(task: string, outputJsonSchema: JsonSchemaObject | undefi
     "Do not use trailing commas. Return one complete JSON object.",
     JSON.stringify(outputJsonSchema),
   ].join("\n\n");
+}
+
+/** Longest worker output included in a delivered background result. */
+export const BACKGROUND_RESULT_LIMIT = 12_000;
+
+/** Formats a settled worker as a self-contained message for the main agent. */
+export function formatSubagentResult(
+  worker: SubagentWorkerState,
+  limit = BACKGROUND_RESULT_LIMIT,
+): string {
+  const output = worker.result?.output ?? worker.transcript.slice(-40).join("\n");
+  const trimmed =
+    output.length > limit
+      ? `${output.slice(0, limit)}\n\n[... worker output truncated to ${limit} characters]`
+      : output;
+  const lines = [
+    `# subagent ${worker.id} (${worker.status})${worker.description ? `: ${worker.description}` : ""}`,
+  ];
+  if (worker.error) lines.push(`error: ${worker.error.message}`);
+  const route =
+    worker.route ??
+    (worker.provider && worker.model
+      ? { provider: worker.provider, model: worker.model, fallback: false }
+      : undefined);
+  if (route) {
+    lines.push(
+      `model: ${route.provider}/${route.model}${route.fallback ? " (fallback)" : ""}`,
+    );
+  }
+  if (worker.roleModel) lines.push(`role: ${worker.roleModel}`);
+  if (worker.mode) lines.push(`mode: ${worker.mode}`);
+  if (worker.phase) lines.push(`phase: ${worker.phase}`);
+  const durationMs = (worker.result?.finished_at ?? worker.updatedAt) - worker.createdAt;
+  if (durationMs > 0) lines.push(`duration: ${(durationMs / 1000).toFixed(1)}s`);
+  if (worker.result?.output_path) lines.push(`output: ${worker.result.output_path}`);
+  lines.push(trimmed.trim().length > 0 ? trimmed : "(no output)");
+  if (worker.result?.files_changed?.length) {
+    lines.push(`files: ${worker.result.files_changed.join(", ")}`);
+  }
+  if (worker.worktreePath) {
+    lines.push(
+      `worktree: ${worker.worktreePath}${worker.result?.branch ? ` (branch ${worker.result.branch})` : ""}`,
+    );
+  }
+  if (worker.result?.diff) {
+    lines.push(`diff:\n${worker.result.diff.slice(0, 1500)}`);
+  }
+  return lines.join("\n");
+}
+
+/** A worker with no progress for this long is shown as stalled in the hub. */
+export const WORKER_STALL_MS = 60_000;
+
+export function workerIsStalled(
+  worker: SubagentWorkerState,
+  now = Date.now(),
+  thresholdMs = WORKER_STALL_MS,
+): boolean {
+  if (!["queued", "preparing", "running", "finalizing"].includes(worker.status)) return false;
+  return worker.lastProgressAt !== undefined && now - worker.lastProgressAt >= thresholdMs;
 }
 
 function isTerminalStatus(status: SubagentState): boolean {

@@ -3,6 +3,7 @@ import { isContextOverflowError } from "../provider/errors";
 import type { LLMProvider } from "../provider/router";
 import { ChatRequestSchema, type Message, type TextBlock, type ToolDefinition } from "../types/schema";
 import { estimateTokenCost } from "./token-estimate";
+import { abortableStream } from "../provider/abortable-stream";
 
 export { COMPACT_LABEL };
 
@@ -642,7 +643,7 @@ async function summarize(
     try {
       let text = "";
       let streamError: string | undefined;
-      for await (const event of provider.streamChat(request, signal)) {
+      for await (const event of abortableStream(provider.streamChat(request, signal), signal)) {
         if (event.type === "token") text += event.text;
         else if (event.type === "error") streamError = event.message;
       }

@@ -7,7 +7,9 @@ import type {
   IAgentRunner,
 } from "../api/server";
 import type { AppConfig, CompactionConfig, WebFetchConfig, WebSearchConfig } from "../config/loader";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveProjectState } from "../runtime-paths";
 import { structuredPatch } from "diff";
 import { registerAstTools } from "../ide/ast-compress";
 import { registerCodeIntelTools } from "../ide/code-intel";
@@ -64,11 +66,12 @@ import {
 import type { SnapshotManager } from "../vcs/snapshot";
 import type { WorktreeManager } from "../vcs/worktree";
 import { AdvisorReviewer } from "./advisor";
+import { SideTurnRunner } from "./side-turn";
+import type { ChatRequest } from "../types/schema";
+import type { LLMProvider } from "../provider/router";
 import {
   Coordinator,
   createCoordinateTool,
-  formatCoordinatorPlan,
-  type CoordinatorResult,
 } from "./coordinator";
 import {
   compactMessages,
@@ -88,6 +91,8 @@ import {
 import { appendUsageLog, usageLogEnabled } from "./usage-log";
 import { TurnMetricsTracker, timeBudgetReached, turnBudgetWarning } from "./turn-metrics";
 import { ReadFileCache, ToolCallTracker, toolCallSignature } from "./tool-call-tracker";
+import { TurnProgress } from "./turn-progress";
+import { abortableStream } from "../provider/abortable-stream";
 import { filterToolsForMode, isConcurrentSafeTool } from "./tool-set";
 import { CustomCommandEngine } from "./custom-commands";
 import { HookRunner, type PluginLoadReport } from "./hooks";
@@ -119,7 +124,16 @@ import {
   SkillRegistry,
   type SkillDocument,
 } from "./skills";
-import { SubagentManager, SubagentTurnLimitError, type SubagentTaskInput, type SubagentTaskResult, type SubagentWorkerState } from "./subagent";
+import {
+  formatSubagentResult,
+  SubagentManager,
+  SubagentTokenBudgetError,
+  SubagentTurnLimitError,
+  type SubagentRouteInfo,
+  type SubagentTaskInput,
+  type SubagentTaskResult,
+  type SubagentWorkerState,
+} from "./subagent";
 import { prepareSubagentRoute } from "./subagent-routing";
 import { appendErrorLog } from "./error-log";
 import { redactSecrets } from "../security/secrets";
@@ -132,11 +146,12 @@ import {
   planInstructionUpdates,
   type InstructionState,
 } from "./prompt/instruction-state";
-import { buildSystemParts } from "./prompt";
+import { backgroundRequest, buildSystemParts, progressCheckpointMessage } from "./prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
 import { currentTurnContext, runWithTurnContext } from "./turn-context";
 import { sleepAbortable } from "../provider/retry";
 import {
+  classifyProviderFailure,
   isContextOverflowError,
   isOutputBudgetError,
   isUnsupportedParamsError,
@@ -159,6 +174,8 @@ export interface ReloadReport {
 
 export interface AgentOrchestratorOptions {
   workerErrorLogPath?: string;
+  /** Directory for full worker output artifacts. Defaults to the project state dir. */
+  workerOutputDir?: string;
   router: ProviderRouter;
   worktrees: WorktreeManager;
   snapshots: SnapshotManager;
@@ -187,6 +204,7 @@ export interface PromptSnapshot {
 
 const MAX_OUTPUT_LIMIT_CONTINUES = 2;
 const MAX_SUBAGENT_TURNS = 40;
+class TurnTimeLimitError extends Error {}
 /** Background summary starts when the prompt reaches this share of the budget. */
 const PRECOMPUTE_SHARE = 0.85;
 /** Small sessions compact quickly enough without a background summary. */
@@ -346,6 +364,7 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly lsp: LSPClient | undefined;
   private readonly hashEditLifecycle: HashlineLifecycle | undefined;
   private readonly root: string;
+  private readonly workerOutputDir: string;
   private readonly maxTurns: number;
   private readonly contextTokenBudget: number;
   private readonly compactionConfig: CompactionConfig;
@@ -365,8 +384,21 @@ export class AgentOrchestrator implements IAgentRunner {
   private projectContext: ProjectContext | undefined;
   private readonly taskRequests = new Map<string, AgentTaskRequest>();
   private readonly pendingDiagnostics = new Map<string, string>();
+  private readonly pendingSubagentResults = new Map<string, Message[]>();
+  private readonly activeRuns = new Set<string>();
+  private readonly deliveredSubagentResults = new Set<string>();
+  private readonly subagentResultListeners = new Set<
+    (worker: SubagentWorkerState, text: string, message?: Message) => void
+  >();
   private questionHandler: QuestionHandler | undefined;
   private requestedModeSwitch: AgentMode | undefined;
+  private readonly sideTurns = new SideTurnRunner();
+  private readonly sideSnapshots = new Map<string, {
+    request: ChatRequest; provider: LLMProvider; mode: AgentMode;
+    providerId?: string; model?: string; messages: () => Message[];
+    currentRoute: () => { provider: string; model: string } | undefined;
+    reasoning: boolean; reasoningEfforts?: string[];
+  }>();
 
   constructor(options: AgentOrchestratorOptions) {
     this.router = options.router;
@@ -376,6 +408,8 @@ export class AgentOrchestrator implements IAgentRunner {
     this.lsp = options.lsp;
     this.hashEditLifecycle = options.hashEditLifecycle;
     this.root = options.repoRoot ?? globalThis.process.cwd();
+    this.workerOutputDir =
+      options.workerOutputDir ?? join(resolveProjectState(this.root).dataDir, "worker-outputs");
     this.shellAdapter = resolveShellAdapter();
     this.shellLabel = this.shellAdapter?.label ?? globalThis.process.env.SHELL ?? "unknown";
     this.maxTurns = options.maxTurns ?? 0;
@@ -439,12 +473,19 @@ export class AgentOrchestrator implements IAgentRunner {
         return `@${agent.name}: ${role} (${this.router.getRole(role) ? "configured" : "not configured"})`;
       }).join("; ")}.`,
       timeoutSeconds: () => this.config?.orchestration?.worker_timeout_seconds ?? 0,
+      maxConcurrent: () => this.config?.orchestration?.max_concurrent_workers ?? 4,
       onFinished: (worker) => {
+        this.persistWorkerOutput(worker);
+        this.deliverSubagentResult(worker);
         if (worker.status !== "failed" && worker.status !== "timed_out") return;
         void this.bgProcesses.stopForWorker(worker.id, true).catch(() => {});
         void appendErrorLog({ at: Date.now(), session_id: worker.parentSessionId,
-          worker_id: worker.id, agent: worker.agent, provider: worker.provider,
-          model: worker.model, role: worker.roleModel, mode: worker.mode,
+          worker_id: worker.id, agent: worker.agent,
+          provider: worker.route?.provider ?? worker.provider,
+          model: worker.route?.model ?? worker.model,
+          role: worker.roleModel, mode: worker.mode, phase: worker.phase,
+          fallback: worker.route?.fallback,
+          last_progress_at: worker.lastProgressAt,
           error_code: worker.error?.code, finish_reason: `worker_${worker.status}`,
           duration_ms: (worker.result?.finished_at ?? worker.updatedAt) - worker.createdAt,
           timeout_seconds: worker.timeoutSeconds,
@@ -473,8 +514,9 @@ export class AgentOrchestrator implements IAgentRunner {
         return stopped;
       },
       merger: (workerId) => options.worktrees.mergeAndCleanup(workerId),
-      maxConcurrent: 3,
+      maxConcurrent: options.config?.orchestration?.max_concurrent_workers ?? 4,
       maxTasks: options.config?.limits?.max_workers_per_turn ?? 10,
+      subagents: this.subagents,
       store: options.database,
     });
     this.coordinator = new Coordinator({
@@ -520,6 +562,78 @@ export class AgentOrchestrator implements IAgentRunner {
 
   setQuestionHandler(handler: QuestionHandler | undefined): void {
     this.questionHandler = handler;
+  }
+
+  /** Subscribes to background worker results delivered to this session. */
+  onSubagentResult(
+    listener: (worker: SubagentWorkerState, text: string, message?: Message) => void,
+  ): () => void {
+    this.subagentResultListeners.add(listener);
+    return () => this.subagentResultListeners.delete(listener);
+  }
+
+  /**
+   * Persists one background result and queues it for the active turn. A worker
+   * that settles after the turn is stored in the session, so the next turn or a
+   * resume sees it. Blocking workers already return their output through the
+   * tool result and are never delivered twice.
+   */
+  /** Writes the full worker output so the capped result always has a source. */
+  private persistWorkerOutput(worker: SubagentWorkerState): void {
+    const output = worker.result?.output;
+    if (!output) return;
+    try {
+      mkdirSync(this.workerOutputDir, { recursive: true });
+      const path = join(this.workerOutputDir, `${worker.id}.md`);
+      writeFileSync(path, output, "utf8");
+      if (worker.result) worker.result.output_path = path;
+    } catch {
+      // The capped delivery still works when the artifact cannot be written.
+    }
+  }
+
+  private deliverSubagentResult(worker: SubagentWorkerState): void {
+    if (worker.background !== true) return;
+    if (this.deliveredSubagentResults.has(worker.id)) return;
+    this.deliveredSubagentResults.add(worker.id);
+    const text = formatSubagentResult(worker);
+    let message: Message | undefined;
+    const sessionId = worker.parentSessionId;
+    if (sessionId) {
+      message = {
+        id: `subagent-result-${worker.id}`,
+        role: "user",
+        content: [{ type: "text", text }],
+        created_at: Date.now(),
+        metadata: {
+          synthetic: true,
+          subagent_result: worker.id,
+          subagent_status: worker.status,
+        },
+      };
+      try {
+        this.database.saveMessage(sessionId, message);
+      } catch {
+        // Delivery is best effort; the worker transcript remains in the hub.
+      }
+    }
+    if (worker.parentRunId && this.activeRuns.has(worker.parentRunId)) {
+      message ??= {
+        id: `subagent-result-${worker.id}`, role: "user",
+        content: [{ type: "text", text }], created_at: Date.now(),
+        metadata: { synthetic: true, subagent_result: worker.id, subagent_status: worker.status },
+      };
+      const pending = this.pendingSubagentResults.get(worker.parentRunId) ?? [];
+      pending.push(message);
+      this.pendingSubagentResults.set(worker.parentRunId, pending);
+    }
+    for (const listener of this.subagentResultListeners) {
+      try {
+        listener(worker, text, message);
+      } catch {
+        // A listener must not block delivery.
+      }
+    }
   }
 
   async initialize(): Promise<PluginLoadReport> {
@@ -630,7 +744,7 @@ export class AgentOrchestrator implements IAgentRunner {
       projectSummary: this.projectContext?.summary,
       skillsIndex: this.skills.buildIndexPrompt({ compact }),
       autoDelegate: this.config?.orchestration?.auto_delegate ?? "off",
-      coordinatorPlan: true,
+      delegation: this.config?.orchestration?.delegation ?? "balanced",
       compact,
       includeInstructions: false,
       includeClosing: false,
@@ -652,6 +766,35 @@ export class AgentOrchestrator implements IAgentRunner {
 
   getLastTurnMetrics(sessionId?: string): TurnMetrics | undefined {
     return sessionId ? this.lastTurnMetrics.get(sessionId) : undefined;
+  }
+
+  cancelSideTurns(sessionId: string): void {
+    this.sideTurns.cancelSession(sessionId);
+  }
+
+  closeSideTurns(): void {
+    this.sideTurns.close();
+    this.sideSnapshots.clear();
+  }
+
+  async runSideTurn(input: { sessionId: string; purpose: "title" | "recap"; instruction: string; signal?: AbortSignal; maxTokens?: number }) {
+    const snapshot = this.sideSnapshots.get(input.sessionId);
+    if (!snapshot) throw new Error("No conversation snapshot is available for this session");
+    const current = snapshot.currentRoute();
+    if (current?.provider !== snapshot.providerId || current?.model !== snapshot.model) throw new Error("The session model changed");
+    const request = backgroundRequest({ ...snapshot.request, messages: snapshot.messages() }, input.instruction, input.maxTokens ?? 256);
+    request.reasoning_effort = snapshot.reasoning ? clampReasoningEffort("none", snapshot.reasoningEfforts) : undefined;
+    if (this.maxRequestBytes > 0 && estimateRequestBytes(request) > this.maxRequestBytes) throw new Error("Background snapshot exceeds the request size limit");
+    const result = await this.sideTurns.run({
+      sessionId: input.sessionId, purpose: input.purpose, provider: snapshot.provider,
+      request, signal: input.signal, timeoutMs: (this.config?.background?.timeout_seconds ?? 30) * 1000,
+      onUsage: (usage) => {
+        try { this.database.addSessionUsage(input.sessionId, usage.prompt_tokens + usage.completion_tokens, usage.cost_usd ?? 0); } catch { /* A deleted session cannot block accounting cleanup. */ }
+      },
+    });
+    const latest = snapshot.currentRoute();
+    if (latest?.provider !== snapshot.providerId || latest?.model !== snapshot.model) throw new Error("The session model changed during the background request");
+    return result;
   }
 
   async runOnce(request: AgentRunRequest): Promise<AgentRunResult> {
@@ -845,9 +988,27 @@ export class AgentOrchestrator implements IAgentRunner {
   ): Promise<AgentRunResult> {
     const mode = PROFILE_MODES[request.profile];
     const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
-    return runWithTurnContext({ mode, sessionId }, () =>
-      this.executeInner(request, signal, sink, mode),
-    );
+    if (sessionId) {
+      this.sideTurns.cancelSession(sessionId);
+      try { this.database.clearRecap?.(sessionId); } catch { /* A stale recap must not block a foreground request. */ }
+    }
+    const runId = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const seconds = this.config?.limits?.max_wall_seconds ?? 1200;
+    const deadline = new AbortController();
+    const timer = seconds > 0
+      ? setTimeout(() => deadline.abort(new TurnTimeLimitError("Turn time limit reached")), seconds * 1000)
+      : undefined;
+    const runSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+    this.activeRuns.add(runId);
+    try {
+      return await runWithTurnContext({ mode, sessionId, runId, workspaceRoot: this.root }, () =>
+        this.executeInner(request, runSignal, sink, mode),
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.activeRuns.delete(runId);
+      this.pendingSubagentResults.delete(runId);
+    }
   }
 
   private async executeInner(
@@ -859,13 +1020,14 @@ export class AgentOrchestrator implements IAgentRunner {
     const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
     // Ids are stored in the session database, so every run needs its own prefix
     // or a second user turn would reuse turn-0 and collide.
-    const runId = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const runId = currentTurnContext()!.runId!;
     const metrics = new TurnMetricsTracker();
     let totals: Usage = zeroUsage();
     const configuredSteps = this.config?.modes?.[mode]?.steps;
     const stepLimit = modeStepLimit(mode, configuredSteps, this.maxTurns);
-    const toolLimit = this.config?.limits?.max_tool_calls ?? 0;
-    const wallLimitMs = (this.config?.limits?.max_wall_seconds ?? 0) * 1000;
+    const toolLimit = this.config?.limits?.max_tool_calls ?? 100;
+    const wallLimitMs = (this.config?.limits?.max_wall_seconds ?? 1200) * 1000;
+    const progress = new TurnProgress(this.config?.limits?.checkpoint_interval ?? 25);
     const webSearchLimit = this.config?.limits?.max_web_searches ?? 0;
     const maxRepeatedCalls = this.config?.limits?.max_repeated_calls ?? 0;
     const toolCallTracker = new ToolCallTracker(maxRepeatedCalls);
@@ -880,6 +1042,12 @@ export class AgentOrchestrator implements IAgentRunner {
           break;
         case "tool_start":
           metrics.recordTool(event.name);
+          break;
+        case "tool_end":
+          metrics.recordToolEnd(event.name, event.duration_ms);
+          break;
+        case "progress_checkpoint":
+          metrics.recordCheckpoint();
           break;
         case "compaction":
           metrics.recordCompaction({
@@ -912,6 +1080,11 @@ export class AgentOrchestrator implements IAgentRunner {
             stepLimit: stepLimit > 0 ? stepLimit : undefined,
             toolLimit: toolLimit > 0 ? toolLimit : undefined,
             timeLimitMs: wallLimitMs > 0 ? wallLimitMs : undefined,
+            workers: this.subagents.listWorkers().filter((worker) => worker.parentRunId === runId).map((worker) => ({
+              id: worker.id, state: worker.status,
+              queue_ms: (worker.executionStartedAt ?? Date.now()) - worker.createdAt,
+              duration_ms: (worker.result?.finished_at ?? Date.now()) - worker.createdAt,
+            })),
           });
           this.lastTurnMetrics.set(sessionId ?? runId, snapshot);
           rawSink({ ...event, metrics: snapshot });
@@ -921,6 +1094,15 @@ export class AgentOrchestrator implements IAgentRunner {
           break;
       }
       rawSink(event);
+    };
+
+    const stopForTime = (): AgentRunResult => {
+      const notice = `Turn time limit reached (${Math.round(wallLimitMs / 1000)} seconds). Work already completed is retained; remaining work is unverified. Review the changes before continuing. Change limits.max_wall_seconds in Settings to adjust this limit.`;
+      sink({ type: "turn_budget_warning", reason: "time", used: metrics.elapsedMs(), limit: wallLimitMs });
+      sink({ type: "final_text", text: notice });
+      sink(usageEvent(totals, true));
+      sink({ type: "done", finish_reason: "turn_limit" });
+      return { message: makeMessage(`${runId}-time-budget`, "assistant", notice), usage: totals, finish_reason: "turn_limit" };
     };
 
     let activeSpecialist: SpecialistAgentProfile | undefined;
@@ -1015,42 +1197,6 @@ export class AgentOrchestrator implements IAgentRunner {
     }
 
     const autoDelegate = this.config?.orchestration?.auto_delegate ?? "off";
-    let coordinatorPrepass: CoordinatorResult | undefined;
-    let coordinatorPrepassError: string | undefined;
-    if (
-      autoDelegate === "always" &&
-      mode !== "plan" &&
-      !request.task &&
-      lastText.trim().length > 0
-    ) {
-      try {
-        coordinatorPrepass = await this.coordinator.coordinate(
-          { goal: lastText, context: request.context },
-          signal,
-        );
-        sink({
-          type: "advisor_note",
-          note: `Polaris planned ${coordinatorPrepass.tasks.length} task(s).`,
-          severity: "info",
-        });
-      } catch (error) {
-        coordinatorPrepassError = error instanceof Error ? error.message : String(error);
-        sink({
-          type: "advisor_note",
-          note: `Polaris planning failed: ${coordinatorPrepassError}. Continuing without a coordinator plan.`,
-          severity: "warning",
-        });
-      }
-      if (signal?.aborted) {
-        sink(usageEvent(totals, true));
-        sink({ type: "done", finish_reason: "aborted" });
-        return {
-          message: makeMessage(`${runId}-coordinator-aborted`, "assistant", ""),
-          usage: totals,
-          finish_reason: "aborted",
-        };
-      }
-    }
 
     const requestedRole: "main" | "fast" | "advisor" | undefined =
       activeSpecialist?.roleModel === "advisor" ||
@@ -1154,7 +1300,7 @@ export class AgentOrchestrator implements IAgentRunner {
       }),
       extra: request.system,
       autoDelegate,
-      coordinatorPlan: coordinatorPrepass !== undefined,
+      delegation: this.config?.orchestration?.delegation ?? "balanced",
       compact,
       includeInstructions: !useInstructionState,
       includeClosing: false,
@@ -1225,29 +1371,6 @@ export class AgentOrchestrator implements IAgentRunner {
       `${runId}-closing`,
       closingReminder({ task: request.task }),
     );
-    if (coordinatorPrepass) {
-      insertBeforeLastUser(messages, [
-        {
-          ...makeMessage(
-            `${runId}-coordinator`,
-            "system",
-            formatCoordinatorPlan(coordinatorPrepass),
-          ),
-          metadata: { synthetic: true, coordinatorPlan: true },
-        },
-      ]);
-    } else if (coordinatorPrepassError) {
-      insertBeforeLastUser(messages, [
-        {
-          ...makeMessage(
-            `${runId}-coordinator-failed`,
-            "system",
-            `Polaris planning failed: ${coordinatorPrepassError}. Continue manually without a coordinator plan.`,
-          ),
-          metadata: { synthetic: true, coordinatorPlan: true },
-        },
-      ]);
-    }
     const overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
     const availableSkillCount = this.skills.listAvailableDocuments().length;
     const mentionedSkillNames = turnSkills.map((document) => document.name);
@@ -1431,7 +1554,7 @@ export class AgentOrchestrator implements IAgentRunner {
       let text = "";
       let thinking = "";
       try {
-        for await (const event of provider.streamChat(retryRequest, signal)) {
+        for await (const event of abortableStream(provider.streamChat(retryRequest, signal), signal)) {
           if (event.type === "token") text += event.text;
           else if (event.type === "thinking_token") thinking += event.text;
           else if (event.type === "usage") accumulateUsage(totals, event);
@@ -1455,20 +1578,17 @@ export class AgentOrchestrator implements IAgentRunner {
       ]);
 
     for (let turn = 0; stepLimit === 0 || turn < stepLimit || toolBudgetExhausted; turn += 1) {
-      const finalStep = toolBudgetExhausted || (stepLimit > 0 && turn === stepLimit - 1);
-      if (timeBudgetReached(metrics.elapsedMs(), wallLimitMs)) {
-        const seconds = Math.round(wallLimitMs / 1000);
-        const label = seconds >= 60 ? `${Math.round(seconds / 60)} minutes` : `${seconds} seconds`;
-        const notice = `Wall-clock budget reached (${label}). Send another message to continue, or raise limits.max_wall_seconds.`;
-        sink({ type: "final_text", text: notice });
-        sink(usageEvent(totals, true));
-        sink({ type: "done", finish_reason: "turn_limit" });
-        return {
-          message: makeMessage(`${runId}-time-budget`, "assistant", notice),
-          usage: totals,
-          finish_reason: "turn_limit",
-        };
+      // Run ownership also routes results for stateless callers without a session.
+      {
+        const pending = this.pendingSubagentResults.get(runId);
+        if (pending && pending.length > 0) {
+          this.pendingSubagentResults.delete(runId);
+          const knownIds = new Set(messages.map((message) => message.id));
+          messages.push(...pending.filter((message) => !knownIds.has(message.id)));
+        }
       }
+      const finalStep = toolBudgetExhausted || (stepLimit > 0 && turn === stepLimit - 1);
+      if (signal?.reason instanceof TurnTimeLimitError || timeBudgetReached(metrics.elapsedMs(), wallLimitMs)) return stopForTime();
       const requestedMode = this.consumeModeSwitch();
       if (requestedMode) applyModeSwitch(requestedMode, turn);
       const spentTokens = totals.prompt_tokens + totals.completion_tokens;
@@ -1587,6 +1707,7 @@ export class AgentOrchestrator implements IAgentRunner {
       if (this.compactionConfig.auto) {
         const compaction = await compactMessages(messages, {
           provider,
+          signal,
           contextWindow,
           keepTokens: keepTokensForAttempt(),
           buffer: this.compactionConfig.buffer,
@@ -1699,7 +1820,23 @@ export class AgentOrchestrator implements IAgentRunner {
       });
 
       const requestEstimate = estimatePromptTokens();
+      metrics.toolAvailability(chatRequest.tools.map((tool) => tool.name));
       const accumulator = new TurnAccumulator();
+      if (sessionId) {
+        this.sideSnapshots.set(sessionId, {
+          request: { ...chatRequest, messages: [...chatRequest.messages] }, provider, mode,
+          providerId: providerRef?.provider, model: providerRef?.model,
+          currentRoute: () => requestedRole ? this.router.getRole(requestedRole) : this.router.getModeModel(mode),
+          reasoning: capabilities.reasoning, reasoningEfforts: capabilities.reasoning_efforts,
+          messages: () => {
+            const live = accumulator.toMessage(`${runId}-turn-${turn}`);
+            const content = live.content.filter((block) => block.type === "text");
+            return messages.some((message) => message.id === live.id) || content.length === 0
+              ? [...messages] : [...messages, { ...live, content }];
+          },
+        });
+        while (this.sideSnapshots.size > 8) this.sideSnapshots.delete(this.sideSnapshots.keys().next().value!);
+      }
       let turnError: string | undefined;
       let turnErrorCode: string | undefined;
       let contextOverflow = false;
@@ -1721,8 +1858,10 @@ export class AgentOrchestrator implements IAgentRunner {
         }, this.maxSilentReasoningSeconds * 1000);
       };
       resetProgress();
+      metrics.startProvider(providerRef?.provider, providerRef?.model, chatRequest.reasoning_effort);
       try {
-      for await (const event of provider.streamChat(chatRequest, providerSignal)) {
+      for await (const event of abortableStream(provider.streamChat(chatRequest, providerSignal), providerSignal)) {
+        metrics.providerEvent(event);
         switch (event.type) {
           case "token":
             silentReasoningChars = 0;
@@ -1801,7 +1940,10 @@ export class AgentOrchestrator implements IAgentRunner {
         }
         if (reasoningStalled || timeStalled) break;
       }
+      } catch (error) {
+        if (!providerSignal.aborted) throw error;
       } finally {
+        metrics.finishProvider();
         if (progressTimer) clearTimeout(progressTimer);
       }
 
@@ -1842,6 +1984,7 @@ export class AgentOrchestrator implements IAgentRunner {
       // An interrupted turn stops here. Never promote buffered reasoning into an
       // answer, and never run recovery that would call the provider again.
       if (signal?.aborted) {
+        if (signal.reason instanceof TurnTimeLimitError) return stopForTime();
         sink(usageEvent(totals, true));
         sink({ type: "done", finish_reason: "aborted" });
         return {
@@ -1961,6 +2104,7 @@ export class AgentOrchestrator implements IAgentRunner {
         try {
           const forced = await compactMessages(messages, {
             provider,
+            signal,
             contextWindow,
             keepTokens,
             buffer: this.compactionConfig.buffer,
@@ -2141,6 +2285,7 @@ export class AgentOrchestrator implements IAgentRunner {
             const compacted = hasPriorTurn
               ? await compactMessages(messages, {
                   provider,
+                  signal,
                   contextWindow,
                   keepTokens: this.compactionConfig.keep_tokens,
                   buffer: this.compactionConfig.buffer,
@@ -2268,6 +2413,7 @@ export class AgentOrchestrator implements IAgentRunner {
           });
         }
         await this.hooks.runOnStop({});
+        if (signal?.reason instanceof TurnTimeLimitError) return stopForTime();
         const finalReason: FinishReason = turnError
           ? "error"
           : finalStep && finishReason !== "error"
@@ -2597,6 +2743,21 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
 
+      if (signal?.reason instanceof TurnTimeLimitError) return stopForTime();
+      if (!toolBudgetExhausted && toolLimit > 0 && metrics.toolCallCount >= toolLimit) {
+        toolBudgetExhausted = true;
+        sink({ type: "turn_budget_warning", reason: "tool", used: metrics.toolCallCount, limit: toolLimit });
+      }
+      if (!toolBudgetExhausted && (stepLimit === 0 || turn + 1 < stepLimit - 1)) {
+        const checkpoint = progress.checkpoint({ toolCalls: metrics.toolCallCount, step: turn + 1, elapsedMs: metrics.elapsedMs() });
+        if (checkpoint) {
+          const reminder = progressCheckpointMessage(runId, checkpoint);
+          messages.push(reminder);
+          persistConversationMessage(reminder);
+          sink(checkpoint);
+        }
+      }
+
       if (toolBudgetExhausted) {
         if (stepLimit === 0 || turn + 1 < stepLimit) {
           continue;
@@ -2776,6 +2937,55 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 
   private async executeSubagent(input: SubagentTaskInput): Promise<SubagentTaskResult> {
+    const attemptState = { toolsRan: false };
+    try {
+      return await this.executeSubagentAttempt(input, false, attemptState);
+    } catch (error) {
+      if (input.signal.aborted) throw error;
+      if ((this.config?.orchestration?.worker_fallback ?? "off") !== "main") throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (classifyProviderFailure(message) !== "retryable") throw error;
+      const mode = input.mode ?? "build";
+      // A write worker that already ran a tool may have changed the workspace.
+      // Restarting it on another model could duplicate those changes.
+      if (attemptState.toolsRan && mode !== "plan") throw error;
+      const fallback = this.router.getModeModel(mode);
+      if (!fallback) throw error;
+      if (input.provider && input.model &&
+        fallback.provider === input.provider && fallback.model === input.model) {
+        throw error;
+      }
+      const route: SubagentRouteInfo = {
+        provider: fallback.provider,
+        model: fallback.model,
+        fallback: true,
+      };
+      input.onProgress?.(`Provider retry on ${fallback.provider}/${fallback.model}`);
+      input.onTranscript(`[fallback] ${message}`);
+      try {
+        return await this.executeSubagentAttempt(
+          {
+            ...input,
+            provider: fallback.provider,
+            model: fallback.model,
+            roleModel: "main",
+          },
+          true,
+        );
+      } catch (fallbackError) {
+        if (fallbackError && typeof fallbackError === "object") {
+          (fallbackError as { route?: SubagentRouteInfo }).route = route;
+        }
+        throw fallbackError;
+      }
+    }
+  }
+
+  private async executeSubagentAttempt(
+    input: SubagentTaskInput,
+    fallbackAttempt: boolean,
+    attemptState?: { toolsRan: boolean },
+  ): Promise<SubagentTaskResult> {
     if (input.signal.aborted) throw new Error("worker aborted");
     let specialist: SpecialistAgentProfile | undefined;
     if (input.agent) {
@@ -2807,6 +3017,13 @@ export class AgentOrchestrator implements IAgentRunner {
     const providerName =
       input.provider ??
       (role ? this.router.getRole(role)?.provider : this.router.getModeModel(mode)?.provider);
+    const resolvedModel =
+      input.model ??
+      (role ? this.router.getRole(role)?.model : this.router.getModeModel(mode)?.model);
+    const route: SubagentRouteInfo | undefined =
+      providerName && resolvedModel
+        ? { provider: providerName, model: resolvedModel, fallback: fallbackAttempt }
+        : undefined;
     const provider =
       input.provider && input.model
         ? this.router.provider(input.provider, input.model)
@@ -2825,6 +3042,8 @@ export class AgentOrchestrator implements IAgentRunner {
       : "";
     messages.push(makeMessage("subagent-task", "user", `${scope}${input.task}`));
     const totals = zeroUsage();
+    const workerTokenLimit = this.config?.limits?.worker_tokens ?? 0;
+    let workerBudgetWarned = false;
 
     if (skillAccess.preload.length > 0) {
       const preloaded: Message[] = [];
@@ -2874,17 +3093,14 @@ export class AgentOrchestrator implements IAgentRunner {
     const subagentSystemParts = buildSystemParts({
       mode: effectiveMode,
       providerKind: providerName ? this.router.providerKind(providerName) : undefined,
-      model:
-        input.model ??
-        (role ? this.router.getRole(role)?.model : this.router.getModeModel(mode)?.model),
-      modelName:
-        input.model ??
-        (role ? this.router.getRole(role)?.model : this.router.getModeModel(mode)?.model),
+      model: resolvedModel,
+      modelName: resolvedModel,
       repoRoot: input.worktreePath ?? this.root,
       branch: this.branch,
       shell: this.shellLabel,
       agentInstructions: this.globalRules,
       specialistPrompt: specialist?.systemPrompt,
+      worker: true,
       projectSummary: this.projectContext?.summary,
       skillsIndex: this.skills.buildIndexPrompt({
         compact: compactPrompt,
@@ -2952,17 +3168,33 @@ export class AgentOrchestrator implements IAgentRunner {
       }
 
       if (input.signal.aborted) throw new Error("worker aborted");
+      const usedTokens = totals.prompt_tokens + totals.completion_tokens;
+      if (workerTokenLimit > 0 && usedTokens >= workerTokenLimit) {
+        throw new SubagentTokenBudgetError(workerTokenLimit);
+      }
+      if (
+        workerTokenLimit > 0 &&
+        !workerBudgetWarned &&
+        usedTokens >= Math.floor(workerTokenLimit * 0.8)
+      ) {
+        workerBudgetWarned = true;
+        input.onTranscript(
+          `[budget] ${usedTokens}/${workerTokenLimit} tokens used; finish the task soon.`,
+        );
+        input.onProgress?.(`Token budget ${usedTokens}/${workerTokenLimit}`);
+      }
       const assistantMessage = accumulator.toMessage(`subagent-turn-${turn}`);
       messages.push(assistantMessage);
       const toolUses = assistantMessage.content.filter((block) => block.type === "tool_use");
       if (toolUses.length === 0) {
-        return this.finishSubagent(input, accumulator.textOutput(), totals);
+        return this.finishSubagent(input, accumulator.textOutput(), totals, route);
       }
       for (const block of toolUses) {
         if (input.signal.aborted) throw new Error("worker aborted");
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         input.onTranscript(`[tool] ${call.name}`);
         input.onProgress?.(`Running ${call.name}`);
+        if (attemptState) attemptState.toolsRan = true;
         const result = await this.registry.run(call, effectiveMode, input.signal, specialistRules);
         input.onProgress?.(`Finished ${call.name}`);
         messages.push(
@@ -2982,8 +3214,9 @@ export class AgentOrchestrator implements IAgentRunner {
     input: SubagentTaskInput,
     output: string,
     usage: Usage,
+    route?: SubagentRouteInfo,
   ): Promise<SubagentTaskResult> {
-    if (!input.worktreePath) return { output, usage };
+    if (!input.worktreePath) return { output, usage, route };
     const branch = await runGit(input.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"], {
       allowFailure: true,
     });
@@ -3005,6 +3238,7 @@ export class AgentOrchestrator implements IAgentRunner {
     return {
       output,
       usage,
+      route,
       filesChanged,
       branch: branch.exitCode === 0 ? branch.stdout.trim() || undefined : undefined,
       diff: diff.length > 0 ? diff.slice(0, 20_000) : undefined,

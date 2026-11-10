@@ -6,6 +6,7 @@ import type { ToolRulePattern } from "./permissions";
 export interface TurnContext {
   mode: AgentMode;
   sessionId?: string;
+  runId?: string;
   /** Worker id when this turn runs inside a subagent. */
   workerId?: string;
   /** Directory tools should treat as the project root, set for isolated workers. */

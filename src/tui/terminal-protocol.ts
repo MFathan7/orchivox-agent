@@ -9,6 +9,18 @@ export const DISABLE_KEYBOARD_PROTOCOL = "\x1b[>4;0m\x1b[<u";
 const DISABLE_MOUSE = "\x1b[?1000l\x1b[?1006l";
 
 let entered = false;
+let extendedKeyboard = false;
+export const RESET_ATTRIBUTES = "\x1b[0m";
+
+export function supportsExtendedKeyboard(platform = process.platform, env = process.env): boolean {
+  if (env.ORCHIVOX_KEYBOARD_PROTOCOL === "off") return false;
+  if (env.ORCHIVOX_KEYBOARD_PROTOCOL === "extended") return true;
+  return platform !== "win32" && env.TERM !== "dumb";
+}
+
+export function resetBeforeErase(frame: string): string {
+  return frame.replace(/\x1b\[[012]?[JK]/g, (erase) => `${RESET_ATTRIBUTES}${erase}`);
+}
 
 function defaultWrite(chunk: string): void {
   process.stdout.write(chunk);
@@ -19,10 +31,11 @@ function defaultWrite(chunk: string): void {
  * The push must happen after the screen switch so terminals that keep
  * per-screen flag state apply it to the screen the TUI actually uses.
  */
-export function enterTerminal(write: TerminalWriter = defaultWrite): void {
+export function enterTerminal(write: TerminalWriter = defaultWrite, options: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv } = {}): void {
   if (entered) return;
-  write(ENTER_ALTERNATE_SCREEN);
-  write(ENABLE_KEYBOARD_PROTOCOL);
+  write(`${RESET_ATTRIBUTES}${ENTER_ALTERNATE_SCREEN}`);
+  extendedKeyboard = supportsExtendedKeyboard(options.platform, options.env);
+  if (extendedKeyboard) write(ENABLE_KEYBOARD_PROTOCOL);
   entered = true;
 }
 
@@ -35,12 +48,13 @@ export function leaveTerminal(write: TerminalWriter = defaultWrite): void {
   if (!entered) return;
   entered = false;
   write(DISABLE_MOUSE);
-  write(DISABLE_KEYBOARD_PROTOCOL);
-  write(LEAVE_ALTERNATE_SCREEN);
+  if (extendedKeyboard) write(DISABLE_KEYBOARD_PROTOCOL);
+  write(`${RESET_ATTRIBUTES}${LEAVE_ALTERNATE_SCREEN}`);
 }
 
 export function resetTerminalProtocolForTests(): void {
   entered = false;
+  extendedKeyboard = false;
 }
 
 export type FatalSignal = "uncaughtException" | "unhandledRejection";

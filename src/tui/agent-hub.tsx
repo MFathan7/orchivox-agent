@@ -1,7 +1,7 @@
 import React from "react";
 import { Box, Text, useInput } from "ink";
 
-import type { SubagentWorkerState } from "../agent/subagent";
+import { workerIsStalled, type SubagentWorkerState } from "../agent/subagent";
 import type { TaskItem } from "../agent/task-board";
 import { taskActivity, taskNeedsMerge, workerActive, workerActivity, workerTitle, workerTranscript, workerModelLabel, type ActivityTone } from "./agent-activity";
 import { formatElapsed } from "./format";
@@ -82,7 +82,13 @@ export function AgentHub(props: AgentHubProps) {
     const end = worker.result?.finished_at ?? (workerActive(worker) ? Date.now() : worker.updatedAt);
     add(`${worker.status} · ${formatElapsed(Math.max(0, (end - worker.createdAt) / 1000))}`, workerTone(worker));
     add(`Activity: ${workerActivity(worker)}`);
-    if (worker.lastProgressAt !== undefined) add(`Last progress: ${formatElapsed((Date.now() - worker.lastProgressAt) / 1000)} ago`, "muted");
+    const stalled = workerIsStalled(worker);
+    if (worker.lastProgressAt !== undefined) {
+      add(
+        `Last progress: ${formatElapsed((Date.now() - worker.lastProgressAt) / 1000)} ago${stalled ? " (stalled)" : ""}`,
+        stalled ? "warning" : "muted",
+      );
+    }
     add(`Time limit: ${worker.timeoutSeconds ? `${worker.timeoutSeconds}s` : "Off"}`, "muted");
     if (worker.agent) add(`Agent: @${worker.agent}`);
     if (worker.error) add(`Error: ${worker.error.message}`, "error");

@@ -7,6 +7,7 @@ export interface TurnObservation {
   prompt: string;
   metrics: TurnMetrics;
   events: StreamEvent[];
+  answer: string;
 }
 
 export interface ObserveTurnOptions {
@@ -15,6 +16,7 @@ export interface ObserveTurnOptions {
   prompt: string;
   sessionId: string;
   reasoningEffort?: string;
+  signal?: AbortSignal;
 }
 
 /**
@@ -38,14 +40,18 @@ export async function observeTurn(options: ObserveTurnOptions): Promise<TurnObse
     ...(options.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
   };
   const events: StreamEvent[] = [];
-  for await (const event of options.orchestrator.runStream(request)) {
+  let answer = "";
+  for await (const event of options.orchestrator.runStream(request, options.signal)) {
     events.push(event);
+    if (event.type === "token") answer += event.text;
+    else if (event.type === "final_text") answer = event.text;
+    else if (event.type === "tool_start") answer = "";
   }
   const metrics = options.orchestrator.getLastTurnMetrics(options.sessionId);
   if (!metrics) {
     throw new Error("The observed turn finished without metrics.");
   }
-  return { prompt: options.prompt, metrics, events };
+  return { prompt: options.prompt, metrics, events, answer };
 }
 
 export function formatTurnObservation(observation: TurnObservation): string {

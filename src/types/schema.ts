@@ -254,6 +254,15 @@ export const TurnBudgetWarningEventSchema = z.object({
 });
 export type TurnBudgetWarningEvent = z.infer<typeof TurnBudgetWarningEventSchema>;
 
+export const ProgressCheckpointEventSchema = z.object({
+  type: z.literal("progress_checkpoint"),
+  tool_calls: z.number().int().nonnegative(),
+  step: z.number().int().nonnegative(),
+  elapsed_ms: z.number().int().nonnegative(),
+  interval: z.number().int().positive(),
+});
+export type ProgressCheckpointEvent = z.infer<typeof ProgressCheckpointEventSchema>;
+
 export const ContextEstimateEventSchema = z.object({
   type: z.literal("context_estimate"),
   tokens: z.number().int().nonnegative(),
@@ -276,11 +285,22 @@ export const TurnCompactionSchema = z.object({
 });
 export type TurnCompaction = z.infer<typeof TurnCompactionSchema>;
 
+export const ProviderTimingSchema = z.object({
+  provider: z.string().optional(), model: z.string().optional(),
+  reasoning_effort: z.string().optional(),
+  started_ms: z.number().nonnegative(), duration_ms: z.number().nonnegative(),
+  first_event_ms: z.number().nonnegative().optional(), first_text_ms: z.number().nonnegative().optional(),
+  retries: z.number().int().nonnegative(), retry_delay_ms: z.number().nonnegative(),
+  prompt_tokens: z.number().int().nonnegative(), cache_read_tokens: z.number().int().nonnegative(),
+});
+export type ProviderTiming = z.infer<typeof ProviderTimingSchema>;
+
 export const TurnMetricsSchema = z.object({
   steps: z.number().int().nonnegative(),
   tool_calls: z.number().int().nonnegative(),
   tool_counts: z.record(z.string(), z.number().int().nonnegative()),
   repeated_calls: z.number().int().nonnegative(),
+  progress_checkpoints: z.number().int().nonnegative().optional(),
   duration_ms: z.number().int().nonnegative(),
   prompt_tokens: z.number().int().nonnegative(),
   completion_tokens: z.number().int().nonnegative(),
@@ -292,6 +312,16 @@ export const TurnMetricsSchema = z.object({
   tool_limit: z.number().int().positive().optional(),
   time_limit_ms: z.number().int().positive().optional(),
   finish_reason: z.string().optional(),
+  first_response_ms: z.number().nonnegative().optional(),
+  first_text_ms: z.number().nonnegative().optional(),
+  provider_timings: z.array(ProviderTimingSchema).optional(),
+  tool_duration_ms: z.number().nonnegative().optional(),
+  worker_wait_ms: z.number().nonnegative().optional(),
+  worker_tools_available: z.boolean().optional(),
+  coordinator_available: z.boolean().optional(),
+  workers: z.array(z.object({
+    id: z.string(), state: z.string(), queue_ms: z.number().nonnegative(), duration_ms: z.number().nonnegative(),
+  })).optional(),
 });
 export type TurnMetrics = z.infer<typeof TurnMetricsSchema>;
 
@@ -563,6 +593,7 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   UsageEventSchema,
   StepStartedEventSchema,
   TurnBudgetWarningEventSchema,
+  ProgressCheckpointEventSchema,
   ContextEstimateEventSchema,
   RuleViolationEventSchema,
   RetryScheduledEventSchema,
@@ -636,6 +667,7 @@ export const SubagentResultSchema = z.object({
   id: z.string().min(1),
   state: z.enum(["completed", "failed", "aborted", "timed_out"]),
   output: z.string(),
+  output_path: z.string().optional(),
   diff: z.string().optional(),
   files_changed: z.array(z.string()).default([]),
   commits: z.array(z.string()).default([]),

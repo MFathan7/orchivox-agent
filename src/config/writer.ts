@@ -6,9 +6,13 @@ import { isMap, isSeq, parseDocument, type Document } from "yaml";
 import type { ThemeSelection } from "../types/theme";
 import type {
   ApprovalPreset,
+  BackgroundConfig,
   AutoDelegateMode,
+  DelegationPolicy,
+  LimitsConfig,
   ModelCapabilitiesPatch,
   ProviderProfile,
+  WorkerFallbackMode,
 } from "./loader";
 
 export type ConfigRole = "main" | "fast" | "advisor";
@@ -173,6 +177,27 @@ export async function saveAutoDelegate(
   await writeDocument(configPath, document);
 }
 
+export async function saveBackground(configPath: string, patch: Partial<BackgroundConfig>): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "background");
+  for (const [key, value] of Object.entries(patch)) document.setIn(["background", key], value);
+  await writeDocument(configPath, document);
+}
+
+export async function saveTurnLimits(configPath: string, patch: Partial<LimitsConfig>): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "limits");
+  for (const [key, value] of Object.entries(patch)) document.setIn(["limits", key], value);
+  await writeDocument(configPath, document);
+}
+
+export async function saveDelegationPolicy(configPath: string, value: DelegationPolicy): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "orchestration");
+  document.setIn(["orchestration", "delegation"], value);
+  await writeDocument(configPath, document);
+}
+
 export async function saveAnimations(configPath: string, enabled: boolean): Promise<void> {
   const document = await readDocument(configPath);
   ensureMap(document, "ui");
@@ -184,6 +209,16 @@ export async function saveWorkerTimeout(configPath: string, seconds: number): Pr
   const document = await readDocument(configPath);
   ensureMap(document, "orchestration");
   document.setIn(["orchestration", "worker_timeout_seconds"], seconds);
+  await writeDocument(configPath, document);
+}
+
+export async function saveWorkerFallback(
+  configPath: string,
+  value: WorkerFallbackMode,
+): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "orchestration");
+  document.setIn(["orchestration", "worker_fallback"], value);
   await writeDocument(configPath, document);
 }
 

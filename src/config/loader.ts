@@ -407,15 +407,19 @@ export const LimitsConfigSchema = z.object({
   // Stop a turn after this many tokens across its internal steps.
   turn_tokens: z.number().int().positive().optional(),
   // Stop a turn after this many tool calls. 0 disables the check.
-  max_tool_calls: z.number().int().nonnegative().default(0),
+  max_tool_calls: z.number().int().nonnegative().default(100),
   // Suppress an identical tool call after this many in one turn. 0 disables it.
   max_repeated_calls: z.number().int().nonnegative().default(0),
   // Stop a turn after this many seconds. 0 disables the check.
-  max_wall_seconds: z.number().int().nonnegative().default(0),
+  max_wall_seconds: z.number().int().nonnegative().default(1200),
+  // Review remaining work every N tool calls, without a separate model request.
+  checkpoint_interval: z.number().int().nonnegative().default(25),
   // Stop new web searches after this many per turn. 0 disables the check.
   max_web_searches: z.number().int().nonnegative().default(0),
   // Maximum number of task-board workers held at once.
   max_workers_per_turn: z.number().int().positive().default(10),
+  // Stop one worker after this many tokens. 0 disables the per-worker budget.
+  worker_tokens: z.number().int().nonnegative().default(0),
   // Explicit request-body cap. 0 disables the preflight byte guard.
   max_request_bytes: z.number().int().nonnegative().default(0),
   // Warn when resuming a session above either size. 0 disables the check.
@@ -497,13 +501,31 @@ export type ModesConfig = z.infer<typeof ModesConfigSchema>;
 export const AutoDelegateModeSchema = z.enum(["off", "ultrawork", "always"]);
 export type AutoDelegateMode = z.infer<typeof AutoDelegateModeSchema>;
 
+export const DelegationPolicySchema = z.enum(["requested", "balanced", "eager"]);
+export type DelegationPolicy = z.infer<typeof DelegationPolicySchema>;
+
+export const WorkerFallbackModeSchema = z.enum(["off", "main"]);
+export type WorkerFallbackMode = z.infer<typeof WorkerFallbackModeSchema>;
+
 export const OrchestrationConfigSchema = z.object({
+  max_concurrent_workers: z.number().int().min(1).max(8).default(4),
   worker_timeout_seconds: z.number().int().nonnegative().default(0),
-  /** off: no automatic coordinator. ultrawork: only in Ultrawork. always: Build and Ultrawork. */
-  auto_delegate: AutoDelegateModeSchema.default("off"),
+  /** off: no fallback. main: retry a retryable worker provider failure on the session mode model. */
+  worker_fallback: WorkerFallbackModeSchema.default("off"),
+  /** Coordinator availability; every policy leaves the delegation decision to the main agent. */
+  auto_delegate: AutoDelegateModeSchema.default("always"),
+  delegation: DelegationPolicySchema.default("balanced"),
   coordinator_agent: z.string().min(1).default("polaris"),
 });
 export type OrchestrationConfig = z.infer<typeof OrchestrationConfigSchema>;
+
+export const BackgroundConfigSchema = z.object({
+  titles: z.boolean().default(true),
+  recap: z.boolean().default(true),
+  recap_idle_seconds: z.number().int().min(1).max(3600).default(240),
+  timeout_seconds: z.number().int().min(1).max(120).default(30),
+});
+export type BackgroundConfig = z.infer<typeof BackgroundConfigSchema>;
 
 export const ApprovalPresetSchema = z.enum([
   "safer",
@@ -553,6 +575,7 @@ export const AppConfigSchema = z.object({
   permissions: z.array(PermissionRuleSchema).default([]),
   sandbox: SandboxConfigSchema.prefault({}),
   compaction: CompactionConfigSchema.prefault({}),
+  background: BackgroundConfigSchema.prefault({}),
   websearch: WebSearchConfigSchema.prefault({}),
   webfetch: WebFetchConfigSchema.prefault({}),
   prompt: PromptConfigSchema.prefault({}),

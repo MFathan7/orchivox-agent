@@ -26,7 +26,8 @@ import { formatAppInfo, formatDoctor, getAppInfo, isCompiledExecutable, runUpdat
 import { compactMessages, estimateRequestBytes, extractSummary, markPrunedToolResults } from "./agent/compaction";
 import { formatTurnMetrics } from "./agent/turn-metrics";
 import { shouldWarnLargeSession } from "./agent/session-warning";
-import { generateSessionTitle, isPlaceholderTitle, messageText } from "./agent/session-title";
+import { isPlaceholderTitle, messageText } from "./agent/session-title";
+import { SessionBackgroundJobs } from "./agent/session-background";
 import type { SkillDocument } from "./agent/skills";
 import {
   GranularPermissionEngine,
@@ -40,15 +41,23 @@ import {
   type AppConfig,
   type ApprovalPreset,
   type AutoDelegateMode,
+  type BackgroundConfig,
+  type DelegationPolicy,
+  type LimitsConfig,
+  type WorkerFallbackMode,
 } from "./config/loader";
 import { resolveConfigPaths, type ConfigSource } from "./config/paths";
 import {
   clearModeModelSelections,
   saveActiveMode,
+  saveBackground,
+  saveTurnLimits,
+  saveDelegationPolicy,
   saveApprovalsPreset,
   saveAutoDelegate,
   saveAnimations,
   saveWorkerTimeout,
+  saveWorkerFallback,
   saveModeReasoning,
   saveModeSteps,
   saveRoleSelection,
@@ -391,6 +400,7 @@ export async function bootstrap(
     mcpServers: mcpReport.connected.map((entry) => entry.server),
     close: async () => {
       unsubscribeLearned();
+      orchestrator.closeSideTurns();
       await orchestrator.stopAllWorkers();
       await orchestrator.bgProcesses.stopAll();
       await mcpClient.close();
@@ -668,11 +678,13 @@ async function runTuiSession(
     if (configured) state.reasoningByMode[mode] = configured as ReasoningEffortLevel;
   }
   normalizeAllReasoning();
+  let cancelBackgroundView = (): void => undefined;
   const setActiveMode = (next: AgentMode): void => {
     const changed = state.mode !== next;
     state.mode = next;
     state.reasoningEffort = normalizeReasoningForMode(next, state.reasoningByMode[next]);
     if (changed) {
+      cancelBackgroundView();
       runtime.config.active_mode = next;
       void saveActiveMode(runtime.configPath, next).catch((error) => {
         setNotice(
@@ -843,52 +855,41 @@ async function runTuiSession(
     return session.id;
   };
 
-  const titleGeneratedFor = new Set<string>();
-
-  const maybeGenerateSessionTitle = async (sessionId: string, messages: Message[]): Promise<void> => {
-    if (titleGeneratedFor.has(sessionId)) return;
-    titleGeneratedFor.add(sessionId);
-
+  let hasComposerDraft = false;
+  let hasOpenInteraction = false;
+  const backgroundJobs = new SessionBackgroundJobs({
+    config: () => runtime.config.background,
+    view: () => ({
+      sessionId: state.sessionId, busy: state.busy || queuedTurns.length > 0, draft: hasComposerDraft,
+      blocked: hasOpenInteraction || state.helpOpen || state.modelsOpen || state.skillsOpen || state.settingsOpen || state.paletteOpen || state.hubOpen || state.sessionTab !== null || Boolean(state.report) || Boolean(approvals.current()) || Boolean(pendingQuestion),
+      workers: runtime.orchestrator.subagents.listWorkers().some((worker) => worker.parentSessionId === state.sessionId && ["queued", "preparing", "running", "finalizing"].includes(worker.status)),
+    }),
+    store: runtime.database,
+    run: (input) => runtime.orchestrator.runSideTurn(input),
+    onTitle: (sessionId, title) => {
+      if (state.sessionId !== sessionId) return;
+      setTerminalTitle(title);
+      refreshSessionUsage();
+      rerender();
+    },
+    onRecap: (sessionId, text) => {
+      if (state.sessionId !== sessionId) return;
+      state.entries = state.entries.filter((entry) => !entry.id.startsWith("recap-"));
+      state.entries.push({ id: `recap-${sessionId}`, role: "system", text: `Recap: ${text}` });
+      refreshSessionUsage();
+      rerender();
+    },
+  });
+  cancelBackgroundView = () => {
+    backgroundJobs.invalidate();
+    if (state.sessionId) runtime.orchestrator.cancelSideTurns(state.sessionId);
+  };
+  const maybeGenerateSessionTitle = (sessionId: string): void => {
     const session = runtime.database.getSession(sessionId);
-    if (!session) return;
-    const firstUser = messages.find(
-      (message) =>
-        message.role === "user" &&
-        message.metadata?.synthetic !== true &&
-        messageText(message).length > 0,
-    );
-    if (!firstUser) return;
-    const initial = sessionTitle(messageText(firstUser));
-    if (session.title !== initial && !isPlaceholderTitle(session.title)) return;
-
-    const roles: Array<"fast" | "main"> = runtime.router.getRole("fast") ? ["fast", "main"] : ["main"];
-    for (const role of roles) {
-      let provider: LLMProvider;
-      try {
-        provider = runtime.router.get(role);
-      } catch {
-        continue;
-      }
-      const title = await generateSessionTitle({ messages, provider });
-      if (!title) continue;
-      try {
-        runtime.database.updateSession(sessionId, { title });
-        setTerminalTitle(title);
-        rerender();
-      } catch {
-        // Title generation is best effort.
-      }
-      return;
-    }
-    if (session.title !== initial) {
-      try {
-        runtime.database.updateSession(sessionId, { title: initial });
-        setTerminalTitle(initial);
-        rerender();
-      } catch {
-        // A deleted session must not break the turn.
-      }
-    }
+    const firstUser = state.messages.find((message) => message.role === "user" && message.metadata?.synthetic !== true && messageText(message));
+    if (!session || !firstUser) return;
+    if (session.title !== sessionTitle(messageText(firstUser)) && !isPlaceholderTitle(session.title)) return;
+    void backgroundJobs.ensureTitle(sessionId, session.title);
   };
 
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1000,6 +1001,7 @@ async function runTuiSession(
   }> = [];
 
   const resetToWelcome = (): void => {
+    cancelBackgroundView();
     queuedTurns.length = 0;
     state.sessionId = undefined;
     state.sessionEpoch += 1;
@@ -1101,6 +1103,14 @@ async function runTuiSession(
       });
       rerender();
     },
+    workerFallback: runtime.config.orchestration.worker_fallback,
+    onWorkerFallbackChange: (value: WorkerFallbackMode) => {
+      runtime.config.orchestration.worker_fallback = value;
+      void saveWorkerFallback(runtime.configPath, value).catch((error) => {
+        setNotice(`Could not save worker fallback: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      });
+      rerender();
+    },
     onAnimationsChange: (enabled: boolean) => {
       runtime.config.ui.animations = enabled;
       void saveAnimations(runtime.configPath, enabled).catch((error) => {
@@ -1129,7 +1139,28 @@ async function runTuiSession(
       void saveAutoDelegate(runtime.configPath, mode).catch((error) => {
         setNotice(`could not save auto coordinator: ${error instanceof Error ? error.message : String(error)}`, 8000);
       });
-      setNotice(`Auto coordinator: ${AUTO_DELEGATE_LABELS[mode]}`, 6000);
+      setNotice(`Coordinator: ${AUTO_DELEGATE_LABELS[mode]}`, 6000);
+      rerender();
+    },
+    background: runtime.config.background,
+    limits: runtime.config.limits,
+    onLimitsChange: (patch: Partial<LimitsConfig>) => {
+      runtime.config.limits = { ...runtime.config.limits, ...patch };
+      void saveTurnLimits(runtime.configPath, patch).catch((error) => setNotice(`Could not save turn limits: ${error instanceof Error ? error.message : String(error)}`, 8000));
+      setNotice("Turn limits updated for the next message.", 6000);
+      rerender();
+    },
+    delegation: runtime.config.orchestration.delegation,
+    onDelegationChange: (value: DelegationPolicy) => {
+      runtime.config.orchestration.delegation = value;
+      void saveDelegationPolicy(runtime.configPath, value).catch((error) => setNotice(`Could not save delegation: ${error instanceof Error ? error.message : String(error)}`, 8000));
+      setNotice(`Delegation: ${value}. Applies to the next message.`, 6000);
+      rerender();
+    },
+    onBackgroundChange: (patch: Partial<BackgroundConfig>) => {
+      runtime.config.background = { ...runtime.config.background, ...patch };
+      cancelBackgroundView();
+      void saveBackground(runtime.configPath, patch).catch((error) => setNotice(`Could not save background settings: ${error instanceof Error ? error.message : String(error)}`, 8000));
       rerender();
     },
     onModeStepsChange: (mode: SettingsMode, steps: number) => {
@@ -1235,6 +1266,7 @@ async function runTuiSession(
         setNotice("Cancel the running turn before switching sessions.", 8000);
         return;
       }
+      cancelBackgroundView();
       state.sessionId = sessionId;
       state.sessionEpoch += 1;
       state.liveEntry = undefined;
@@ -1244,6 +1276,8 @@ async function runTuiSession(
       state.messages = msgs;
       state.activeSkills = runtime.database.listSessionSkills(sessionId).map((skill) => skill.name);
       state.entries = buildTranscriptEntries(history, runtime.database.getCompaction(sessionId));
+      const recap = runtime.database.getRecap(sessionId);
+      if (recap) state.entries.push({ id: `recap-${sessionId}`, role: "system", text: `Recap: ${recap.text}` });
       state.counter = state.entries.length;
       const sess = runtime.database.getSession(sessionId);
       if (sess) setActiveMode(sess.mode);
@@ -1269,6 +1303,7 @@ async function runTuiSession(
         setNotice("Cancel the running turn before forking the session.", 8000);
         return;
       }
+      cancelBackgroundView();
       state.sessionId = forked.id;
       state.sessionEpoch += 1;
       setTerminalTitle(forked.title);
@@ -1380,6 +1415,7 @@ async function runTuiSession(
       rerender();
     },
     onAbort: () => {
+      cancelBackgroundView();
       if (questionResolver) {
         const resolve = questionResolver;
         questionResolver = undefined;
@@ -1415,17 +1451,39 @@ async function runTuiSession(
     onSubmit: (text: string, action: InputAction, attachments?: FileAttachmentRef[]) => {
       void handleInput(text, action, attachments);
     },
+    onDraftChange: (hasDraft: boolean) => {
+      hasComposerDraft = hasDraft;
+      backgroundJobs.activity();
+      const hadRecap = hasDraft && state.entries.some((entry) => entry.id.startsWith("recap-"));
+      if (hadRecap) state.entries = state.entries.filter((entry) => !entry.id.startsWith("recap-"));
+      if (hadRecap) rerender();
+      backgroundJobs.refresh();
+    },
+    onInteractionBlockedChange: (blocked: boolean) => {
+      hasOpenInteraction = blocked;
+      backgroundJobs.refresh();
+    },
   });
 
   const synced = installSynchronizedOutput({ onFrame: (frame) => void relay?.broadcast(frame) });
   let instance: ReturnType<typeof render>;
   instance = render(React.createElement(OrchivoxApp, view()));
   const rerender = (): void => {
+    backgroundJobs.refresh();
     instance.rerender(React.createElement(OrchivoxApp, view()));
   };
   const unsubscribeCapabilities = runtime.router.onCapabilitiesChanged(rerender);
+  const unsubscribeSubagentResults = runtime.orchestrator.onSubagentResult((worker, text, message) => {
+    if (!state.sessionId || worker.parentSessionId !== state.sessionId) return;
+    if (message && !state.messages.some((entry) => entry.id === message.id)) {
+      state.messages = [...state.messages, message];
+    }
+    pushEntry("system", text);
+    rerender();
+  });
 
   const activityTimer = setInterval(() => {
+    backgroundJobs.refresh();
     pruneStoppedApprovals();
     const tokensBefore = state.totalTokens;
     const costBefore = state.totalCostUsd;
@@ -1483,6 +1541,10 @@ async function runTuiSession(
       ? runtime.database.getSession(state.sessionId)?.mode
       : undefined;
     const sessionId = ensureSession(displayUserText ?? promptText);
+    state.entries = state.entries.filter((entry) => !entry.id.startsWith("recap-"));
+    backgroundJobs.beginTurn(sessionId);
+    runtime.orchestrator.cancelSideTurns(sessionId);
+    let recapEligible = false;
     const saveSystemLine = (text: string, metadata: Record<string, unknown> = {}): void => {
       try {
         runtime.database.saveMessage(sessionId, {
@@ -1639,8 +1701,13 @@ async function runTuiSession(
       let completionTokens = 0;
       let lastUsage: { prompt_tokens: number; completion_tokens: number; total_tokens?: number } | undefined;
       let sawErrorEvent = false;
+      let titleScheduled = false;
       const turnFiles = new Set<string>();
       for await (const event of runtime.orchestrator.runStream(request, activeAbortController.signal)) {
+        if (!titleScheduled && (event.type === "token" || event.type === "thinking_token" || event.type === "tool_start")) {
+          titleScheduled = true;
+          maybeGenerateSessionTitle(sessionId);
+        }
         if (event.type === "token") {
           const now = Date.now();
           if (firstTokenAt === undefined) firstTokenAt = now;
@@ -1891,6 +1958,10 @@ async function runTuiSession(
           liveEntry.timeLimitSeconds =
             event.time_limit_ms !== undefined ? Math.ceil(event.time_limit_ms / 1000) : undefined;
           renderLive(true);
+        } else if (event.type === "progress_checkpoint") {
+          setNotice(`Progress check after ${event.tool_calls} calls: reviewing remaining work and verification evidence.`, 10000);
+          pushEntry("system", `Progress check: ${event.tool_calls} calls, ${formatElapsed(Math.round(event.elapsed_ms / 1000))} elapsed. Reviewing remaining work and verification evidence.`);
+          renderLive(true);
         } else if (event.type === "turn_budget_warning") {
           const label =
             event.reason === "time" ? "time" : event.reason === "tool" ? "tool calls" : "steps";
@@ -2061,7 +2132,7 @@ async function runTuiSession(
         } catch {
           // Ignore database save error if session not found.
         }
-        void maybeGenerateSessionTitle(sessionId, [...state.messages]);
+        recapEligible = !aborted && finishReason !== "error";
       }
     } catch (error) {
       pushEntry("system", `turn failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -2084,6 +2155,7 @@ async function runTuiSession(
         renderScheduled = undefined;
       }
       state.busy = false;
+      backgroundJobs.endTurn(sessionId, recapEligible);
       renderFrame();
       const next = queuedTurns.shift();
       if (next) {
@@ -2508,6 +2580,7 @@ async function runTuiSession(
           setNotice("Cancel the running turn before starting a new session.", 8000);
           break;
         }
+        cancelBackgroundView();
         state.sessionId = undefined;
         state.sessionEpoch += 1;
         state.messages = [];
@@ -2574,6 +2647,7 @@ async function runTuiSession(
       case "/quit": {
         pushEntry("system", "shutting down Orchivox...");
         rerender();
+        unsubscribeSubagentResults();
         cleanupSignals();
         return;
       }
@@ -2626,6 +2700,7 @@ async function runTuiSession(
   };
 
   const cleanupSignals = () => {
+    backgroundJobs.close();
     if (noticeTimer) clearTimeout(noticeTimer);
     clearInterval(activityTimer);
     unsubscribeCapabilities();
@@ -2644,6 +2719,7 @@ async function runTuiSession(
   process.on("SIGTERM", cleanupSignals);
   rerender();
   await instance.waitUntilExit();
+  backgroundJobs.close();
   if (noticeTimer) clearTimeout(noticeTimer);
   clearInterval(activityTimer);
   unsubscribeCapabilities();

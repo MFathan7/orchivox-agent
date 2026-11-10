@@ -78,6 +78,20 @@ function entrypointKind(executable: string): AppInfo["entrypoint"] {
   return "unknown";
 }
 
+/**
+ * A source checkout reports the version of the code it is running, not the
+ * version recorded by a previous binary install. A compiled binary keeps the
+ * install record so update checks and rollback stay accurate.
+ */
+export function resolveAppVersion(
+  entrypoint: AppInfo["entrypoint"],
+  installVersion: string | undefined,
+  packageVersion: string,
+): string {
+  if (entrypoint === "source") return packageVersion;
+  return installVersion ?? packageVersion;
+}
+
 const SOURCE_PACKAGE_NAMES = new Set(["orchivox", "orchivox-agent"]);
 
 function isSourceCheckout(dir: string): boolean {
@@ -159,7 +173,7 @@ export async function getAppInfo(): Promise<AppInfo> {
     .then((result) => result.stdout.trim())
     .catch(() => "");
   return {
-    version: record?.version ?? packageJson.version,
+    version: resolveAppVersion(kind, record?.version, packageJson.version),
     commit,
     dirty: status.length > 0,
     entrypoint: kind,

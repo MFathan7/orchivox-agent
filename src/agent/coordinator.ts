@@ -368,7 +368,7 @@ export function formatCoordinatorPlan(result: CoordinatorResult): string {
     result.warnings.length > 0
       ? `Warnings:\n${result.warnings.map((warning) => `- ${warning}`).join("\n")}`
       : "",
-    "Use task_wait to collect the results. Review them and merge only what passes.",
+    "Start the ready tasks, continue with independent work, and use task_wait only when blocked. Review results and merge only what passes.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -381,7 +381,7 @@ export function createCoordinateTool(options: {
   return {
     name: "coordinate",
     description:
-      "Plan multi-step work with the read-only Polaris coordinator and create worker tasks. Use this when a goal needs more than one independent step or a specialist. Polaris cannot edit files. Returns the plan and task ids; call task_wait to collect results.",
+      "Optional dependency planner for substantial work with unclear task ownership. Prefer assigning independent slices directly with spawn_subagents. This call waits for Polaris to plan, validates the result, and starts ready tasks. It is not needed for routine project study or a direct answer. A plan does not authorize edits beyond the user's request.",
     parameters: z.object({
       goal: z.string().min(1).describe("The outcome the user wants."),
       context: z
@@ -400,7 +400,7 @@ export function createCoordinateTool(options: {
     readOnly: false,
     execute: async (args, context) => {
       if (!options.enabled()) {
-        throw new Error("Auto coordinator is off. Enable it in /settings first.");
+        throw new Error("Coordinator is off. Enable it in /settings first.");
       }
       const input = args as CoordinatorInput;
       const result = await options.coordinator.coordinate(input, context?.signal);
@@ -417,7 +417,7 @@ export function createCoordinateTool(options: {
           ? `Warnings:\n${result.warnings.map((warning) => `- ${warning}`).join("\n")}`
           : "",
         result.plan.merge ? "Merge requested after the tasks complete." : "",
-        "Call task_wait to collect the results.",
+        "Start the ready tasks, continue with independent work, and use task_wait only when blocked.",
       ].filter(Boolean);
       return lines.join("\n");
     },

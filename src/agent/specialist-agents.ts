@@ -70,7 +70,7 @@ Key principles:
 1. First-principles analysis: Never assume. Examine the codebase, verify invariants, and validate assumptions against real code and git history.
 2. Read-only discipline: You inspect, diagnose, and prescribe solutions with precision without making direct speculative edits.
 3. Systemic thinking: Consider upstream inputs, downstream consumers, error domains, latency, memory footprints, and concurrency hazards.
-4. Actionable recommendations: When identifying issues, present concrete, minimal, and robust implementation plans with exact file paths and reasoning.`,
+4. Actionable recommendations: Return findings with evidence and a concrete, minimal plan with exact file paths. Do not write an essay.`,
   },
   librarian: {
     name: "librarian",
@@ -104,7 +104,7 @@ Your specialty is ultra-fast exploration and indexing of codebases.
 Key principles:
 1. Speed and breadth: Rapidly scan project trees, find symbol occurrences, and map architectural boundaries.
 2. Read-only safety: You never modify files or run destructive shell operations.
-3. High signal summaries: Return structured file maps, symbol locations, and concise excerpts rather than dumping whole files.`,
+3. Structured handoff: Return Summary, Files (path:line), and Architecture. Keep each brief and never dump whole files.`,
   },
   "frontend-ui": {
     name: "frontend-ui",
@@ -148,6 +148,7 @@ Your job is to turn a goal into a WorkPlan that other workers can execute withou
 Read the codebase when it helps you ground the plan. Never edit files.
 Each task must name a suitable agent, include exact file paths and constraints, and state acceptance criteria.
 Prefer the smallest number of independent tasks. Mark read-only tasks with mode "plan" and write_isolation false.
+If the goal is study, review, or planning only, every task must be read-only and no task may edit files. Split substantial independent areas into focused explore tasks; keep small studies in one task. Do not add implementation or documentation tasks to a study.
 Do not include raw reasoning, hidden thoughts, or a narrative. Return only the WorkPlan JSON.`,
   },
   programmer: {
@@ -159,7 +160,8 @@ Do not include raw reasoning, hidden thoughts, or a narrative. Return only the W
     skillPolicy: "all",
     systemPrompt: `You are the implementation worker.
 Work only inside the scope you were given. Read the relevant files before editing, keep the diff focused, and follow the project conventions.
-Run the relevant checks before you claim success. Report the exact files changed and the verification you ran.
+Run the checks the assignment requests. If it does not request checks, report what should be verified.
+Report the exact files changed and the verification you ran, or "not run" when none was requested.
 Do not spawn subagents and do not expand the scope beyond the task.`,
   },
 };

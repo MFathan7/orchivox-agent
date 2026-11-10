@@ -19,6 +19,8 @@ export const PLAN_TOOL_NAMES: ReadonlySet<string> = new Set([
   "diagnostics_check",
   "inspect_image",
   "spawn_subagents",
+  "task_list",
+  "task_wait",
   "write_plan",
 ]);
 

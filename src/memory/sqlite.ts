@@ -121,6 +121,11 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+CREATE TABLE IF NOT EXISTS session_recaps (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  text TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(message_id UNINDEXED, session_id UNINDEXED, role, content);
 CREATE TABLE IF NOT EXISTS session_skills (
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -234,6 +239,20 @@ export class MemoryDatabase implements TaskStore {
       .query("UPDATE sessions SET compaction_json = ?, updated_at = ? WHERE id = ?")
       .run(JSON.stringify(compaction), Date.now(), sessionId);
     if (result.changes === 0) throw new Error(`unknown session "${sessionId}"`);
+  }
+
+  saveRecap(sessionId: string, text: string): void {
+    this.db.query("INSERT INTO session_recaps (session_id, text, created_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET text = excluded.text, created_at = excluded.created_at")
+      .run(sessionId, text, Date.now());
+  }
+
+  getRecap(sessionId: string): { text: string; created_at: number } | undefined {
+    const row = this.db.query("SELECT text, created_at FROM session_recaps WHERE session_id = ?").get(sessionId) as { text: string; created_at: number } | null;
+    return row ?? undefined;
+  }
+
+  clearRecap(sessionId: string): void {
+    this.db.query("DELETE FROM session_recaps WHERE session_id = ?").run(sessionId);
   }
 
   getCompaction(sessionId: string): SessionCompaction | undefined {

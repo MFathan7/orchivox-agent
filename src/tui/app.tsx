@@ -11,7 +11,8 @@ import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import type { ProviderRouter } from "../provider/router";
 import type { MemoryDatabase, SessionRecord } from "../memory/sqlite";
 import type { RestoreResult, SnapshotManager } from "../vcs/snapshot";
-import type { ApprovalPreset, AutoDelegateMode } from "../config/loader";
+import type { ApprovalPreset, AutoDelegateMode, WorkerFallbackMode } from "../config/loader";
+import type { BackgroundConfig, DelegationPolicy, LimitsConfig } from "../config/loader";
 import type { ConfigMode, ConfigRole } from "../config/writer";
 import { AgentHub, type AgentHubTab } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
@@ -40,6 +41,7 @@ import {
   type DisplaySegment,
 } from "./format";
 import { isMouseSequence, parseMouseWheel } from "./mouse";
+import { RESET_ATTRIBUTES, resetBeforeErase } from "./terminal-protocol";
 import { LiveStatus } from "./spinner";
 import { MotionProvider } from "./motion";
 import { agentActivityCounts, agentActivitySummary } from "./agent-activity";
@@ -171,10 +173,20 @@ export interface ChatEntryView {
 }
 
 export interface OrchivoxAppProps {
+  limits?: LimitsConfig;
+  onLimitsChange?: (patch: Partial<LimitsConfig>) => void;
+  delegation?: DelegationPolicy;
+  onDelegationChange?: (value: DelegationPolicy) => void;
   workerTimeoutSeconds?: number;
   onWorkerTimeoutChange?: (seconds: number) => void;
+  workerFallback?: WorkerFallbackMode;
+  onWorkerFallbackChange?: (value: WorkerFallbackMode) => void;
   animations?: boolean;
   onAnimationsChange?: (enabled: boolean) => void;
+  background?: BackgroundConfig;
+  onBackgroundChange?: (patch: Partial<BackgroundConfig>) => void;
+  onDraftChange?: (hasDraft: boolean) => void;
+  onInteractionBlockedChange?: (blocked: boolean) => void;
   projectName?: string;
   branch?: string;
   mcpCount?: number;
@@ -312,7 +324,7 @@ export function computeViewportHeight(rows: number, chromeRows: number, composer
 
 
 export function installSynchronizedOutput(
-  options: { frameMs?: number; target?: WriteTarget; onFrame?: (frame: string) => void },
+  options: { frameMs?: number; target?: WriteTarget; onFrame?: (frame: string) => void; platform?: NodeJS.Platform },
 ): SyncedOutputHandle {
   const target = options.target ?? (process.stdout as unknown as WriteTarget);
   const frameMs = options.frameMs ?? 16;
@@ -340,7 +352,12 @@ export function installSynchronizedOutput(
     const startedAt = Date.now();
     try {
       originalWrite(SYNC_START);
-      for (const chunk of chunks) originalWrite(chunk);
+      if ((options.platform ?? process.platform) === "win32") {
+        const frame = chunks.map((chunk) => typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk)).join("");
+        originalWrite(`${RESET_ATTRIBUTES}${resetBeforeErase(frame)}${RESET_ATTRIBUTES}`);
+      } else {
+        for (const chunk of chunks) originalWrite(chunk);
+      }
     } finally {
       // Always leave synchronized update mode, even if one write fails.
       originalWrite(SYNC_END);
@@ -589,6 +606,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     modePickerOpen ||
     reasoningPickerOpen ||
     themePickerOpen;
+  const interactionCallback = React.useRef(props.onInteractionBlockedChange);
+  interactionCallback.current = props.onInteractionBlockedChange;
+  React.useEffect(() => { interactionCallback.current?.(hasModalOpen); }, [hasModalOpen]);
   // The turn status belongs next to the composer, not between the thinking
   // block and the answer.
 
@@ -945,8 +965,16 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           />
         ) : settingsOpen ? (
           <SettingsModal
+            limits={props.limits}
+            onLimitsChange={props.onLimitsChange}
+            delegation={props.delegation}
+            onDelegationChange={props.onDelegationChange}
             workerTimeoutSeconds={props.workerTimeoutSeconds}
             onWorkerTimeoutChange={props.onWorkerTimeoutChange}
+            background={props.background}
+            onBackgroundChange={props.onBackgroundChange}
+            workerFallback={props.workerFallback}
+            onWorkerFallbackChange={props.onWorkerFallbackChange}
             height={viewportHeight}
             animations={props.animations}
             onAnimationsChange={props.onAnimationsChange}
@@ -1141,6 +1169,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         {statusGapRows > 0 ? <Box height={1} /> : null}
 
         <PromptComposer
+            onDraftChange={props.onDraftChange}
             mode={mode}
             theme={theme}
             width={innerWidth}

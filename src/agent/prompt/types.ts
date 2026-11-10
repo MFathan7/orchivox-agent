@@ -1,4 +1,4 @@
-import type { AutoDelegateMode } from "../../config/loader";
+import type { AutoDelegateMode, DelegationPolicy } from "../../config/loader";
 import type { AgentMode } from "../../types/schema";
 
 export type PromptPartKind = "agent" | "tools" | "instructions" | "coordinator" | "extra" | "closing";
@@ -30,13 +30,14 @@ export interface SystemPromptOptions {
   now?: Date;
   agentInstructions?: string;
   specialistPrompt?: string;
+  /** True for a spawned worker. Workers get a result contract and no delegation. */
+  worker?: boolean;
   projectSummary?: string;
   skillsIndex?: string;
   extra?: string;
-  /** Automatic coordinator policy for this session. */
+  /** Modes in which the optional coordinator is available. */
   autoDelegate?: AutoDelegateMode;
-  /** True when an "always" turn already has a Polaris plan in the conversation. */
-  coordinatorPlan?: boolean;
+  delegation?: DelegationPolicy;
   compact?: boolean;
   /** Include environment, project, rules, and skills in the system prompt. Defaults to true. */
   includeInstructions?: boolean;
