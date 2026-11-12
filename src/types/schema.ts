@@ -155,6 +155,7 @@ export const UsageSchema = z.object({
   completion_tokens: z.number().int().nonnegative(),
   total_tokens: z.number().int().nonnegative().optional(),
   cost_usd: z.number().nonnegative().optional(),
+  cost_incomplete: z.boolean().optional(),
   /** Input tokens served from cache. Included in `prompt_tokens`. */
   cache_read_input_tokens: z.number().int().nonnegative().default(0),
   /** Input tokens written to cache. Included in `prompt_tokens`. */
@@ -174,6 +175,9 @@ export function computeCostUsd(tokens: CostTokens, pricing: TokenPricing | undef
   if (!pricing) return undefined;
   const cacheReadTokens = tokens.cacheReadTokens ?? 0;
   const cacheCreationTokens = tokens.cacheCreationTokens ?? 0;
+  if (cacheReadTokens + cacheCreationTokens > tokens.promptTokens) return undefined;
+  if (cacheReadTokens > 0 && pricing.cache_read_usd_per_million_tokens === undefined) return undefined;
+  if (cacheCreationTokens > 0 && pricing.cache_creation_usd_per_million_tokens === undefined) return undefined;
   const uncachedPromptTokens = Math.max(0, tokens.promptTokens - cacheReadTokens - cacheCreationTokens);
   const cacheReadPrice =
     pricing.cache_read_usd_per_million_tokens ?? pricing.input_usd_per_million_tokens;
@@ -260,6 +264,13 @@ export const ProgressCheckpointEventSchema = z.object({
   step: z.number().int().nonnegative(),
   elapsed_ms: z.number().int().nonnegative(),
   interval: z.number().int().positive(),
+  activity: z.object({
+    tool_counts: z.record(z.string(), z.number().int().nonnegative()),
+    read_paths: z.array(z.object({ path: z.string(), calls: z.number().int().positive() })),
+    file_changes: z.number().int().nonnegative(),
+    error_results: z.number().int().nonnegative(),
+    repeated_results: z.number().int().nonnegative(),
+  }).optional(),
 });
 export type ProgressCheckpointEvent = z.infer<typeof ProgressCheckpointEventSchema>;
 

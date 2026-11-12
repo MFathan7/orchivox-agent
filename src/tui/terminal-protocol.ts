@@ -1,12 +1,12 @@
 export type TerminalWriter = (chunk: string) => unknown;
 
 export const ENTER_ALTERNATE_SCREEN =
-  "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1006h";
+  "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 export const LEAVE_ALTERNATE_SCREEN = "\x1b[?1049l\x1b[?25h";
 export const ENABLE_KEYBOARD_PROTOCOL = "\x1b[>1u\x1b[>4;2m";
 export const DISABLE_KEYBOARD_PROTOCOL = "\x1b[>4;0m\x1b[<u";
 
-const DISABLE_MOUSE = "\x1b[?1000l\x1b[?1006l";
+const DISABLE_MOUSE = "\x1b[?1002l\x1b[?1000l\x1b[?1006l";
 
 let entered = false;
 let extendedKeyboard = false;

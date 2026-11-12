@@ -499,7 +499,8 @@ export class AgentOrchestrator implements IAgentRunner {
           this.database.addSessionUsage(
             sessionId,
             usage.prompt_tokens + usage.completion_tokens,
-            usage.cost_usd ?? 0,
+            usage.cost_usd,
+            usage.cost_incomplete,
           );
         } catch {
           // Usage accounting is best effort and must not break a worker.
@@ -789,7 +790,7 @@ export class AgentOrchestrator implements IAgentRunner {
       sessionId: input.sessionId, purpose: input.purpose, provider: snapshot.provider,
       request, signal: input.signal, timeoutMs: (this.config?.background?.timeout_seconds ?? 30) * 1000,
       onUsage: (usage) => {
-        try { this.database.addSessionUsage(input.sessionId, usage.prompt_tokens + usage.completion_tokens, usage.cost_usd ?? 0); } catch { /* A deleted session cannot block accounting cleanup. */ }
+        try { this.database.addSessionUsage(input.sessionId, usage.prompt_tokens + usage.completion_tokens, usage.cost_usd, usage.cost_incomplete); } catch { /* A deleted session cannot block accounting cleanup. */ }
       },
     });
     const latest = snapshot.currentRoute();
@@ -1046,10 +1047,14 @@ export class AgentOrchestrator implements IAgentRunner {
         case "tool_end":
           metrics.recordToolEnd(event.name, event.duration_ms);
           break;
+        case "file_change":
+          progress.recordFileChange();
+          break;
         case "progress_checkpoint":
           metrics.recordCheckpoint();
           break;
         case "compaction":
+          readFileCache.reset();
           metrics.recordCompaction({
             trigger:
               event.trigger ??
@@ -1071,6 +1076,7 @@ export class AgentOrchestrator implements IAgentRunner {
           });
           break;
         case "context_pruned":
+          readFileCache.reset();
           metrics.recordPrune();
           break;
         case "done": {
@@ -1205,6 +1211,10 @@ export class AgentOrchestrator implements IAgentRunner {
         ? activeSpecialist.roleModel
         : undefined;
     const provider = requestedRole ? this.router.get(requestedRole) : this.router.getMode(mode);
+    const onCompactionUsage = (usage: Usage): void => {
+      if (!sessionId) return;
+      this.database.addSessionUsage(sessionId, usage.prompt_tokens + usage.completion_tokens, usage.cost_usd, usage.cost_incomplete);
+    };
     const providerRef = requestedRole ? this.router.getRole(requestedRole) : this.router.getModeModel(mode);
     const capabilities = requestedRole
       ? this.router.capabilitiesForRole(requestedRole)
@@ -1557,7 +1567,10 @@ export class AgentOrchestrator implements IAgentRunner {
         for await (const event of abortableStream(provider.streamChat(retryRequest, signal), signal)) {
           if (event.type === "token") text += event.text;
           else if (event.type === "thinking_token") thinking += event.text;
-          else if (event.type === "usage") accumulateUsage(totals, event);
+          else if (event.type === "usage") {
+            accumulateUsage(totals, event);
+            sink({ ...event, turn_total: false });
+          }
         }
       } catch {
         return sanitizeAssistantText(originalText);
@@ -1678,6 +1691,7 @@ export class AgentOrchestrator implements IAgentRunner {
         const capturedMessages = messages;
         const capturedEpoch = precomputeEpoch;
         const precompute = precomputeCompaction(capturedMessages, {
+          onUsage: onCompactionUsage,
           provider,
           contextWindow,
           keepTokens: this.compactionConfig.keep_tokens,
@@ -1706,6 +1720,7 @@ export class AgentOrchestrator implements IAgentRunner {
       }
       if (this.compactionConfig.auto) {
         const compaction = await compactMessages(messages, {
+          onUsage: onCompactionUsage,
           provider,
           signal,
           contextWindow,
@@ -1946,6 +1961,7 @@ export class AgentOrchestrator implements IAgentRunner {
         metrics.finishProvider();
         if (progressTimer) clearTimeout(progressTimer);
       }
+      if (!lastUsage) totals.cost_incomplete = true;
 
       if (usageLogEnabled()) {
         // Await the tiny append so a headless run does not exit before the line
@@ -2103,6 +2119,7 @@ export class AgentOrchestrator implements IAgentRunner {
         });
         try {
           const forced = await compactMessages(messages, {
+            onUsage: onCompactionUsage,
             provider,
             signal,
             contextWindow,
@@ -2284,6 +2301,7 @@ export class AgentOrchestrator implements IAgentRunner {
               ).length > 1;
             const compacted = hasPriorTurn
               ? await compactMessages(messages, {
+                  onUsage: onCompactionUsage,
                   provider,
                   signal,
                   contextWindow,
@@ -2683,6 +2701,18 @@ export class AgentOrchestrator implements IAgentRunner {
         return { message: toolResult, skillDocument };
       };
 
+      const recordToolResult = (block: ToolUseBlock, message: Message): void => {
+        for (const result of message.content) {
+          if (result.type !== "tool_result") continue;
+          progress.recordResult({
+            name: block.name,
+            readOnly: this.registry.get(block.name)?.readOnly === true,
+            path: extractFilePath(block.input),
+            root: this.root,
+          }, result);
+        }
+      };
+
       const concurrencyEnabled =
         toolUses.length > 1 &&
         capabilities.tool_calling &&
@@ -2726,7 +2756,8 @@ export class AgentOrchestrator implements IAgentRunner {
           await runWithConcurrency(started, MAX_CONCURRENT_TOOLS, async (entry, index) => {
             outcomes[index] = await runTool(entry.block, entry.at);
           });
-          for (const outcome of outcomes) {
+          for (const [index, outcome] of outcomes.entries()) {
+            recordToolResult(batch.calls[index], outcome.message);
             messages.push(outcome.message);
             persistConversationMessage(outcome.message);
             if (outcome.skillDocument) {
@@ -2736,6 +2767,7 @@ export class AgentOrchestrator implements IAgentRunner {
           continue;
         }
         const outcome = await runTool(batch.calls[0], startTool(batch.calls[0]));
+        recordToolResult(batch.calls[0], outcome.message);
         messages.push(outcome.message);
         persistConversationMessage(outcome.message);
         if (outcome.skillDocument) {
@@ -3668,6 +3700,7 @@ function zeroUsage(): Usage {
 }
 
 function accumulateUsage(totals: Usage, usage: Usage): void {
+  if (usage.cost_incomplete || usage.cost_usd === undefined) totals.cost_incomplete = true;
   totals.prompt_tokens += usage.prompt_tokens;
   totals.completion_tokens += usage.completion_tokens;
   totals.cache_read_input_tokens += usage.cache_read_input_tokens;

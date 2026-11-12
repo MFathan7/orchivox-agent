@@ -1,7 +1,7 @@
 import { COMPACT_LABEL, estimateMessageTokens } from "../memory/hindsight";
 import { isContextOverflowError } from "../provider/errors";
 import type { LLMProvider } from "../provider/router";
-import { ChatRequestSchema, type Message, type TextBlock, type ToolDefinition } from "../types/schema";
+import { ChatRequestSchema, type Message, type TextBlock, type ToolDefinition, type Usage } from "../types/schema";
 import { estimateTokenCost } from "./token-estimate";
 import { abortableStream } from "../provider/abortable-stream";
 
@@ -59,6 +59,7 @@ export interface CompactionOptions {
   maxSummaryTokens?: number;
   signal?: AbortSignal;
   onStart?: () => void;
+  onUsage?: (usage: Usage) => void;
   /** Summary prepared earlier in the background, reused when the older set matches. */
   precomputed?: PrecomputedCompaction;
 }
@@ -298,6 +299,7 @@ export async function precomputeCompaction(
     previousSummary,
     options.maxSummaryTokens ?? 2000,
     options.signal,
+    options.onUsage,
   );
   return {
     summary,
@@ -551,6 +553,7 @@ export async function compactMessages(messages: Message[], options: CompactionOp
         previousSummary,
         options.maxSummaryTokens ?? 2000,
         options.signal,
+        options.onUsage,
       );
   const summaryMessage: Message = {
     id: `compaction-${Date.now().toString(36)}`,
@@ -621,6 +624,7 @@ async function summarize(
   previousSummary: string | undefined,
   maxTokens: number,
   signal?: AbortSignal,
+  onUsage?: (usage: Usage) => void,
 ): Promise<string> {
   const levels = [0, 1, 2, 3];
   for (const level of levels) {
@@ -640,18 +644,22 @@ async function summarize(
       temperature: 0.2,
     });
 
+    let usage: Usage | undefined;
     try {
       let text = "";
       let streamError: string | undefined;
       for await (const event of abortableStream(provider.streamChat(request, signal), signal)) {
         if (event.type === "token") text += event.text;
         else if (event.type === "error") streamError = event.message;
+        else if (event.type === "usage") usage = event;
       }
       if (!streamError && text.trim().length > 0) return text.trim();
       if (streamError && !isContextOverflowError(streamError)) break;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!isContextOverflowError(message)) break;
+    } finally {
+      try { onUsage?.(usage ?? { prompt_tokens: 0, completion_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost_incomplete: true }); } catch {}
     }
     if (signal?.aborted) break;
   }

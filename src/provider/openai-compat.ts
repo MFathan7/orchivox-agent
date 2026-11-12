@@ -687,6 +687,7 @@ export function buildUsageEvent(
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: usage.total_tokens ?? promptTokens + completionTokens,
+    cost_incomplete: usage.cost == null && (usage.prompt_tokens == null || usage.completion_tokens == null) ? true : undefined,
     cost_usd:
       usage.cost ??
       computeCostUsd(

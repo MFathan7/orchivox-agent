@@ -394,7 +394,7 @@ export function ToolApprovalModal(props: ToolApprovalModalProps) {
     <Box
       flexDirection="column"
       height={safeHeight}
-      borderStyle="round"
+      borderStyle="single"
       borderColor={theme.border.active}
       paddingX={1}
       overflow="hidden"

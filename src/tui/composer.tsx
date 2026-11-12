@@ -549,7 +549,7 @@ export function PromptComposer(props: PromptComposerProps) {
     repoRoot,
     width,
     maxRows,
-    placeholder = "Ask Orchivox, / for commands, @ for files, $ for skills",
+    placeholder = "Ask Orchivox",
     historyFilePath,
     disabled = false,
     streaming = false,
@@ -1168,12 +1168,7 @@ export function PromptComposer(props: PromptComposerProps) {
   const popupLimit = Math.max(1, Math.min(6, Math.floor(screenRows / 4)));
   const popupRows = popupVisible ? Math.min(popupLimit, autocompleteItems.length) + 4 : 0;
   const attachmentRows = attachedFiles.length > 0 ? 1 : 0;
-  const effectivePlaceholder =
-    (width ?? 80) < 55
-      ? "Ask Orchivox"
-      : (width ?? 80) < 70
-        ? "Ask Orchivox, / commands, @ files"
-        : placeholder;
+  const effectivePlaceholder = placeholder;
   const hintText =
     (width ?? 80) < 50
       ? "Shift+Tab · Enter send"
@@ -1231,7 +1226,7 @@ export function PromptComposer(props: PromptComposerProps) {
 
       <Box
         flexDirection="column"
-        borderStyle="round"
+        borderStyle="single"
         borderColor={modeStyle.primary}
         paddingX={1}
       >

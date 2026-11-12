@@ -47,7 +47,7 @@ export function WorkspaceTrustPrompt(props: WorkspaceTrustPromptProps): React.Re
   });
 
   return (
-    <Box flexDirection="column" paddingX={2} paddingY={1} borderStyle="round" borderColor={theme.border.active}>
+    <Box flexDirection="column" paddingX={2} paddingY={1} borderStyle="single" borderColor={theme.border.active}>
       <Box marginBottom={1} gap={1} alignItems="center">
         <OrchivoxLogo variant="compact" theme={theme} />
         <Text bold color={theme.text}>

@@ -11,6 +11,7 @@ function thinkingSegmentsFromMetadata(value: unknown): ThinkingSegmentView[] | u
     return [
       {
         id: typeof record.id === "string" ? record.id : `thinking-${record.startedAt}`,
+        kind: record.kind === "text" ? "text" : "thinking",
         text: record.text,
         startedAt: record.startedAt,
         completedAt: typeof record.completedAt === "number" ? record.completedAt : undefined,
@@ -142,7 +143,7 @@ export function buildTranscriptEntries(
         ? metadata.tokens_per_second
         : undefined;
     const turnTokens =
-      typeof metadata?.turn_tokens === "number" && Number.isFinite(metadata.turn_tokens)
+      metadata?.usage_reported !== false && typeof metadata?.turn_tokens === "number" && Number.isFinite(metadata.turn_tokens)
         ? metadata.turn_tokens
         : undefined;
     const filesChanged =
@@ -155,10 +156,16 @@ export function buildTranscriptEntries(
       id: `entry-${index + 1}`,
       role: message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user",
       text: messageEntryText(message),
+      completedAt: message.role === "assistant" && !hasToolUse ? message.created_at : undefined,
+      responseDurationMs: message.role === "assistant" && !hasToolUse && typeof metadata?.response_duration_ms === "number" && Number.isFinite(metadata.response_duration_ms) && metadata.response_duration_ms >= 0
+        ? metadata.response_duration_ms : undefined,
+      turnPromptTokens: metadata?.usage_reported !== false && typeof metadata?.turn_prompt_tokens === "number" ? metadata.turn_prompt_tokens : undefined,
+      turnCompletionTokens: metadata?.usage_reported !== false && typeof metadata?.turn_completion_tokens === "number" ? metadata.turn_completion_tokens : undefined,
+      turnRequests: metadata?.usage_reported !== false && typeof metadata?.turn_requests === "number" ? metadata.turn_requests : undefined,
       ...(thinkingSegments
         ? {
             thinkingSegments,
-            thinking: thinkingSegments.map((segment) => segment.text).join("\n"),
+            thinking: thinkingSegments.filter((segment) => segment.kind !== "text").map((segment) => segment.text).join("\n"),
           }
         : {}),
       ...(toolCalls ? { toolCalls } : {}),

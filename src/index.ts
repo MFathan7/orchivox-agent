@@ -90,7 +90,7 @@ import {
   type InputAction,
   type ThinkingSegmentView,
 } from "./tui/app";
-import { applyCompactionMeter, applyContextEstimate } from "./tui/session-meter";
+import { applyCompactionMeter, applyContextEstimate, applyUsageContext, finishContextMeter } from "./tui/session-meter";
 import { AUTO_DELEGATE_LABELS, type SettingsMode } from "./tui/settings-modal";
 import { formatStatsReport } from "./tui/stats-report";
 import { buildTranscriptEntries } from "./tui/transcript";
@@ -617,6 +617,7 @@ async function runTuiSession(
     modifiedFiles: new Map<string, { path: string; additions: number; deletions: number }>(),
     totalTokens: 0,
     contextTokens: 0,
+    contextSource: "estimated" as "estimated" | "reported",
     contextRequestBytes: 0,
     contextInputBudget: 0,
     contextBufferTokens: 0,
@@ -624,6 +625,7 @@ async function runTuiSession(
     totalPromptTokens: 0,
     totalCompletionTokens: 0,
     totalCostUsd: 0,
+    costIncomplete: false,
     lastPromptTokens: 0,
     lastCompletionTokens: 0,
     lastTotalTokens: 0,
@@ -631,6 +633,7 @@ async function runTuiSession(
     turnPromptTokens: 0,
     turnCompletionTokens: 0,
     turnTotalTokens: 0,
+    turnRequests: 0,
     tokenBudgetWarned: false,
     lastOutcome: undefined as string | undefined,
     busy: false,
@@ -657,6 +660,7 @@ async function runTuiSession(
     state.turnPromptTokens = 0;
     state.turnCompletionTokens = 0;
     state.turnTotalTokens = 0;
+    state.turnRequests = 0;
     state.tokenBudgetWarned = false;
     state.lastOutcome = undefined;
   };
@@ -685,6 +689,8 @@ async function runTuiSession(
     state.reasoningEffort = normalizeReasoningForMode(next, state.reasoningByMode[next]);
     if (changed) {
       cancelBackgroundView();
+      state.contextTokens = estimateContextTokens(next, state.messages);
+      state.contextSource = "estimated";
       runtime.config.active_mode = next;
       void saveActiveMode(runtime.configPath, next).catch((error) => {
         setNotice(
@@ -875,7 +881,7 @@ async function runTuiSession(
     onRecap: (sessionId, text) => {
       if (state.sessionId !== sessionId) return;
       state.entries = state.entries.filter((entry) => !entry.id.startsWith("recap-"));
-      state.entries.push({ id: `recap-${sessionId}`, role: "system", text: `Recap: ${text}` });
+      state.entries.push({ id: `recap-${sessionId}`, role: "system", kind: "recap", text: `Recap: ${text}` });
       refreshSessionUsage();
       rerender();
     },
@@ -916,6 +922,7 @@ async function runTuiSession(
       if (!session) return;
       state.totalTokens = session.totalTokens;
       state.totalCostUsd = session.totalCostUsd;
+      state.costIncomplete = session.costIncomplete ?? session.totalTokens > 0;
     } catch {
       // Usage refresh is best effort.
     }
@@ -1011,6 +1018,7 @@ async function runTuiSession(
     state.streamingText = "";
     state.activeSkills = [];
     state.contextTokens = 0;
+    state.contextSource = "estimated";
     state.contextRequestBytes = 0;
     state.contextInputBudget = 0;
     state.contextBufferTokens = 0;
@@ -1019,6 +1027,7 @@ async function runTuiSession(
     state.totalPromptTokens = 0;
     state.totalCompletionTokens = 0;
     state.totalCostUsd = 0;
+    state.costIncomplete = false;
     resetUsageDetails();
     state.modifiedFiles.clear();
     state.counter = 0;
@@ -1042,6 +1051,8 @@ async function runTuiSession(
       state.contextRequestBytes > 0 ? formatBytes(state.contextRequestBytes) : undefined,
     maxRequestLabel: state.maxRequestBytes > 0 ? formatBytes(state.maxRequestBytes) : undefined,
     totalCostUsd: state.totalCostUsd,
+    costIncomplete: state.costIncomplete,
+    contextSource: state.contextSource,
     entries: state.entries,
     streamingText: state.streamingText,
     liveEntry: state.liveEntry,
@@ -1208,6 +1219,8 @@ async function runTuiSession(
     },
     onSessionModelChange: (provider: string, model: string) => {
       normalizeAllReasoning();
+      state.contextTokens = estimateContextTokens(state.mode, state.messages);
+      state.contextSource = "estimated";
       setNotice(`all modes now use ${provider} / ${model}`, 6000);
       rerender();
     },
@@ -1215,6 +1228,10 @@ async function runTuiSession(
       runtime.router.setModeModel(mode, provider, model);
       state.reasoningByMode[mode] = normalizeReasoningForMode(mode, state.reasoningByMode[mode]);
       if (state.mode === mode) state.reasoningEffort = state.reasoningByMode[mode];
+      if (state.mode === mode) {
+        state.contextTokens = estimateContextTokens(state.mode, state.messages);
+        state.contextSource = "estimated";
+      }
       setNotice(`${mode} mode now uses ${provider} / ${model}`);
     },
     onModeReasoningChange: (mode: ConfigMode, reasoning: string) => {
@@ -1277,7 +1294,7 @@ async function runTuiSession(
       state.activeSkills = runtime.database.listSessionSkills(sessionId).map((skill) => skill.name);
       state.entries = buildTranscriptEntries(history, runtime.database.getCompaction(sessionId));
       const recap = runtime.database.getRecap(sessionId);
-      if (recap) state.entries.push({ id: `recap-${sessionId}`, role: "system", text: `Recap: ${recap.text}` });
+      if (recap) state.entries.push({ id: `recap-${sessionId}`, role: "system", kind: "recap", text: `Recap: ${recap.text}` });
       state.counter = state.entries.length;
       const sess = runtime.database.getSession(sessionId);
       if (sess) setActiveMode(sess.mode);
@@ -1289,6 +1306,8 @@ async function runTuiSession(
       warnLargeSession(sessionId, sess?.totalTokens, msgs);
       state.totalTokens = sess?.totalTokens ?? 0;
       state.totalCostUsd = sess?.totalCostUsd ?? 0;
+      state.costIncomplete = sess?.costIncomplete ?? (sess?.totalTokens ?? 0) > 0;
+      state.contextSource = "estimated";
       state.totalPromptTokens = 0;
       state.totalCompletionTokens = 0;
       resetUsageDetails();
@@ -1312,6 +1331,8 @@ async function runTuiSession(
       state.modifiedFiles.clear();
       state.totalTokens = forked.totalTokens ?? 0;
       state.totalCostUsd = forked.totalCostUsd ?? 0;
+      state.costIncomplete = forked.costIncomplete ?? forked.totalTokens > 0;
+      state.contextSource = "estimated";
       state.totalPromptTokens = 0;
       state.totalCompletionTokens = 0;
       resetUsageDetails();
@@ -1545,6 +1566,7 @@ async function runTuiSession(
     backgroundJobs.beginTurn(sessionId);
     runtime.orchestrator.cancelSideTurns(sessionId);
     let recapEligible = false;
+    let sawContextUpdate = false;
     const saveSystemLine = (text: string, metadata: Record<string, unknown> = {}): void => {
       try {
         runtime.database.saveMessage(sessionId, {
@@ -1587,11 +1609,13 @@ async function runTuiSession(
     state.turnPromptTokens = 0;
     state.turnCompletionTokens = 0;
     state.turnTotalTokens = 0;
+    state.turnRequests = 0;
     // The orchestrator compacts before each provider request, because it sees
     // the exact payload. The TUI only renders the compaction events.
     const turnMode = state.mode;
     const turnModel = runtime.router.getModeModel(turnMode)?.model;
     const turnStartedAt = Date.now();
+    const turnStartedClock = performance.now();
     const liveEntry: ChatEntryView = {
       id: "live",
       role: "assistant",
@@ -1612,9 +1636,10 @@ async function runTuiSession(
       activeThinking.completedAt = Date.now();
       activeThinking = undefined;
     };
-    const startThinkingSegment = (): ThinkingSegmentView => {
+    const startThinkingSegment = (kind: "thinking" | "text" = "thinking"): ThinkingSegmentView => {
       const segment: ThinkingSegmentView = {
         id: `thinking-${Date.now().toString(36)}-${++thinkingCounter}`,
+        kind,
         text: "",
         startedAt: Date.now(),
         toolIndex: liveEntry.toolCalls?.length ?? 0,
@@ -1741,16 +1766,8 @@ async function runTuiSession(
           closeThinkingSegment();
           const narration = takeAnswer(answerStream);
           if (narration.trim().length > 0) {
-            const segment = startThinkingSegment();
+            const segment = startThinkingSegment("text");
             segment.text = narration.trim();
-            const now = Date.now();
-            if (thinkingStartedAt === undefined) thinkingStartedAt = segment.startedAt;
-            thinkingCompletedAt = now;
-            liveEntry.thinkingStartedAt = thinkingStartedAt;
-            liveEntry.thinkingCompletedAt = thinkingCompletedAt;
-            liveEntry.thinking = `${liveEntry.thinking ?? ""}${
-              liveEntry.thinking ? "\n\n" : ""
-            }${segment.text}`;
             liveEntry.thinkingSegments = thinkingSegments;
             closeThinkingSegment();
           }
@@ -1982,24 +1999,32 @@ async function runTuiSession(
           );
         } else if (event.type === "context_estimate") {
           applyContextEstimate(state, event);
+          state.lastEstimatedPromptTokens = event.tokens;
+          sawContextUpdate = true;
           renderLive(true);
         } else if (event.type === "usage") {
           const usedTokens = event.prompt_tokens + event.completion_tokens;
-          sawUsage = true;
-          completionTokens = event.completion_tokens;
           lastUsage = {
             prompt_tokens: event.prompt_tokens,
             completion_tokens: event.completion_tokens,
             total_tokens: event.total_tokens,
           };
-          state.lastEstimatedPromptTokens = estimatedPromptTokens;
           if (event.turn_total === true) {
+            if (event.cost_incomplete) {
+              state.costIncomplete = true;
+              try { runtime.database.addSessionUsage(sessionId, 0, 0, true); } catch {}
+            }
             // The final event aggregates the whole turn. Per-request events
             // already updated the counters, so only refresh the summary values.
             state.lastCompletionTokens = event.completion_tokens;
             state.lastTotalTokens = event.total_tokens ?? usedTokens;
           } else {
-            state.contextTokens = usedTokens;
+            sawUsage = true;
+            sawContextUpdate = true;
+            completionTokens = event.completion_tokens;
+            applyUsageContext(state, event);
+            state.turnRequests += 1;
+            if (event.cost_usd === undefined || event.cost_incomplete) state.costIncomplete = true;
             state.lastPromptTokens = event.prompt_tokens;
             state.lastCompletionTokens = event.completion_tokens;
             state.lastTotalTokens = event.total_tokens ?? usedTokens;
@@ -2019,7 +2044,7 @@ async function runTuiSession(
               );
             }
             try {
-              runtime.database.addSessionUsage(sessionId, usedTokens, event.cost_usd ?? 0);
+              runtime.database.addSessionUsage(sessionId, usedTokens, event.cost_usd, event.cost_incomplete);
             } catch {
               // Usage tracking is best effort.
             }
@@ -2043,6 +2068,8 @@ async function runTuiSession(
         answer.trim().length === 0 && (aborted || finishReason === "error");
       const finalToolCalls = finalizeToolCalls(liveEntry.toolCalls);
       const entryMeta = {
+        completedAt: Date.now(),
+        responseDurationMs: Math.max(0, performance.now() - turnStartedClock),
         thinking: liveEntry.thinking,
         thinkingSegments: thinkingSegments.map((segment) => ({ ...segment })),
         thinkingStartedAt,
@@ -2052,7 +2079,10 @@ async function runTuiSession(
         mode: turnMode,
         model: turnModel,
         tokensPerSecond,
-        turnTokens: state.turnTotalTokens,
+        turnTokens: sawUsage ? state.turnTotalTokens : undefined,
+        turnPromptTokens: sawUsage ? state.turnPromptTokens : undefined,
+        turnCompletionTokens: sawUsage ? state.turnCompletionTokens : undefined,
+        turnRequests: sawUsage ? state.turnRequests : undefined,
         filesChanged: turnFiles.size,
       };
       if (failedWithoutAnswer) {
@@ -2106,11 +2136,12 @@ async function runTuiSession(
           id: `assistant-${Date.now().toString(36)}`,
           role: "assistant",
           content: [{ type: "text", text: answer }],
-          created_at: Date.now(),
+          created_at: entryMeta.completedAt,
           metadata: {
             mode: turnMode,
             model: turnModel,
             tokens_per_second: tokensPerSecond,
+            response_duration_ms: entryMeta.responseDurationMs,
             finish_reason: finishReason,
             completion_tokens: lastUsage?.completion_tokens ?? completionTokens,
             prompt_tokens: lastUsage?.prompt_tokens,
@@ -2120,13 +2151,17 @@ async function runTuiSession(
             context_window: runtime.router.capabilitiesForMode(turnMode).context_window,
             estimated_prompt_tokens: estimatedPromptTokens,
             turn_tokens: state.turnTotalTokens,
+            turn_prompt_tokens: state.turnPromptTokens,
+            turn_completion_tokens: state.turnCompletionTokens,
+            turn_requests: state.turnRequests,
+            usage_reported: sawUsage,
             thinking_segments: thinkingSegments.map((segment) => ({ ...segment })),
             tool_calls: finalToolCalls,
             files_changed: turnFiles.size,
           },
         };
         state.messages = [...state.messages, assistantMsg];
-        if (!sawUsage) state.contextTokens = estimateContextTokens(state.mode, state.messages);
+        if (!sawContextUpdate) state.contextTokens = estimateContextTokens(state.mode, state.messages);
         try {
           runtime.database.saveMessage(sessionId, assistantMsg);
         } catch {
@@ -2145,7 +2180,7 @@ async function runTuiSession(
       if (state.sessionId === sessionId) {
         try {
           state.messages = runtime.database.loadMessages(sessionId);
-          state.contextTokens = estimateContextTokens(state.mode, state.messages);
+          finishContextMeter(state, sawContextUpdate, () => estimateContextTokens(state.mode, state.messages));
         } catch {
           // A deleted session must not break the turn.
         }
@@ -2362,9 +2397,7 @@ async function runTuiSession(
         const capabilities = runtime.router.capabilitiesForMode(state.mode);
         const contextWindow = capabilities.context_window;
         const turnMetrics = runtime.orchestrator.getLastTurnMetrics(state.sessionId);
-        const allSessionsCost = runtime.database
-          .listSessions()
-          .reduce((sum, session) => sum + session.totalCostUsd, 0);
+        const allSessionsUsage = runtime.database.getUsageTotals();
         state.report = {
           title: "Session statistics",
           text: formatStatsReport({
@@ -2378,7 +2411,10 @@ async function runTuiSession(
             lastOutcome: state.lastOutcome,
             turnMetrics,
             sessionCostUsd: state.totalCostUsd,
-            allSessionsCostUsd: allSessionsCost,
+            allSessionsCostUsd: allSessionsUsage.costUsd,
+            sessionCostIncomplete: state.costIncomplete,
+            allSessionsCostIncomplete: allSessionsUsage.costIncomplete,
+            contextUsageSource: state.contextSource,
             mode: state.mode,
             modeModel: modeModel ? `${modeModel.provider} / ${modeModel.model}` : undefined,
             contextTokens: state.contextTokens,
@@ -2490,11 +2526,13 @@ async function runTuiSession(
         const compactionConfig = runtime.config.compaction;
         const capabilities = runtime.router.capabilitiesForMode(state.mode);
         state.busy = true;
-        setNotice("Compacting session context...", 30_000);
+        if (noticeTimer) clearTimeout(noticeTimer);
+        state.notice = undefined;
         rerender();
         try {
           const result = await compactMessages(state.messages, {
             provider,
+            onUsage: (usage) => runtime.database.addSessionUsage(state.sessionId!, usage.prompt_tokens + usage.completion_tokens, usage.cost_usd, usage.cost_incomplete),
             contextWindow: capabilities.context_window,
             inputLimit: capabilities.max_input,
             outputLimit: capabilities.max_output,
@@ -2537,13 +2575,13 @@ async function runTuiSession(
               auto: false,
               reason: "manual",
             });
-            setNotice("Context compacted", 4000);
           }
         } catch (error) {
           cancelCompaction();
           pushEntry("system", `compact failed: ${error instanceof Error ? error.message : String(error)}`);
           setNotice("Compaction failed", 6000);
         } finally {
+          refreshSessionUsage();
           state.busy = false;
           rerender();
         }

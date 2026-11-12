@@ -1,19 +1,20 @@
 import React from "react";
 import { Box, Text, useInput, useStdin, useStdout } from "ink";
 
-import type { ChatEntryView, ChatToolCallView, WriteTarget } from "./app";
-import { DIFF_PREVIEW_LINES } from "./diff-view";
-import { parseMouseClick } from "./mouse";
+import type { ChatEntryView, WriteTarget } from "./app";
+import { isMouseSequence, parseMouseClick, parseMousePointerEvents } from "./mouse";
 import { groupToolCalls } from "./tool-groups";
 import { WelcomeBanner } from "./logo";
-import { estimateMarkdownLines, markdownRows } from "./markdown";
+import { markdownRows } from "./markdown";
 import { enterTerminal, leaveTerminal } from "./terminal-protocol";
-import { useActiveTheme, type Theme } from "./theme";
-import { displayWidth, wrapText } from "./text-wrap";
+import { getTheme, useActiveTheme, type Theme } from "./theme";
+import { displayWidth, fitDisplayText, wrapText } from "./text-wrap";
+import { rowContent, type RenderRow } from "./rows";
+import { copyTextToClipboard } from "./clipboard";
+import { highlightSelection, selectedText, selectionRange, type SelectionPoint, type TextSelection } from "./text-selection";
 import {
-  LIVE_TOOL_LIMIT,
   buildTranscriptRows,
-  liveDisplayText,
+  TranscriptRowIndex,
   type TranscriptRow,
 } from "./transcript-lines";
 
@@ -72,6 +73,10 @@ export interface ScrollableChatViewportProps {
   offsetFromBottom?: number;
   onOffsetChange?: React.Dispatch<React.SetStateAction<number>>;
   topOffset?: number;
+  leftOffset?: number;
+  platform?: NodeJS.Platform;
+  onCopyText?: (text: string) => Promise<unknown> | void;
+  onCopyError?: (error: Error) => void;
   initiallyExpandedActivity?: boolean;
   initiallyExpandedThinking?: boolean;
 }
@@ -166,53 +171,6 @@ export function freezeLiveEntry(entry: ChatEntryView): ChatEntryView {
   };
 }
 
-function estimateFileDiffLines(
-  additions: number | undefined,
-  deletions: number | undefined,
-  collapsed: boolean,
-  diffExpanded: boolean,
-): number {
-  if (collapsed) return 1;
-  const changed = (additions ?? 0) + (deletions ?? 0);
-  if (diffExpanded) return Math.max(2, changed + 2);
-  return Math.min(changed, DIFF_PREVIEW_LINES) + (changed > DIFF_PREVIEW_LINES ? 1 : 0);
-}
-
-function estimateToolLines(
-  call: ChatToolCallView,
-  width: number,
-  collapsed: boolean,
-  diffExpanded = false,
-): number {
-  let lines = 4;
-  const isCommand = Boolean(call.command) || ["shell", "bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"].includes(call.name);
-  if (isCommand && call.command) {
-    lines += wrapText(call.command, Math.max(1, width - 4)).length;
-  }
-  if (call.output) {
-    if (collapsed) {
-      lines += 1;
-    } else {
-      const outputLines = call.output.split("\n").length;
-      const visible = diffExpanded
-        ? outputLines
-        : Math.min(isCommand ? 24 : 14, outputLines);
-      lines += visible + (outputLines > visible ? 1 : 0);
-    }
-  }
-  if (call.diff) {
-    if (collapsed) {
-      lines += 1;
-    } else if (diffExpanded) {
-      lines += Math.max(2, (call.diff.additions ?? 0) + (call.diff.deletions ?? 0) + 6);
-    } else {
-      const changed = (call.diff.additions ?? 0) + (call.diff.deletions ?? 0);
-      lines += Math.min(changed, DIFF_PREVIEW_LINES) + (changed > DIFF_PREVIEW_LINES ? 1 : 0);
-    }
-  }
-  return lines;
-}
-
 export function estimateEntryLines(
   entry: ChatEntryView,
   width: number,
@@ -221,84 +179,14 @@ export function estimateEntryLines(
   thinkingExpanded = false,
   diffExpanded = false,
 ): number {
-  const safeWidth = Math.max(1, width);
-  const liveView = entry.live && !entry.frozenLive;
-  if (entry.role === "compaction") {
-    const header = 1;
-    const footer = entry.compaction?.status === "running" ? 0 : 1;
-    const body = collapsed ? 1 : countWrappedLines(entry.text, safeWidth);
-    const error = entry.compaction?.error
-      ? countWrappedLines(entry.compaction.error, safeWidth)
-      : 0;
-    return header + body + footer + error + 2;
-  }
-  if (entry.role === "user") {
-    return wrapText(entry.text, Math.max(1, safeWidth - 2)).length + 2;
-  }
-  let lines =
-    entry.role === "assistant"
-      ? liveView
-        ? (() => {
-            const display = liveDisplayText(entry.text);
-            return countWrappedLines(display.text, safeWidth) + (display.truncated ? 1 : 0);
-          })()
-        : estimateMarkdownLines(entry.text, safeWidth)
-      : countWrappedLines(entry.text, safeWidth);
-  if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
-    const visibleSegments = liveView
-      ? entry.thinkingSegments.filter((segment) => segment.completedAt !== undefined)
-      : entry.thinkingSegments;
-    if (visibleSegments.length > 0) {
-      const textLines = visibleSegments.reduce(
-        (total, segment) => total + countWrappedLines(segment.text, Math.max(1, safeWidth - 2)),
-        0,
-      );
-      lines += thinkingExpanded ? 1 + textLines : 1;
-    }
-  } else if (entry.thinking && !liveView) {
-    lines += thinkingExpanded ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2)) : 1;
-  }
-  const hasThinkingContent =
-    Boolean(entry.thinking) || (entry.thinkingSegments?.length ?? 0) > 0;
-  const hasCompletedSegment = (entry.thinkingSegments ?? []).some(
-    (segment) => segment.completedAt !== undefined,
-  );
-  const thinkingHeading =
-    entry.role === "assistant" &&
-    hasThinkingContent &&
-    (!entry.live || entry.text.length > 0 || hasCompletedSegment);
-  if (thinkingHeading) {
-    lines += 1;
-  }
-  const calls = entry.toolCalls ?? [];
-  const visibleCalls = liveView ? calls.slice(-LIVE_TOOL_LIMIT) : calls;
-  lines += visibleCalls.reduce(
-    (total, call) => total + estimateToolLines(call, safeWidth, collapsed, diffExpanded),
-    0,
-  );
-  if (liveView && calls.length > LIVE_TOOL_LIMIT) lines += 1;
-  const linkedPaths = new Set(
-    (entry.toolCalls ?? [])
-      .filter((call) => call.diff)
-      .map((call) => call.filePath)
-      .filter((path): path is string => Boolean(path)),
-  );
-  const unlinkedFiles = (entry.files ?? []).filter((file) => !linkedPaths.has(file.path));
-  for (const file of unlinkedFiles) {
-    lines += estimateFileDiffLines(file.additions, file.deletions, collapsed, diffExpanded);
-  }
-  if (liveView) lines += 1;
-  if (entry.diff) lines += collapsed ? 1 : diffExpanded ? 10 : Math.min(DIFF_PREVIEW_LINES + 1, 10);
-  if (entry.role === "assistant") lines += 2;
-  if (
-    entry.role === "assistant" &&
-    entry.text &&
-    !entry.live &&
-    (entry.mode || entry.model || entry.tokensPerSecond !== undefined)
-  ) {
-    lines += 1;
-  }
-  return lines;
+  return buildTranscriptRows([entry], {
+    width: Math.max(1, width),
+    theme: getTheme("tokyonight"),
+    collapsed,
+    expandedGroups,
+    thinkingExpanded,
+    diffExpanded,
+  }).length;
 }
 
 export function findActivityRowAt(
@@ -312,53 +200,20 @@ export function findActivityRowAt(
   thinkingExpanded = false,
   diffExpanded = false,
 ): ChatEntryView | undefined {
-  const safeWidth = Math.max(1, width);
-  const visible = selectWindow(
-    entries,
+  const rows = buildTranscriptRows(entries, {
     width,
-    height,
-    offsetFromBottom,
+    theme: getTheme("tokyonight"),
     collapsed,
     expandedGroups,
     thinkingExpanded,
     diffExpanded,
-  );
-  let row = 0;
-  for (const entry of visible) {
-    const liveView = entry.live && !entry.frozenLive;
-    const activity = groupToolCalls(entry.toolCalls);
-    if (entry.role === "assistant" && activity.total > 0) {
-      let thinking = 0;
-      if (entry.thinkingSegments && entry.thinkingSegments.length > 0) {
-        const visibleSegments = liveView
-          ? entry.thinkingSegments.filter((segment) => segment.completedAt !== undefined)
-          : entry.thinkingSegments;
-        if (visibleSegments.length > 0) {
-          const textLines = visibleSegments.reduce(
-            (total, segment) =>
-              total + countWrappedLines(segment.text, Math.max(1, safeWidth - 2)),
-            0,
-          );
-          thinking = thinkingExpanded ? 1 + textLines : 1;
-        }
-      } else if (entry.thinking && !liveView) {
-        thinking = thinkingExpanded
-          ? 1 + countWrappedLines(entry.thinking, Math.max(1, safeWidth - 2))
-          : 1;
-      }
-      const headerRow = row + (liveView ? 1 : 0) + thinking;
-      if (Math.abs(clickRow - headerRow) <= 1) return entry;
-    }
-    row += estimateEntryLines(
-      entry,
-      width,
-      collapsed,
-      expandedGroups,
-      thinkingExpanded,
-      diffExpanded,
-    );
-  }
-  return undefined;
+  });
+  const window = computeViewportWindow(rows.length, height, offsetFromBottom);
+  const leadingRows = window.showIndicator ? 0 : Math.max(0, height - rows.length);
+  const contentRow = clickRow - (window.showIndicator ? 1 : 0) - leadingRows;
+  if (contentRow < 0 || contentRow >= window.contentHeight) return undefined;
+  const target = rows[window.start + contentRow];
+  return target?.clickable === "activity" ? entries.find((entry) => entry.id === target.entryId) : undefined;
 }
 
 function dividerLine(label: string, width: number): string {
@@ -479,6 +334,32 @@ export function formatProgressBar(done: number, total: number, width = 8): strin
   return `[${"#".repeat(filled)}${"-".repeat(width - filled)}] ${done}/${total}`;
 }
 
+export interface ScrollbarGeometry {
+  thumbStart: number;
+  thumbSize: number;
+  travel: number;
+  maxOffset: number;
+}
+
+export function computeScrollbar(rowCount: number, height: number, offset: number): ScrollbarGeometry | undefined {
+  if (height < 1 || rowCount <= height) return undefined;
+  const window = computeViewportWindow(rowCount, height, offset);
+  const thumbSize = Math.max(1, Math.min(height, Math.floor(height * height / rowCount)));
+  const travel = height - thumbSize;
+  return {
+    thumbStart: Math.round((1 - window.effectiveOffset / window.maxOffset) * travel),
+    thumbSize,
+    travel,
+    maxOffset: window.maxOffset,
+  };
+}
+
+export function scrollbarOffsetAtRow(bar: ScrollbarGeometry, row: number, grabOffset = Math.floor(bar.thumbSize / 2)): number {
+  if (bar.travel <= 0) return 0;
+  const start = Math.max(0, Math.min(bar.travel, row - grabOffset));
+  return Math.round((1 - start / bar.travel) * bar.maxOffset);
+}
+
 export function ScrollableChatViewport({
   entries,
   streamingText,
@@ -494,6 +375,10 @@ export function ScrollableChatViewport({
   offsetFromBottom: controlledOffset,
   onOffsetChange,
   topOffset = 0,
+  leftOffset = 0,
+  platform = process.platform,
+  onCopyText,
+  onCopyError,
   initiallyExpandedActivity = false,
   initiallyExpandedThinking = false,
 }: ScrollableChatViewportProps): React.ReactElement {
@@ -502,8 +387,20 @@ export function ScrollableChatViewport({
   const offsetFromBottom = controlledOffset ?? internalOffset;
   const setOffsetFromBottom = onOffsetChange ?? setInternalOffset;
   const [collapsed, setCollapsed] = React.useState(initiallyCollapsed);
+  const [detailsExpanded, setDetailsExpanded] = React.useState(initiallyExpandedActivity);
   const [thinkingExpanded, setThinkingExpanded] = React.useState(initiallyExpandedThinking);
-  const [diffExpanded, setDiffExpanded] = React.useState(false);
+  const diffExpanded = detailsExpanded;
+  const contentWidth = Math.max(1, width - (width >= 3 ? 2 : 0));
+  const dragGrabOffset = React.useRef<number | undefined>();
+  type SelectionSnapshot = { rows: RenderRow[]; scrollbar?: ScrollbarGeometry; range: TextSelection };
+  const [selection, setSelection] = React.useState<SelectionSnapshot>();
+  const selectionDrag = React.useRef<(SelectionSnapshot & { moved: boolean; target?: TranscriptRow }) | undefined>();
+  const copyQueue = React.useRef<Promise<unknown>>(Promise.resolve());
+  const { stdout } = useStdout();
+  const copyRef = React.useRef(onCopyText);
+  copyRef.current = onCopyText ?? ((text) => copyTextToClipboard(text, { platform, isTTY: stdout.isTTY, write: (sequence) => stdout.write(sequence) }));
+  const copyErrorRef = React.useRef(onCopyError);
+  copyErrorRef.current = onCopyError;
   const [frozenLiveEntry, setFrozenLiveEntry] = React.useState<ChatEntryView | undefined>();
 
   React.useEffect(() => {
@@ -532,12 +429,18 @@ export function ScrollableChatViewport({
 
   useInput(
     (input, key) => {
+      if (isMouseSequence(input)) return;
+      if (selectionDrag.current) {
+        selectionDrag.current = undefined;
+        setSelection(undefined);
+      }
       if (key.ctrl && input === "o") {
-        setDiffExpanded((value) => !value);
-        setThinkingExpanded((value) => !value);
+        const expand = !(thinkingExpanded || detailsExpanded);
+        setThinkingExpanded(expand);
+        setDetailsExpanded(expand);
         setCollapsed(false);
-        setExpandedGroups((previous) => {
-          if (previous.size > 0) return new Set();
+        setExpandedGroups(() => {
+          if (!expand) return new Set();
           return new Set(
             allEntries
               .filter((entry) => groupToolCalls(entry.toolCalls).total > 0)
@@ -549,15 +452,23 @@ export function ScrollableChatViewport({
     { isActive: active },
   );
 
-  const rows: TranscriptRow[] = buildTranscriptRows(allEntries, {
-    width,
+  const rowOptions = React.useMemo(() => ({
+    width: contentWidth,
     theme,
     collapsed,
     expandedGroups,
     thinkingExpanded,
     diffExpanded,
-    now: Date.now(),
-  });
+  }), [contentWidth, theme, collapsed, expandedGroups, thinkingExpanded, diffExpanded]);
+  const history = React.useMemo(() => new TranscriptRowIndex(entries, rowOptions), [entries, rowOptions]);
+  const rows: TranscriptRow[] = displayedLiveEntry ? buildTranscriptRows([displayedLiveEntry], rowOptions) : [];
+  if (history.length > 0 && rows.length > 0 && displayedLiveEntry) {
+    rows.unshift({
+      key: `${displayedLiveEntry.id}-spacer`,
+      entryId: displayedLiveEntry.id,
+      node: <Text> </Text>,
+    });
+  }
   if (!liveEntry && streamingText) {
     rows.push({
       key: "streaming-header",
@@ -568,38 +479,50 @@ export function ScrollableChatViewport({
       ),
     });
     rows.push(
-      ...markdownRows(streamingText, width, theme).map((row, index) => ({
+      ...markdownRows(streamingText, contentWidth, theme).map((row, index) => ({
         ...row,
         key: `streaming-${index}`,
       })),
     );
   }
 
-  const window = computeViewportWindow(rows.length, height, offsetFromBottom);
+  const rowCount = history.length + rows.length;
+  const window = computeViewportWindow(rowCount, height, offsetFromBottom);
+  const scrollbar = width >= 3 ? computeScrollbar(rowCount, height, offsetFromBottom) : undefined;
+  const scrollbarRef = React.useRef(scrollbar);
+  scrollbarRef.current = scrollbar;
   const { start, contentHeight, maxOffset, showIndicator } = window;
-  const visibleRows = rows.slice(start, start + contentHeight);
-  const hasChatMessages = allEntries.some((entry) => entry.role === "user" || entry.role === "assistant");
-  const showWelcome = !hasChatMessages && !streamingText && !liveEntry;
+  const end = start + contentHeight;
+  const visibleRows = history.slice(start, end);
+  if (end > history.length) {
+    visibleRows.push(...rows.slice(Math.max(0, start - history.length), end - history.length));
+  }
+  const showWelcome = rowCount === 0 && !streamingText && !liveEntry;
   const leadingRows = showWelcome || showIndicator ? 0 : Math.max(0, height - visibleRows.length);
   const visibleRowsRef = React.useRef(visibleRows);
   visibleRowsRef.current = visibleRows;
+  const screenRows: RenderRow[] = [
+    ...(showIndicator ? [{ key: "scroll-paused", node: <Text color={theme.badge.running} bold>{fitDisplayText(AUTO_SCROLL_PAUSED, contentWidth)}</Text> }] : []),
+    ...Array.from({ length: leadingRows }, (_, row) => ({ key: `leading-${row}`, node: <Text> </Text> })),
+    ...visibleRows,
+  ];
+  const screenRowsRef = React.useRef(screenRows);
+  screenRowsRef.current = screenRows;
 
   React.useEffect(() => {
     if (offsetFromBottom > maxOffset) setOffsetFromBottom(maxOffset);
   }, [offsetFromBottom, maxOffset]);
 
   React.useEffect(() => {
-    if (!active) return;
-    const onData = (data: Buffer): void => {
-      const click = parseMouseClick(data.toString());
-      if (!click) return;
-      const clickRow = click.y - (topOffset + 1);
-      if (clickRow < 0 || clickRow >= height) return;
-      const contentRow = clickRow - (showIndicator ? 1 : 0) - leadingRows;
-      if (contentRow < 0) return;
-      const target = visibleRowsRef.current[contentRow];
-      const entryId = target?.entryId;
-      if (!entryId || target?.clickable !== "activity") return;
+    if (!active) {
+      dragGrabOffset.current = undefined;
+      selectionDrag.current = undefined;
+      setSelection(undefined);
+      return;
+    }
+    const toggleActivity = (target?: TranscriptRow): void => {
+      if (!target?.entryId || target.clickable !== "activity") return;
+      const entryId = target.entryId;
       setExpandedGroups((previous) => {
         const next = new Set(previous);
         if (next.has(entryId)) next.delete(entryId);
@@ -607,19 +530,101 @@ export function ScrollableChatViewport({
         return next;
       });
     };
+    const onData = (data: Buffer): void => {
+      const input = data.toString();
+      let pointerHandled = false;
+      for (const pointer of parseMousePointerEvents(input)) {
+        if (pointer.type === "release") {
+          pointerHandled ||= dragGrabOffset.current !== undefined;
+          dragGrabOffset.current = undefined;
+          const drag = selectionDrag.current;
+          if (drag) {
+            pointerHandled = true;
+            selectionDrag.current = undefined;
+            setSelection(undefined);
+            const focus: SelectionPoint = {
+              row: Math.max(0, Math.min(height - 1, pointer.y - topOffset - 1)),
+              column: Math.max(0, Math.min(contentWidth - 1, pointer.x - leftOffset - 1)),
+            };
+            drag.range = { anchor: drag.range.anchor, focus };
+            drag.moved ||= focus.row !== drag.range.anchor.row || focus.column !== drag.range.anchor.column;
+            if (drag.moved) {
+              const text = selectedText(drag.rows.map((row) => rowContent(row.node).text), drag.range, contentWidth);
+              if (text.trim()) {
+                const copy = copyRef.current!;
+                copyQueue.current = copyQueue.current.catch(() => undefined).then(() => copy(text)).catch((error: unknown) => {
+                  copyErrorRef.current?.(error instanceof Error ? error : new Error(String(error)));
+                });
+              }
+            } else toggleActivity(drag.target);
+          }
+          continue;
+        }
+        const bar = scrollbarRef.current;
+        const row = pointer.y - (topOffset + 1);
+        if (pointer.type === "press") {
+          dragGrabOffset.current = undefined;
+          selectionDrag.current = undefined;
+          setSelection(undefined);
+          if (!bar || pointer.x !== leftOffset + width || row < 0 || row >= height) {
+            if (platform !== "win32" && pointer.x > leftOffset && pointer.x <= leftOffset + contentWidth && row >= 0 && row < height) {
+              const point: SelectionPoint = { row, column: pointer.x - leftOffset - 1 };
+              const contentRow = row - (showIndicator ? 1 : 0) - leadingRows;
+              selectionDrag.current = {
+                rows: [...screenRowsRef.current], scrollbar: bar, range: { anchor: point, focus: point }, moved: false,
+                target: visibleRowsRef.current[contentRow],
+              };
+              pointerHandled = true;
+            }
+            continue;
+          }
+          const onThumb = row >= bar.thumbStart && row < bar.thumbStart + bar.thumbSize;
+          dragGrabOffset.current = onThumb ? row - bar.thumbStart : Math.floor(bar.thumbSize / 2);
+          if (!onThumb) setOffsetFromBottom(scrollbarOffsetAtRow(bar, row, dragGrabOffset.current));
+        } else {
+          const drag = selectionDrag.current;
+          if (drag) {
+            const focus: SelectionPoint = { row: Math.max(0, Math.min(height - 1, row)), column: Math.max(0, Math.min(contentWidth - 1, pointer.x - leftOffset - 1)) };
+            drag.range = { anchor: drag.range.anchor, focus };
+            drag.moved ||= focus.row !== drag.range.anchor.row || focus.column !== drag.range.anchor.column;
+            if (drag.moved) setSelection({ rows: drag.rows, scrollbar: drag.scrollbar, range: drag.range });
+          } else {
+            if (!bar || dragGrabOffset.current === undefined) continue;
+            setOffsetFromBottom(scrollbarOffsetAtRow(bar, row, dragGrabOffset.current));
+          }
+        }
+        pointerHandled = true;
+      }
+      if (pointerHandled) return;
+      const click = parseMouseClick(input);
+      if (!click) return;
+      if (click.x <= leftOffset || click.x > leftOffset + contentWidth) return;
+      const clickRow = click.y - (topOffset + 1);
+      if (clickRow < 0 || clickRow >= height) return;
+      const contentRow = clickRow - (showIndicator ? 1 : 0) - leadingRows;
+      if (contentRow < 0) return;
+      toggleActivity(visibleRowsRef.current[contentRow]);
+    };
     stdin.on("data", onData);
     return () => {
       stdin.off("data", onData);
     };
-  }, [active, stdin, topOffset, height, showIndicator, leadingRows]);
+  }, [active, stdin, topOffset, leftOffset, width, height, contentWidth, showIndicator, leadingRows, setOffsetFromBottom, platform]);
+
+  React.useEffect(() => {
+    selectionDrag.current = undefined;
+    setSelection(undefined);
+  }, [offsetFromBottom, width, height, resetKey, thinkingExpanded, detailsExpanded]);
 
   React.useEffect(() => {
     setOffsetFromBottom(0);
-    setDiffExpanded(false);
+    dragGrabOffset.current = undefined;
+    setDetailsExpanded(initiallyExpandedActivity);
+    setThinkingExpanded(initiallyExpandedThinking);
   }, [resetKey]);
 
   return (
-    <Box flexDirection="column" height={height} flexShrink={0} overflowY="hidden">
+    <Box flexDirection="column" width={width} height={height} flexShrink={0} overflowY="hidden">
       {showWelcome ? (
         height >= 12 && width >= 100 ? (
           <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />
@@ -630,15 +635,16 @@ export function ScrollableChatViewport({
           </Box>
         )
       ) : null}
-      {showIndicator ? (
-        <Text color={theme.badge.running} bold wrap="truncate">
-          {AUTO_SCROLL_PAUSED}
-        </Text>
-      ) : null}
-      {leadingRows > 0 ? <Box height={leadingRows} flexShrink={0} /> : null}
-      {visibleRows.map((row) => (
-        <React.Fragment key={row.key}>{row.node}</React.Fragment>
-      ))}
+      {!showWelcome ? (selection?.rows ?? screenRows).map((row, index) => {
+        const content = rowContent(row.node);
+        const bar = selection ? selection.scrollbar : scrollbar;
+        const thumb = bar && index >= bar.thumbStart && index < bar.thumbStart + bar.thumbSize;
+        const range = selection ? selectionRange(selection.range, index, contentWidth) : undefined;
+        return <Text key={row.key} wrap="truncate">
+          {range ? highlightSelection(content.node, range.from, range.to, theme) : content.node}
+          {bar ? <>{" ".repeat(Math.max(0, contentWidth - displayWidth(content.text)) + 1)}<Text color={thumb ? theme.text : theme.muted}>{thumb ? "█" : "│"}</Text></> : null}
+        </Text>;
+      }) : null}
     </Box>
   );
 }

@@ -50,11 +50,14 @@ export interface ThinkingBlockProps {
 }
 
 export function formatThinkingDuration(durationMs: number): string {
-  if (durationMs < 1000) return `${durationMs}ms`;
-  const seconds = durationMs / 1000;
-  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  const safe = Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0;
+  if (safe < 1000) return `${(safe / 1000).toFixed(2)}s`;
+  const seconds = Math.round(safe / 1000);
+  if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${Math.round(seconds % 60)}s`;
+  const tail = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${tail}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${tail}s`;
 }
 
 interface DisplayLine {
@@ -168,6 +171,7 @@ export function diffRows(
   const hunks = collectDiffHunks(oldText, newText);
   const rows: RenderRow[] = [];
   const sideBySide = !unified && width >= 100;
+  const dividerColor = background ? theme.border.passive : theme.muted;
   const lineColor = (kind: DisplayLine["kind"]): string =>
     kind === "add" ? theme.diff.added : kind === "remove" ? theme.diff.removed : theme.muted;
   const panelRow = (
@@ -218,7 +222,7 @@ export function diffRows(
             panelRow(
               `diff-${hunkIndex}-${lineIndex}-${chunkIndex}`,
               <Text color={lineColor(view.kind)} wrap="truncate">
-                <Text color={theme.border.passive}>▎ </Text>
+                <Text color={dividerColor}>▎ </Text>
                 {prefix} {chunk}
               </Text>,
               `▎ ${prefix} ${chunk}`,
@@ -250,7 +254,7 @@ export function diffRows(
             <Text color={pair.left ? lineColor(pair.left.kind) : theme.muted}>
               {leftText}
             </Text>
-            <Text color={theme.border.passive}>│</Text>
+            <Text color={dividerColor}>│</Text>
             <Text color={pair.right ? lineColor(pair.right.kind) : theme.muted}>
               {rightText}
             </Text>
@@ -280,6 +284,7 @@ export function diffPreviewRows(
   const limit = Math.max(1, maxLines);
   const visible = changed.slice(0, limit);
   const remaining = changed.length - visible.length;
+  const dividerColor = background ? theme.border.passive : theme.muted;
   const rows: RenderRow[] = [];
   const lineColor = (kind: DisplayLine["kind"]): string =>
     kind === "add" ? theme.diff.added : kind === "remove" ? theme.diff.removed : theme.muted;
@@ -304,7 +309,7 @@ export function diffPreviewRows(
       panelRow(
         `diff-preview-${index}`,
         <Text color={lineColor(view.kind)} wrap="truncate">
-          <Text color={theme.border.passive}>▎ </Text>
+          <Text color={dividerColor}>▎ </Text>
           {prefix} {text}
         </Text>,
         `▎ ${prefix} ${text}`,
@@ -313,7 +318,9 @@ export function diffPreviewRows(
   });
 
   if (remaining > 0) {
-    const note = `… ${remaining} more changed line${remaining === 1 ? "" : "s"} · Ctrl+O to expand`;
+    const note = width < 60
+      ? `… ${remaining} more changes · Ctrl+O`
+      : `… ${remaining} more changed line${remaining === 1 ? "" : "s"} · Ctrl+O to expand`;
     rows.push(
       panelRow(
         "diff-preview-more",
@@ -417,7 +424,7 @@ export function ToolCallBadge({
         {statusIcon} {label ?? toolDisplay(name).label}
       </Text>
       {detail ? <Text color={theme.muted}>{detail}</Text> : null}
-      {durationMs !== undefined ? <Text color={theme.muted}>{durationMs}ms</Text> : null}
+      {durationMs !== undefined ? <Text color={theme.muted}>{formatThinkingDuration(durationMs)}</Text> : null}
       {lspStatus ? <Text color={theme.badge.running}>lsp:{lspStatus}</Text> : null}
     </Box>
   );

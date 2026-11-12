@@ -575,7 +575,7 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
   return (
     <Box
       flexDirection="column"
-      borderStyle="round"
+      borderStyle="single"
       borderColor={triggerColor}
       paddingX={1}
       marginBottom={0}

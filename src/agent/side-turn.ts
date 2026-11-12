@@ -93,6 +93,7 @@ export class SideTurnRunner {
     let text = "";
     let firstText: number | undefined;
     let completed = false;
+    let usage: Usage | undefined;
     let abort!: () => void;
     const cancelled = new Promise<never>((_resolve, reject) => {
       abort = () => reject(job.signal.reason ?? new Error("Background request cancelled"));
@@ -109,7 +110,7 @@ export class SideTurnRunner {
           text += event.text;
           if (text.length > 8_192) throw new Error("Background response exceeded its text limit");
         } else if (event.type === "usage") {
-          try { job.input.onUsage?.(event); } catch { /* Usage reporting cannot stop the response. */ }
+          usage = event;
         } else if (event.type === "tool_call_ready" || event.type === "tool_call_delta") {
           throw new Error("Background requests cannot execute tools");
         } else if (event.type === "error") {
@@ -120,6 +121,7 @@ export class SideTurnRunner {
       if (!text.trim()) throw new Error("Background request returned no text");
       return { text: text.trim(), duration_ms: Date.now() - startedAt, queue_ms: startedAt - job.createdAt, first_text_ms: firstText };
     } finally {
+      try { job.input.onUsage?.(usage ?? { prompt_tokens: 0, completion_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost_incomplete: true }); } catch {}
       job.signal.removeEventListener("abort", abort);
       if (!completed) {
         job.controller.abort();

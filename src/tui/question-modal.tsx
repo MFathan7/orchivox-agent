@@ -236,7 +236,7 @@ export function QuestionModal(props: QuestionModalProps): React.ReactElement {
   return (
     <Box
       flexDirection="column"
-      borderStyle="round"
+      borderStyle="single"
       borderColor={theme.border.passive}
       paddingX={1}
       marginY={1}
