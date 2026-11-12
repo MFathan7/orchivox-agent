@@ -307,7 +307,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
   return (
     <Box
       flexDirection="column"
-      borderStyle="round"
+      borderStyle="single"
       borderColor={theme.border.active}
       paddingX={1}
       marginY={compact ? 0 : 1}

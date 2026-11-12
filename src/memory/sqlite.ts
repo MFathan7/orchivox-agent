@@ -19,6 +19,7 @@ export interface SessionRecord {
   updatedAt: number;
   totalTokens: number;
   totalCostUsd: number;
+  costIncomplete?: boolean;
 }
 
 export interface SessionCompaction {
@@ -55,6 +56,7 @@ interface SessionRow {
   updated_at: number;
   total_tokens: number;
   total_cost_usd: number;
+  cost_incomplete: number;
 }
 
 interface MessageRow {
@@ -109,6 +111,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at INTEGER NOT NULL,
   total_tokens INTEGER NOT NULL DEFAULT 0,
   total_cost_usd REAL NOT NULL DEFAULT 0,
+  cost_incomplete INTEGER NOT NULL DEFAULT 0,
   compaction_json TEXT,
   instruction_state_json TEXT
 );
@@ -192,6 +195,10 @@ export class MemoryDatabase implements TaskStore {
       this.db.exec("ALTER TABLE tasks ADD COLUMN requires_merge INTEGER;");
     }
     const sessionColumns = this.db.query("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+    if (!sessionColumns.some((column) => column.name === "cost_incomplete")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN cost_incomplete INTEGER NOT NULL DEFAULT 0;");
+      this.db.exec("UPDATE sessions SET cost_incomplete = 1 WHERE total_tokens > 0;");
+    }
     if (!sessionColumns.some((column) => column.name === "compaction_json")) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN compaction_json TEXT;");
     }
@@ -223,6 +230,11 @@ export class MemoryDatabase implements TaskStore {
       .query("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?")
       .all(limit) as unknown as SessionRow[];
     return rows.map(toSession);
+  }
+
+  getUsageTotals(): { tokens: number; costUsd: number; costIncomplete: boolean } {
+    const row = this.db.query("SELECT COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(total_cost_usd), 0) AS cost, COALESCE(MAX(cost_incomplete), 0) AS incomplete FROM sessions").get() as { tokens: number; cost: number; incomplete: number };
+    return { tokens: row.tokens, costUsd: row.cost, costIncomplete: Boolean(row.incomplete) };
   }
 
   updateSession(id: string, patch: { title?: string; mode?: AgentMode }): SessionRecord {
@@ -320,12 +332,12 @@ export class MemoryDatabase implements TaskStore {
     this.db.query("DELETE FROM session_skills WHERE session_id = ?").run(sessionId);
   }
 
-  addSessionUsage(id: string, tokens: number, costUsd: number): void {
+  addSessionUsage(id: string, tokens: number, costUsd?: number, incomplete = false): void {
     this.db
       .query(
-        "UPDATE sessions SET total_tokens = total_tokens + ?, total_cost_usd = total_cost_usd + ?, updated_at = ? WHERE id = ?",
+        "UPDATE sessions SET total_tokens = total_tokens + ?, total_cost_usd = total_cost_usd + ?, cost_incomplete = MAX(cost_incomplete, ?), updated_at = ? WHERE id = ?",
       )
-      .run(tokens, costUsd, Date.now(), id);
+      .run(tokens, costUsd ?? 0, Number(incomplete || costUsd === undefined), Date.now(), id);
   }
 
   deleteSession(id: string): boolean {
@@ -478,8 +490,8 @@ export class MemoryDatabase implements TaskStore {
   recordUsage(sessionId: string, usage: Usage): void {
     const tokens = usage.prompt_tokens + usage.completion_tokens;
     const result = this.db
-      .query("UPDATE sessions SET total_tokens = total_tokens + ?, total_cost_usd = total_cost_usd + ?, updated_at = ? WHERE id = ?")
-      .run(tokens, usage.cost_usd ?? 0, Date.now(), sessionId);
+      .query("UPDATE sessions SET total_tokens = total_tokens + ?, total_cost_usd = total_cost_usd + ?, cost_incomplete = MAX(cost_incomplete, ?), updated_at = ? WHERE id = ?")
+      .run(tokens, usage.cost_usd ?? 0, Number(usage.cost_incomplete || usage.cost_usd === undefined), Date.now(), sessionId);
     if (result.changes === 0) throw new Error(`unknown session "${sessionId}"`);
   }
 
@@ -604,6 +616,7 @@ function toSession(row: SessionRow): SessionRecord {
     updatedAt: row.updated_at,
     totalTokens: row.total_tokens,
     totalCostUsd: row.total_cost_usd,
+    costIncomplete: Boolean(row.cost_incomplete),
   };
 }
 

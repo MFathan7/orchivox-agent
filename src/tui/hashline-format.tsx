@@ -85,15 +85,24 @@ export function hashlinePanelParts(
   const { panelWidth, innerPad, theme } = options;
   const numberWidth = Math.max(1, ...lines.map((line) => String(line.lineNumber).length));
   const paths = lines.filter((line) => line.path !== undefined);
-  const pathWidth =
+  const fullPathWidth =
     paths.length === 0
       ? 0
       : Math.max(...paths.map((line) => displayWidth(line.path ?? ""))) + 1;
   const gutterWidth = numberWidth + 3;
-  const contentWidth = Math.max(8, panelWidth - innerPad - pathWidth - gutterWidth);
+  const stackedPaths = fullPathWidth > Math.max(0, Math.floor((panelWidth - innerPad - gutterWidth) / 2));
+  const pathWidth = stackedPaths ? 0 : fullPathWidth;
+  const contentWidth = Math.max(1, panelWidth - innerPad - pathWidth - gutterWidth);
   const rows: PanelPart[][] = [];
+  let previousPath: string | undefined;
 
   for (const line of lines) {
+    if (stackedPaths && line.path !== undefined && line.path !== previousPath) {
+      for (const chunk of wrapPreservingWhitespace(line.path, Math.max(1, panelWidth - innerPad))) {
+        rows.push([{ text: " ".repeat(innerPad) }, { text: chunk, color: theme.muted }]);
+      }
+      previousPath = line.path;
+    }
     const pathText = pathWidth > 0 ? `${padToWidth(line.path ?? "", pathWidth - 1)} ` : "";
     wrapPreservingWhitespace(line.content, contentWidth).forEach((chunk, index) => {
       const numberText =
@@ -111,13 +120,13 @@ export function hashlinePanelParts(
       }
       parts.push({
         text: numberText,
-        node: <Text color={theme.border.passive}>{numberText}</Text>,
-        color: theme.border.passive,
+        node: <Text color={theme.muted}>{numberText}</Text>,
+        color: theme.muted,
       });
       parts.push({
         text: " │ ",
-        node: <Text color={theme.border.passive}>{" │ "}</Text>,
-        color: theme.border.passive,
+        node: <Text color={theme.muted}>{" │ "}</Text>,
+        color: theme.muted,
       });
       parts.push({
         text: body,

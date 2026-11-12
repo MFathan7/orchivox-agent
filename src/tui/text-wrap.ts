@@ -2,6 +2,7 @@ import { eastAsianWidth } from "get-east-asian-width";
 
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const ASCII_PRINTABLE = /^[\u0020-\u007e]*$/;
+const EMOJI_PRESENTATION = /\p{Emoji_Presentation}/u;
 const WIDTH_CACHE_LIMIT = 4096;
 const widthCache = new Map<string, number>();
 const EMOJI_RANGES: ReadonlyArray<readonly [number, number]> = [
@@ -55,7 +56,7 @@ function graphemeWidth(cluster: string): number {
     if (isEmojiCodePoint(code)) emoji = true;
   }
   if (visible === 0) return 0;
-  if (forcedPresentation) return 2;
+  if (forcedPresentation || EMOJI_PRESENTATION.test(cluster)) return 2;
   if (visible > 1) {
     return emoji ? 2 : eastAsianWidth(base, { ambiguousAsWide: false });
   }

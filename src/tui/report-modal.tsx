@@ -1,7 +1,7 @@
 import React from "react";
-import { Box, Text, useInput } from "ink";
+import { Box, Text, useInput, useStdin } from "ink";
 
-import { isMouseSequence } from "./mouse";
+import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { useActiveTheme, type Theme } from "./theme";
 
 export interface ReportModalProps {
@@ -20,6 +20,20 @@ export function ReportModal(props: ReportModalProps): React.ReactElement {
   const visibleCount = Math.max(1, height - 4);
   const maxOffset = Math.max(0, lines.length - visibleCount);
   const [offset, setOffset] = React.useState(0);
+  const { stdin } = useStdin();
+
+  React.useEffect(() => {
+    setOffset(0);
+  }, [title, text]);
+
+  React.useEffect(() => {
+    const onData = (data: Buffer): void => {
+      const delta = parseMouseWheel(data.toString());
+      if (delta !== 0) setOffset((value) => Math.max(0, Math.min(maxOffset, value - delta * 3)));
+    };
+    stdin.on("data", onData);
+    return () => { stdin.off("data", onData); };
+  }, [stdin, maxOffset]);
 
   useInput((input, key) => {
     if (isMouseSequence(input)) return;
@@ -79,7 +93,7 @@ export function ReportModal(props: ReportModalProps): React.ReactElement {
         {divider}
       </Text>
       <Text color={theme.muted} wrap="truncate">
-        Up/Down scroll · PageUp/PageDown jump · Esc close
+        Wheel / Up/Down scroll · PgUp/PgDn jump · Esc close
       </Text>
     </Box>
   );

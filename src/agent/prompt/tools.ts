@@ -24,9 +24,19 @@ const CODE_MODE_GUIDANCE = [
   "- Use the execute tool to batch independent reads or searches in one script and return only the relevant result. It runs with the same permissions as the agent.",
 ];
 
+const READ_GUIDANCE = [
+  "- Use read_file to collect enough surrounding code to understand the relevant unit. Batch independent ranges in one model step instead of scanning a file a few lines per round trip; reuse ranges already in context until a relevant change requires a fresh read.",
+];
+
+const DIAGNOSTICS_GUIDANCE = [
+  "- Use diagnostics_check when investigating syntax or type errors. Read the reported locations with context; use the project's compiler or parser if diagnostics are unavailable. Counting punctuation in source text does not account for strings, comments, or language syntax.",
+];
+
 export function toolGuidanceText(toolNames?: string[]): string {
   const active = toolNames ? new Set(toolNames) : undefined;
   const lines: string[] = [];
+  if (!active || active.has("read_file")) lines.push(...READ_GUIDANCE);
+  if (!active || active.has("diagnostics_check")) lines.push(...DIAGNOSTICS_GUIDANCE);
   if (!active || active.has("shell") || active.has("bash") || active.has("bg_start")) {
     lines.push(...SHELL_GUIDANCE);
   }

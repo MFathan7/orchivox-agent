@@ -69,6 +69,18 @@ export function formatCost(costUsd: number): string {
   return `$${costUsd.toFixed(4)}`;
 }
 
+export function formatSessionCost(costUsd: number, incomplete: boolean): string {
+  if (incomplete) return costUsd > 0 ? `partial ~${formatCost(costUsd)}` : "cost n/a";
+  return `~${formatCost(costUsd)}`;
+}
+
+export function formatReplyDate(timestamp: number): string {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return "";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getDate())}/${pad(date.getMonth() + 1)}/${String(date.getFullYear()).padStart(4, "0")} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 /** One line for the token cost of a single user turn. */
 export function formatTurnUsage(input: {
   promptTokens: number;

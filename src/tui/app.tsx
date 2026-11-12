@@ -34,7 +34,7 @@ import {
   fitSegments,
   formatContextUsage,
   formatContextWindow,
-  formatCost,
+  formatSessionCost,
   formatTokenCount,
   summarizeSubagents,
   truncateText,
@@ -73,6 +73,9 @@ export const SYNC_END = "\u001b[?2026l";
 
 export interface WriteTarget {
   write(chunk: string | Uint8Array, callback?: () => void): boolean;
+  writableNeedDrain?: boolean;
+  once?: (event: "drain", listener: () => void) => unknown;
+  removeListener?: (event: "drain", listener: () => void) => unknown;
 }
 
 export interface SyncedOutputHandle {
@@ -139,6 +142,7 @@ export interface ChatCompactionView {
 
 export interface ThinkingSegmentView {
   id: string;
+  kind?: "thinking" | "text";
   text: string;
   startedAt: number;
   completedAt?: number;
@@ -148,6 +152,7 @@ export interface ThinkingSegmentView {
 export interface ChatEntryView {
   id: string;
   role: "user" | "assistant" | "system" | "compaction";
+  kind?: "recap";
   text: string;
   thinking?: string;
   thinkingSegments?: ThinkingSegmentView[];
@@ -159,6 +164,8 @@ export interface ChatEntryView {
   /** A paused live entry keeps its full text and tool history while the user scrolls. */
   frozenLive?: boolean;
   startedAt?: number;
+  completedAt?: number;
+  responseDurationMs?: number;
   step?: number;
   stepLimit?: number;
   toolLimit?: number;
@@ -167,6 +174,9 @@ export interface ChatEntryView {
   model?: string;
   tokensPerSecond?: number;
   turnTokens?: number;
+  turnPromptTokens?: number;
+  turnCompletionTokens?: number;
+  turnRequests?: number;
   filesChanged?: number;
   diff?: { oldText: string; newText: string; oldLabel?: string; newLabel?: string; unified?: boolean };
   compaction?: ChatCompactionView;
@@ -196,6 +206,8 @@ export interface OrchivoxAppProps {
   contextRequestLabel?: string;
   maxRequestLabel?: string;
   totalCostUsd?: number;
+  costIncomplete?: boolean;
+  contextSource?: "reported" | "estimated";
   entries: ChatEntryView[];
   streamingText?: string;
   liveEntry?: ChatEntryView;
@@ -334,13 +346,19 @@ export function installSynchronizedOutput(
   let timer: ReturnType<typeof setTimeout> | undefined;
   let pendingBytes = 0;
   let pendingFrames = 0;
+  let waitingForDrain = false;
 
-  const flush = (): void => {
+  const onDrain = (): void => {
+    waitingForDrain = false;
+    flush();
+  };
+
+  const flush = (force = false): void => {
     if (timer !== undefined) {
       clearTimeout(timer);
       timer = undefined;
     }
-    if (pending.length === 0) return;
+    if (pending.length === 0 || (waitingForDrain && !force)) return;
     const chunks = pending;
     const done = callbacks;
     const frames = pendingFrames;
@@ -350,26 +368,28 @@ export function installSynchronizedOutput(
     pendingBytes = 0;
     pendingFrames = 0;
     const startedAt = Date.now();
-    try {
-      originalWrite(SYNC_START);
-      if ((options.platform ?? process.platform) === "win32") {
-        const frame = chunks.map((chunk) => typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk)).join("");
-        originalWrite(`${RESET_ATTRIBUTES}${resetBeforeErase(frame)}${RESET_ATTRIBUTES}`);
-      } else {
-        for (const chunk of chunks) originalWrite(chunk);
-      }
-    } finally {
-      // Always leave synchronized update mode, even if one write fails.
-      originalWrite(SYNC_END);
+    const frame = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+    const payload = (options.platform ?? process.platform) === "win32"
+      ? `${RESET_ATTRIBUTES}${resetBeforeErase(frame.toString("utf8"))}${RESET_ATTRIBUTES}`
+      : frame;
+    const output = typeof payload === "string"
+      ? `${SYNC_START}${payload}${SYNC_END}`
+      : Buffer.concat([Buffer.from(SYNC_START), payload, Buffer.from(SYNC_END)]);
+    // Keep the closing escape in the same write even when the stream fills up.
+    const accepted = originalWrite(output, () => {
+      for (const callback of done) callback();
+    });
+    if (!accepted && !waitingForDrain && target.once) {
+      waitingForDrain = true;
+      target.once("drain", onDrain);
     }
     const elapsed = Date.now() - startedAt;
     if (freezeDebugEnabled() && (elapsed > 50 || frames > 20 || bytes > 1_000_000)) {
       logFreeze("stdout", { frames, bytes, ms: elapsed });
     }
     if (options.onFrame) {
-      options.onFrame(chunks.map((chunk) => (typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk))).join(""));
+      options.onFrame(frame.toString("utf8"));
     }
-    for (const callback of done) callback();
   };
 
   (target as unknown as { write: unknown }).write = ((
@@ -380,16 +400,18 @@ export function installSynchronizedOutput(
     pending.push(chunk);
     pendingBytes += typeof chunk === "string" ? chunk.length : chunk.byteLength;
     pendingFrames += 1;
-    if (typeof callback === "function") callbacks.push(callback as () => void);
+    const done = typeof encoding === "function" ? encoding : callback;
+    if (typeof done === "function") callbacks.push(done as () => void);
     if (timer === undefined) timer = setTimeout(flush, frameMs);
-    return true;
+    return !waitingForDrain && !target.writableNeedDrain;
   }) as unknown as WriteTarget["write"];
 
   return {
     flush,
-    isBackpressured: () => pendingBytes > 8_000_000 || pendingFrames > 60,
+    isBackpressured: () => waitingForDrain || Boolean(target.writableNeedDrain) || pendingBytes > 8_000_000 || pendingFrames > 60,
     uninstall: () => {
-      flush();
+      flush(true);
+      target.removeListener?.("drain", onDrain);
       (target as unknown as { write: unknown }).write = originalWrite;
     },
   };
@@ -401,6 +423,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     branch = "main",
     contextTokens = 0,
     totalCostUsd = 0,
+    costIncomplete = true,
+    contextSource = "estimated",
     entries,
     streamingText,
     liveEntry,
@@ -562,6 +586,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
       : runningCalls[0]
         ? (runningCalls[0].label ?? `Running ${runningCalls[0].name}`)
         : undefined;
+  const runningDetail = runningCalls.length === 1
+    ? runningCalls[0].filePath ?? runningCalls[0].command ?? runningCalls[0].detail
+    : undefined;
   const runningStartedAt = runningCalls.reduce<number | undefined>(
     (earliest, call) =>
       call.startedAt === undefined
@@ -667,8 +694,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
       ? ` [${props.reasoningEffort}]`
       : "";
   const statusText = escArmed ? "Press Esc again to stop the current turn" : statusMessage;
+  const compacting = entries.some((entry) => entry.role === "compaction" && entry.compaction?.status === "running");
   const statusRows = statusText ? countWrappedLines(statusText, innerWidth) : 0;
-  const liveStatusRows = streaming && !hasModalOpen && !statusText ? 1 : 0;
+  const liveStatusRows = streaming && !hasModalOpen && !statusText && !compacting ? 1 : 0;
   const liveStatusGapRows = liveStatusRows > 0 ? 1 : 0;
   const showSubagentStatus = !hasModalOpen && liveStatusRows === 0;
   const subagentLineRows = showSubagentStatus && agentActivitySummary(workers, tasks, innerWidth) ? 1 : 0;
@@ -699,8 +727,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const divider = "─".repeat(innerWidth);
   const contextLabel =
     innerWidth < 70
-      ? `ctx ${formatTokenCount(contextTokens)}/${formatContextWindow(modeCapabilities?.context_window)}`
-      : `ctx ${formatContextUsage(contextTokens, modeCapabilities?.context_window)}`;
+      ? `ctx ${contextSource === "estimated" ? "~" : ""}${formatTokenCount(contextTokens)}/${formatContextWindow(modeCapabilities?.context_window)}`
+      : `ctx ${contextSource === "estimated" ? "~" : ""}${formatContextUsage(contextTokens, modeCapabilities?.context_window)}`;
   const requestLabel = props.contextRequestLabel
     ? `${props.contextRequestLabel}${props.maxRequestLabel ? `/${props.maxRequestLabel}` : ""}`
     : undefined;
@@ -798,12 +826,12 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   });
   headerParts.push({
     key: "cost",
-    text: ` · ${formatCost(totalCostUsd)}`,
+    text: ` · ${formatSessionCost(totalCostUsd, costIncomplete)}`,
     dropOrder: 5,
     node: (
       <React.Fragment key="cost">
         <Text color={theme.muted}> · </Text>
-        <Text color={theme.text}>{formatCost(totalCostUsd)}</Text>
+        <Text color={theme.text}>{formatSessionCost(totalCostUsd, costIncomplete)}</Text>
       </React.Fragment>
     ),
   });
@@ -1122,6 +1150,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 offsetFromBottom={chatOffsetFromBottom}
                 onOffsetChange={setChatOffsetFromBottom}
                 topOffset={2}
+                leftOffset={1}
+                onCopyError={(error) => onStatusMessage?.(error.message)}
               />
             </Box>
             {showSidebar ? (
@@ -1147,7 +1177,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <Text color={theme.badge.running}>Press Esc again to stop the current turn</Text>
         ) : statusMessage ? (
           <Text color={theme.status.info}>{statusMessage}</Text>
-        ) : streaming && !hasModalOpen ? (
+        ) : streaming && !hasModalOpen && !compacting ? (
           <LiveStatus
             agentCounts={agentActivityCounts(workers, tasks)}
             active={streaming}
@@ -1155,6 +1185,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             startedAt={props.liveEntry?.startedAt}
             completedTools={completedTools}
             runningLabel={runningLabel}
+            runningDetail={runningDetail}
             runningStartedAt={runningStartedAt}
             step={props.liveEntry?.step}
             stepLimit={props.liveEntry?.stepLimit}

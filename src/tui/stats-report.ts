@@ -3,7 +3,7 @@ import {
   formatBytes,
   formatContextUsage,
   formatContextWindow,
-  formatCost,
+  formatSessionCost,
   formatTokenCount,
   formatTurnUsage,
 } from "./format";
@@ -20,6 +20,9 @@ export interface StatsReportInput {
   turnMetrics?: TurnMetrics;
   sessionCostUsd: number;
   allSessionsCostUsd: number;
+  sessionCostIncomplete?: boolean;
+  allSessionsCostIncomplete?: boolean;
+  contextUsageSource?: "reported" | "estimated";
   mode: string;
   modeModel?: string;
   contextTokens: number;
@@ -79,14 +82,14 @@ export function formatStatsReport(input: StatsReportInput): string {
     `  Active Session ID : ${input.sessionId ?? "(draft)"}`,
     `  Messages          : ${input.messageCount} messages`,
     `  Total Tokens      : ${formatTokenCount(input.totalTokens, false)} tokens`,
-    `  Session Spent     : ${formatCost(input.sessionCostUsd)} (estimated)`,
-    `  All Sessions Spent: ${formatCost(input.allSessionsCostUsd)} (estimated)`,
+    `  Session Spent     : ${formatSessionCost(input.sessionCostUsd, input.sessionCostIncomplete ?? true)}`,
+    `  All Sessions Spent: ${formatSessionCost(input.allSessionsCostUsd, input.allSessionsCostIncomplete ?? true)}`,
     `  VCS Snapshots     : ${input.snapshotCount} snapshots recorded`,
     "  Note              : Session spend accumulates and survives compaction.",
     "",
     "Current Context:",
     `  Window            : ${formatContextWindow(input.contextWindow)} (${input.contextSource})`,
-    `  Used              : ${formatContextUsage(input.contextTokens, input.contextWindow)}`,
+    `  Used              : ${formatContextUsage(input.contextTokens, input.contextWindow)} (${input.contextUsageSource ?? "estimated"})`,
     `  Input Limit       : ${
       input.inputLimit
         ? `${formatContextWindow(input.inputLimit)} (${input.inputSource})`

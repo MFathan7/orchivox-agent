@@ -80,7 +80,7 @@ export const HELP_SECTIONS: HelpSection[] = [
       { keys: "Alt+A", description: "Open the subagent hub" },
       { keys: "Hub keys", description: "Tab switch · d dispatch · m merge · x cancel · s steer · k kill" },
       { keys: "Ctrl+B", description: "Toggle the sidebar" },
-      { keys: "Ctrl+O", description: "Expand or collapse activity, diff details, and thinking" },
+      { keys: "Ctrl+O", description: "Toggle full tool output, diffs, and thinking" },
       { keys: "Click Activity", description: "Expand or collapse a tool activity group" },
       { keys: "Mouse wheel", description: "Scroll the transcript" },
       { keys: "PageUp / PageDown", description: "Scroll the transcript by a page" },
