@@ -11,6 +11,7 @@ import type {
   DelegationPolicy,
   LimitsConfig,
   ModelCapabilitiesPatch,
+  McpServerConfig,
   ProviderProfile,
   WorkerFallbackMode,
 } from "./loader";
@@ -109,6 +110,13 @@ export async function saveTheme(configPath: string, theme: ThemeSelection): Prom
   await writeDocument(configPath, document);
 }
 
+export async function saveMcpServer(configPath: string, name: string, config?: McpServerConfig): Promise<void> {
+  const document = await readDocument(configPath);
+  if (config) document.setIn(["mcp", "servers", name], config);
+  else document.deleteIn(["mcp", "servers", name]);
+  await writeDocument(configPath, document);
+}
+
 /** Removes every per-mode model pin so all modes fall back to the main model. */
 export async function clearModeModelSelections(
   configPath: string,
@@ -181,6 +189,13 @@ export async function saveBackground(configPath: string, patch: Partial<Backgrou
   const document = await readDocument(configPath);
   ensureMap(document, "background");
   for (const [key, value] of Object.entries(patch)) document.setIn(["background", key], value);
+  await writeDocument(configPath, document);
+}
+
+export async function saveMemoryEnabled(configPath: string, enabled: boolean): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "memory");
+  document.setIn(["memory", "enabled"], enabled);
   await writeDocument(configPath, document);
 }
 

@@ -2,33 +2,43 @@ import React from "react";
 import { Box, Text } from "ink";
 
 import packageJson from "../../package.json";
-import { useActiveTheme, type Theme } from "./theme";
+import { ORCHIVOX_BRAND_PALETTES, useActiveTheme, type Theme } from "./theme";
+import { COMPACT_LOGO_TEXT, ORBIT_EMBLEM, SMALL_ORBIT_EMBLEM } from "./logo-art";
+import { truncateText } from "./format";
+
+export { COMPACT_LOGO_TEXT } from "./logo-art";
+
+export function logoPalette(theme: Theme): Record<string, string> {
+  return ORCHIVOX_BRAND_PALETTES[theme.appearance];
+}
 
 export interface OrchivoxLogoProps {
   variant?: "emblem" | "compact";
   theme?: Theme;
+  small?: boolean;
 }
 
-export function OrchivoxLogo({ variant = "emblem", theme }: OrchivoxLogoProps): React.ReactElement {
+export function OrchivoxLogo({ variant = "emblem", theme, small = false }: OrchivoxLogoProps): React.ReactElement {
   const active = useActiveTheme(theme);
+  const palette = logoPalette(active);
 
   if (variant === "compact") {
     return (
-      <Box>
-        <Text color={active.border.passive}>(</Text>
-        <Text bold color={active.accent}>◎</Text>
-        <Text color={active.border.passive}>)</Text>
-      </Box>
+      <Text><Text color={palette.V}>{COMPACT_LOGO_TEXT[0]}</Text><Text bold color={palette.C}>{COMPACT_LOGO_TEXT[1]}</Text><Text color={palette.M}>{COMPACT_LOGO_TEXT[2]}</Text></Text>
     );
   }
 
   return (
     <Box flexDirection="column" alignItems="center">
-      <Text bold color={active.accent}>          ▄▄███▄▄  ╱●           </Text>
-      <Text bold color={active.accent}>        ▄██▀   ▀█╱´█▄           </Text>
-      <Text bold color={active.accent}>        ███  ● ╱´ ███           </Text>
-      <Text bold color={active.accent}>        ▀██▄ ╱´▄███▀            </Text>
-      <Text bold color={active.accent}>         ●╱▀▀███▀▀              </Text>
+      {(small ? SMALL_ORBIT_EMBLEM : ORBIT_EMBLEM).map(([glyphs, tones], row) => {
+        const runs: Array<{ text: string; tone: string }> = [];
+        for (let column = 0; column < glyphs.length; column++) {
+          const tone = tones[column];
+          if (runs.at(-1)?.tone === tone) runs[runs.length - 1].text += glyphs[column];
+          else runs.push({ text: glyphs[column], tone });
+        }
+        return <Text key={row} wrap="truncate">{runs.map((run, index) => <Text key={index} color={palette[run.tone]}>{run.text}</Text>)}</Text>;
+      })}
     </Box>
   );
 }
@@ -37,24 +47,27 @@ export interface WelcomeBannerProps {
   theme?: Theme;
   repoPath?: string;
   branch?: string;
+  width?: number;
+  height?: number;
 }
 
-export function WelcomeBanner({ theme, repoPath, branch }: WelcomeBannerProps): React.ReactElement {
+export function WelcomeBanner({ theme, repoPath, branch, width = 100, height = 18 }: WelcomeBannerProps): React.ReactElement {
   const active = useActiveTheme(theme);
+  const palette = logoPalette(active);
 
   return (
-    <Box flexDirection="column" alignItems="center" marginY={1}>
-      <OrchivoxLogo variant="emblem" theme={active} />
+    <Box flexDirection="column" alignItems="center" marginTop={1}>
+      <OrchivoxLogo variant="emblem" theme={active} small={height < 18} />
       <Box marginTop={1}>
-        <Text bold color={active.accent}>ORCHIVOX</Text>
+        <Text bold color={active.text}>ORCHIVO<Text color={palette.C}>X</Text></Text>
         <Text> </Text>
-        <Text bold color={active.modes.plan.secondary}>AGENT</Text>
+        <Text bold color={active.muted}>AGENT</Text>
         <Text color={active.muted}> v{packageJson.version}</Text>
       </Box>
       {repoPath ? (
         <Box marginTop={0}>
           <Text color={active.muted}>
-            {repoPath} {branch && branch !== "unknown" ? `(${branch})` : ""}
+            {truncateText(`${repoPath}${branch && branch !== "unknown" ? ` (${branch})` : ""}`, Math.max(1, width - 4))}
           </Text>
         </Box>
       ) : null}

@@ -2,6 +2,9 @@ import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { z } from "zod";
+import { pathToFileURL } from "node:url";
+import { LspFailure, lspFailure } from "./lsp-status";
+import { ToolResultError } from "../tools/result";
 
 import { computeLineHash, formatLine, splitLines } from "../tools/hashline-edit";
 import type { AgentTool, ToolRegistry } from "../tools/registry";
@@ -41,7 +44,8 @@ export interface HoverTypeResult {
   column: number;
   signature: string;
   documentation?: string;
-  source: "lsp" | "ast";
+  source: "lsp" | "local-scanner";
+  fallback?: { code: string; reason: string; status: string };
 }
 
 export interface SymbolImpactUsage {
@@ -88,35 +92,35 @@ const SOURCE_EXTENSIONS = new Set([
   ".cjs",
 ]);
 
-export async function collectSourceFiles(dir: string, repoRoot: string): Promise<string[]> {
-  const files: string[] = [];
+export interface SourceScanReport {
+  files: string[];
+  issues: Array<{ path: string; error: string }>;
+}
 
+export async function collectSourceFilesReport(dir: string, repoRoot: string, signal?: AbortSignal): Promise<SourceScanReport> {
+  const files: string[] = [], issues: SourceScanReport["issues"] = [];
   async function walk(currentDir: string): Promise<void> {
+    signal?.throwIfAborted();
     let entries;
-    try {
-      entries = await readdir(currentDir, { withFileTypes: true });
-    } catch {
+    try { entries = await readdir(currentDir, { withFileTypes: true }); }
+    catch (error) {
+      signal?.throwIfAborted();
+      issues.push({ path: currentDir, error: error instanceof Error ? error.message : String(error) });
       return;
     }
-
     for (const entry of entries) {
+      signal?.throwIfAborted();
       if (entry.isDirectory()) {
-        if (!IGNORED_DIRS.has(entry.name) && !entry.name.startsWith(".")) {
-          await walk(join(currentDir, entry.name));
-        }
-      } else if (entry.isFile()) {
-        const ext = getExtension(entry.name);
-        if (SOURCE_EXTENSIONS.has(ext)) {
-          const fullPath = join(currentDir, entry.name);
-          const relPath = relative(repoRoot, fullPath);
-          files.push(relPath);
-        }
-      }
+        if (!IGNORED_DIRS.has(entry.name) && !entry.name.startsWith(".")) await walk(join(currentDir, entry.name));
+      } else if (entry.isFile() && SOURCE_EXTENSIONS.has(getExtension(entry.name))) files.push(relative(repoRoot, join(currentDir, entry.name)));
     }
   }
-
   await walk(dir);
-  return files.sort();
+  return { files: files.sort(), issues };
+}
+
+export async function collectSourceFiles(dir: string, repoRoot: string): Promise<string[]> {
+  return (await collectSourceFilesReport(dir, repoRoot)).files;
 }
 
 function getExtension(filename: string): string {
@@ -419,12 +423,15 @@ function normalizeCycle(cycle: string[]): string {
   return rotated.join(" -> ");
 }
 
-export async function scanWorkspaceSymbols(
+export async function scanWorkspaceSymbolsReport(
   repoRoot: string,
   query: string,
-  options?: { kind?: string; maxResults?: number },
-): Promise<WorkspaceSymbolItem[]> {
-  const allFiles = await collectSourceFiles(repoRoot, repoRoot);
+  options?: { kind?: string; maxResults?: number; signal?: AbortSignal },
+): Promise<{ results: WorkspaceSymbolItem[]; scannedFiles: number; discoveredFiles: number; issues: SourceScanReport["issues"]; limitReached: boolean; enumerationComplete: boolean }> {
+  const collection = await collectSourceFilesReport(repoRoot, repoRoot, options?.signal);
+  const allFiles = collection.files;
+  let scannedFiles = 0;
+  const issues = [...collection.issues];
   const results: WorkspaceSymbolItem[] = [];
   const normalizedQuery = query.toLowerCase();
   const maxResults = options?.maxResults ?? 25;
@@ -433,16 +440,19 @@ export async function scanWorkspaceSymbols(
   const declarationRegex = /(?:^|\n)\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(class|interface|type|enum|function|const|let|var)\s+([A-Za-z0-9_$]+)/g;
 
   for (const relFile of allFiles) {
+    options?.signal?.throwIfAborted();
     if (results.length >= maxResults) break;
 
     const fullPath = resolve(repoRoot, relFile);
     let content = "";
     try {
-      content = await readFile(fullPath, "utf8");
-    } catch {
+      content = await readFile(fullPath, { encoding: "utf8", signal: options?.signal });
+    } catch (error) {
+      options?.signal?.throwIfAborted();
+      issues.push({ path: fullPath, error: error instanceof Error ? error.message : String(error) });
       continue;
     }
-
+    scannedFiles++;
     const lines = splitLines(content);
 
     for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
@@ -476,7 +486,11 @@ export async function scanWorkspaceSymbols(
     }
   }
 
-  return results;
+  return { results, scannedFiles, discoveredFiles: allFiles.length, issues, limitReached: results.length >= maxResults, enumerationComplete: collection.issues.length === 0 };
+}
+
+export async function scanWorkspaceSymbols(repoRoot: string, query: string, options?: { kind?: string; maxResults?: number }): Promise<WorkspaceSymbolItem[]> {
+  return (await scanWorkspaceSymbolsReport(repoRoot, query, options)).results;
 }
 
 export async function getHoverTypeInfo(
@@ -485,34 +499,33 @@ export async function getHoverTypeInfo(
   line: number,
   column: number,
   lsp?: LSPClient,
-): Promise<HoverTypeResult> {
+  signal?: AbortSignal,
+): Promise<HoverTypeResult | null> {
   const fullPath = isAbsolute(filePath) ? filePath : resolve(repoRoot, filePath);
   const relPath = relative(repoRoot, fullPath);
 
-  if (lsp && lsp.isReady()) {
+  signal?.throwIfAborted();
+  let failure = new LspFailure("not_ready", "textDocument/hover", "No language server is attached.");
+  if (lsp) {
     try {
-      const hoverText = await lsp.hover(fullPath, line, column);
-      if (hoverText && hoverText.trim().length > 0) {
-        return {
-          symbolName: `symbol at ${relPath}:${line}:${column}`,
-          filePath: relPath,
-          line,
-          column,
-          signature: hoverText,
-          source: "lsp",
-        };
-      }
-    } catch {
-      // Fallback to AST extraction
+      const hoverText = await lsp.hover(fullPath, line, column, signal);
+      signal?.throwIfAborted();
+      if (!hoverText?.trim()) return null;
+      return { symbolName: `symbol at ${relPath}:${line}:${column}`, filePath: relPath, line, column, signature: hoverText, source: "lsp" };
+    } catch (error) {
+      failure = lspFailure(error, "textDocument/hover", signal);
+      if (failure.kind === "cancelled") throw failure;
     }
   }
 
   let content = "";
   try {
-    content = await readFile(fullPath, "utf8");
-  } catch {
-    throw new Error(`file not found: ${filePath}`);
+    content = await readFile(fullPath, { encoding: "utf8", signal });
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw new ToolResultError({ status: "error", code: "local_read_failed", text: `Cannot read hover fallback: ${error instanceof Error ? error.message : String(error)}`, reason: failure.message, sources: [{ uri: pathToFileURL(fullPath).href, title: "Local source file" }] });
   }
+  signal?.throwIfAborted();
 
   const lines = splitLines(content);
   if (line < 1 || line > lines.length) {
@@ -520,6 +533,7 @@ export async function getHoverTypeInfo(
   }
 
   const targetLine = lines[line - 1];
+  if (column < 1 || column > targetLine.length + 1) throw new ToolResultError({ status: "error", code: "invalid_position", text: `Column ${column} is outside the local source line.` });
 
   let symbolName = "";
   const tokenRegex = /[A-Za-z0-9_$]+/g;
@@ -533,11 +547,7 @@ export async function getHoverTypeInfo(
     }
   }
 
-  if (!symbolName) {
-    tokenRegex.lastIndex = 0;
-    const firstMatch = tokenRegex.exec(targetLine);
-    symbolName = firstMatch ? firstMatch[0] : targetLine.trim();
-  }
+  if (!symbolName) symbolName = `source excerpt at ${relPath}:${line}:${column}`;
 
   let docLines: string[] = [];
   let checkIndex = line - 2;
@@ -591,7 +601,8 @@ export async function getHoverTypeInfo(
     column,
     signature,
     documentation,
-    source: "ast",
+    source: "local-scanner",
+    fallback: { status: failure.output.status, code: failure.output.code!, reason: failure.message },
   };
 }
 
@@ -764,6 +775,7 @@ export function createRepoArchitectureMapTool(options?: {
       includeSymbols: z.boolean().default(true).describe("Whether to include key exported symbols."),
     }),
     readOnly: true,
+    concurrency: "shared",
     execute: async (args) => {
       const input = args as { maxHubs: number; includeCycles: boolean; includeSymbols: boolean };
       const graph = await analyzeRepoGraph(workspaceRoot(repoRoot));
@@ -834,61 +846,70 @@ export function createLspWorkspaceSymbolsTool(options?: {
       maxResults: z.number().int().positive().default(25).describe("Maximum symbols to return."),
     }),
     readOnly: true,
-    execute: async (args) => {
+    concurrency: "shared",
+    execute: async (args, context) => {
+      const activeRoot = workspaceRoot(repoRoot);
       const input = args as { query: string; kind?: string; maxResults?: number };
       const maxResults = input.maxResults ?? 25;
-
-      if (lsp && lsp.isReady()) {
+      const signal = context?.signal;
+      signal?.throwIfAborted();
+      let failure = new LspFailure("not_ready", "workspace/symbol", "No language server is attached.");
+      if (lsp) {
         try {
-          const lspSymbols = await lsp.workspaceSymbols(input.query);
-          if (lspSymbols.length > 0) {
-            const filtered =
-              input.kind && input.kind !== "all"
-                ? lspSymbols.filter((s) => s.kind.toLowerCase() === input.kind?.toLowerCase())
-                : lspSymbols;
-
-            const selected = filtered.slice(0, maxResults);
-            const items: string[] = [];
-
-            for (const sym of selected) {
-              const relFile = relative(repoRoot, sym.file);
-              let lineSnippet = "";
+          const symbols = await lsp.workspaceSymbols(input.query, signal);
+          signal?.throwIfAborted();
+          const scoped = symbols.filter((symbol) => {
+            if (!isAbsolute(symbol.file)) return false;
+            const path = relative(activeRoot, symbol.file);
+            return path !== ".." && !path.startsWith("../") && !path.startsWith("..\\") && !isAbsolute(path);
+          });
+          const outside = symbols.length - scoped.length;
+          const filtered = input.kind && input.kind !== "all" ? scoped.filter((symbol) => symbol.kind.toLowerCase() === input.kind?.toLowerCase()) : scoped;
+          const selected = filtered.slice(0, maxResults);
+          const matches: Array<LSPWorkspaceSymbol & { snippet?: string }> = [], issues: string[] = [];
+          for (const symbol of selected) {
+            signal?.throwIfAborted();
+            let snippet = "";
+            if (symbol.line !== undefined && (symbol.uri?.startsWith("file:") || isAbsolute(symbol.file))) {
               try {
-                const content = await readFile(sym.file, "utf8");
+                const content = await readFile(symbol.file, { encoding: "utf8", signal });
                 const lines = splitLines(content);
-                if (sym.line >= 1 && sym.line <= lines.length) {
-                  lineSnippet = `\n    ${formatLine(sym.line, lines[sym.line - 1])}`;
-                }
-              } catch {
-                // Keep without line snippet
+                if (symbol.line <= lines.length) snippet = `\n    ${formatLine(symbol.line, lines[symbol.line - 1]!)}`;
+                else issues.push(`Snippet line is unavailable: ${symbol.file}:${symbol.line}`);
+              } catch (error) {
+                signal?.throwIfAborted();
+                issues.push(`Snippet unavailable for ${symbol.file}: ${error instanceof Error ? error.message : String(error)}`);
               }
-              items.push(`- [${sym.kind}] ${sym.name} in ${relFile}:${sym.line}${lineSnippet}`);
             }
-
-            if (items.length > 0) {
-              return [
-                `Workspace symbols matching "${input.query}" (via LSP, ${items.length} returned):`,
-                ...items,
-              ].join("\n");
-            }
+            matches.push({ ...symbol, ...(snippet ? { snippet: snippet.trim() } : {}) });
           }
-        } catch {
-          // Fallback to static workspace scanner
+          if (outside) issues.push(`${outside} server result(s) outside the active workspace or without a local workspace file were omitted.`);
+          const partial = selected.length < filtered.length || issues.length > 0;
+          return {
+            status: partial ? "partial" as const : selected.length ? "success" as const : "empty" as const,
+            text: `Language server returned ${selected.length} matching workspace symbols.`,
+            ...(partial ? { reason: [selected.length < filtered.length ? "Result limit reached." : "", ...issues].filter(Boolean).join(" ") } : {}),
+            data: JSON.parse(JSON.stringify({ source: "lsp", symbols: matches, snippetIssues: issues })),
+            coverage: { scope: "Language server workspace index response; unindexed files are not covered.", complete: !partial, returned: selected.length, total: filtered.length, unit: "symbols" },
+            sources: [{ uri: "lsp:workspace/symbol", title: "Language server" }],
+          };
+        } catch (error) {
+          failure = lspFailure(error, "workspace/symbol", signal);
+          if (failure.kind === "cancelled") throw failure;
         }
       }
+      signal?.throwIfAborted();
+      const report = await scanWorkspaceSymbolsReport(activeRoot, input.query, { ...input, signal });
+      signal?.throwIfAborted();
+      return {
+        status: "partial" as const, code: `fallback_${failure.output.code}`,
+        text: `Local declaration scanner returned ${report.results.length} matching symbols.`,
+        reason: `${failure.message} Fallback covers TS/JS declaration patterns only, excludes hidden/generated directories, and does not resolve types. ${report.limitReached ? "Result limit reached. " : ""}${report.issues.length ? "Some paths could not be read. " : ""}No match here does not prove workspace-wide absence.`,
+        data: JSON.parse(JSON.stringify({ source: "local-scanner", lsp: { status: failure.output.status, code: failure.output.code, reason: failure.message }, ...report })),
+        coverage: { scope: "Local .ts/.tsx/.js/.jsx/.mjs/.cjs declaration scan; hidden/generated directories excluded.", complete: false, returned: report.scannedFiles, ...(report.enumerationComplete ? { total: report.discoveredFiles } : {}), unit: "files" },
+        sources: [{ uri: pathToFileURL(activeRoot).href, title: "Local declaration scanner" }],
+      };
 
-      const results = await scanWorkspaceSymbols(repoRoot, input.query, input);
-      if (results.length === 0) {
-        return `No workspace symbols found matching "${input.query}".`;
-      }
-
-      const rows = results.map(
-        (s) => `- [${s.kind}] ${s.name} in ${s.file}:${s.line}\n    ${s.formattedLine}`,
-      );
-
-      return [`Workspace symbols matching "${input.query}" (${results.length} found):`, ...rows].join(
-        "\n",
-      );
     },
   };
 }
@@ -903,31 +924,28 @@ export function createLspHoverTypeTool(options?: {
   return {
     name: "lsp_hover_type",
     description:
-      "Retrieve detailed type information, signatures, and JSDoc documentation for a symbol at a specific line and column using LSP textDocument/hover, with AST fallback.",
+      "Retrieve detailed type information, signatures, and JSDoc documentation for a symbol at a specific line and column using LSP textDocument/hover, with a labeled local source-excerpt fallback.",
     parameters: z.object({
       filePath: z.string().min(1).describe("Relative or absolute file path."),
       line: z.number().int().positive().describe("1-based line number."),
       column: z.number().int().positive().describe("1-based column position."),
     }),
     readOnly: true,
-    execute: async (args) => {
+    concurrency: "shared",
+    execute: async (args, context) => {
+      const activeRoot = workspaceRoot(repoRoot);
       const input = args as { filePath: string; line: number; column: number };
-      const info = await getHoverTypeInfo(repoRoot, input.filePath, input.line, input.column, lsp);
+      const info = await getHoverTypeInfo(activeRoot, input.filePath, input.line, input.column, lsp, context?.signal);
+      if (!info) return { status: "empty" as const, text: "Language server returned no hover information at this position.", sources: [{ uri: "lsp:textDocument/hover", title: "Language server" }] };
+      return {
+        status: info.source === "lsp" ? "success" as const : "partial" as const,
+        text: `Hover information (${info.source}) at ${info.filePath}:${info.line}:${info.column}.`,
+        ...(info.fallback ? { code: `fallback_${info.fallback.code}`, reason: `${info.fallback.reason} Local fallback is a nearby source excerpt, not language-server type resolution.` } : {}),
+        data: JSON.parse(JSON.stringify(info)),
+        ...(info.fallback ? { coverage: { scope: "Nearby lines in one local file; no type resolution.", complete: false } } : {}),
+        sources: [{ uri: info.source === "lsp" ? "lsp:textDocument/hover" : pathToFileURL(resolve(activeRoot, input.filePath)).href, title: info.source === "lsp" ? "Language server" : "Local source excerpt" }],
+      };
 
-      const docSection = info.documentation
-        ? `\n**Documentation:**\n${info.documentation}`
-        : "";
-
-      return [
-        `[HOVER TYPE INFORMATION: ${info.source.toUpperCase()}]`,
-        `Location: ${info.filePath}:${info.line}:${info.column}`,
-        `Symbol: ${info.symbolName}`,
-        "",
-        "```typescript",
-        info.signature,
-        "```",
-        docSection,
-      ].filter(Boolean).join("\n");
     },
   };
 }
@@ -956,6 +974,7 @@ export function createSymbolImpactAnalysisTool(options?: {
         .describe("Maximum consumer files to list."),
     }),
     readOnly: true,
+    concurrency: "shared",
     execute: async (args) => {
       const input = args as { symbolName: string; filePath?: string; maxConsumers?: number };
       const report = await analyzeSymbolImpact(repoRoot, input.symbolName, input);

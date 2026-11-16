@@ -4,6 +4,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import { detectShell, ShellAdapterError, type ShellAdapter } from "../tools/shell-adapter";
+import { killProcessTree } from "../tools/process-tree";
 
 export interface CustomCommandFrontmatter {
   description?: string;
@@ -199,7 +200,8 @@ export class CustomCommandEngine {
     return this.cachedCommands.get(cleanName);
   }
 
-  async expandTemplate(template: string, rawArgs: string): Promise<string> {
+  async expandTemplate(template: string, rawArgs: string, signal?: AbortSignal): Promise<string> {
+    signal?.throwIfAborted();
     const tokens = parseArgumentsList(rawArgs);
     let result = template;
 
@@ -218,7 +220,8 @@ export class CustomCommandEngine {
     for (const match of shellMatches) {
       const fullMatch = match[0];
       const shellCmd = match[1];
-      const output = await this.executeInlineShell(shellCmd);
+      signal?.throwIfAborted();
+      const output = await this.executeInlineShell(shellCmd, signal);
       result = result.replace(fullMatch, output);
     }
 
@@ -230,6 +233,7 @@ export class CustomCommandEngine {
       const target = match[1];
 
       const expanded = await this.tryExpandFileReference(target);
+      signal?.throwIfAborted();
       if (expanded !== null) {
         result = result.replace(fullMatch, expanded);
       }
@@ -238,11 +242,13 @@ export class CustomCommandEngine {
     return result;
   }
 
-  async executeCommand(name: string, rawArgs: string): Promise<ExpandedCustomCommand | undefined> {
+  async executeCommand(name: string, rawArgs: string, signal?: AbortSignal): Promise<ExpandedCustomCommand | undefined> {
+    signal?.throwIfAborted();
     const cmd = await this.getCommand(name);
     if (!cmd) return undefined;
 
-    const expandedPrompt = await this.expandTemplate(cmd.template, rawArgs);
+    signal?.throwIfAborted();
+    const expandedPrompt = await this.expandTemplate(cmd.template, rawArgs, signal);
 
     return {
       command: cmd,
@@ -253,11 +259,12 @@ export class CustomCommandEngine {
     };
   }
 
-  private async executeInlineShell(command: string): Promise<string> {
+  private async executeInlineShell(command: string, signal?: AbortSignal): Promise<string> {
     try {
       const adapter =
         this.adapter ?? detectShell({ env: collectEnv(globalThis.process.env) });
       const [program, ...programArgs] = adapter.command(command);
+      signal?.throwIfAborted();
       const proc = Bun.spawn([program, ...programArgs], {
         cwd: this.repoRoot,
         stdout: "pipe",
@@ -265,23 +272,24 @@ export class CustomCommandEngine {
         detached: process.platform !== "win32",
       });
 
-      const [stdout, stderr] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-      ]);
-
-      const exitCode = await proc.exited;
-      const trimmedOut = stdout.trim();
-      const trimmedErr = stderr.trim();
-
-      if (trimmedOut.length > 0) {
-        return trimmedOut;
-      }
-      if (trimmedErr.length > 0) {
-        return `[stderr: ${trimmedErr}]`;
-      }
-      return exitCode === 0 ? "" : `[exit code: ${exitCode}]`;
+      const abort = () => killProcessTree(proc, { force: true });
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+      try {
+        const [stdout, stderr] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+        ]);
+        const exitCode = await proc.exited;
+        signal?.throwIfAborted();
+        const trimmedOut = stdout.trim();
+        const trimmedErr = stderr.trim();
+        if (trimmedOut.length > 0) return trimmedOut;
+        if (trimmedErr.length > 0) return `[stderr: ${trimmedErr}]`;
+        return exitCode === 0 ? "" : `[exit code: ${exitCode}]`;
+      } finally { signal?.removeEventListener("abort", abort); }
     } catch (error) {
+      if (signal?.aborted) throw signal.reason;
       const detail =
         error instanceof ShellAdapterError
           ? error.message

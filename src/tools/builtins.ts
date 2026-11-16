@@ -84,13 +84,16 @@ export async function collectFilesWithStatus(
   include: string | undefined,
   maxFiles: number,
   timeoutMs: number = DEFAULT_SEARCH_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<CollectFilesResult> {
+  signal?.throwIfAborted();
   if (timeoutMs <= 0) return { files: [], timedOut: true };
   const deadline = Date.now() + timeoutMs;
   const rules = await loadIgnoreRules(basePath);
   const glob = new Bun.Glob(include ?? "**/*");
   const collected: string[] = [];
   for await (const relative of glob.scan({ cwd: basePath, onlyFiles: true })) {
+    signal?.throwIfAborted();
     if (Date.now() > deadline) return { files: collected.sort(), timedOut: true };
     if (isIgnored(relative, rules)) continue;
     collected.push(relative);
@@ -123,7 +126,7 @@ export type GlobFilesArgs = z.infer<typeof GlobFilesArgsSchema>;
 
 export function createGlobFilesTool(
   options: { maxResults?: number; timeoutMs?: number } = {},
-): AgentTool<typeof GlobFilesArgsSchema> {
+): AgentTool<typeof GlobFilesArgsSchema, string> {
   const limit = options.maxResults ?? DEFAULT_GLOB_LIMIT;
   const timeoutMs = options.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
   return {
@@ -132,6 +135,7 @@ export function createGlobFilesTool(
       "List files matching a glob pattern such as src/**/*.ts. The .gitignore in the base path is honored.",
     parameters: GlobFilesArgsSchema,
     readOnly: true,
+    concurrency: "shared",
     async execute(args) {
       const maxResults = Math.min(args.maxResults, limit);
       const result = await collectFilesWithStatus(
@@ -163,7 +167,7 @@ export type GrepSearchArgs = z.infer<typeof GrepSearchArgsSchema>;
 
 export function createGrepSearchTool(
   options: { maxResults?: number; timeoutMs?: number; maxFiles?: number } = {},
-): AgentTool<typeof GrepSearchArgsSchema> {
+): AgentTool<typeof GrepSearchArgsSchema, string> {
   const limit = options.maxResults ?? DEFAULT_GREP_LIMIT;
   const timeoutMs = options.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
   const maxFiles = options.maxFiles ?? 5000;
@@ -173,6 +177,7 @@ export function createGrepSearchTool(
       "Search a regex across files in parallel. Each match prints path:line:hash| text, and the line:hash part is a valid anchor for hash_edit.",
     parameters: GrepSearchArgsSchema,
     readOnly: true,
+    concurrency: "shared",
     async execute(args) {
       let regex: RegExp;
       try {
@@ -246,12 +251,13 @@ export const DiffViewArgsSchema = z.object({
 });
 export type DiffViewArgs = z.infer<typeof DiffViewArgsSchema>;
 
-export function createDiffViewTool(): AgentTool<typeof DiffViewArgsSchema> {
+export function createDiffViewTool(): AgentTool<typeof DiffViewArgsSchema, string> {
   return {
     name: "diff_view",
     description: "Build a unified diff from two texts, useful as a preview before hash_edit.",
     parameters: DiffViewArgsSchema,
     readOnly: true,
+    concurrency: "shared",
     execute(args) {
       if (args.oldText === args.newText) return "no differences";
       const patch = createTwoFilesPatch(
@@ -281,13 +287,14 @@ export const JsonQueryArgsSchema = z
   });
 export type JsonQueryArgs = z.infer<typeof JsonQueryArgsSchema>;
 
-export function createJsonQueryTool(): AgentTool<typeof JsonQueryArgsSchema> {
+export function createJsonQueryTool(): AgentTool<typeof JsonQueryArgsSchema, string> {
   return {
     name: "json_query",
     description:
       "Evaluate a JSON path query like items[*].id or items[?(@.price < 10)].name against a JSON file or a JSON string. Queries are parsed and evaluated in memory, never executed as code.",
     parameters: JsonQueryArgsSchema,
     readOnly: true,
+    concurrency: "shared",
     async execute(args) {
       const source = args.filePath ? await readText(args.filePath) : (args.json ?? "");
       let data: unknown;

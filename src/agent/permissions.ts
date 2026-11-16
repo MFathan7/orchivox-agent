@@ -97,6 +97,11 @@ const MEDIUM_RISK_COMMAND_PATTERNS = [
 
 const SHELL_TOOL_NAMES = new Set(["shell", "bash", "bg_start"]);
 export const EDIT_TOOL_NAMES = new Set([
+  "lsp_rename",
+  "lsp_apply_action",
+  "ast_edit",
+  "remote_edit",
+  "edit_notebook_cell",
   "hash_edit",
   "replace_text",
   "write_file",
@@ -268,11 +273,24 @@ export function permissionRulesFromConfig(
 ): ToolRulePattern[] {
   const rulesForAction = (action: string): string[] => {
     if (action === "shell") return [...SHELL_TOOL_NAMES];
+    if (action === "execute") return ["execute", "eval", "browser_session", "debug_session", "desktop_control"];
     if (action === "edit") return [...EDIT_TOOL_NAMES];
     if (action === "read") {
       return [
         "read_file",
         "read_document",
+        "read_database",
+        "ast_search",
+        "code_find",
+        "read_archive",
+        "read_notebook",
+        "github_read",
+        "browser_read",
+        "debug_read",
+        "remote_read",
+        "desktop_read",
+        "lsp_code_actions",
+        "lsp_preview_file_rename",
         "read_skeleton",
         "glob_files",
         "grep_search",
@@ -343,6 +361,8 @@ const SAFER_BUILD_RULES: PermissionConfigRule[] = [
 
   // Arbitrary code can read credentials or run database queries invisibly.
   { action: "execute", resource: "*", effect: "ask" },
+  { action: "github_write", resource: "*", effect: "ask" },
+  { action: "remote_edit", resource: "**", effect: "ask" },
 ];
 
 /** Default approval rules for a preset, before user permissions are appended. */
@@ -1351,6 +1371,7 @@ export class GranularPermissionEngine extends EventEmitter {
   }
 
   private extractTargetKey(toolName: string, args: Record<string, unknown>): string {
+    if ((toolName === "remote_read" || toolName === "remote_edit") && typeof args.host === "string" && typeof args.remotePath === "string") return `ssh://${args.host}/${args.remotePath.split("/").map(encodeURIComponent).join("/")}`;
     if (SHELL_TOOL_NAMES.has(toolName) && typeof args.command === "string") {
       return args.command.trim();
     }

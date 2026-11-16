@@ -1,3 +1,5 @@
+import { prepareToolResults, toolResultImages, withoutToolImages } from "./tool-results";
+import { toolResultText as resultText } from "../tools/result";
 import { z } from "zod";
 
 import type { ModelCapabilities, ProviderKind } from "../config/loader";
@@ -7,7 +9,6 @@ import {
   type ChatRequest,
   type FinishReason,
   type StreamEvent,
-  type TextBlock,
   type TokenPricing,
 } from "../types/schema";
 import { learnLimitsFromError } from "./limit-cache";
@@ -232,6 +233,7 @@ export class OpenAICompatProvider implements LLMProvider {
     const model = req.model ?? this.model;
     if (!model) throw new Error("ChatRequest.model is required when the provider has no default model");
 
+    req = await prepareToolResults(req, this.capabilities.vision, signal);
     const payload = buildChatPayload(req, model, this.kind, this.capabilities);
     for (const name of this.unsupportedParams) delete payload[name];
 
@@ -515,7 +517,7 @@ export function buildChatPayload(
   const reasoningFamily = capabilities.temperature === false || /^(o[1-9]|gpt-5)/i.test(basename);
   const payload: Record<string, unknown> = {
     model,
-    messages: toOpenAiMessages(req, capabilities.vision ? "auto" : undefined),
+    messages: toOpenAiMessages(capabilities.vision ? req : withoutToolImages(req), capabilities.vision ? "auto" : undefined),
     stream: true,
     stream_options: { include_usage: true },
   };
@@ -589,13 +591,26 @@ export function toOpenAiMessages(
     messages.push({ role: "system", content: part.text });
   }
 
+  const pendingImages: Array<{ id: string; image: import("../types/schema").ImageBlock }> = [];
+  const flushImages = () => {
+    if (!pendingImages.length) return;
+    const content: OpenAiContentPart[] = [];
+    for (const { id, image } of pendingImages) {
+      content.push({ type: "text", text: `Image from tool result ${id}.` });
+      content.push({ type: "image_url", image_url: { url: `data:${image.source.media_type};base64,${image.source.data}`, detail: image.detail ?? defaultImageDetail ?? "auto" } });
+    }
+    messages.push({ role: "user", content });
+    pendingImages.length = 0;
+  };
   for (const message of req.messages) {
+    if (message.role !== "tool") flushImages();
     if (message.role === "tool") {
       let lastToolMessage: OpenAiMessage | undefined;
       for (const block of message.content) {
         if (block.type === "tool_result") {
-          lastToolMessage = { role: "tool", tool_call_id: block.tool_use_id, content: toolResultText(block.content) };
+          lastToolMessage = { role: "tool", tool_call_id: block.tool_use_id, content: resultText(block) };
           messages.push(lastToolMessage);
+          pendingImages.push(...toolResultImages(block.content).map((image) => ({ id: block.tool_use_id, image })));
         } else if (block.type === "text" && lastToolMessage) {
           const existing = typeof lastToolMessage.content === "string" ? lastToolMessage.content : "";
           lastToolMessage.content = [existing, block.text].filter(Boolean).join("\n");
@@ -656,7 +671,8 @@ export function toOpenAiMessages(
           break;
         case "tool_result":
           flush();
-          messages.push({ role: "tool", tool_call_id: block.tool_use_id, content: toolResultText(block.content) });
+          messages.push({ role: "tool", tool_call_id: block.tool_use_id, content: resultText(block) });
+          pendingImages.push(...toolResultImages(block.content).map((image) => ({ id: block.tool_use_id, image })));
           break;
         case "thinking":
           break;
@@ -664,13 +680,11 @@ export function toOpenAiMessages(
     }
     flush();
   }
+  flushImages();
   return messages;
 }
 
-function toolResultText(content: string | TextBlock[]): string {
-  if (typeof content === "string") return content;
-  return content.map((block) => block.text).join("\n");
-}
+
 
 export function buildUsageEvent(
   usage: OpenAiUsage,

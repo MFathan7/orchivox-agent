@@ -83,7 +83,7 @@ export function ReportModal(props: ReportModalProps): React.ReactElement {
           <Text color={theme.muted}>No data.</Text>
         ) : (
           visible.map((line, index) => (
-            <Text key={`${clamped + index}`} wrap="truncate">
+            <Text key={`${clamped + index}`} color={theme.text} wrap="truncate">
               {line.length > 0 ? line : " "}
             </Text>
           ))

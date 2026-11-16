@@ -111,6 +111,13 @@ export class TurnMetricsTracker {
     this.currentProvider = undefined;
   }
 
+  recordToolModelRequest(request: { provider: string; model: string; startedAt: number; durationMs: number; usage: Usage; retries: number; retryDelayMs: number }): void {
+    this.providerTimings.push({ provider: request.provider, model: request.model,
+      started_ms: Math.max(0, request.startedAt - this.startedAt), duration_ms: request.durationMs,
+      retries: request.retries, retry_delay_ms: request.retryDelayMs,
+      prompt_tokens: request.usage.prompt_tokens, cache_read_tokens: request.usage.cache_read_input_tokens });
+  }
+
   recordToolEnd(name: string, durationMs: number): void {
     this.toolDurationMs += durationMs;
     if (name === "task_wait") this.workerWaitMs += durationMs;

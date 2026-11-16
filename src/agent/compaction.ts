@@ -1,7 +1,8 @@
+import { pruneToolResult, toolContentText, toolImageBudget, toolResultText as projectedToolResult } from "../tools/result";
 import { COMPACT_LABEL, estimateMessageTokens } from "../memory/hindsight";
 import { isContextOverflowError } from "../provider/errors";
 import type { LLMProvider } from "../provider/router";
-import { ChatRequestSchema, type Message, type TextBlock, type ToolDefinition, type Usage } from "../types/schema";
+import { ChatRequestSchema, type Message, type ToolDefinition, type Usage } from "../types/schema";
 import { estimateTokenCost } from "./token-estimate";
 import { abortableStream } from "../provider/abortable-stream";
 
@@ -174,16 +175,18 @@ export function estimateRequestBytes(input: {
   system?: string;
   messages: Message[];
   tools?: ToolDefinition[];
+  vision?: boolean;
 }): number {
   const body = JSON.stringify({
     system: input.system ?? "",
     messages: input.messages.map((message) => ({
       role: message.role,
-      content: message.content,
+      content: message.content.map((block) => block.type === "tool_result" ? { type: block.type, tool_use_id: block.tool_use_id, content: projectedToolResult(block), is_error: block.is_error } : block),
     })),
     tools: input.tools ?? [],
   });
-  return Math.ceil(Buffer.byteLength(body, "utf8") * 1.05);
+  const imageBytes = input.vision === false ? 0 : [...toolImageBudget(input.messages).values()].reduce((sum, bytes) => sum + bytes, 0);
+  return Math.ceil((Buffer.byteLength(body, "utf8") + imageBytes) * 1.05);
 }
 
 export function extractSummary(messages: Message[]): string | undefined {
@@ -320,9 +323,7 @@ export interface PruneResult {
 export const PRUNED_TOOL_RESULT =
   "[context pruned: old tool output removed to save room. Run the command or read the file again if the detail is needed.]";
 
-function toolResultText(content: string | TextBlock[]): string {
-  return typeof content === "string" ? content : content.map((block) => block.text).join("\n");
-}
+
 
 /**
  * Removes tool output the model no longer needs. Walks backwards, keeps the
@@ -359,8 +360,8 @@ export function pruneToolOutput(
     for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex -= 1) {
       const block = message.content[blockIndex];
       if (block.type !== "tool_result") continue;
-      const text = toolResultText(block.content);
-      if (text.startsWith("[context pruned:")) continue;
+      const text = projectedToolResult(block);
+      if (toolContentText(block.content).startsWith("[context pruned:")) continue;
       const tokens = estimateTextTokens(text);
       if (protectedTokens + tokens <= protectTokens) {
         protectedTokens += tokens;
@@ -380,7 +381,7 @@ export function pruneToolOutput(
     const message = next[target.messageIndex];
     const block = message?.content[target.blockIndex];
     if (block?.type !== "tool_result") continue;
-    message.content[target.blockIndex] = { ...block, content: PRUNED_TOOL_RESULT };
+    message.content[target.blockIndex] = pruneToolResult(block, PRUNED_TOOL_RESULT);
     prunedTokens += target.tokens;
     prunedMessageIds.add(target.messageId);
   }
@@ -404,7 +405,7 @@ export function markPrunedToolResults(
           ...message,
           content: message.content.map((block) =>
             block.type === "tool_result"
-              ? { ...block, content: PRUNED_TOOL_RESULT }
+              ? pruneToolResult(block, PRUNED_TOOL_RESULT)
               : block,
           ),
         }
@@ -412,8 +413,8 @@ export function markPrunedToolResults(
   );
 }
 
-function clipToolResult(content: string | TextBlock[], maxChars: number): string {
-  const text = typeof content === "string" ? content : content.map((block) => block.text).join("\n");
+function clipToolResult(content: import("../types/schema").ToolResultBlock["content"], maxChars: number): string {
+  const text = toolContentText(content);
   if (text.length <= maxChars * 2) return text;
   const head = text.slice(0, maxChars);
   const tail = text.slice(-maxChars);
@@ -446,7 +447,8 @@ export function reduceTranscriptForOverflow(
       ...message,
       content: message.content.map((block) =>
         block.type === "tool_result"
-          ? { ...block, content: clipToolResult(block.content, Math.max(200, clipChars)) }
+          ? (projectedToolResult(block).length > Math.max(200, clipChars) * 2 || block.outcome?.images?.length || (Array.isArray(block.content) && block.content.some((part) => part.type === "image"))
+            ? pruneToolResult(block, clipToolResult([{ type: "text", text: projectedToolResult(block) }], Math.max(200, clipChars))) : block)
           : block,
       ),
     }));
@@ -456,7 +458,7 @@ export function reduceTranscriptForOverflow(
     return messages.map((message) => ({
       ...message,
       content: message.content.map((block) =>
-        block.type === "tool_result" ? { ...block, content: PRUNED_TOOL_RESULT } : block,
+        block.type === "tool_result" ? pruneToolResult(block, PRUNED_TOOL_RESULT) : block,
       ),
     }));
   }
@@ -599,9 +601,7 @@ function trimTailToBudget(messages: Message[], budget: number, overhead: number)
     const content = message.content.map((block) => {
       if (block.type !== "tool_result" || freed >= needChars) return block;
       const text =
-        typeof block.content === "string"
-          ? block.content
-          : block.content.map((item) => item.text).join("\n");
+        projectedToolResult(block);
       const keep = TRIM_KEEP_CHARS;
       if (text.length <= keep * 2) return block;
       const removed = text.length - keep * 2;
@@ -609,10 +609,7 @@ function trimTailToBudget(messages: Message[], budget: number, overhead: number)
       changed = true;
       const head = text.slice(0, keep);
       const tail = text.slice(-keep);
-      return {
-        ...block,
-        content: `${head}\n\n[... ${removed} characters trimmed to fit the context window. Read the file again with offset or limit, or narrow the command, if the detail is needed.]\n\n${tail}`,
-      };
+      return pruneToolResult(block, `${head}\n\n[... ${removed} characters trimmed to fit the context window. Read the file again with offset or limit, or narrow the command, if the detail is needed.]\n\n${tail}`);
     });
     return changed ? { ...message, content } : message;
   });
@@ -674,7 +671,7 @@ function formatMessageForSummary(message: Message): string {
     else if (block.type === "tool_use") {
       parts.push(`called ${block.name}(${truncate(JSON.stringify(block.input), 1000)})`);
     } else if (block.type === "tool_result") {
-      const text = typeof block.content === "string" ? block.content : block.content.map((item) => item.text).join("\n");
+      const text = projectedToolResult(block);
       if (text.startsWith("<skill_content")) {
         const name = /^<skill_content name="([^"]+)"/.exec(text)?.[1] ?? "unknown";
         const base = /Base directory for this skill:\s*(.+)/.exec(text)?.[1]?.trim();

@@ -72,6 +72,7 @@ export function createReadSkeletonTool(): AgentTool {
       "Read a code file as a skeleton: imports, type declarations, classes, and function signatures with their docs, while implementation bodies fold into an omitted marker with line range and body hash.",
     parameters: z.object({ filePath: z.string().min(1) }),
     readOnly: true,
+    concurrency: "shared",
     execute: async (args) => {
       const { filePath } = args as { filePath: string };
       const language = detectLanguage(filePath);
@@ -93,6 +94,7 @@ export function createRepoMapTool(): AgentTool {
       maxFiles: z.number().int().positive().default(40),
     }),
     readOnly: true,
+    concurrency: "shared",
     execute: async (args) => {
       const request = args as { basePath: string; include?: string; maxFiles: number };
       const files = await collectFiles(request.basePath, request.include, 5000);

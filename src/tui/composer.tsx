@@ -45,6 +45,7 @@ export interface FileAttachmentRef {
   mimeType?: string;
   base64?: string;
   error?: string;
+  context?: string;
 }
 
 const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
@@ -123,16 +124,20 @@ export interface PromptSubmitPayload {
 }
 
 export interface PromptComposerProps {
+  initialText?: string;
+  initialAttachments?: FileAttachmentRef[];
   mode?: AgentMode;
   theme?: Theme;
   repoRoot?: string;
   width?: number;
   maxRows?: number;
+  maxHeight?: number;
   placeholder?: string;
+  hint?: string;
   historyFilePath?: string;
   disabled?: boolean;
   streaming?: boolean;
-  onSubmit?: (payload: PromptSubmitPayload) => void;
+  onSubmit?: (payload: PromptSubmitPayload) => boolean | void;
   onModeToggle?: () => void;
   onOpenHub?: () => void;
   onOpenPalette?: () => void;
@@ -314,6 +319,7 @@ export async function buildInjectedContext(
 
   for (const item of attachments) {
     if (item.kind === "image") continue;
+    if (item.context !== undefined) { if (item.context) blocks.push(item.context); continue; }
     if (!item.exists) continue;
     const fullPath = resolve(root, item.filePath);
 
@@ -333,13 +339,13 @@ export async function buildInjectedContext(
       }
 
       const rangeLabel = item.startLine ? `:${item.startLine}${item.endLine ? `-${item.endLine}` : ""}` : "";
-      blocks.push(
-        [
-          `--- File Context: ${item.filePath}${rangeLabel} (${formattedLines.length} lines) ---`,
-          ...formattedLines,
-        ].join("\n"),
-      );
+      item.context = [
+        `--- File Context: ${item.filePath}${rangeLabel} (${formattedLines.length} lines) ---`,
+        ...formattedLines,
+      ].join("\n");
+      blocks.push(item.context);
     } catch {
+      item.context = "";
       // Skip files that cannot be read.
     }
   }
@@ -368,6 +374,7 @@ export async function loadImageAttachments(
       results.push({ ...item, error: `only ${MAX_IMAGES_PER_MESSAGE} images per message` });
       continue;
     }
+    if (item.base64) { results.push(item); imageCount += 1; continue; }
 
     try {
       const file = Bun.file(resolve(root, item.filePath));
@@ -387,6 +394,18 @@ export async function loadImageAttachments(
   }
 
   return results;
+}
+
+export async function preparePromptAttachments(text: string, repoRoot?: string, retained: FileAttachmentRef[] = []): Promise<FileAttachmentRef[]> {
+  const references = parseFileAttachments(text);
+  const saved = new Map(retained.filter(hasAttachmentSnapshot).map((item) => [item.raw, item]));
+  const fresh = await resolveFileAttachments(references.filter((item) => !saved.has(item.raw)), repoRoot);
+  const byRaw = new Map(fresh.map((item) => [item.raw, item]));
+  return loadImageAttachments(references.map((item) => structuredClone(saved.get(item.raw) ?? byRaw.get(item.raw)!)), repoRoot);
+}
+
+function hasAttachmentSnapshot(item: FileAttachmentRef): boolean {
+  return !item.error && (item.kind === "image" ? Boolean(item.base64) : Boolean(item.context));
 }
 
 export function getLineAndColumn(text: string, cursor: number): { line: number; col: number; lines: string[] } {
@@ -566,12 +585,12 @@ export function PromptComposer(props: PromptComposerProps) {
   } = props;
 
   const theme = useActiveTheme(themeProp);
-  const [text, setText] = React.useState("");
+  const [text, setText] = React.useState(props.initialText ?? "");
   const hasDraft = text.length > 0;
   const draftCallback = React.useRef(props.onDraftChange);
   draftCallback.current = props.onDraftChange;
   React.useEffect(() => { draftCallback.current?.(hasDraft); }, [hasDraft]);
-  const [cursorPos, setCursorPos] = React.useState(0);
+  const [cursorPos, setCursorPos] = React.useState((props.initialText ?? "").length);
   const [attachedFiles, setAttachedFiles] = React.useState<FileAttachmentRef[]>([]);
   const [historyManager] = React.useState(() => new PersistentCommandHistory(historyFilePath, repoRoot));
 
@@ -588,6 +607,9 @@ export function PromptComposer(props: PromptComposerProps) {
   const undoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
   const redoStack = React.useRef<Array<{ text: string; cursor: number }>>([]);
   const pastedRef = React.useRef<PastedEntry[]>([]);
+  const submittingRef = React.useRef(false);
+  const draftTextRef = React.useRef(text);
+  draftTextRef.current = text;
   const autocompleteSuppressedRef = React.useRef(false);
 
   React.useEffect(() => {
@@ -641,14 +663,14 @@ export function PromptComposer(props: PromptComposerProps) {
 
     void resolveFileAttachments(rawAttachments, repoRoot).then((resolved) => {
       if (!cancelled) {
-        setAttachedFiles(resolved);
+        setAttachedFiles(resolved.map((item) => props.initialAttachments?.find((saved) => saved.raw === item.raw && hasAttachmentSnapshot(saved)) ?? item));
       }
     });
 
     return () => {
       cancelled = true;
     };
-  }, [text, repoRoot]);
+  }, [text, repoRoot, props.initialAttachments]);
 
   React.useEffect(() => {
     if (autocompleteSuppressedRef.current) {
@@ -757,34 +779,38 @@ export function PromptComposer(props: PromptComposerProps) {
     const raw = explicitText ?? text;
     const expanded = explicitText ? raw : expandPastedText(raw, pastedRef.current);
     const trimmed = expanded.trim();
-    if (!trimmed) return;
+    if (!trimmed || submittingRef.current) return;
+    submittingRef.current = true;
 
-    const lower = trimmed.toLowerCase();
-    const ultrawork = /^(ulw|ultrawork)\b/.test(lower);
-    const resolvedAttachments = await resolveFileAttachments(parseFileAttachments(trimmed), repoRoot);
-    const loadedAttachments = await loadImageAttachments(resolvedAttachments, repoRoot);
-    const injectedContext = await buildInjectedContext(loadedAttachments, repoRoot);
-    const fullText = injectedContext.length > 0 ? `${trimmed}\n\n${injectedContext}` : trimmed;
+    try {
+      const lower = trimmed.toLowerCase();
+      const ultrawork = /^(ulw|ultrawork)\b/.test(lower);
+      const loadedAttachments = await preparePromptAttachments(trimmed, repoRoot, props.initialAttachments);
+      const injectedContext = await buildInjectedContext(loadedAttachments, repoRoot);
+      const fullText = injectedContext.length > 0 ? `${trimmed}\n\n${injectedContext}` : trimmed;
 
-    await historyManager.append(trimmed);
-
-    setText("");
-    setCursorPos(0);
-    setAttachedFiles([]);
-    setAutocompleteContext(null);
-    setAutocompleteItems([]);
-    pastedRef.current = [];
-    undoStack.current = [];
-    redoStack.current = [];
-
-    if (onSubmit) {
-      onSubmit({
+      const accepted = onSubmit?.({
         rawText: trimmed,
         injectedContext: injectedContext.length > 0 ? injectedContext : undefined,
         fullText,
         ultrawork,
         attachments: loadedAttachments,
       });
+      if (accepted === false) return;
+
+      if (draftTextRef.current === text) {
+        setText("");
+        setCursorPos(0);
+        setAttachedFiles([]);
+        setAutocompleteContext(null);
+        setAutocompleteItems([]);
+        pastedRef.current = [];
+        undoStack.current = [];
+        redoStack.current = [];
+      }
+      await historyManager.append(trimmed);
+    } finally {
+      submittingRef.current = false;
     }
   };
 
@@ -1147,7 +1173,27 @@ export function PromptComposer(props: PromptComposerProps) {
   const textWidth = Math.max(8, (width ?? 80) - 4 - maxPrefixWidth);
   const visualRows = buildVisualRows(text, textWidth);
   const cursorSpot = locateCursorRow(visualRows, activeLine, activeCol);
-  const maxVisibleRows = Math.max(1, maxRows ?? 8);
+  const attachmentRows = attachedFiles.length > 0 ? 1 : 0;
+  const effectivePlaceholder = placeholder;
+  const hintText = props.hint ?? (
+    (width ?? 80) < 50
+      ? "Shift+Tab · Enter send"
+      : (width ?? 80) < 60
+        ? "Enter send · Ctrl+J newline · / commands"
+        : (width ?? 80) < 80
+          ? "Shift+Tab mode · / commands · @ files · Enter send"
+          : (width ?? 80) < 110
+            ? "Shift+Tab · / commands · @ files · Enter send"
+            : "Shift+Tab mode · / commands · @ files · $ skills · Enter send · Shift+Enter newline (Ctrl+J)");
+  const hintRows = wrapText(hintText, Math.max(1, (width ?? 80) - 2)).length;
+  const composerChrome = attachmentRows + 2 + hintRows;
+  const popupVisible = autocompleteItems.length > 0 && autocompleteContext !== null;
+  const popupRoom = (props.maxHeight ?? Infinity) - composerChrome - 1;
+  const screenRows = process.stdout.rows ?? 24;
+  const popupLimit = Math.max(1, Math.min(6, Math.floor(screenRows / 4), popupRoom - 4));
+  const singleLinePopup = popupRoom < 5;
+  const popupRows = popupVisible ? singleLinePopup ? 1 : Math.min(popupLimit, autocompleteItems.length) + 4 : 0;
+  const maxVisibleRows = Math.max(1, Math.min(maxRows ?? 8, (props.maxHeight ?? Infinity) - composerChrome - popupRows));
 
   React.useLayoutEffect(() => {
     setInputScroll((previous) => {
@@ -1163,23 +1209,6 @@ export function PromptComposer(props: PromptComposerProps) {
   const visibleStart = Math.min(inputScroll, Math.max(0, visualRows.length - maxVisibleRows));
   const visibleRows = visualRows.slice(visibleStart, visibleStart + maxVisibleRows);
 
-  const popupVisible = autocompleteItems.length > 0 && autocompleteContext !== null;
-  const screenRows = process.stdout.rows ?? 24;
-  const popupLimit = Math.max(1, Math.min(6, Math.floor(screenRows / 4)));
-  const popupRows = popupVisible ? Math.min(popupLimit, autocompleteItems.length) + 4 : 0;
-  const attachmentRows = attachedFiles.length > 0 ? 1 : 0;
-  const effectivePlaceholder = placeholder;
-  const hintText =
-    (width ?? 80) < 50
-      ? "Shift+Tab · Enter send"
-      : (width ?? 80) < 60
-        ? "Enter send · Ctrl+J newline · / commands"
-        : (width ?? 80) < 80
-          ? "Shift+Tab mode · / commands · @ files · Enter send"
-          : (width ?? 80) < 110
-            ? "Shift+Tab · / commands · @ files · Enter send"
-            : "Shift+Tab mode · / commands · @ files · $ skills · Enter send · Shift+Enter newline (Ctrl+J)";
-  const hintRows = wrapText(hintText, Math.max(1, (width ?? 80) - 2)).length;
   const layoutRows =
     popupRows + attachmentRows + Math.min(visualRows.length, maxVisibleRows) + 2 + hintRows;
 
@@ -1196,6 +1225,7 @@ export function PromptComposer(props: PromptComposerProps) {
           trigger={autocompleteContext.trigger}
           theme={theme}
           maxVisible={popupLimit}
+          singleLine={singleLinePopup}
           width={width}
         />
       ) : null}
@@ -1255,7 +1285,7 @@ export function PromptComposer(props: PromptComposerProps) {
             if (!isCurrent) {
               return (
                 <Box key={`row-${visualIndex}`}>
-                  <Text color={theme.border.passive}>{prefix}</Text>
+                  <Text color={theme.muted}>{prefix}</Text>
                   <Text color={theme.text}>{displayLine}</Text>
                 </Box>
               );

@@ -1,11 +1,6 @@
 import type { LLMProvider } from "../provider/router";
 import { ChatRequestSchema, type Message } from "../types/schema";
-
-const TITLE_SYSTEM = [
-  "You write concise session titles for a coding assistant.",
-  "Reply with one short title of 3 to 6 words.",
-  "Use plain text. No quotes, no markdown, no trailing punctuation.",
-].join(" ");
+import { SESSION_TITLE_SYSTEM } from "./prompt/background";
 
 const PLACEHOLDER_TITLE = /^(?:\(?unknown\)?|untitled|new (?:chat|session)|session|n\/a|none)$/i;
 
@@ -28,14 +23,44 @@ export function messageText(message: Message): string {
   return parts.join(" ").trim();
 }
 
-export function normalizeTitle(raw: string, maxChars = 60): string | undefined {
-  const firstLine = raw
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => line.length > 0);
-  if (!firstLine) return undefined;
+function visibleTitleOutput(raw: string): string {
+  const markers = /<\s*(\/?)\s*(think|thinking|reasoning|analysis)\b[^>]*>|\[(\/?)(think|thinking|reasoning|analysis)\]|```(?:[ \t]*(thinking|reasoning|analysis)\b[^\n]*(?:\r?\n|$))?/gi;
+  const stack: string[] = [];
+  let visible = "", cursor = 0;
+  for (const marker of raw.matchAll(markers)) {
+    if (!stack.length) visible += raw.slice(cursor, marker.index);
+    const token = marker[0];
+    if (stack.at(-1) === "fence") {
+      if (token === "```") stack.pop();
+    } else if (marker[5]) stack.push("fence");
+    else if (token === "```") { if (!stack.length) visible += token; }
+    else {
+      const name = (marker[2] ?? marker[4]).toLowerCase();
+      if (marker[1] || marker[3]) { if (stack.at(-1) === name) stack.pop(); }
+      else if (!token.endsWith("/>")) stack.push(name);
+    }
+    cursor = marker.index! + token.length;
+  }
+  if (!stack.length) visible += raw.slice(cursor);
+  return visible.trim();
+}
 
-  let title = firstLine
+export function normalizeTitle(raw: string, maxChars = 60): string | undefined {
+  const visible = visibleTitleOutput(raw.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, ""));
+  const marked = /<(session_title|title)\s*>([\s\S]*?)<\/\1\s*>/i.exec(visible);
+  let candidate = marked ? marked[2].trim() : visible;
+  if (/<\/?(?:session_title|title)\b/i.test(candidate)) return undefined;
+  candidate = candidate.replace(/^```(?:json|text)?\s*\n?/i, "").replace(/\n?```\s*$/, "").trim();
+  if (candidate.startsWith("{")) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (!parsed || typeof parsed !== "object" || !("title" in parsed) || typeof parsed.title !== "string") return undefined;
+      candidate = visibleTitleOutput(parsed.title);
+    } catch { return undefined; }
+  }
+  if (!candidate || /[<>\u0000-\u001f\u007f-\u009f]/.test(candidate)) return undefined;
+
+  let title = candidate
     .replace(/^#+\s*/, "")
     .replace(/^["'`]+|["'`]+$/g, "")
     .replace(/\*\*/g, "")
@@ -71,10 +96,11 @@ export async function generateSessionTitle(options: SessionTitleOptions): Promis
     : `First user message:\n${userText}`;
 
   const request = ChatRequestSchema.parse({
-    system: TITLE_SYSTEM,
+    system: SESSION_TITLE_SYSTEM,
     messages: [{ id: "session-title", role: "user", content: [{ type: "text", text: prompt }] }],
-    max_tokens: 48,
-    temperature: 0.2,
+    max_tokens: 128,
+    temperature: 0,
+    reasoning_effort: "none",
   });
 
   try {

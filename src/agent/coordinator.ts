@@ -5,8 +5,7 @@ import type { JsonSchemaObject } from "../types/schema";
 import { parseStructuredJson } from "./json-output";
 import type { SpecialistAgentProfile, SpecialistAgentRegistry } from "./specialist-agents";
 import { resolveSubagentSkillAccess } from "./skill-access";
-import type { SkillRegistry } from "./skills";
-import { normalizeSkillName } from "./skills";
+import { normalizeSkillName, skillId, type SkillRegistry } from "./skills";
 import type { SubagentManager, SubagentSpawnTask } from "./subagent";
 import type { TaskBoard, TaskItem } from "./task-board";
 
@@ -107,8 +106,8 @@ export class Coordinator {
 
     const installedSkills = new Map(
       this.skills.listDocuments().map((document) => [
-        normalizeSkillName(document.name),
-        document.name,
+        normalizeSkillName(skillId(document)),
+        skillId(document),
       ]),
     );
     const warnings: string[] = [];

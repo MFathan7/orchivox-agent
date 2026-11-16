@@ -204,6 +204,7 @@ export function createInspectImageTool(options?: {
       "Inspect and analyze an image from a local file, web URL, or system clipboard. Resizes and compresses the image to the configured limits, then queries the active vision model to describe UI components, extract screenshot text, or verify visual designs.",
     parameters: InspectImageArgsSchema,
     readOnly: true,
+    concurrency: "shared",
     async execute(args) {
       let imageBytes: Uint8Array;
       let source: "file" | "url" | "clipboard";

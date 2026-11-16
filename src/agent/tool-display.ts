@@ -4,8 +4,32 @@ export interface ToolDisplay {
 }
 
 const LABELS: Record<string, string> = {
+  ast_search: "Searching code structure",
+  ast_edit: "Editing code structure",
+  code_find: "Locating implementation",
+  read_archive: "Reading archive",
+  read_notebook: "Reading notebook",
+  edit_notebook_cell: "Editing notebook cell",
+  remote_read: "Reading remote project",
+  remote_edit: "Editing remote file",
+  desktop_read: "Observing desktop",
+  desktop_control: "Operating selected window",
+  browser_read: "Observing browser",
+  browser_session: "Controlling browser",
+  debug_read: "Inspecting debugger",
+  debug_session: "Controlling debugger",
+  github_read: "Reading GitHub",
+  github_write: "Updating GitHub",
+  lsp_code_actions: "Inspecting code actions",
+  lsp_preview_file_rename: "Previewing file move",
+  lsp_apply_action: "Applying code action",
+  eval: "Running code cell",
+  eval_reset: "Resetting code kernel",
+  context_checkpoint: "Starting context checkpoint",
+  context_rewind: "Keeping exploration report",
   read_file: "Reading file",
   read_document: "Reading document",
+  read_database: "Inspecting database",
   read_skeleton: "Reading code skeleton",
   hash_edit: "Editing file",
   replace_text: "Replacing text",
@@ -43,7 +67,6 @@ const LABELS: Record<string, string> = {
   lsp_workspace_symbols: "Searching symbols",
   lsp_hover_type: "Inspecting type",
   symbol_impact_analysis: "Analyzing impact",
-  debug_session: "Debugging session",
   run_sandbox_script: "Running sandbox script",
   execute: "Running code",
   remember_insight: "Updating memory",
@@ -60,6 +83,12 @@ export function humanizeToolName(name: string): string {
 }
 
 export function toolDisplay(name: string, args: Record<string, unknown> = {}): ToolDisplay {
+  if (name === "mcp_resources" || name === "mcp_prompts") {
+    const label = name === "mcp_resources" ? args.action === "read" ? "Reading resource" : args.action === "templates" ? "Listing templates" : "Listing resources"
+      : args.action === "get" ? "Getting prompt" : "Listing prompts";
+    const detail = [args.server, args.uri ?? args.uriTemplate ?? (name === "mcp_prompts" ? args.name : undefined)].filter((value) => typeof value === "string").join(" · ");
+    return detail ? { label, detail: truncate(detail, 72) } : { label };
+  }
   const label = LABELS[name] ?? humanizeToolName(name);
   const detail = detailFor(name, args);
   return detail ? { label, detail: truncate(detail, 72) } : { label };
@@ -72,6 +101,7 @@ function detailFor(name: string, args: Record<string, unknown>): string | undefi
   switch (name) {
     case "read_file":
     case "read_document":
+    case "read_database":
     case "read_skeleton":
     case "hash_edit":
     case "replace_text":

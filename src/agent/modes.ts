@@ -14,11 +14,12 @@ export interface ModeContract {
   prompt: readonly string[];
   /** Compact variant used when the provider only gets a small prompt. */
   compactPrompt: string;
-  /**
-   * Last line of the system prompt. Small models follow the end of the prompt
-   * best, so the mode rule is repeated after the long sections like skills.
-   */
+  /** Completion review text for the mode's bounded reminders. */
   finalReminder: string;
+  /** Workflow guidance delivered in synthetic mode reminders. */
+  workflowGuidance?: readonly string[];
+  /** Shell constraints included in the mode's synthetic reminder. */
+  shellGuidance?: readonly string[];
   /** Tool surface: read-only, build (edits plus delegation), or everything. */
   toolPolicy: "read-only" | "build" | "all";
   /** Mutating tools run without an approval prompt. */
@@ -42,6 +43,19 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     prompt: [],
     compactPrompt: "",
     finalReminder: "",
+    workflowGuidance: [
+      "Scale planning to the request: a focused fix may need only a few concrete steps. Investigate code facts with inspection tools; ask the user only for consequential preferences or scope choices that the code cannot answer.",
+      "Ground the plan in inspected code. State the requested outcome, agreed decisions, existing patterns to reuse, ordered changes, and an observable check of success. Distinguish verified facts, assumptions, and unresolved decisions.",
+      "Resolve decisions that affect implementation before presenting the plan as ready. Keep implementation details proportional to the change; omit sections that add no decision or evidence.",
+      "Keep the latest agreed decisions and any unresolved choices clear in the conversation so implementation can continue from them. An exploratory suggestion or saved plan is not approval to implement.",
+    ],
+    shellGuidance: [
+      "Prefer available read_file for text and directories, read_database for SQLite, glob_files, grep_search, read_document, json_query, and dedicated inspection tools instead of shell-based inspection scripts.",
+      "Plan shell access uses a conservative allowlist: a command that looks read-only may still be rejected. Use the shell reported in Environment and simple supported inspection commands.",
+      "For POSIX shells, examples are pwd, ls, cat, head, rg, git status, and git diff. For PowerShell, examples are Get-Location, Get-ChildItem, Get-Content, Select-String, git status, and git diff.",
+      "Do not run interpreters or arbitrary code, database CLIs, tests, builds, package scripts, installs, or development servers in Plan mode. Do not use command substitution, redirection, heredocs, multiline scripts, or background jobs.",
+      "After a Plan permission denial, use an available dedicated read-only tool rather than retrying the same operation through another shell, interpreter, or wrapper. If verification requires execution that Plan does not permit, explain that limit and continue the read-only investigation.",
+    ],
     toolPolicy: "read-only",
     fullAccess: false,
     enforceTodos: false,
@@ -56,6 +70,13 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     prompt: [],
     compactPrompt: "",
     finalReminder: "",
+    workflowGuidance: [
+      "For authorized implementation, work through the requested outcome, relevant code, focused changes, and verification. A mode switch alone is not permission to implement; answer discussion or review requests without editing.",
+      "Carry forward the latest agreed decisions from the conversation or a user-designated plan. Read that plan if its content is unavailable. Reopen a decision only if the user changes it or current evidence contradicts it; explain the conflict.",
+      "Read the relevant code and reuse its patterns. Keep small fixes direct; use a short task list only when dependencies or scope need tracking. Do not require a plan file or a planning round before a straightforward change.",
+      "Prove the changed behavior with a focused check and run required repository checks. Reuse passing evidence until a relevant change or new uncertainty requires another check.",
+      "Finish when the requested behavior is supported by evidence. Report material limits; leave optional cleanup, tuning, and unrelated improvements for a separate request.",
+    ],
     toolPolicy: "all",
     fullAccess: true,
     enforceTodos: false,
@@ -69,15 +90,16 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
     hint: "finish autonomously",
     prompt: [
       "You are in ULTRAWORK mode.",
-      "Own the task until it is finished: plan it, implement it, verify it, and report the evidence.",
-      "Track the work with todo_write and do not stop while a todo item is pending or in progress.",
-      "Use spawn_subagents for independent work and the task board (task_create, task_list) to track dispatched work.",
-      "Verify with tools before you claim success, and fix what the verification exposes.",
+      "Use this mode for sustained work across related stages: carry the user's authorized outcomes through implementation, integration, and verification. Discussion, study, and review requests remain read-only unless the user asks for changes.",
+      "Carry forward the latest agreed decisions. Track required work with todo_write, update it as evidence arrives, and do not stop while required work is pending or in progress. Keep optional improvements out of the required todo list.",
+      "Follow the selected delegation policy. Honor explicit requests for subagents within available tools, model routing, and permissions; prompt length, task size, or file count alone must not veto them. For automatic delegation, use spawn_subagents when independent results justify setup and integration cost, and the task board (task_create, task_list) to track dispatched work. A worker is not required on every task.",
+      "Integrate required worker results and prove the requested behavior. Run required repository checks and focused checks for changed behavior; reuse passing evidence rather than repeating verification after each status review.",
+      "Fix failures that affect the requested outcome. Once required work is verified, finish; do not pursue perfection, speculative hardening, or another audit. If a required outcome is blocked, report the evidence and missing prerequisite honestly rather than marking it complete or retrying without new information.",
       "Reply with a short final summary that names the changes and the checks that passed.",
     ],
-    compactPrompt: "You are in ultrawork mode: keep working and verifying until every todo item is complete.",
+    compactPrompt: "You are in ultrawork mode: finish the authorized outcomes, track required work, follow delegation policy, and stop when the evidence is sufficient. Report blockers honestly; optional improvements are separate work.",
     finalReminder:
-      "Current mode: ULTRAWORK. Keep working autonomously with tools until the task is complete and verified. Do not stop for a status update.",
+      "Current mode: ULTRAWORK. Review existing evidence against the requested outcomes and update the todo list. Continue only for required unfinished work; do not repeat passed checks just because of this reminder. If complete, deliver the final summary. If blocked, report the missing prerequisite and unverified work honestly.",
     toolPolicy: "all",
     fullAccess: true,
     enforceTodos: true,
@@ -113,6 +135,8 @@ export function modeTransitionReminder(from: AgentMode, to: AgentMode): string {
     `The previous ${from.toUpperCase()} mode instructions no longer apply.`,
     `Continue in ${to.toUpperCase()} mode.`,
     "Do not tell the user to switch modes, press Tab, or run /build; the switch already happened.",
+    "Retain the user's latest agreed decisions and unresolved questions. Switching modes does not approve a draft, authorize edits, or request additional work.",
+    ...(to === "ultrawork" ? modeContract(to).prompt : []),
   ].join(" ");
 }
 

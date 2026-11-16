@@ -1,6 +1,9 @@
+import { toolEventStatus, toolResultText } from "../tools/result";
+import { ToolOutcomeSchema, ToolHostMetadataSchema } from "../types/tool-output";
 import type { SessionCompaction } from "../memory/sqlite";
-import type { AgentMode, Message } from "../types/schema";
+import type { AgentMode, Message, ToolResultBlock } from "../types/schema";
 import type { ChatEntryView, ChatToolCallView, ThinkingSegmentView } from "./app";
+import { ToolProgressSchema } from "../types/tool-output";
 
 function thinkingSegmentsFromMetadata(value: unknown): ThinkingSegmentView[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -62,12 +65,16 @@ function toolCallsFromMetadata(value: unknown): ChatToolCallView[] | undefined {
         diff: toolDiffFromMetadata(record.diff),
         argumentsSummary:
           typeof record.argumentsSummary === "string" ? record.argumentsSummary : "",
+        workerIds: Array.isArray(record.workerIds) ? record.workerIds.filter((id): id is string => typeof id === "string") : undefined,
         status:
-          record.status === "running" || record.status === "ok" || record.status === "error"
+          record.status === "running" || record.status === "ok" || record.status === "error" || record.status === "partial" || record.status === "empty" || record.status === "cancelled" || record.status === "unavailable"
             ? record.status
             : undefined,
+        outcome: ToolOutcomeSchema.safeParse(record.outcome).data,
+        metadata: ToolHostMetadataSchema.safeParse(record.metadata).data,
         durationMs: typeof record.durationMs === "number" ? record.durationMs : undefined,
         lspStatus: typeof record.lspStatus === "string" ? record.lspStatus : undefined,
+        progress: ToolProgressSchema.safeParse(record.progress).data,
       },
     ];
   });
@@ -109,6 +116,12 @@ export function buildTranscriptEntries(
   compaction?: SessionCompaction,
 ): ChatEntryView[] {
   const entries: ChatEntryView[] = [];
+  const toolResults = new Map<string, ToolResultBlock>();
+  for (const message of messages) {
+    for (const block of message.content) {
+      if (block.type === "tool_result") toolResults.set(block.tool_use_id, block);
+    }
+  }
   const tailId = compaction?.tail_start_message_id;
   const insertIndex = compaction ? (tailId ? messages.findIndex((message) => message.id === tailId) : 0) : -1;
   let inserted = false;
@@ -128,6 +141,7 @@ export function buildTranscriptEntries(
     if (message.metadata?.instruction !== undefined) return;
     if (message.metadata?.planReminder !== undefined) return;
     if (message.metadata?.coordinatorPlan !== undefined) return;
+    if (message.metadata?.subagent_result !== undefined) return;
     const hasToolUse = message.content.some((block) => block.type === "tool_use");
     if (message.role === "assistant" && hasToolUse && messageEntryText(message).trim().length === 0) return;
     const metadata = message.metadata;
@@ -152,6 +166,21 @@ export function buildTranscriptEntries(
         : undefined;
     const thinkingSegments = thinkingSegmentsFromMetadata(metadata?.thinking_segments);
     const toolCalls = toolCallsFromMetadata(metadata?.tool_calls);
+    for (const call of toolCalls ?? []) {
+      if (!call.id) continue;
+      const result = toolResults.get(call.id);
+      if (!result) continue;
+      if (result.outcome) {
+        call.outcome = { ...result.outcome, data: undefined };
+        call.metadata = result.metadata;
+        call.status = toolEventStatus(result);
+        if (call.durationMs === undefined && result.metadata?.duration_ms !== undefined) call.durationMs = result.metadata.duration_ms;
+      }
+      if (call.name === "inspect_image" || result.outcome?.data !== undefined) {
+        const text = toolResultText(result);
+        if (text) call.output = text;
+      }
+    }
     entries.push({
       id: `entry-${index + 1}`,
       role: message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user",

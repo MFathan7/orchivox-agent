@@ -7,7 +7,8 @@ import { extractDeclarations, detectLanguage, type SourceLanguage } from "../ide
 import { readText } from "../tools/hashline-edit";
 import { CustomCommandEngine } from "../agent/custom-commands";
 import { SpecialistAgentRegistry } from "../agent/specialist-agents";
-import { SkillRegistry } from "../agent/skills";
+import { SkillRegistry, skillId } from "../agent/skills";
+import { skillEnabled, skillInvocationLabel } from "../agent/skill-metadata";
 import { useActiveTheme, type Theme } from "./theme";
 
 export type AutocompleteTrigger = "command" | "file" | "symbol" | "skill";
@@ -45,6 +46,7 @@ export interface AutocompletePopupProps {
   maxVisible?: number;
   title?: string;
   width?: number;
+  singleLine?: boolean;
 }
 
 function truncateText(text: string, max: number): string {
@@ -78,8 +80,11 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/build", description: "Switch to build mode (workspace autonomy)" },
   { name: "/ultrawork", description: "Switch to autonomous ultrawork mode" },
   { name: "/study", description: "Study the project and report what exists" },
+  { name: "/btw", description: "Ask a side question or open its history" },
+  { name: "/queue", description: "Edit, cancel, or resume queued messages" },
   { name: "/review", requiresArgs: true, description: "Review a file or answer a code question" },
   { name: "/theme", requiresArgs: false, description: "Change or inspect the terminal theme" },
+  { name: "/mcp", requiresArgs: false, description: "Manage MCP servers, sign-in, resources, and prompts" },
   { name: "/reasoning", requiresArgs: false, description: "Set thinking effort" },
   { name: "/palette", description: "Search actions and settings" },
   { name: "/settings", description: "Configure approvals, safety, and step limits" },
@@ -128,7 +133,7 @@ interface CacheEntry<T> {
 let cachedFiles: CacheEntry<string[]> | undefined;
 let cachedSymbols: CacheEntry<AutocompleteItem[]> | undefined;
 let cachedCommands: CacheEntry<AutocompleteItem[]> | undefined;
-let cachedSkills: CacheEntry<AutocompleteItem[]> | undefined;
+let cachedSkills: (CacheEntry<AutocompleteItem[]> & { root: string }) | undefined;
 
 const CACHE_TTL_FILES_MS = 10_000;
 const CACHE_TTL_SYMBOLS_MS = 30_000;
@@ -139,6 +144,10 @@ export function resetAutocompleteCaches(): void {
   cachedFiles = undefined;
   cachedSymbols = undefined;
   cachedCommands = undefined;
+  resetSkillAutocompleteCache();
+}
+
+export function resetSkillAutocompleteCache(): void {
   cachedSkills = undefined;
 }
 
@@ -362,24 +371,24 @@ export async function fetchSpecialistAgents(repoRoot?: string): Promise<Autocomp
 
 export async function fetchSkills(repoRoot?: string): Promise<AutocompleteItem[]> {
   const now = Date.now();
-  if (cachedSkills && now - cachedSkills.timestamp < CACHE_TTL_SKILLS_MS) {
+  const root = resolve(repoRoot ?? globalThis.process.cwd());
+  if (cachedSkills?.root === root && now - cachedSkills.timestamp < CACHE_TTL_SKILLS_MS) {
     return cachedSkills.data;
   }
 
-  const root = repoRoot ?? globalThis.process.cwd();
   const registry = new SkillRegistry({ repoRoot: root });
   try {
     const documents = await registry.load(true);
-    const items: AutocompleteItem[] = documents.map((document) => ({
-      id: `skill:${document.name}`,
+    const items: AutocompleteItem[] = documents.filter(skillEnabled).map((document) => ({
+      id: `skill:${skillId(document)}`,
       trigger: "skill",
-      label: document.name,
-      insertText: `$${document.name} `,
+      label: skillId(document),
+      insertText: `$${skillId(document)} `,
       kind: "skill",
-      detail: document.modelRole ? `(${document.modelRole})` : undefined,
+      detail: `${document.scope}${document.autoinvoke === false || document.hidden ? ` · ${skillInvocationLabel(document)}` : ""}${document.modelRole ? ` · model hint: ${document.modelRole}` : ""}`,
       description: document.description,
     }));
-    cachedSkills = { data: items, timestamp: now };
+    cachedSkills = { data: items, timestamp: now, root };
     return items;
   } catch {
     return [];
@@ -549,6 +558,9 @@ export function AutocompletePopup(props: AutocompletePopupProps) {
   const descWidth = Math.max(12, Math.min(48, popupWidth - 34));
 
   const clampedSelected = Math.max(0, Math.min(items.length - 1, selectedIndex));
+  if (props.singleLine) return <Box width={width}>
+    <Text color={theme.accent} wrap="truncate">{clampedSelected + 1}/{items.length} · ↑/↓ Tab · {items[clampedSelected]!.label}</Text>
+  </Box>;
   const halfWindow = Math.floor(maxVisible / 2);
   let startIndex = Math.max(0, clampedSelected - halfWindow);
   if (startIndex + maxVisible > items.length) {

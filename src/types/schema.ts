@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { ToolOutcomeSchema, ToolHostMetadataSchema, ToolProgressSchema } from "./tool-output";
+export * from "./tool-output";
 
 export const RoleSchema = z.enum(["system", "user", "assistant", "tool"]);
 export type Role = z.infer<typeof RoleSchema>;
@@ -35,8 +37,10 @@ export type ToolUseBlock = z.infer<typeof ToolUseBlockSchema>;
 export const ToolResultBlockSchema = z.object({
   type: z.literal("tool_result"),
   tool_use_id: z.string().min(1),
-  content: z.union([z.string(), z.array(TextBlockSchema)]),
+  content: z.union([z.string(), z.array(z.union([TextBlockSchema, ImageBlockSchema]))]),
   is_error: z.boolean().default(false),
+  outcome: ToolOutcomeSchema.optional(),
+  metadata: ToolHostMetadataSchema.optional(),
 });
 export type ToolResultBlock = z.infer<typeof ToolResultBlockSchema>;
 
@@ -138,6 +142,7 @@ export const ToolResultSchema = z.object({
   content: z.union([z.string(), z.array(ContentBlockSchema)]),
   is_error: z.boolean().default(false),
   metadata: z.record(z.string(), z.unknown()).optional(),
+  outcome: ToolOutcomeSchema.optional(),
 });
 export type ToolResult = z.infer<typeof ToolResultSchema>;
 
@@ -504,18 +509,25 @@ export const ToolStartEventSchema = z.object({
   detail: z.string().optional(),
   command: z.string().optional(),
   arguments_summary: z.string().default(""),
+  worker_ids: z.array(z.string()).optional(),
   file_path: z.string().optional(),
 });
 export type ToolStartEvent = z.infer<typeof ToolStartEventSchema>;
+
+export const ToolProgressEventSchema = z.object({ type: z.literal("tool_progress"), id: z.string().min(1), name: z.string().min(1), progress: ToolProgressSchema });
+export type ToolProgressEvent = z.infer<typeof ToolProgressEventSchema>;
 
 export const ToolEndEventSchema = z.object({
   type: z.literal("tool_end"),
   id: z.string().min(1),
   name: z.string().min(1),
-  status: z.enum(["ok", "error"]),
+  status: z.enum(["ok", "error", "empty", "cancelled", "unavailable", "partial"]),
   duration_ms: z.number().nonnegative().default(0),
   file_path: z.string().optional(),
   output: z.string().optional(),
+  worker_ids: z.array(z.string()).optional(),
+  outcome: ToolOutcomeSchema.optional(),
+  metadata: ToolHostMetadataSchema.optional(),
 });
 export type ToolEndEvent = z.infer<typeof ToolEndEventSchema>;
 
@@ -615,6 +627,7 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
   AdvisorNoteEventSchema,
   BgProcessUpdateEventSchema,
   ToolStartEventSchema,
+  ToolProgressEventSchema,
   ToolEndEventSchema,
   FileChangeEventSchema,
   SkillActivatedEventSchema,

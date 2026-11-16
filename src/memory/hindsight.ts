@@ -1,3 +1,4 @@
+import { toolResultText } from "../tools/result";
 import { z } from "zod";
 
 import { estimateTokenCost } from "../agent/token-estimate";
@@ -10,7 +11,7 @@ export const COMPACT_LABEL = "[COMPACTED SESSION SUMMARY]";
 export class HindsightMemory {
   private readonly database: MemoryDatabase;
 
-  constructor(database: MemoryDatabase) {
+  constructor(database: MemoryDatabase, private readonly enabled: () => boolean = () => false) {
     this.database = database;
   }
 
@@ -22,6 +23,7 @@ export class HindsightMemory {
   private rememberInsightTool(): AgentTool {
     return {
       name: "remember_insight",
+      enabled: this.enabled,
       description:
         "Store a long-term insight (architecture convention, past bug fix, decision) with optional file globs so future sessions can recall it.",
       parameters: z.object({
@@ -31,6 +33,7 @@ export class HindsightMemory {
       }),
       readOnly: false,
       execute: (args) => {
+        if (!this.enabled()) throw new Error("Long-term memory is off. Enable it in Settings to save project notes.");
         const request = args as { topic: string; insight: string; file_patterns: string[] };
         const note = this.database.saveInsight({
           topic: request.topic,
@@ -45,6 +48,7 @@ export class HindsightMemory {
   private recallInsightsTool(): AgentTool {
     return {
       name: "recall_insights",
+      enabled: this.enabled,
       description:
         "Recall long-term insights. Filters combine: query matches topic or insight text, file_path matches the stored file globs.",
       parameters: z.object({
@@ -54,6 +58,7 @@ export class HindsightMemory {
       }),
       readOnly: true,
       execute: (args) => {
+        if (!this.enabled()) throw new Error("Long-term memory is off. Enable it in Settings to read project notes.");
         const request = args as { query?: string; file_path?: string; limit: number };
         const candidates = request.query
           ? this.database.searchInsights(request.query, Math.max(request.limit, 50))
@@ -80,10 +85,8 @@ export function estimateMessageTokens(message: Message): number {
     else if (block.type === "tool_use") {
       tokens += estimateTokenCost(block.name + JSON.stringify(block.input));
     } else if (block.type === "tool_result") {
-      tokens +=
-        typeof block.content === "string"
-          ? estimateTokenCost(block.content)
-          : block.content.reduce((sum, item) => sum + estimateTokenCost(item.text), 0);
+      tokens += estimateTokenCost(toolResultText(block));
+      for (const image of block.outcome?.images ?? []) imageTokens += Math.max(1000, Math.ceil((image.size_bytes ?? 0) / 1024));
     } else if (block.type === "image") {
       imageTokens += Math.max(1000, Math.ceil((block.source.data.length * 3) / 4096));
     }

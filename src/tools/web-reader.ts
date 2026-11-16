@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 import { truncateHead } from "./output-budget";
+import { redactSecrets } from "../security/secrets";
+import type { ToolOutput } from "../types/tool-output";
 import type { AgentTool, ToolRegistry } from "./registry";
 
 export type WebSearchProvider = "tavily" | "brave" | "exa" | "firecrawl" | "duckduckgo";
@@ -51,9 +53,21 @@ interface SearchResult {
   published?: string;
 }
 
+const SearchRequestSchema = z.object({
+  query: z.string().min(1), maxResults: z.number().int().min(1).max(20).optional(),
+  includeDomains: z.array(z.string().regex(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/i)).max(100).optional(),
+  excludeDomains: z.array(z.string().regex(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/i)).max(100).optional(),
+  page: z.number().int().min(0).max(9).optional().describe("Brave page offset; pins requests to Brave. Follow returned continuation only."),
+  startDate: z.iso.date().optional(), endDate: z.iso.date().optional(),
+}).refine((value) => !value.startDate || !value.endDate || value.startDate <= value.endDate, "startDate must not follow endDate");
+export type WebSearchRequest = z.infer<typeof SearchRequestSchema>;
+
 export interface WebSearchResult {
   provider: WebSearchProvider;
   results: SearchResult[];
+  limitations?: string[];
+  nextPage?: number;
+  truncated?: boolean;
 }
 
 const DEFAULT_ENDPOINTS = {
@@ -81,29 +95,34 @@ export function registerWebTools(registry: ToolRegistry, options: WebReaderOptio
   if (options.fetch?.enabled !== false) registry.register(createWebFetchTool(options));
 }
 
-export function createWebSearchTool(options: WebReaderOptions = {}): AgentTool {
+export function createWebSearchTool(options: WebReaderOptions = {}): AgentTool<z.ZodTypeAny, ToolOutput> {
   return {
     name: "web_search",
     description: [
-      "Search the web for current information beyond your knowledge cutoff.",
+      "Search the web. includeDomains/excludeDomains accept hostnames; startDate/endDate use YYYY-MM-DD. Filters require Tavily or Exa; unsupported adapters are skipped. Brave exposes pages 0–9 through continuation; other adapters require refining the query.",
       `The current year is ${new Date().getFullYear()}. Use this year when searching for recent information or current events.`,
     ].join(" "),
-    parameters: z.object({
-      query: z.string().min(1).describe("Web search query."),
-    }),
+    parameters: SearchRequestSchema,
     readOnly: true,
+    concurrency: "shared",
     execute: async (args, context) => {
-      const request = args as { query: string };
+      const request = SearchRequestSchema.parse(args);
       const result = await webSearch(
-        { ...request, maxResults: options.search?.max_results },
+        request,
         { ...options, signal: context?.signal },
       );
-      return formatSearchResults(request.query, result);
+      return { status: result.limitations?.length ? "partial" : result.results.length ? "success" : "empty",
+        text: formatSearchResults(request.query, result), data: JSON.parse(JSON.stringify({ provider: result.provider, results: result.results, filters: request, limitations: result.limitations ?? [] })),
+        sources: result.results.filter((item) => item.url).map((item) => ({ uri: item.url, title: item.title })),
+        coverage: { scope: `Web index (${result.provider}); bounded ranked results, total unknown`, complete: false, returned: result.results.length, unit: "results" },
+        truncation: { truncated: result.truncated === true, reason: "Backend returns bounded ranked results; total web matches are unknown." },
+        continuation: result.nextPage === undefined ? { tool: "web_search", message: "This result exposes no pagination continuation. Refine the query or filters; use web_fetch to read a source." } : { tool: "web_search", arguments: { ...request, maxResults: Math.min(request.maxResults ?? options.search?.max_results ?? DEFAULT_SEARCH_RESULTS, 20), page: result.nextPage }, message: "Fetch the next Brave page. Live rankings can change or overlap." },
+      };
     },
   };
 }
 
-export function createWebFetchTool(options: WebReaderOptions = {}): AgentTool {
+export function createWebFetchTool(options: WebReaderOptions = {}): AgentTool<z.ZodTypeAny, string> {
   return {
     name: "web_fetch",
     description:
@@ -123,6 +142,7 @@ export function createWebFetchTool(options: WebReaderOptions = {}): AgentTool {
         .describe(`Optional timeout in seconds (maximum: ${MAX_FETCH_TIMEOUT_SECONDS}).`),
     }),
     readOnly: true,
+    concurrency: "shared",
     execute: async (args, context) => {
       const request = args as { url: string; format: WebFetchFormat; timeout?: number };
       return webFetch(request.url, {
@@ -136,8 +156,8 @@ export function createWebFetchTool(options: WebReaderOptions = {}): AgentTool {
 }
 
 function formatSearchResults(query: string, result: WebSearchResult): string {
-  if (result.results.length === 0) return NO_RESULTS;
-  const lines = [`# Search results for "${query}" (${result.provider})`, ""];
+  if (result.results.length === 0) return [NO_RESULTS, ...(result.limitations ?? [])].join("\n");
+  const lines = [`# Search results for "${query}" (${result.provider})`, ...(result.limitations ?? []), ""];
   for (const item of result.results) {
     lines.push(`## [${item.title || item.url}](${item.url})`);
     if (item.published) lines.push(`Published: ${item.published}`);
@@ -148,9 +168,12 @@ function formatSearchResults(query: string, result: WebSearchResult): string {
 }
 
 export async function webSearch(
-  request: { query: string; maxResults?: number },
+  request: WebSearchRequest,
   options: WebReaderOptions = {},
 ): Promise<WebSearchResult> {
+  request = SearchRequestSchema.parse(request);
+  options.signal?.throwIfAborted();
+  const filtered = !!(request.includeDomains?.length || request.excludeDomains?.length || request.startDate || request.endDate);
   const env = options.env ?? globalThis.process.env;
   const session = options.session ?? options.getSession?.();
   const providers = providerOrder(
@@ -158,33 +181,43 @@ export async function webSearch(
     env,
     session?.preferredProvider,
   );
-  const maxResults =
-    request.maxResults ?? options.search?.max_results ?? DEFAULT_SEARCH_RESULTS;
-  const errors: string[] = [];
-  let lastProvider: WebSearchProvider = providers[0] ?? "duckduckgo";
+  const requestedMax = request.maxResults ?? options.search?.max_results ?? DEFAULT_SEARCH_RESULTS;
+  const maxResults = Math.min(requestedMax, 20);
+  const errors: string[] = requestedMax > 20 ? ["Configured result count capped at 20 for backend compatibility."] : [];
+  let emptyProvider: WebSearchProvider | undefined;
   const now = Date.now();
   for (const provider of providers) {
-    lastProvider = provider;
-    if ((providerCooldowns.get(provider) ?? 0) > now) continue;
+    options.signal?.throwIfAborted();
+    if (request.page !== undefined && provider !== "brave") { errors.push(`${provider}: pagination unsupported; skipped`); continue; }
+    if (filtered && provider !== "tavily" && provider !== "exa") { errors.push(`${provider}: domain/date filters unsupported by this adapter; skipped`); continue; }
+    if ((providerCooldowns.get(provider) ?? 0) > now) { errors.push(`${provider}: cooling down`); continue; }
     try {
-      const results = await searchWith(provider, request.query, maxResults, options);
+      const page = await searchWith(provider, request.query, maxResults, options, request);
+      const results = page.results;
+      options.signal?.throwIfAborted();
       if (results.length === 0) {
+        emptyProvider = provider;
         errors.push(`${provider}: no results`);
         continue;
       }
       if (session) session.preferredProvider = provider;
-      return { provider, results };
+      return { provider, results: results.slice(0, maxResults), ...(page.nextPage !== undefined ? { nextPage: page.nextPage } : {}), ...(results.length > maxResults ? { truncated: true } : {}), ...(errors.length ? { limitations: errors.map(redactSecrets) } : {}) };
     } catch (error) {
+      options.signal?.throwIfAborted();
       if (error instanceof WebSearchRateLimitError) {
         setProviderCooldown(provider, error.retryAfterMs);
       }
       errors.push(`${provider}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  if (emptyProvider) {
+    const limitations = errors.filter((error) => !error.endsWith(": no results")).map(redactSecrets);
+    return { provider: emptyProvider, results: [], ...(limitations.length ? { limitations } : {}) };
+  }
   if (errors.length === 0) {
     throw new Error("search failed because every provider is cooling down");
   }
-  return { provider: lastProvider, results: [] };
+  throw new Error(`Web search failed; results could not be retrieved. ${redactSecrets(errors.join("; "))}`);
 }
 
 function providerOrder(
@@ -250,7 +283,8 @@ async function searchWith(
   query: string,
   maxResults: number,
   options: WebReaderOptions,
-): Promise<SearchResult[]> {
+  filters: WebSearchRequest,
+): Promise<{ results: SearchResult[]; nextPage?: number }> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const env = options.env ?? globalThis.process.env;
   const endpoints = { ...DEFAULT_ENDPOINTS, ...options.endpoints };
@@ -262,29 +296,30 @@ async function searchWith(
       searchInit({
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-        body: JSON.stringify({ query, max_results: maxResults }),
+        body: JSON.stringify({ query, max_results: maxResults, ...(filters.includeDomains?.length ? { include_domains: filters.includeDomains } : {}), ...(filters.excludeDomains?.length ? { exclude_domains: filters.excludeDomains } : {}), ...(filters.startDate ? { start_date: filters.startDate } : {}), ...(filters.endDate ? { end_date: filters.endDate } : {}) }),
       }, options.signal),
     );
     assertSearchResponse(response, provider);
     const body = (await readJson(response)) as {
       results?: Array<{ title?: string; url?: string; content?: string; published_date?: string }>;
     };
-    return (body.results ?? []).map((item) => ({
+    return { results: (body.results ?? []).map((item) => ({
       title: item.title ?? item.url ?? "untitled",
       url: item.url ?? "",
       snippet: item.content ?? "",
       published: item.published_date,
-    }));
+    })) };
   }
 
   if (provider === "brave") {
     const key = requireKey(env, "BRAVE_API_KEY");
     const response = await fetchImpl(
-      `${endpoints.brave}?q=${encodeURIComponent(query)}&count=${maxResults}`,
+      `${endpoints.brave}?q=${encodeURIComponent(query)}&count=${maxResults}${filters.page === undefined ? "" : `&offset=${filters.page}`}`,
       searchInit({ headers: { accept: "application/json", "x-subscription-token": key } }, options.signal),
     );
     assertSearchResponse(response, provider);
     const body = (await readJson(response)) as {
+      query?: { more_results_available?: boolean };
       web?: {
         results?: Array<{
           title?: string;
@@ -295,12 +330,12 @@ async function searchWith(
         }>;
       };
     };
-    return (body.web?.results ?? []).map((item) => ({
+    return { results: (body.web?.results ?? []).map((item) => ({
       title: item.title ?? item.url ?? "untitled",
       url: item.url ?? "",
       snippet: item.description ?? "",
       published: item.age ?? item.page_age,
-    }));
+    })), ...(body.query?.more_results_available && (filters.page ?? 0) < 9 ? { nextPage: (filters.page ?? 0) + 1 } : {}) };
   }
 
   if (provider === "exa") {
@@ -310,19 +345,19 @@ async function searchWith(
       searchInit({
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": key },
-        body: JSON.stringify({ query, numResults: maxResults }),
+        body: JSON.stringify({ query, numResults: maxResults, ...(filters.includeDomains?.length ? { includeDomains: filters.includeDomains } : {}), ...(filters.excludeDomains?.length ? { excludeDomains: filters.excludeDomains } : {}), ...(filters.startDate ? { startPublishedDate: `${filters.startDate}T00:00:00.000Z` } : {}), ...(filters.endDate ? { endPublishedDate: `${filters.endDate}T23:59:59.999Z` } : {}) }),
       }, options.signal),
     );
     assertSearchResponse(response, provider);
     const body = (await readJson(response)) as {
       results?: Array<{ title?: string; url?: string; text?: string; publishedDate?: string }>;
     };
-    return (body.results ?? []).map((item) => ({
+    return { results: (body.results ?? []).map((item) => ({
       title: item.title ?? item.url ?? "untitled",
       url: item.url ?? "",
       snippet: item.text ?? "",
       published: item.publishedDate,
-    }));
+    })) };
   }
 
   if (provider === "firecrawl") {
@@ -345,11 +380,11 @@ async function searchWith(
     };
     if (body.success === false) throw new Error(body.error ?? "firecrawl search failed");
     const items = Array.isArray(body.data) ? body.data : (body.data?.web ?? []);
-    return items.map((item) => ({
+    return { results: items.map((item) => ({
       title: item.title ?? item.url ?? "untitled",
       url: item.url ?? "",
       snippet: item.description ?? "",
-    }));
+    })) };
   }
 
   const response = await fetchImpl(
@@ -357,7 +392,7 @@ async function searchWith(
     searchInit({ headers: { accept: "text/html" } }, options.signal),
   );
   assertSearchResponse(response, provider);
-  return parseDuckDuckGo(await response.text(), maxResults);
+  return { results: parseDuckDuckGo(await response.text(), maxResults) };
 }
 
 export function parseDuckDuckGo(html: string, maxResults: number): SearchResult[] {

@@ -12,7 +12,7 @@ export const INSTALLER_PALETTE: InstallerPalette = {
   accent: "#7aa2f7",
   success: "#9ece6a",
   error: "#f7768e",
-  muted: "#7a86b8",
+  muted: "#8b96c9",
   text: "#c0caf5",
 };
 

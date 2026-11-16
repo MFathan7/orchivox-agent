@@ -2,8 +2,26 @@ import type { AgentMode } from "../types/schema";
 import { modeContract } from "./modes";
 
 export const PLAN_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "remote_read",
+  "desktop_read",
+  "browser_read",
+  "debug_read",
+  "ast_search",
+  "code_find",
+  "read_archive",
+  "read_notebook",
+  "github_read",
+  "context_checkpoint",
+  "context_rewind",
+  "lsp_definition",
+  "lsp_references",
+  "lsp_hover_type",
+  "lsp_workspace_symbols",
+  "lsp_code_actions",
+  "lsp_preview_file_rename",
   "read_file",
   "read_document",
+  "read_database",
   "glob_files",
   "grep_search",
   "diff_view",
@@ -27,6 +45,7 @@ export const PLAN_TOOL_NAMES: ReadonlySet<string> = new Set([
 export const BUILD_TOOL_NAMES: ReadonlySet<string> = new Set([
   "read_file",
   "read_document",
+  "read_database",
   "hash_edit",
   "replace_text",
   "create_file",
@@ -75,37 +94,3 @@ export function filterToolsForMode<T extends { name: string }>(
 
 /** Tools that only make sense in plan mode, even when ultrawork sees every tool. */
 export const PLAN_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["write_plan"]);
-
-/**
- * Read-only tools that depend on nothing another tool in the same turn writes.
- * Interactive or stateful reads stay out: `question` waits for the user, and
- * `shell` can leave side effects behind even when its intent is read-only.
- */
-export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
-  "read_file",
-  "read_document",
-  "read_skeleton",
-  "repo_map",
-  "repo_architecture_map",
-  "glob_files",
-  "grep_search",
-  "diff_view",
-  "json_query",
-  "lsp_workspace_symbols",
-  "lsp_hover_type",
-  "symbol_impact_analysis",
-  "diagnostics_check",
-  "web_search",
-  "web_fetch",
-  "inspect_image",
-  "todo_read",
-  "skill_list",
-  "task_list",
-  "bg_list",
-  "bg_logs",
-]);
-
-/** Tools whose results may be produced together without changing state. */
-export function isConcurrentSafeTool(name: string): boolean {
-  return READ_ONLY_TOOL_NAMES.has(name);
-}

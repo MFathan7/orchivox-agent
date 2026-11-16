@@ -38,6 +38,7 @@ export const ShellArgsSchema = z.object({
   timeoutMs: z.number().int().positive().max(600_000).optional(),
   /** Working directory for this call, relative to the current shell directory. */
   workdir: z.string().min(1).optional(),
+  isolatedState: z.boolean().optional().describe("Snapshot cwd and environment without persisting changes. Enables parallel independent commands; workspace files are still shared."),
 });
 export type ShellArgs = z.infer<typeof ShellArgsSchema>;
 
@@ -58,9 +59,10 @@ export interface ShellMeta {
 export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
   readonly name: string;
   readonly description =
-    "Run a shell command. The working directory and exported environment persist between calls. Use workdir instead of cd. For a dev server or long-running process, use bg_start. Use curl --max-time or --connect-timeout for HTTP probes.";
+    "Run a shell command. The working directory and exported environment persist between calls. Use workdir instead of cd. Set isolatedState: true only for independent commands that do not need persistent cwd/env updates or share writable outputs; workspace files are not isolated. For a dev server or long-running process, use bg_start. Use curl --max-time or --connect-timeout for HTTP probes.";
   readonly parameters = ShellArgsSchema;
   readonly readOnly = false;
+  readonly concurrency = (args: Record<string, unknown>): "shared" | "exclusive" => args.isolatedState === true ? "shared" : "exclusive";
 
   private readonly defaultDir: string;
   private readonly baseEnv: Record<string, string>;
@@ -101,7 +103,8 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       }
     }
     const root = currentTurnContext()?.workspaceRoot ?? this.defaultDir;
-    const state = this.stateFor(root);
+    const persistent = this.stateFor(root);
+    const state = args.isolatedState ? { dir: persistent.dir, env: { ...persistent.env } } : persistent;
     const adapter = this.resolveAdapter();
     const workdir = args.workdir ? resolve(state.dir, args.workdir) : state.dir;
     assertWorkdir(workdir);

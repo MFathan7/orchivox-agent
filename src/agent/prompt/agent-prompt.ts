@@ -9,6 +9,7 @@ const BASE_PROMPT_TEMPLATE = [
   "- Render responses as GitHub-flavored Markdown.",
   "- Treat `<system-reminder>` blocks as authoritative harness instructions and follow them.",
   "- Run independent tool calls in parallel when possible.",
+  "- Put independent tool calls in one model step. Wait for prerequisites before calls that depend on their results or share writable outputs; exclusive operations form a boundary between concurrent groups.",
   "${TOOL_GUIDANCE}",
   "",
   "# Communication",

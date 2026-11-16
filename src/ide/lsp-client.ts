@@ -3,6 +3,12 @@ import { z } from "zod";
 
 import type { AgentTool, ToolRegistry } from "../tools/registry";
 import { StdioFramedTransport } from "./framing";
+import type { HashlineLifecycle } from "../tools/hashline-edit";
+import { parseWorkspaceEdit, registerLspActionTools } from "./lsp-actions";
+import { LspFailure, lspFailure } from "./lsp-status";
+import type { ToolOutput } from "../types/schema";
+import { applyWorkspaceUpdates } from "./workspace-edits";
+import { ToolResultError } from "../tools/result";
 
 export interface LSPDiagnostic {
   file: string;
@@ -24,8 +30,9 @@ export interface LSPWorkspaceSymbol {
   kind: string;
   containerName?: string;
   file: string;
-  line: number;
-  column: number;
+  line?: number;
+  column?: number;
+  uri?: string;
 }
 
 export interface LSPClientOptions {
@@ -33,6 +40,7 @@ export interface LSPClientOptions {
   args?: string[];
   env?: Record<string, string>;
   diagnosticTimeoutMs?: number;
+  requestTimeoutMs?: number;
 }
 
 interface RawRange {
@@ -65,12 +73,14 @@ export class LSPClient {
   private readonly args: string[];
   private readonly env: Record<string, string> | undefined;
   private readonly diagnosticTimeoutMs: number;
+  private readonly requestTimeoutMs: number;
   private transport: StdioFramedTransport | undefined;
   private serverCapabilities: unknown;
+  private initialized = false;
   private nextId = 1;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly latestDiagnostics = new Map<string, LSPDiagnostic[]>();
-  private readonly diagnosticWaiters = new Map<string, Array<(diagnostics: LSPDiagnostic[]) => void>>();
+  private readonly diagnosticWaiters = new Map<string, Array<{ resolve: (diagnostics: LSPDiagnostic[]) => void; reject: (error: Error) => void }>>();
   private readonly openDocuments = new Set<string>();
   private readonly documentVersions = new Map<string, number>();
 
@@ -79,76 +89,99 @@ export class LSPClient {
     this.args = options.args ?? [];
     this.env = options.env;
     this.diagnosticTimeoutMs = options.diagnosticTimeoutMs ?? 250;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   }
 
-  async initialize(workspaceRoot: string): Promise<void> {
+  async initialize(workspaceRoot: string, signal?: AbortSignal): Promise<void> {
     if (this.transport) throw new Error("language client is already initialized");
-    this.transport = new StdioFramedTransport(this.command, this.args, { env: this.env });
+    try { this.transport = new StdioFramedTransport(this.command, this.args, { env: this.env }); }
+    catch (error) { throw new LspFailure("not_ready", "initialize", error instanceof Error ? error.message : String(error)); }
     this.transport.onMessage((message) => this.handleMessage(message));
+    const activeTransport = this.transport;
+    this.transport.onClose((error) => {
+      if (this.transport !== activeTransport) return;
+      this.initialized = false;
+      for (const pending of [...this.pending.values()]) pending.reject(new LspFailure("server_exited", "transport", error.message));
+      for (const waiters of [...this.diagnosticWaiters.values()]) for (const waiter of [...waiters]) waiter.reject(new LspFailure("server_exited", "diagnostics", error.message));
+    });
 
     const rootUri = pathToFileURL(workspaceRoot).toString();
-    const result = (await this.request("initialize", {
-      processId: globalThis.process.pid ?? null,
-      rootUri,
-      workspaceFolders: [{ uri: rootUri, name: workspaceRoot.split(/[\\/]/).pop() ?? workspaceRoot }],
-      capabilities: {
-        textDocument: {
-          synchronization: { didSave: true },
-          publishDiagnostics: {},
-          rename: { prepareSupport: false },
-          definition: {},
-          references: {},
+    try {
+      const result = (await this.request("initialize", {
+        processId: globalThis.process.pid ?? null,
+        rootUri,
+        workspaceFolders: [{ uri: rootUri, name: workspaceRoot.split(/[\\/]/).pop() ?? workspaceRoot }],
+        capabilities: {
+          textDocument: {
+            synchronization: { didSave: true },
+            publishDiagnostics: {},
+            rename: { prepareSupport: false },
+            definition: {},
+            references: {},
+            codeAction: { resolveSupport: { properties: ["edit"] } },
+          },
+          workspace: { workspaceFolders: true, fileOperations: { willRename: true, didRename: true } },
         },
-        workspace: { workspaceFolders: true },
-      },
-    })) as { capabilities?: unknown };
-    this.serverCapabilities = result.capabilities ?? {};
-    this.notify("initialized", {});
+      }, signal)) as { capabilities?: unknown };
+      if (!result || typeof result !== "object") throw new LspFailure("invalid_response", "initialize", "Language server returned an invalid initialize response.");
+      this.serverCapabilities = result.capabilities ?? {};
+      this.notify("initialized", {});
+      this.initialized = true;
+    } catch (error) {
+      await this.transport.close();
+      this.transport = undefined;
+      throw lspFailure(error, "initialize", signal);
+    }
   }
 
-  async notifyFileChanged(filePath: string, newContent: string): Promise<LSPDiagnostic[]> {
+  async notifyFileChanged(filePath: string, newContent: string, signal?: AbortSignal): Promise<LSPDiagnostic[]> {
+    if (signal?.aborted) throw new LspFailure("cancelled", "diagnostics", "Language server diagnostics cancelled.");
     const transport = this.assertReady();
     const uri = pathToFileURL(filePath).toString();
     const version = (this.documentVersions.get(uri) ?? 0) + 1;
     this.documentVersions.set(uri, version);
-    const waiting = this.awaitDiagnostics(uri);
-
-    if (!this.openDocuments.has(uri)) {
-      this.openDocuments.add(uri);
-      transport.send({
-        jsonrpc: "2.0",
-        method: "textDocument/didOpen",
-        params: {
-          textDocument: { uri, languageId: languageIdFor(filePath), version, text: newContent },
-        },
-      });
-    } else {
-      transport.send({
-        jsonrpc: "2.0",
-        method: "textDocument/didChange",
-        params: {
-          textDocument: { uri, version },
-          contentChanges: [{ text: newContent }],
-        },
-      });
+    const waiting = this.awaitDiagnostics(uri, signal);
+    void waiting.catch(() => {});
+    try {
+      if (!this.openDocuments.has(uri)) {
+        this.openDocuments.add(uri);
+        transport.send({
+          jsonrpc: "2.0",
+          method: "textDocument/didOpen",
+          params: {
+            textDocument: { uri, languageId: languageIdFor(filePath), version, text: newContent },
+          },
+        });
+      } else {
+        transport.send({
+          jsonrpc: "2.0",
+          method: "textDocument/didChange",
+          params: {
+            textDocument: { uri, version },
+            contentChanges: [{ text: newContent }],
+          },
+        });
+      }
+    } catch (error) {
+      for (const waiter of [...(this.diagnosticWaiters.get(uri) ?? [])]) waiter.reject(lspFailure(error, "diagnostics", signal));
     }
     return waiting;
   }
 
-  async definition(filePath: string, line: number, column: number): Promise<string[]> {
+  async definition(filePath: string, line: number, column: number, signal?: AbortSignal): Promise<string[]> {
     const result = await this.request("textDocument/definition", {
       textDocument: { uri: pathToFileURL(filePath).toString() },
       position: { line: line - 1, character: column - 1 },
-    });
+    }, signal);
     return formatLocations(result);
   }
 
-  async references(filePath: string, line: number, column: number, includeDeclaration = true): Promise<string[]> {
+  async references(filePath: string, line: number, column: number, includeDeclaration = true, signal?: AbortSignal): Promise<string[]> {
     const result = await this.request("textDocument/references", {
       textDocument: { uri: pathToFileURL(filePath).toString() },
       position: { line: line - 1, character: column - 1 },
       context: { includeDeclaration },
-    });
+    }, signal);
     return formatLocations(result);
   }
 
@@ -158,64 +191,63 @@ export class LSPClient {
       position: { line: line - 1, character: column - 1 },
       newName,
     })) as WorkspaceEdit | null;
-    if (!result) return [];
-    const editsByFile = collectWorkspaceEdits(result);
-    const changed: string[] = [];
+    if (result === null) return [];
+    const editsByFile = collectWorkspaceEdits(parseWorkspaceEdit(result));
+    const updates = [];
     for (const [file, edits] of editsByFile) {
       const handle = Bun.file(file);
       const content = (await handle.exists()) ? await handle.text() : "";
-      await Bun.write(file, applyTextEdits(content, edits));
-      changed.push(file);
+      updates.push({ file, before: content, after: applyTextEdits(content, edits) });
     }
-    return changed;
+    const outcome = await applyWorkspaceUpdates({ updates });
+    if (outcome.status !== "success" && outcome.status !== "empty") throw new ToolResultError(outcome);
+    return (outcome.data as { changedFiles: string[] }).changedFiles;
   }
 
   isReady(): boolean {
-    return Boolean(this.transport);
+    return this.initialized && this.transport?.isOpen() === true;
   }
 
-  async hover(filePath: string, line: number, column: number): Promise<string | null> {
-    if (!this.transport) return null;
-    try {
-      const result = await this.request("textDocument/hover", {
-        textDocument: { uri: pathToFileURL(filePath).toString() },
-        position: { line: line - 1, character: column - 1 },
-      });
-      return formatHover(result);
-    } catch {
-      return null;
-    }
+  async hover(filePath: string, line: number, column: number, signal?: AbortSignal): Promise<string | null> {
+    const result = await this.request("textDocument/hover", {
+      textDocument: { uri: pathToFileURL(filePath).toString() },
+      position: { line: line - 1, character: column - 1 },
+    }, signal);
+    return formatHover(result);
   }
 
-  async workspaceSymbols(query: string): Promise<LSPWorkspaceSymbol[]> {
-    if (!this.transport) return [];
-    try {
-      const result = await this.request("workspace/symbol", { query });
-      return formatWorkspaceSymbols(result);
-    } catch {
-      return [];
-    }
+  async workspaceSymbols(query: string, signal?: AbortSignal): Promise<LSPWorkspaceSymbol[]> {
+    const result = await this.request("workspace/symbol", { query }, signal);
+    return formatWorkspaceSymbols(result);
   }
 
-  registerTools(registry: ToolRegistry): void {
-    registry.register(this.renameTool());
+  registerTools(registry: ToolRegistry, lifecycle: HashlineLifecycle = {}): void {
+    const applyEdit = registerLspActionTools(registry, this, lifecycle);
+    registry.register(this.renameTool(applyEdit));
     registry.register(this.definitionTool());
     registry.register(this.referencesTool());
   }
 
+  protocolRequest(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> { return this.request(method, params, signal); }
+  protocolNotify(method: string, params: unknown): void { this.notify(method, params); }
+
   async dispose(): Promise<void> {
     if (!this.transport) return;
+    for (const pending of this.pending.values()) pending.reject(new LspFailure("not_ready", "dispose", "Language client disposed."));
+    this.pending.clear();
+    for (const waiters of [...this.diagnosticWaiters.values()]) for (const waiter of [...waiters]) waiter.reject(new LspFailure("not_ready", "diagnostics", "Language client disposed."));
     try {
-      await this.request("shutdown", null);
+      await this.request("shutdown", null, AbortSignal.timeout(Math.min(1000, this.requestTimeoutMs)));
       this.notify("exit", {});
     } catch {
       // the server may already be gone
     }
     await this.transport.close();
     this.transport = undefined;
+    this.initialized = false;
   }
 
-  private renameTool(): AgentTool {
+  private renameTool(applyEdit: (filePath: string, edit: unknown, signal?: AbortSignal) => Promise<ToolOutput>): AgentTool {
     return {
       name: "lsp_rename",
       description:
@@ -227,11 +259,14 @@ export class LSPClient {
         newName: z.string().min(1),
       }),
       readOnly: false,
-      execute: async (args) => {
+      execute: async (args, context) => {
         const typed = args as { filePath: string; line: number; column: number; newName: string };
-        const changed = await this.rename(typed.filePath, typed.line, typed.column, typed.newName);
-        if (changed.length === 0) return "rename produced no edits";
-        return `renamed to "${typed.newName}" in ${changed.length} file(s):\n${changed.join("\n")}`;
+        const edit = await this.request("textDocument/rename", {
+          textDocument: { uri: pathToFileURL(typed.filePath).href },
+          position: { line: typed.line - 1, character: typed.column - 1 }, newName: typed.newName,
+        }, context?.signal);
+        if (edit === null) return { status: "empty", text: "rename produced no edits", sources: [{ uri: "lsp:textDocument/rename", title: "Language server" }] };
+        return applyEdit(typed.filePath, parseWorkspaceEdit(edit), context?.signal);
       },
     };
   }
@@ -246,10 +281,11 @@ export class LSPClient {
         column: z.number().int().positive(),
       }),
       readOnly: true,
-      execute: async (args) => {
+      concurrency: "shared",
+      execute: async (args, context) => {
         const typed = args as { filePath: string; line: number; column: number };
-        const locations = await this.definition(typed.filePath, typed.line, typed.column);
-        return locations.length > 0 ? locations.join("\n") : "no definition found";
+        const locations = await this.definition(typed.filePath, typed.line, typed.column, context?.signal);
+        return { status: locations.length ? "success" : "empty", text: locations.length > 0 ? locations.join("\n") : "Language server returned no definition.", sources: [{ uri: "lsp:textDocument/definition", title: "Language server" }] };
       },
     };
   }
@@ -265,7 +301,8 @@ export class LSPClient {
         includeDeclaration: z.boolean().default(true),
       }),
       readOnly: true,
-      execute: async (args) => {
+      concurrency: "shared",
+      execute: async (args, context) => {
         const typed = args as {
           filePath: string;
           line: number;
@@ -276,19 +313,35 @@ export class LSPClient {
           typed.filePath,
           typed.line,
           typed.column,
-          typed.includeDeclaration,
+          typed.includeDeclaration, context?.signal,
         );
-        return locations.length > 0 ? locations.join("\n") : "no references found";
+        return { status: locations.length ? "success" : "empty", text: locations.length > 0 ? locations.join("\n") : "Language server returned no references.", sources: [{ uri: "lsp:textDocument/references", title: "Language server" }] };
       },
     };
   }
 
-  private request(method: string, params: unknown): Promise<unknown> {
-    const transport = this.assertReady();
+  private request(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) return Promise.reject(new LspFailure("cancelled", method, `Language server request cancelled: ${method}`));
+    let transport: StdioFramedTransport;
+    try {
+      transport = this.assertReady();
+      if (method !== "initialize" && method !== "shutdown" && !this.initialized) throw new LspFailure("not_ready", method, "Language server is not initialized.");
+    } catch (error) { return Promise.reject(lspFailure(error, method, signal)); }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      transport.send({ jsonrpc: "2.0", id, method, params });
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); this.pending.delete(id); };
+      const cancel = (error: Error) => {
+        cleanup();
+        try { transport.send({ jsonrpc: "2.0", method: "$/cancelRequest", params: { id } }); } catch { /* Server may have exited. */ }
+        reject(error);
+      };
+      const abort = () => cancel(new LspFailure("cancelled", method, `Language server request cancelled: ${method}`));
+      const timer = setTimeout(() => cancel(new LspFailure("timeout", method, `Language server request timed out after ${this.requestTimeoutMs}ms: ${method}`)), this.requestTimeoutMs);
+      this.pending.set(id, { resolve: (value) => { cleanup(); resolve(value); }, reject: (error) => { cleanup(); reject(error instanceof LspFailure ? new LspFailure(error.kind, method, error.message) : lspFailure(error, method, signal)); } });
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) { abort(); return; }
+      try { transport.send({ jsonrpc: "2.0", id, method, params }); }
+      catch (error) { cleanup(); reject(new LspFailure("server_exited", method, error instanceof Error ? error.message : String(error))); }
     });
   }
 
@@ -297,7 +350,8 @@ export class LSPClient {
   }
 
   private assertReady(): StdioFramedTransport {
-    if (!this.transport) throw new Error("call initialize() before using the language client");
+    if (!this.transport) throw new LspFailure("not_ready", "transport", "call initialize() before using the language client");
+    if (!this.transport.isOpen()) throw new LspFailure("server_exited", "transport", "Language server is no longer running.");
     return this.transport;
   }
 
@@ -305,7 +359,7 @@ export class LSPClient {
     const message = raw as {
       id?: number;
       result?: unknown;
-      error?: { message?: string };
+      error?: { message?: string; code?: number };
       method?: string;
       params?: unknown;
     };
@@ -313,7 +367,7 @@ export class LSPClient {
       const entry = this.pending.get(message.id);
       if (!entry) return;
       this.pending.delete(message.id);
-      if (message.error) entry.reject(new Error(message.error.message ?? "language server request failed"));
+      if (message.error) entry.reject(new LspFailure(message.error.code === -32601 ? "unsupported" : message.error.code === -32800 ? "cancelled" : "protocol_error", "response", message.error.message ?? "language server request failed"));
       else entry.resolve(message.result);
       return;
     }
@@ -323,28 +377,28 @@ export class LSPClient {
       this.latestDiagnostics.set(params.uri, mapped);
       const waiters = this.diagnosticWaiters.get(params.uri) ?? [];
       this.diagnosticWaiters.delete(params.uri);
-      for (const waiter of waiters) waiter(mapped);
+      for (const waiter of waiters) waiter.resolve(mapped);
     }
   }
 
-  private awaitDiagnostics(uri: string): Promise<LSPDiagnostic[]> {
-    return new Promise((resolve) => {
-      let timer: ReturnType<typeof setTimeout>;
-      const waiter = (diagnostics: LSPDiagnostic[]): void => {
+  private awaitDiagnostics(uri: string, signal?: AbortSignal): Promise<LSPDiagnostic[]> {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
         clearTimeout(timer);
-        resolve(diagnostics);
-      };
-      timer = setTimeout(() => {
+        signal?.removeEventListener("abort", abort);
         const remaining = (this.diagnosticWaiters.get(uri) ?? []).filter((entry) => entry !== waiter);
-        if (remaining.length > 0) this.diagnosticWaiters.set(uri, remaining);
-        else this.diagnosticWaiters.delete(uri);
-        resolve([]);
-      }, this.diagnosticTimeoutMs);
+        if (remaining.length) this.diagnosticWaiters.set(uri, remaining); else this.diagnosticWaiters.delete(uri);
+      };
+      const waiter = { resolve: (diagnostics: LSPDiagnostic[]) => { cleanup(); resolve(diagnostics); }, reject: (error: Error) => { cleanup(); reject(error); } };
+      const abort = () => waiter.reject(new LspFailure("cancelled", "diagnostics", "Language server diagnostics cancelled."));
+      const timer = setTimeout(() => waiter.reject(new LspFailure("timeout", "diagnostics", `No language-server diagnostic publication arrived within ${this.diagnosticTimeoutMs}ms.`)), this.diagnosticTimeoutMs);
       const waiters = this.diagnosticWaiters.get(uri) ?? [];
-      waiters.push(waiter);
-      this.diagnosticWaiters.set(uri, waiters);
+      waiters.push(waiter); this.diagnosticWaiters.set(uri, waiters);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
     });
   }
+
 }
 
 function toDiagnostic(uri: string, raw: RawDiagnostic): LSPDiagnostic {
@@ -360,13 +414,15 @@ function toDiagnostic(uri: string, raw: RawDiagnostic): LSPDiagnostic {
 }
 
 function formatLocations(raw: unknown): string[] {
-  const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
-  return list.map((item) => {
-    const entry = item as { uri?: string; targetUri?: string; range?: RawRange; targetSelectionRange?: RawRange };
-    const uri = entry.uri ?? entry.targetUri ?? "";
-    const range = entry.range ?? entry.targetSelectionRange;
-    const file = uri.startsWith("file:") ? fileURLToPath(uri) : uri;
-    return `${file}:${(range?.start.line ?? 0) + 1}:${(range?.start.character ?? 0) + 1}`;
+  if (raw === null) return [];
+  const location = z.union([z.object({ uri: z.string().min(1), range: RawRangeSchema }), z.object({ targetUri: z.string().min(1), targetSelectionRange: RawRangeSchema })]);
+  const parsed = z.union([location, z.array(location)]).safeParse(raw);
+  if (!parsed.success) throw new LspFailure("invalid_response", "navigation", "Language server returned invalid navigation locations.");
+  const entries = Array.isArray(parsed.data) ? parsed.data : [parsed.data];
+  return entries.map((entry) => {
+    const uri = "uri" in entry ? entry.uri : entry.targetUri;
+    const range = "range" in entry ? entry.range : entry.targetSelectionRange;
+    return `${uri.startsWith("file:") ? fileURLToPath(uri) : uri}:${range.start.line + 1}:${range.start.character + 1}`;
   });
 }
 
@@ -438,34 +494,17 @@ function languageIdFor(filePath: string): string {
   }
 }
 
-function formatHover(raw: unknown): string | null {
-  if (!raw || typeof raw !== "object") return null;
-  const hover = raw as { contents?: unknown };
-  if (!hover.contents) return null;
+const RawPositionSchema = z.object({ line: z.number().int().nonnegative(), character: z.number().int().nonnegative() });
+const RawRangeSchema = z.object({ start: RawPositionSchema, end: RawPositionSchema });
+const MarkedStringSchema = z.union([z.string(), z.object({ value: z.string(), language: z.string().optional(), kind: z.string().optional() })]);
 
-  if (typeof hover.contents === "string") {
-    return hover.contents;
-  }
-  if (Array.isArray(hover.contents)) {
-    return hover.contents
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (part && typeof part === "object" && "value" in part) {
-          const typed = part as { language?: string; value: string };
-          return typed.language ? `\`\`\`${typed.language}\n${typed.value}\n\`\`\`` : typed.value;
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n\n");
-  }
-  if (typeof hover.contents === "object") {
-    const obj = hover.contents as { kind?: string; value?: string; language?: string };
-    if (obj.value) {
-      return obj.language ? `\`\`\`${obj.language}\n${obj.value}\n\`\`\`` : obj.value;
-    }
-  }
-  return null;
+function formatHover(raw: unknown): string | null {
+  if (raw === null) return null;
+  const parsed = z.object({ contents: z.union([MarkedStringSchema, z.array(MarkedStringSchema)]) }).safeParse(raw);
+  if (!parsed.success) throw new LspFailure("invalid_response", "textDocument/hover", "Language server returned an invalid hover response.");
+  const format = (part: z.infer<typeof MarkedStringSchema>) => typeof part === "string" ? part : part.language ? `\`\`\`${part.language}\n${part.value}\n\`\`\`` : part.value;
+  const text = Array.isArray(parsed.data.contents) ? parsed.data.contents.map(format).join("\n\n") : format(parsed.data.contents);
+  return text.trim() ? text : null;
 }
 
 const LSP_SYMBOL_KINDS: Record<number, string> = {
@@ -498,33 +537,15 @@ const LSP_SYMBOL_KINDS: Record<number, string> = {
 };
 
 function formatWorkspaceSymbols(raw: unknown): LSPWorkspaceSymbol[] {
-  if (!Array.isArray(raw)) return [];
-  const results: LSPWorkspaceSymbol[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== "object") continue;
-    const entry = item as {
-      name?: string;
-      kind?: number;
-      containerName?: string;
-      location?: {
-        uri?: string;
-        range?: RawRange;
-      };
-    };
-    if (!entry.name || !entry.location?.uri) continue;
+  if (raw === null) return [];
+  const parsed = z.array(z.object({ name: z.string().min(1), kind: z.number().int(), containerName: z.string().optional(), location: z.object({ uri: z.string().min(1), range: RawRangeSchema.optional() }) })).safeParse(raw);
+  if (!parsed.success) throw new LspFailure("invalid_response", "workspace/symbol", "Language server returned an invalid workspace symbol response.");
+  return parsed.data.map((entry) => {
     const uri = entry.location.uri;
-    const file = uri.startsWith("file:") ? fileURLToPath(uri) : uri;
-    const line = (entry.location.range?.start.line ?? 0) + 1;
-    const column = (entry.location.range?.start.character ?? 0) + 1;
-    const kind = (entry.kind && LSP_SYMBOL_KINDS[entry.kind]) || "symbol";
-    results.push({
-      name: entry.name,
-      kind,
-      containerName: entry.containerName,
-      file,
-      line,
-      column,
-    });
-  }
-  return results;
+    return {
+      name: entry.name, kind: LSP_SYMBOL_KINDS[entry.kind] ?? "symbol", containerName: entry.containerName, uri,
+      file: uri.startsWith("file:") ? fileURLToPath(uri) : uri,
+      ...(entry.location.range ? { line: entry.location.range.start.line + 1, column: entry.location.range.start.character + 1 } : {}),
+    };
+  });
 }

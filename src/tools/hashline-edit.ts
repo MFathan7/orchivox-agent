@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
-import { mkdir, unlink } from "node:fs/promises";
+import { constants, existsSync } from "node:fs";
+import { copyFile, mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { applyPatch } from "diff";
 import { z } from "zod";
@@ -133,14 +133,28 @@ export const ReadFileArgsSchema = z.object({
 });
 export type ReadFileArgs = z.infer<typeof ReadFileArgsSchema>;
 
-export function createReadFileTool(): AgentTool<typeof ReadFileArgsSchema> {
+export function createReadFileTool(): AgentTool<typeof ReadFileArgsSchema, string> {
   return {
     name: "read_file",
     description:
-      "Read a text file as numbered lines with 3-hex line hashes (format 14:a8f| line). The number:hash part is a valid anchor for hash_edit.",
+      "Read a text file as numbered lines with 3-hex line hashes (format 14:a8f| line), or list a directory with pagination. Only file lines are hash_edit anchors. Use read_database for SQLite and read_document for PDF or Office files.",
     parameters: ReadFileArgsSchema,
     readOnly: true,
+    concurrency: "shared",
     async execute(args) {
+      const info = await stat(args.filePath);
+      if (info.isDirectory()) {
+        const entries = (await readdir(args.filePath, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name, "en"));
+        const first = args.offset - 1;
+        const page = entries.slice(first, first + Math.min(args.limit, 200));
+        const body = page.map((entry) => `${entry.isDirectory() ? "[dir]" : entry.isSymbolicLink() ? "[link]" : "[file]"} ${JSON.stringify(entry.name)}`).join("\n");
+        const preview = truncateHead(body, { maxBytes: 40_000 });
+        const count = body ? preview.keptLines : 0;
+        const next = first + count < entries.length ? `\n[next] offset ${args.offset + count}` : "";
+        return `[directory] ${args.filePath} | ${count} of ${entries.length} entries\n${body ? preview.text : "[empty page]"}${next}`;
+      }
+      const prefix = new Uint8Array(await Bun.file(args.filePath).slice(0, 16).arrayBuffer());
+      if (new TextDecoder().decode(prefix) === "SQLite format 3\u0000") throw new Error("Use read_database to inspect SQLite schema or rows without shell commands.");
       const lines = splitLines(await readText(args.filePath));
       const slice = lines.slice(args.offset - 1, args.offset - 1 + args.limit);
       if (slice.length === 0) return `no lines to show: the file has ${lines.length} line(s)`;
@@ -178,7 +192,7 @@ export const HashEditArgsSchema = z
   );
 export type HashEditArgs = z.infer<typeof HashEditArgsSchema>;
 
-export function createHashEditTool(lifecycle: HashlineLifecycle = {}): AgentTool<typeof HashEditArgsSchema> {
+export function createHashEditTool(lifecycle: HashlineLifecycle = {}): AgentTool<typeof HashEditArgsSchema, string> {
   return {
     name: "hash_edit",
     description:
@@ -284,7 +298,7 @@ function countOccurrences(text: string, needle: string): number {
 
 export function createReplaceTextTool(
   lifecycle: HashlineLifecycle = {},
-): AgentTool<typeof ReplaceTextArgsSchema> {
+): AgentTool<typeof ReplaceTextArgsSchema, string> {
   return {
     name: "replace_text",
     description:
@@ -332,7 +346,7 @@ export interface CreateFileToolOptions {
 export function createCreateFileTool(
   lifecycle: HashlineLifecycle = {},
   options: CreateFileToolOptions = {},
-): AgentTool<typeof CreateFileArgsSchema> {
+): AgentTool<typeof CreateFileArgsSchema, string> {
   return {
     name: "create_file",
     description:
@@ -379,7 +393,7 @@ export const DeleteFileArgsSchema = z.object({
 });
 export type DeleteFileArgs = z.infer<typeof DeleteFileArgsSchema>;
 
-export function createDeleteFileTool(lifecycle: HashlineLifecycle = {}): AgentTool<typeof DeleteFileArgsSchema> {
+export function createDeleteFileTool(lifecycle: HashlineLifecycle = {}): AgentTool<typeof DeleteFileArgsSchema, string> {
   return {
     name: "delete_file",
     description: "Delete an existing file from the filesystem.",
@@ -406,7 +420,7 @@ export const MoveFileArgsSchema = z.object({
 });
 export type MoveFileArgs = z.infer<typeof MoveFileArgsSchema>;
 
-export function createMoveFileTool(lifecycle: HashlineLifecycle = {}): AgentTool<typeof MoveFileArgsSchema> {
+export function createMoveFileTool(lifecycle: HashlineLifecycle = {}): AgentTool<typeof MoveFileArgsSchema, string> {
   return {
     name: "move_file",
     description:
@@ -414,6 +428,7 @@ export function createMoveFileTool(lifecycle: HashlineLifecycle = {}): AgentTool
     parameters: MoveFileArgsSchema,
     readOnly: false,
     async execute(args) {
+      if (resolve(args.sourcePath) === resolve(args.destinationPath)) throw new EditRejectedError("Source and destination must be different paths.");
       const srcFile = Bun.file(args.sourcePath);
       if (!(await srcFile.exists())) {
         throw new EditRejectedError(`source file not found: ${args.sourcePath}`);
@@ -434,12 +449,14 @@ export function createMoveFileTool(lifecycle: HashlineLifecycle = {}): AgentTool
         await mkdir(destParent, { recursive: true });
       }
 
-      const content = await srcFile.text();
-      await Bun.write(args.destinationPath, content);
+      await copyFile(args.sourcePath, args.destinationPath, args.overwrite ? 0 : constants.COPYFILE_EXCL);
       await unlink(args.sourcePath);
 
       await lifecycle.onAfterModify?.(args.sourcePath, "");
-      await lifecycle.onAfterModify?.(args.destinationPath, content);
+      const bytes = new Uint8Array(await Bun.file(args.destinationPath).arrayBuffer());
+      let content: string | undefined;
+      try { if (!bytes.includes(0)) content = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch {}
+      if (content !== undefined) await lifecycle.onAfterModify?.(args.destinationPath, content);
       return `moved ${args.sourcePath} to ${args.destinationPath}`;
     },
   };
@@ -453,7 +470,7 @@ export type ApplyUnifiedPatchArgs = z.infer<typeof ApplyUnifiedPatchArgsSchema>;
 
 export function createApplyUnifiedPatchTool(
   lifecycle: HashlineLifecycle = {},
-): AgentTool<typeof ApplyUnifiedPatchArgsSchema> {
+): AgentTool<typeof ApplyUnifiedPatchArgsSchema, string> {
   return {
     name: "apply_unified_patch",
     description: "Apply a standard unified diff / patch to an existing file.",

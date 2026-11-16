@@ -277,6 +277,7 @@ export type InboundServerConfig = z.infer<typeof InboundServerConfigSchema>;
 
 export const LspServerConfigSchema = z.object({
   command: z.string().min(1),
+  request_timeout_ms: z.number().int().min(100).max(120_000).default(30_000),
   args: z.array(z.string()).default([]),
   root_markers: z.array(z.string().min(1)).default([]),
   env: z.record(z.string(), z.string()).default({}),
@@ -293,11 +294,28 @@ export const McpServerConfigSchema = z
     headers: z.record(z.string(), z.string()).default({}),
     env: z.record(z.string(), z.string()).default({}),
     enabled: z.boolean().default(true),
+    oauth: z.object({
+      client_id: z.string().min(1).max(2048).optional(),
+      issuer: z.url().optional(),
+      scope: z.string().max(4096).regex(/^[\x20-\x7e]*$/).optional(),
+      redirect_port: z.number().int().min(1).max(65535).optional(),
+    }).strict().refine((value) => !value.client_id || !!value.issuer, "A pre-registered OAuth client requires its issuer URL.").optional(),
   })
   .refine((value) => (value.transport === "stdio" ? value.command !== undefined : value.url !== undefined), {
     message: "stdio transport requires command, http and sse transports require url",
   });
 export type McpServerConfig = z.infer<typeof McpServerConfigSchema>;
+
+export const McpLifecycleConfigSchema = z.object({
+  connect_concurrency: z.number().int().min(1).max(32).default(4),
+  connect_timeout_ms: z.number().int().min(1).default(10000),
+  request_timeout_ms: z.number().int().min(1).default(60000),
+  reconnect_attempts: z.number().int().min(0).max(10).default(2),
+  reconnect_delay_ms: z.number().int().min(1).default(500),
+  cache_ttl_ms: z.number().int().min(0).default(300000),
+  max_catalog_pages: z.number().int().min(1).max(1000).default(100),
+});
+export type McpLifecycleConfig = z.infer<typeof McpLifecycleConfigSchema>;
 
 export const FilesystemPermissionsSchema = z.object({
   read: z.array(z.string().min(1)).default(["**/*"]),
@@ -408,6 +426,7 @@ export const LimitsConfigSchema = z.object({
   turn_tokens: z.number().int().positive().optional(),
   // Stop a turn after this many tool calls. 0 disables the check.
   max_tool_calls: z.number().int().nonnegative().default(100),
+  tool_argument_retries: z.number().int().min(0).max(2).default(1),
   // Suppress an identical tool call after this many in one turn. 0 disables it.
   max_repeated_calls: z.number().int().nonnegative().default(0),
   // Stop a turn after this many seconds. 0 disables the check.
@@ -429,6 +448,9 @@ export const LimitsConfigSchema = z.object({
 export type LimitsConfig = z.infer<typeof LimitsConfigSchema>;
 
 export const ToolsConfigSchema = z.object({
+  max_concurrent: z.number().int().min(1).max(16).default(4),
+  eval_max_kernels: z.number().int().min(1).max(32).default(8),
+  eval_idle_seconds: z.number().int().min(60).max(3600).default(600),
   // Off by default. read-only batches read tools; full adds file edits.
   code_mode: z.enum(["off", "read-only", "full"]).default("off"),
   // Maximum files returned by glob_files.
@@ -527,6 +549,11 @@ export const BackgroundConfigSchema = z.object({
 });
 export type BackgroundConfig = z.infer<typeof BackgroundConfigSchema>;
 
+export const MemoryConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+});
+export type MemoryConfig = z.infer<typeof MemoryConfigSchema>;
+
 export const ApprovalPresetSchema = z.enum([
   "safer",
   "env-only",
@@ -546,7 +573,62 @@ export const ApprovalsConfigSchema = z.object({
 });
 export type ApprovalsConfig = z.infer<typeof ApprovalsConfigSchema>;
 
+export const BrowserConfigSchema = z.object({
+  executable: z.string().min(1).optional(),
+  args: z.array(z.string()).max(32).default([]).refine((args) => args.every((arg) => !["--user-data-dir", "--remote-debugging-port", "--remote-debugging-address", "--remote-debugging-pipe"].some((reserved) => arg === reserved || arg.startsWith(`${reserved}=`))), "Browser profile and debugging flags are managed by Orchivox."),
+  headless: z.boolean().default(true),
+  max_tabs: z.number().int().min(1).max(100).default(20),
+  attach_url: z.url().refine((url) => ["http:", "https:", "ws:", "wss:"].includes(new URL(url).protocol), "Use an HTTP or WebSocket CDP endpoint.").optional(),
+  timeout_ms: z.number().int().min(100).max(120000).default(30000),
+  max_sessions: z.number().int().min(1).max(16).default(4),
+  idle_seconds: z.number().int().min(1).max(86400).default(600),
+});
+export type BrowserConfig = z.infer<typeof BrowserConfigSchema>;
+export const DebugAdapterConfigSchema = z.object({
+  command: z.string().min(1).optional(), args: z.array(z.string()).max(64).default([]), env: z.record(z.string(), z.string()).default({}),
+  host: z.string().min(1).optional(), port: z.number().int().min(1).max(65535).optional(),
+  launch_type: z.string().optional(), launch: z.record(z.string(), z.json()).default({}), attach: z.record(z.string(), z.json()).optional(),
+}).refine((adapter) => !!adapter.command !== !!(adapter.host && adapter.port) && (!adapter.command || !adapter.host && !adapter.port), "Choose one adapter command or a host and port.");
+export const DebugConfigSchema = z.object({
+  adapters: z.record(z.string().min(1), DebugAdapterConfigSchema).default({}),
+  timeout_ms: z.number().int().min(100).max(120000).default(30000),
+  max_sessions: z.number().int().min(1).max(16).default(4),
+  idle_seconds: z.number().int().min(1).max(86400).default(600),
+});
+export type DebugConfig = z.infer<typeof DebugConfigSchema>;
+
+export const RemoteConfigSchema = z.object({
+  ssh: z.string().optional(),
+  hosts: z.record(z.string().regex(/^[a-z0-9_-]+$/), z.object({
+    destination: z.string().min(1).max(500).refine((value) => !value.startsWith("-") && !value.includes("\0") && !/\s/.test(value), "Use one SSH destination, not command options."),
+    root: z.string().min(1).max(4096).refine((value) => value.startsWith("/") && !value.includes("\0"), "Use an absolute SFTP root."),
+    port: z.number().int().min(1).max(65535).optional(), ssh_config: z.string().optional(),
+    allow_write: z.boolean().default(false),
+  })).default({}),
+  timeout_ms: z.number().int().min(100).max(120000).default(30000),
+  reconnect_attempts: z.number().int().min(0).max(2).default(1),
+  max_sessions: z.number().int().min(1).max(16).default(4), idle_seconds: z.number().int().min(1).max(86400).default(600),
+  max_file_bytes: z.number().int().min(1024).max(5 * 1024 * 1024).default(1024 * 1024),
+  max_search_files: z.number().int().min(1).max(500).default(100),
+  max_scan_entries: z.number().int().min(10).max(10000).default(2000),
+});
+export type RemoteConfig = z.infer<typeof RemoteConfigSchema>;
+export const DesktopConfigSchema = z.object({
+  capture_timeout_ms: z.number().int().min(1000).max(120000).default(60000),
+  enabled: z.boolean().default(false), backend: z.literal("linux-atspi").default("linux-atspi"), python: z.string().optional(),
+  timeout_ms: z.number().int().min(100).max(120000).default(15000),
+  max_windows: z.number().int().min(1).max(100).default(30), max_nodes: z.number().int().min(1).max(2000).default(300),
+  max_depth: z.number().int().min(1).max(20).default(8), max_sessions: z.number().int().min(1).max(16).default(4),
+  idle_seconds: z.number().int().min(1).max(86400).default(600),
+});
+export type DesktopConfig = z.infer<typeof DesktopConfigSchema>;
+
 export const AppConfigSchema = z.object({
+  remote: RemoteConfigSchema.prefault({}),
+  desktop: DesktopConfigSchema.prefault({}),
+  browser: BrowserConfigSchema.prefault({}),
+  debug: DebugConfigSchema.prefault({}),
+  updates: z.object({ check: z.boolean().default(true) }).prefault({}),
   ui: z.object({ animations: z.boolean().default(true) }).prefault({}),
   version: z.number().int().positive().default(1),
   providers: z.record(z.string().min(1), ProviderProfileSchema).default({}),
@@ -568,6 +650,7 @@ export const AppConfigSchema = z.object({
   mcp: z
     .object({
       servers: z.record(z.string().min(1), McpServerConfigSchema).default({}),
+      lifecycle: McpLifecycleConfigSchema.prefault({}),
     })
     .prefault({}),
   hooks: HooksConfigSchema.prefault({}),
@@ -576,6 +659,7 @@ export const AppConfigSchema = z.object({
   sandbox: SandboxConfigSchema.prefault({}),
   compaction: CompactionConfigSchema.prefault({}),
   background: BackgroundConfigSchema.prefault({}),
+  memory: MemoryConfigSchema.prefault({}),
   websearch: WebSearchConfigSchema.prefault({}),
   webfetch: WebFetchConfigSchema.prefault({}),
   prompt: PromptConfigSchema.prefault({}),

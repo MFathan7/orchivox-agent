@@ -5,6 +5,11 @@ export const SKILL_ALWAYS_ALLOWED_TOOLS = [
   "todo_read",
   "read_file",
   "read_document",
+  "read_database",
+  "ast_search",
+  "code_find",
+  "read_archive",
+  "read_notebook",
   "glob_files",
   "grep_search",
   "json_query",
@@ -14,6 +19,7 @@ export const SKILL_ALWAYS_ALLOWED_TOOLS = [
 export class SkillToolPolicy {
   private readonly alwaysAllowed: Set<string>;
   private allowed: Set<string> | undefined;
+  private readonly patterns: RegExp[] = [];
 
   constructor(alwaysAllowed: Iterable<string> = SKILL_ALWAYS_ALLOWED_TOOLS) {
     this.alwaysAllowed = new Set(alwaysAllowed);
@@ -21,16 +27,22 @@ export class SkillToolPolicy {
 
   activate(allowedTools: readonly string[]): void {
     if (!this.allowed) this.allowed = new Set(this.alwaysAllowed);
-    for (const tool of allowedTools) this.allowed.add(tool);
+    for (const tool of allowedTools) {
+      if (this.allowed.has(tool)) continue;
+      this.allowed.add(tool);
+      if (tool.includes("*")) {
+        const escaped = tool.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+        this.patterns.push(new RegExp(`^${escaped}$`));
+      }
+    }
   }
 
   allows(toolName: string): boolean {
-    return this.allowed === undefined || this.allowed.has(toolName);
+    return this.allowed === undefined || this.allowed.has(toolName) || this.patterns.some((pattern) => pattern.test(toolName));
   }
 
   filter<T extends { name: string }>(tools: T[]): T[] {
-    const allowed = this.allowed;
-    return allowed === undefined ? tools : tools.filter((tool) => allowed.has(tool.name));
+    return tools.filter((tool) => this.allows(tool.name));
   }
 
   get active(): boolean {

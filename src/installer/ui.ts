@@ -39,7 +39,7 @@ export interface InstallerSummary {
   pathOnPath: boolean;
 }
 
-const SPINNER = ["◐", "◓", "◑", "◒"];
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const GLYPHS: Record<StepStatus, string> = {
   pending: "○",
   active: "◆",
@@ -442,6 +442,7 @@ export class InstallerUI {
 
   private renderSteps(): void {
     if (!this.interactive || this.steps.length === 0) return;
+    if (this.stdout.writableNeedDrain) return;
     const lines = this.stepLines();
     if (this.lastStepLines > 0) {
       this.stdout.write(`\x1b[${this.lastStepLines}A`);
@@ -458,7 +459,7 @@ export class InstallerUI {
     const labelWidth = compact
       ? Math.min(16, Math.max(10, Math.floor(this.width * 0.4)))
       : 18;
-    return this.steps.map((step) => {
+    const lines = this.steps.map((step) => {
       const glyph =
         step.status === "active" && this.animations
           ? SPINNER[this.spinnerFrame]
@@ -469,10 +470,20 @@ export class InstallerUI {
       const line = fitLine(`  ${glyph} ${label} ${detail}`.trimEnd(), this.width);
       return this.paint(line, step.status);
     });
+    const completed = this.steps.filter((step) => step.status === "done").length;
+    const label = `  Steps ${completed}/${this.steps.length} `;
+    const railWidth = Math.max(1, Math.min(24, this.width - label.length));
+    const filled = Math.floor(completed / this.steps.length * railWidth);
+    lines.push(this.styler.muted(label) + this.styler.accent("━".repeat(filled)) + this.styler.muted("─".repeat(railWidth - filled)));
+    return lines;
   }
 
   private paint(line: string, status: StepStatus): string {
-    if (status === "active") return this.styler.accent(line);
+    if (status === "active") {
+      if (!this.animations) return this.styler.accent(line);
+      const start = Math.floor(this.spinnerFrame / SPINNER.length * line.length);
+      return this.styler.accent(line.slice(0, start)) + this.styler.text(line.slice(start, start + 5)) + this.styler.accent(line.slice(start + 5));
+    }
     if (status === "done") return this.styler.success(line);
     if (status === "failed") return this.styler.error(line);
     return this.styler.muted(this.styler.dim(line));

@@ -8,6 +8,15 @@ export const MODE_PROMPTS: Record<AgentMode, string> = {
   ultrawork: modeContract("ultrawork").prompt.join(" "),
 };
 
+export function buildWorkflowReminder(): string {
+  return [
+    "<system-reminder>",
+    "Current mode: BUILD.",
+    ...(modeContract("build").workflowGuidance ?? []),
+    "</system-reminder>",
+  ].join("\n");
+}
+
 export const TASK_REMINDERS = {
   study: "Current task: study the project and report what exists. Do not write code or a patch.",
   review: "Current task: answer the question about the existing code. Do not rewrite files unless asked.",

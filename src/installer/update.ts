@@ -93,6 +93,7 @@ export function formatUpdateCheck(check: UpdateCheck): string {
 }
 
 export async function fetchUpdateCheck(options: {
+  signal?: AbortSignal;
   currentVersion: string;
   env?: NodeJS.ProcessEnv;
   url?: string;
@@ -100,6 +101,7 @@ export async function fetchUpdateCheck(options: {
   fetchImpl?: typeof fetch;
 }): Promise<UpdateCheck> {
   const manifest = await fetchSignedManifest({
+    signal: options.signal,
     env: options.env,
     url: options.url,
     timeoutMs: options.timeoutMs ?? 5_000,

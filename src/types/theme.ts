@@ -1,5 +1,7 @@
 /** Theme ids shared by the TUI and the config loader. Kept free of React imports. */
 export const THEME_NAMES = [
+  "orbit-dark",
+  "orbit-light",
   "tokyonight",
   "catppuccin",
   "gruvbox",

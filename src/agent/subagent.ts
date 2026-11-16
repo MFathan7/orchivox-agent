@@ -91,6 +91,7 @@ export interface SubagentWorkerState {
   /** Session that spawned this worker, used for session cost accounting. */
   parentSessionId?: string;
   parentRunId?: string;
+  parentToolCallId?: string;
   executionStartedAt?: number;
   worktreePath?: string;
   outputJsonSchema?: JsonSchemaObject;
@@ -272,6 +273,7 @@ export class SubagentManager {
       transcript: [],
       parentSessionId: input.parentSessionId ?? currentTurnContext()?.sessionId,
       parentRunId: currentTurnContext()?.runId,
+      parentToolCallId: currentTurnContext()?.toolCallId,
       outputJsonSchema: input.outputJsonSchema,
       createdAt: Date.now(),
       updatedAt: Date.now(),

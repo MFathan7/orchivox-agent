@@ -53,9 +53,11 @@ export function LiveStatus({
   active,
   answering,
   runningLabel,
+  agentCounts,
   width,
 }: LiveStatusProps): React.ReactElement | null {
   if (!active) return null;
-  const label = runningLabel || (answering ? "Answering" : "Thinking");
+  const activity = runningLabel || (answering ? "Answering" : "Thinking");
+  const label = agentCounts && agentCounts.active + agentCounts.failed > 0 ? `Main · ${activity}` : activity;
   return <ActivityText text={width === undefined ? label : fitDisplayText(label, width)} active={active} />;
 }

@@ -472,6 +472,7 @@ export class BackgroundProcessManager {
         "List all active and historical background processes managed by the agent runtime.",
       parameters: z.object({}),
       readOnly: true,
+      concurrency: "shared",
       execute: async () => {
         const list = this.list();
         if (list.length === 0) {

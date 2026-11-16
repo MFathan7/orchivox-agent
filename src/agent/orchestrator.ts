@@ -1,3 +1,4 @@
+import { resultBlock, toolContentText, toolEventStatus, toolResultText, ToolResultError } from "../tools/result";
 import type {
   AgentRunRequest,
   AgentRunResult,
@@ -15,6 +16,7 @@ import { registerAstTools } from "../ide/ast-compress";
 import { registerCodeIntelTools } from "../ide/code-intel";
 import type { LSPClient } from "../ide/lsp-client";
 import { HindsightMemory, estimateMessageTokens } from "../memory/hindsight";
+import { BtwService, type BtwInput, type BtwTurn } from "./btw";
 import type { MemoryDatabase } from "../memory/sqlite";
 import type { RulesLoader } from "../memory/rules-loader";
 import type { ProviderRouter } from "../provider/router";
@@ -41,12 +43,25 @@ import {
   type LSPDiagnostic,
 } from "../ide/lsp-fixer";
 import { createSandboxScriptTool } from "../tools/sandbox-bridge";
-import { ToolRegistry } from "../tools/registry";
+import { ToolRegistry, type AgentTool } from "../tools/registry";
 import { PersistentShellTool } from "../tools/shell";
 import { detectShell, type ShellAdapter } from "../tools/shell-adapter";
 import { BackgroundProcessManager } from "../tools/bg-process";
 import { createInspectImageTool } from "../tools/vision";
 import { createReadDocumentTool } from "../tools/read-document";
+import { createReadDatabaseTool } from "../tools/read-database";
+import { createAstEditTool, createAstSearchTool } from "../ide/structural-search";
+import { createCodeFindTool } from "../ide/code-find";
+import { registerGithubTools } from "../tools/github";
+import { BrowserTools } from "../tools/browser";
+import { DebugTools } from "../tools/debugger";
+import { RemoteTools } from "../tools/remote";
+import { DesktopTools } from "../tools/desktop";
+import { toolArgumentRecoveryMessage } from "./prompt";
+import { createReadArchiveTool } from "../tools/read-archive";
+import { registerNotebookTools } from "../tools/notebook";
+import { applyContextRewinds, ContextCheckpoint, registerContextTools } from "./context-checkpoint";
+import { EvalKernels } from "../tools/eval";
 import { createWritePlanTool } from "../tools/plan-file";
 import { registerWebTools, type WebSearchSession } from "../tools/web-reader";
 import {
@@ -93,7 +108,7 @@ import { TurnMetricsTracker, timeBudgetReached, turnBudgetWarning } from "./turn
 import { ReadFileCache, ToolCallTracker, toolCallSignature } from "./tool-call-tracker";
 import { TurnProgress } from "./turn-progress";
 import { abortableStream } from "../provider/abortable-stream";
-import { filterToolsForMode, isConcurrentSafeTool } from "./tool-set";
+import { filterToolsForMode } from "./tool-set";
 import { CustomCommandEngine } from "./custom-commands";
 import { HookRunner, type PluginLoadReport } from "./hooks";
 import {
@@ -115,15 +130,16 @@ import {
 import { toolDisplay } from "./tool-display";
 import {
   buildSkillHint,
-  formatSkillContent,
   formatSkillReload,
-  loadedSkillIds,
-  matchSkillNames,
   normalizeSkillName,
   parseSkillMentions,
+  skillId,
   SkillRegistry,
   type SkillDocument,
 } from "./skills";
+import { skillEnabled } from "./skill-metadata";
+import { skillAvailabilityHint, SKILL_OUTPUT_CORRECTION } from "./prompt";
+import { completeSkillOutput, recordSkillEvidence, skillSourceKey, visibleSkillLoads, type SkillLoad } from "./skill-state";
 import {
   formatSubagentResult,
   SubagentManager,
@@ -137,7 +153,7 @@ import {
 import { prepareSubagentRoute } from "./subagent-routing";
 import { appendErrorLog } from "./error-log";
 import { redactSecrets } from "../security/secrets";
-import { closingReminder } from "./prompt/base";
+import { buildWorkflowReminder, closingReminder } from "./prompt/base";
 import { instructionBlocks } from "./prompt/instructions";
 import { planEnterReminder, planLeaveReminder } from "./prompt/plan-mode";
 import {
@@ -146,7 +162,7 @@ import {
   planInstructionUpdates,
   type InstructionState,
 } from "./prompt/instruction-state";
-import { backgroundRequest, buildSystemParts, progressCheckpointMessage } from "./prompt";
+import { backgroundRequest, btwRequest, buildSystemParts, progressCheckpointMessage } from "./prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
 import { currentTurnContext, runWithTurnContext } from "./turn-context";
 import { sleepAbortable } from "../provider/retry";
@@ -256,6 +272,8 @@ const REVIEW_NUDGE = [
 const MIN_STUDY_ANSWER_CHARS = 40;
 
 const SUBAGENT_BLOCKED_TOOLS = new Set([
+  "context_checkpoint",
+  "context_rewind",
   "spawn_subagents",
   "coordinate",
   "task_create",
@@ -266,9 +284,6 @@ const SUBAGENT_BLOCKED_TOOLS = new Set([
   "question",
   "write_plan",
 ]);
-
-/** Upper bound for independent read-only tools running in one batch. */
-const MAX_CONCURRENT_TOOLS = 4;
 
 interface ToolBatch {
   mode: "parallel" | "sequential";
@@ -282,12 +297,12 @@ interface InstructionStore {
 }
 
 /**
- * Groups adjacent independent reads into one batch. A lone read stays
- * sequential because a batch of one gains nothing.
+ * Shared calls run together between exclusive barriers. A lone shared call
+ * stays sequential because a batch of one gains nothing.
  */
 export function partitionToolBatches(
   toolUses: readonly ToolUseBlock[],
-  isConcurrentSafe: (name: string) => boolean,
+  isShared: (call: ToolUseBlock) => boolean,
 ): ToolBatch[] {
   const batches: ToolBatch[] = [];
   let pending: ToolUseBlock[] = [];
@@ -297,7 +312,7 @@ export function partitionToolBatches(
     pending = [];
   };
   for (const block of toolUses) {
-    if (isConcurrentSafe(block.name)) {
+    if (isShared(block)) {
       pending.push(block);
       continue;
     }
@@ -336,6 +351,11 @@ export async function runWithConcurrency<T>(
 }
 
 export class AgentOrchestrator implements IAgentRunner {
+  private readonly evalKernels: EvalKernels;
+  private readonly browsers: BrowserTools;
+  private readonly debugger: DebugTools;
+  private readonly remote: RemoteTools;
+  private readonly desktop: DesktopTools;
   readonly todos = new TodoEngine();
   readonly hooks: HookRunner;
   readonly advisor: AdvisorReviewer;
@@ -353,11 +373,10 @@ export class AgentOrchestrator implements IAgentRunner {
   private readonly snapshots: SnapshotManager;
   private readonly rules: RulesLoader;
   private readonly database: MemoryDatabase;
-  private readonly ephemeralSkills = new Set<string>();
+  private readonly ephemeralSkillLoads = new Map<string, SkillLoad[]>();
   private readonly lastPrompts = new Map<string, PromptSnapshot>();
   private readonly lastTurnMetrics = new Map<string, TurnMetrics>();
   private readonly webSearchSessions = new Map<string, WebSearchSession>();
-  private readonly lastSkillReload = new Map<string, number>();
   private readonly precomputedCompactions = new Map<string, PrecomputedCompaction>();
   private readonly precomputeInFlight = new Map<string, Promise<void>>();
   private readonly hindsight: HindsightMemory;
@@ -393,6 +412,7 @@ export class AgentOrchestrator implements IAgentRunner {
   private questionHandler: QuestionHandler | undefined;
   private requestedModeSwitch: AgentMode | undefined;
   private readonly sideTurns = new SideTurnRunner();
+  readonly btw: BtwService;
   private readonly sideSnapshots = new Map<string, {
     request: ChatRequest; provider: LLMProvider; mode: AgentMode;
     providerId?: string; model?: string; messages: () => Message[];
@@ -405,6 +425,7 @@ export class AgentOrchestrator implements IAgentRunner {
     this.snapshots = options.snapshots;
     this.rules = options.rules;
     this.database = options.database;
+    this.btw = new BtwService({ store: this.database, prepare: (input, history) => this.prepareBtw(input, history) });
     this.lsp = options.lsp;
     this.hashEditLifecycle = options.hashEditLifecycle;
     this.root = options.repoRoot ?? globalThis.process.cwd();
@@ -446,7 +467,7 @@ export class AgentOrchestrator implements IAgentRunner {
       });
     this.questionHandler = options.onQuestion;
     this.registry = new ToolRegistry({ permissions: this.permissions });
-    this.hindsight = new HindsightMemory(options.database);
+    this.hindsight = new HindsightMemory(options.database, () => this.config?.memory?.enabled === true);
     this.hooks = new HookRunner({
       hooks: options.config?.hooks,
       cwd: this.root,
@@ -475,6 +496,11 @@ export class AgentOrchestrator implements IAgentRunner {
       timeoutSeconds: () => this.config?.orchestration?.worker_timeout_seconds ?? 0,
       maxConcurrent: () => this.config?.orchestration?.max_concurrent_workers ?? 4,
       onFinished: (worker) => {
+        this.evalKernels.stopForWorker(worker.id);
+        void this.browsers.stopForWorker(worker.id).catch(() => {});
+        void this.debugger.stopForWorker(worker.id).catch(() => {});
+        void this.remote.stopForWorker(worker.id).catch(() => {});
+        void this.desktop.stopForWorker(worker.id).catch(() => {});
         this.persistWorkerOutput(worker);
         this.deliverSubagentResult(worker);
         if (worker.status !== "failed" && worker.status !== "timed_out") return;
@@ -529,6 +555,14 @@ export class AgentOrchestrator implements IAgentRunner {
       maxTasks: options.config?.limits?.max_workers_per_turn ?? 10,
       checkTask: async (task) => { await prepareSubagentRoute(task, this.specialistAgents, this.router); },
     });
+    this.evalKernels = new EvalKernels(this.registry, {
+      maxKernels: this.config?.tools?.eval_max_kernels,
+      idleMs: (this.config?.tools?.eval_idle_seconds ?? 600) * 1000,
+    });
+    this.browsers = new BrowserTools(this.config?.browser);
+    this.debugger = new DebugTools(this.config?.debug);
+    this.remote = new RemoteTools(this.config?.remote);
+    this.desktop = new DesktopTools(this.config?.desktop);
     this.registerDefaultTools();
   }
 
@@ -559,6 +593,18 @@ export class AgentOrchestrator implements IAgentRunner {
       : undefined;
     if (explicit !== undefined) return !explicit;
     return this.router.providerKind(provider) === "ollama";
+  }
+
+  private toolBatches(
+    calls: ToolUseBlock[],
+    capabilities: { tool_calling: boolean; parallel_tool_calls: boolean },
+    provider?: string,
+    model?: string,
+  ): ToolBatch[] {
+    const enabled = calls.length > 1 && capabilities.tool_calling && capabilities.parallel_tool_calls && !this.prefersSequentialTools(provider, model);
+    return enabled
+      ? partitionToolBatches(calls, (block) => this.registry.concurrencyFor({ id: block.id, name: block.name, arguments: block.input }) === "shared")
+      : calls.map((block) => ({ mode: "sequential", calls: [block] }));
   }
 
   setQuestionHandler(handler: QuestionHandler | undefined): void {
@@ -778,6 +824,35 @@ export class AgentOrchestrator implements IAgentRunner {
     this.sideSnapshots.clear();
   }
 
+  private prepareBtw(input: BtwInput, history: BtwTurn[]) {
+    const session = this.database.getSession(input.sessionId);
+    if (!session) throw new Error("The session is no longer available.");
+    const mode = this.config?.active_mode ?? session.mode;
+    const ref = this.router.getModeModel(mode);
+    const provider = this.router.getMode(mode);
+    const capabilities = this.router.capabilitiesForMode(mode);
+    if (!capabilities.vision && (input.images?.length || history.some((turn) => turn.images?.length))) throw new Error("The active model cannot read images in this side conversation.");
+    const snapshot = this.sideSnapshots.get(input.sessionId);
+    const sameRoute = snapshot?.mode === mode && snapshot.providerId === ref?.provider && snapshot.model === ref?.model;
+    const systemParts = sameRoute && snapshot?.request.system_parts ? snapshot.request.system_parts : buildSystemParts({
+      mode, repoRoot: this.root, branch: this.branch, shell: this.shellLabel,
+      providerKind: ref ? this.router.providerKind(ref.provider) : undefined, model: ref?.model,
+      agentInstructions: this.globalRules, projectSummary: this.projectContext?.summary,
+      tools: [], includeClosing: false,
+    });
+    const messages = snapshot ? snapshot.messages() : this.database.loadMessages(input.sessionId);
+    const workers = this.subagents.listWorkers().filter((worker) => worker.parentSessionId === input.sessionId)
+      .map((worker) => ({ id: worker.id, task: worker.task, status: worker.status, result: worker.result?.output, error: worker.error }));
+    const maxTokens = Math.min(capabilities.max_output ?? 32_000, 256_000);
+    const request = btwRequest({ systemParts, messages, question: input.question, images: input.images, includeContextImages: capabilities.vision, history,
+      activity: JSON.stringify({ observed: input.activity, workers }), maxTokens });
+    const inputBudget = computeInputBudget({ contextWindow: capabilities.context_window ?? this.contextTokenBudget, maxInput: capabilities.max_input, requestedOutput: maxTokens });
+    const estimate = request.messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + estimateTextTokens(request.system ?? "");
+    if (estimate > inputBudget) throw new Error("The side conversation exceeds the model input budget. Compact the main session or start a shorter side topic.");
+    if (this.maxRequestBytes > 0 && estimateRequestBytes(request) > this.maxRequestBytes) throw new Error("The side conversation exceeds the request size limit.");
+    return { provider, request, providerId: ref?.provider, model: ref?.model };
+  }
+
   async runSideTurn(input: { sessionId: string; purpose: "title" | "recap"; instruction: string; signal?: AbortSignal; maxTokens?: number }) {
     const snapshot = this.sideSnapshots.get(input.sessionId);
     if (!snapshot) throw new Error("No conversation snapshot is available for this session");
@@ -881,6 +956,8 @@ export class AgentOrchestrator implements IAgentRunner {
     await Promise.all(workerIds.map((id) => this.bgProcesses.stopForWorker(id, true)));
   }
 
+  async closeToolRuntimes(): Promise<void> { this.evalKernels.dispose(); await Promise.all([this.browsers.dispose(), this.debugger.dispose(), this.remote.dispose(), this.desktop.dispose()]); }
+
   private registerDefaultTools(): void {
     const lifecycle: HashlineLifecycle = {
       onBeforeModify: async (filePath) => {
@@ -898,6 +975,16 @@ export class AgentOrchestrator implements IAgentRunner {
 
     this.registry.register(createReadFileTool());
     this.registry.register(createReadDocumentTool({ config: this.config?.documents }));
+    this.registry.register(createReadDatabaseTool());
+    this.registry.register(createReadArchiveTool());
+    registerNotebookTools(this.registry, lifecycle);
+    registerGithubTools(this.registry);
+    registerContextTools(this.registry);
+    this.evalKernels.registerTools();
+    this.browsers.registerTools(this.registry);
+    this.debugger.registerTools(this.registry);
+    this.remote.registerTools(this.registry);
+    this.desktop.registerTools(this.registry);
     this.registry.register(createWritePlanTool({ repoRoot: this.root }));
     this.registry.register(
       createQuestionTool(async (request) => {
@@ -944,6 +1031,9 @@ export class AgentOrchestrator implements IAgentRunner {
     );
     this.registry.registerAlias("bash", "shell");
     registerAstTools(this.registry);
+    this.registry.register(createAstSearchTool(this.registry));
+    this.registry.register(createAstEditTool(lifecycle));
+    this.registry.register(createCodeFindTool(this.registry, this.router));
     this.todos.registerTools(this.registry);
     this.subagents.registerTools(this.registry);
     this.skills.registerTools(this.registry);
@@ -979,7 +1069,7 @@ export class AgentOrchestrator implements IAgentRunner {
       },
     });
     registerCodeIntelTools(this.registry, { lsp: this.lsp, repoRoot: this.root });
-    if (this.lsp) this.lsp.registerTools(this.registry);
+    if (this.lsp) this.lsp.registerTools(this.registry, lifecycle);
   }
 
   private async execute(
@@ -1023,10 +1113,22 @@ export class AgentOrchestrator implements IAgentRunner {
     // or a second user turn would reuse turn-0 and collide.
     const runId = currentTurnContext()!.runId!;
     const metrics = new TurnMetricsTracker();
+    let skillStateDirty = true;
+    let skillRegistryRevision = -1;
     let totals: Usage = zeroUsage();
+    const contextCheckpoint = new ContextCheckpoint();
+    currentTurnContext()!.contextControl = contextCheckpoint;
+    currentTurnContext()!.onToolUsage = (event) => { accumulateUsage(totals, event); rawSink(event); };
+    currentTurnContext()!.onToolUsageMissing = () => { totals.cost_incomplete = true; };
+    currentTurnContext()!.onToolModelRequest = (request) => metrics.recordToolModelRequest(request);
+    currentTurnContext()!.onToolProgress = (event) => rawSink({ type: "tool_progress", ...event });
     const configuredSteps = this.config?.modes?.[mode]?.steps;
     const stepLimit = modeStepLimit(mode, configuredSteps, this.maxTurns);
     const toolLimit = this.config?.limits?.max_tool_calls ?? 100;
+    currentTurnContext()!.consumeNestedTool = (name) => {
+      if (toolLimit > 0 && metrics.toolCallCount >= toolLimit) throw new Error(`Turn tool budget reached (${toolLimit}); nested tool was not run.`);
+      metrics.recordTool(name);
+    };
     const wallLimitMs = (this.config?.limits?.max_wall_seconds ?? 1200) * 1000;
     const progress = new TurnProgress(this.config?.limits?.checkpoint_interval ?? 25);
     const webSearchLimit = this.config?.limits?.max_web_searches ?? 0;
@@ -1054,6 +1156,8 @@ export class AgentOrchestrator implements IAgentRunner {
           metrics.recordCheckpoint();
           break;
         case "compaction":
+          skillStateDirty = true;
+          contextCheckpoint.invalidate();
           readFileCache.reset();
           metrics.recordCompaction({
             trigger:
@@ -1076,6 +1180,7 @@ export class AgentOrchestrator implements IAgentRunner {
           });
           break;
         case "context_pruned":
+          skillStateDirty = true;
           readFileCache.reset();
           metrics.recordPrune();
           break;
@@ -1116,7 +1221,7 @@ export class AgentOrchestrator implements IAgentRunner {
       activeSpecialist = await this.specialistAgents.getAgent(request.metadata.agent as string);
     }
 
-    let messages: Message[] = [...request.messages];
+    let messages: Message[] = applyContextRewinds(request.messages);
     let contract = modeContract(mode);
     const persistedIds = new Set<string>();
     const useInstructionState = this.supportsInstructionState(sessionId);
@@ -1161,6 +1266,8 @@ export class AgentOrchestrator implements IAgentRunner {
     let lastText =
       lastUserMsg?.content.map((b) => (b.type === "text" ? b.text : "")).join(" ") ?? "";
 
+    await this.skills.refreshSources();
+
     // `/skill:<name> [args]` forces a skill and turns the rest of the line into
     // the request, so the model follows the skill instead of reading the command.
     let forcedSkill: SkillDocument | undefined;
@@ -1185,7 +1292,7 @@ export class AgentOrchestrator implements IAgentRunner {
     const turnContext = currentTurnContext();
     if (turnContext) {
       turnContext.userText = lastText;
-      turnContext.forcedSkills = forcedSkill ? [forcedSkill.name] : [];
+      turnContext.forcedSkills = forcedSkill ? [skillId(forcedSkill)] : [];
     }
 
     if (!activeSpecialist && lastText) {
@@ -1225,47 +1332,25 @@ export class AgentOrchestrator implements IAgentRunner {
     if (!capabilities.vision) messages = stripImageBlocks(messages);
 
     const compact = this.useCompactPrompt();
-    const mentionedSkills = lastText ? parseSkillMentions(lastText, this.skills) : [];
-    if (forcedSkill && !mentionedSkills.some((entry) => entry.name === forcedSkill?.name)) {
-      mentionedSkills.unshift(forcedSkill);
+    const requestedSkillDocs = lastText ? parseSkillMentions(lastText, this.skills) : [];
+    if (forcedSkill && !requestedSkillDocs.some((entry) => skillId(entry) === skillId(forcedSkill!))) {
+      requestedSkillDocs.unshift(forcedSkill);
     }
-    for (const document of mentionedSkills) {
-      const newlyActivated = this.activateSkill(sessionId, document.name);
-      if (newlyActivated) {
-        sink({
-          type: "skill_activated",
-          name: document.name,
-          allowed_tools: document.allowedTools ?? [],
-          trigger: "mention",
-        });
-      }
-    }
-    // Name matching is provider-independent on purpose: the same request loads
-    // the same skills whatever model answers it.
-    const namedSkills = lastText ? matchSkillNames(lastText, this.skills) : [];
-    const loadedSkills = loadedSkillIds(messages);
-    const turnSkills = [
-      ...new Map(
-        [...mentionedSkills, ...namedSkills].map((document) => [document.name, document]),
-      ).values(),
-    ];
-    for (const document of turnSkills) {
-      const newlyActivated = this.activateSkill(sessionId, document.name);
-      if (newlyActivated) {
-        sink({
-          type: "skill_activated",
-          name: document.name,
-          allowed_tools: document.allowedTools ?? [],
-          trigger: mentionedSkills.includes(document) ? "mention" : "auto",
-        });
-      }
-    }
-    const skillHint = buildSkillHint({
-      forcedSkill: forcedSkill?.name,
-      mentionedSkills: mentionedSkills.map((document) => document.name),
-      namedSkills: namedSkills.map((document) => document.name),
-      loadedSkills,
-    });
+    const rememberedLoads = this.rememberedSkillLoads(sessionId);
+    const visibleLoads = visibleSkillLoads(messages, this.skills.listDocuments());
+    const loadedSkills = visibleLoads.map((load) => load.id);
+    if (turnContext) turnContext.invokedSkills = new Set(rememberedLoads.filter((load) => load.invoked).map(skillSourceKey));
+    const unavailableSkills = [...new Map([
+      ...requestedSkillDocs,
+      ...rememberedLoads.map((load) => this.skills.listDocuments().find((doc) => doc.path === load.path)).filter((document): document is SkillDocument => Boolean(document)),
+    ].filter((document) => !skillEnabled(document)).map((document) => [skillId(document), document])).values()];
+    const skillHint = [
+      buildSkillHint({
+        forcedSkill: forcedSkill && skillEnabled(forcedSkill) ? skillId(forcedSkill) : undefined,
+        mentionedSkills: requestedSkillDocs.filter(skillEnabled).map(skillId), loadedSkills,
+      }),
+      skillAvailabilityHint(unavailableSkills.map((document) => ({ id: skillId(document), reason: document.enabled === false ? "disabled" : "invalid metadata" }))),
+    ].filter(Boolean).join("\n\n");
 
     const contextWindowBase = effectiveContextWindow(capabilities) ?? this.contextTokenBudget;
     let contextWindow = contextWindowBase;
@@ -1278,19 +1363,21 @@ export class AgentOrchestrator implements IAgentRunner {
         return contextWindow;
       }
     };
-    const loadedSkillDocs = this.activeSkillDocuments(sessionId);
-    await this.reloadSkillsAfterCompaction(sessionId, messages);
-    const activeSkillDocs = loadedSkillDocs.filter(
-      (document) => !turnSkills.some((turnSkill) => turnSkill.name === document.name),
+    const allowedSkillNames = new Set(skillAccess.allowed.map(normalizeSkillName));
+    const activeSkillDocs = visibleLoads.filter((load) => {
+      const doc = this.skills.get(load.id);
+      return doc && skillEnabled(doc) && (!(doc.autoinvoke === false || doc.hidden) || load.invoked || rememberedLoads.some((previous) => previous.path === load.path && previous.version === load.version && previous.invoked) || requestedSkillDocs.some((entry) => entry.path === doc.path));
+    }).map((load) => this.skills.get(load.id)!).filter(
+      (document) => skillAccess.policy === "all" ||
+        (skillAccess.policy === "listed" && allowedSkillNames.has(normalizeSkillName(skillId(document)))),
     );
-    let tools = this.filterToolsForCapabilities(
-      this.combineTools(request.tools, mode),
-      capabilities,
-    );
-    if (!capabilities.tool_calling) tools = [];
-    if (activeSpecialist) {
-      tools = this.specialistAgents.filterTools(activeSpecialist, tools, this.readOnlyToolNames());
-    }
+    const refreshToolCatalog = () => {
+      const snapshot = this.registry.snapshot(); if (turnContext) turnContext.toolCatalog = snapshot;
+      let current = this.filterToolsForCapabilities(this.combineTools(request.tools, mode, snapshot.values()), capabilities);
+      if (!capabilities.tool_calling) current = [];
+      return activeSpecialist ? this.specialistAgents.filterTools(activeSpecialist, current, this.readOnlyToolNames()) : current;
+    };
+    let tools = refreshToolCatalog();
     const promptBase = {
       mode,
       task: request.task,
@@ -1351,7 +1438,7 @@ export class AgentOrchestrator implements IAgentRunner {
           ? last === enter
             ? undefined
             : enter
-          : last === enter
+          : last !== undefined && last !== leave
             ? leave
             : undefined;
       if (!text) return;
@@ -1372,6 +1459,16 @@ export class AgentOrchestrator implements IAgentRunner {
     const ensureDynamicMessages = (): void => {
       ensureInstructions();
       ensurePlanReminder();
+      if (mode === "build" && !request.task && messages.some((message) => message.role === "user" && !isSyntheticMessage(message))) {
+        const text = buildWorkflowReminder();
+        if (!messages.some((message) => messageText(message) === text)) {
+          // Keep the reminder in the active turn so it cannot become a summary by itself.
+          messages.push({
+            ...makeMessage(`${runId}-build-workflow`, "user", text),
+            metadata: { synthetic: true, buildWorkflow: true },
+          });
+        }
+      }
     };
     ensureDynamicMessages();
     appendSyntheticMessage(messages, `${runId}-context`, request.context);
@@ -1383,25 +1480,21 @@ export class AgentOrchestrator implements IAgentRunner {
     );
     const overheadTokens = estimateTextTokens(system) + estimateToolsTokens(tools);
     const availableSkillCount = this.skills.listAvailableDocuments().length;
-    const mentionedSkillNames = turnSkills.map((document) => document.name);
-    const initialActiveSkillNames = [
-      ...new Set([...loadedSkillDocs.map((document) => document.name), ...mentionedSkillNames]),
-    ];
+    const mentionedSkillNames = requestedSkillDocs.map(skillId);
+    const initialActiveSkillNames = activeSkillDocs.map(skillId);
     const promptStyle = compact ? ("compact" as const) : ("full" as const);
-    const capturePrompt = (documents: SkillDocument[]): void => {
+    const capturePrompt = (): void => {
       this.rememberPrompt(sessionId, {
         system,
         style: promptStyle,
         toolCount: tools.length,
         availableSkills: availableSkillCount,
-        activeSkills: [
-          ...new Set([...activeSkillDocs, ...documents].map((document) => document.name)),
-        ],
+        activeSkills: activeSkillDocs.map(skillId),
         skillMentions: mentionedSkillNames,
         capturedAt: Date.now(),
       });
     };
-    capturePrompt(turnSkills);
+    capturePrompt();
     sink({
       type: "prompt_preflight",
       style: promptStyle,
@@ -1412,15 +1505,17 @@ export class AgentOrchestrator implements IAgentRunner {
       skill_mentions: mentionedSkillNames,
     });
 
-    const skillPolicy = new SkillToolPolicy(SKILL_ALWAYS_ALLOWED_TOOLS);
+    let skillPolicy = new SkillToolPolicy(SKILL_ALWAYS_ALLOWED_TOOLS);
     const activatedSkills = new Set<string>();
-    for (const document of [...loadedSkillDocs, ...turnSkills]) {
-      activatedSkills.add(document.name);
+    for (const document of activeSkillDocs) {
+      activatedSkills.add(skillId(document));
       if (document.allowedTools !== undefined) skillPolicy.activate(document.allowedTools);
     }
     let finishReason: FinishReason = "stop";
     let ultraworkNudges = 0;
     let turnRetries = 0;
+    let toolArgumentRetries = 0;
+    const maxToolArgumentRetries = this.config?.limits?.tool_argument_retries ?? 1;
     let reasoningRecoveries = 0;
     let forceAction = false;
     let taskNudged = false;
@@ -1508,6 +1603,67 @@ export class AgentOrchestrator implements IAgentRunner {
       }
     };
 
+    const explicitlyInvoked = (document: SkillDocument): boolean =>
+      requestedSkillDocs.some((entry) => entry.path === document.path) ||
+      rememberedLoads.some((load) => load.path === document.path && load.version === document.version && load.invoked);
+    const refreshSkillState = (): void => {
+      if (!skillStateDirty && skillRegistryRevision === this.skills.revision) return;
+      skillStateDirty = false;
+      skillRegistryRevision = this.skills.revision;
+      const documents = this.skills.listDocuments();
+      const loads = visibleSkillLoads(messages, documents);
+      activeSkillDocs.length = 0;
+      skillPolicy = new SkillToolPolicy(SKILL_ALWAYS_ALLOWED_TOOLS);
+      for (const load of loads) {
+        const document = documents.find((entry) => entry.path === load.path)!;
+        const record = { ...load, invoked: load.invoked || explicitlyInvoked(document), loadedAt: load.loadedAt || Date.now() };
+        const previous = rememberedLoads.findIndex((entry) => entry.path === load.path);
+        const changed = previous < 0 || rememberedLoads[previous]?.id !== record.id || JSON.stringify(rememberedLoads[previous]?.messageIds) !== JSON.stringify(record.messageIds) || rememberedLoads[previous]?.version !== record.version || rememberedLoads[previous]?.invoked !== record.invoked;
+        if (previous < 0) rememberedLoads.push(record); else rememberedLoads[previous] = record;
+        if (changed) {
+          if (sessionId) {
+            try {
+              this.database.saveSessionSkillLoad(sessionId, record);
+            } catch { this.ephemeralSkillLoads.set(sessionId, [...rememberedLoads]); }
+          }
+        }
+        if (!skillEnabled(document) || skillAccess.policy === "none" ||
+          (skillAccess.policy === "listed" && !allowedSkillNames.has(normalizeSkillName(skillId(document)))) ||
+          ((document.autoinvoke === false || document.hidden) && !load.invoked && !explicitlyInvoked(document))) continue;
+        if (changed && sessionId) {
+          try { this.database.activateSessionSkill(sessionId, record.id); } catch { /* Session persistence is best effort. */ }
+        }
+        activeSkillDocs.push(document);
+        if (document.allowedTools !== undefined) skillPolicy.activate(document.allowedTools);
+        if (!activatedSkills.has(skillId(document))) {
+          activatedSkills.add(skillId(document));
+          sink({ type: "skill_activated", name: skillId(document), allowed_tools: document.allowedTools ?? [], trigger: "tool" });
+        }
+      }
+      if (turnContext) turnContext.invokedSkills = new Set(rememberedLoads.filter((load) => load.invoked).map(skillSourceKey));
+      const missing = rememberedLoads.flatMap((load) => {
+        const document = documents.find((entry) => entry.path === load.path);
+        if (!document || !skillEnabled(document) || activeSkillDocs.includes(document) || skillAccess.policy === "none" ||
+          ((document.autoinvoke === false || document.hidden) && !load.invoked && !explicitlyInvoked(document)) ||
+          (skillAccess.policy === "listed" && !allowedSkillNames.has(normalizeSkillName(skillId(document))))) return [];
+        return [document];
+      });
+      messages = messages.filter((message) => message.metadata?.skillLifecycle !== true && message.id !== `${runId}-skill-hint`);
+      if (missing.length) messages.push({ ...makeMessage(`${runId}-skill-lifecycle`, "user", formatSkillReload(missing)), metadata: { synthetic: true, skillLifecycle: true } });
+      const availability = [...new Map([
+        ...requestedSkillDocs.map((doc) => documents.find((entry) => entry.path === doc.path)),
+        ...rememberedLoads.map((load) => documents.find((entry) => entry.path === load.path)),
+      ].filter((doc): doc is SkillDocument => Boolean(doc) && !skillEnabled(doc!)).map((doc) => [doc.path, doc])).values()];
+      const hint = [buildSkillHint({
+        forcedSkill: forcedSkill && skillEnabled(this.skills.get(skillId(forcedSkill)) ?? forcedSkill) ? skillId(forcedSkill) : undefined,
+        mentionedSkills: requestedSkillDocs.filter((doc) => skillEnabled(this.skills.get(skillId(doc)) ?? doc)).map(skillId),
+        loadedSkills: activeSkillDocs.map(skillId),
+      }), skillAvailabilityHint(availability.map((doc) => ({ id: skillId(doc), reason: doc.enabled === false ? "disabled" : "invalid metadata" })))].filter(Boolean).join("\n\n");
+      appendSyntheticMessage(messages, `${runId}-skill-hint`, hint);
+      capturePrompt();
+    };
+    refreshSkillState();
+
     // A compaction tail may start at an internal notice that was never stored.
     // Point it at the first stored message so resume still keeps the tail.
     const persistableTail = (tailId: string | undefined): string | undefined => {
@@ -1536,7 +1692,7 @@ export class AgentOrchestrator implements IAgentRunner {
         `turn-${turn}-mode`,
         modeTransitionReminder(from, mode),
       );
-      ensurePlanReminder();
+      ensureDynamicMessages();
       sink({ type: "mode_changed", from, to: mode });
     };
 
@@ -1545,12 +1701,12 @@ export class AgentOrchestrator implements IAgentRunner {
       correction: string[],
     ): Promise<string> => {
       const retryCorrection = ["# Correction", ...correction].join("\n\n");
-      const retryParts = [...systemParts, { text: retryCorrection }];
+      const retryParts = systemParts;
       const retrySystem = retryParts.map((part) => part.text).join("\n\n");
       const retryRequest = ChatRequestSchema.parse({
         system: retrySystem,
         system_parts: retryParts,
-        messages: messages.slice(0, -1),
+        messages: [...messages.slice(0, -1), { ...makeMessage(`${runId}-output-correction`, "user", retryCorrection), metadata: { synthetic: true } }],
         tools: [],
         tool_choice: "none",
         max_tokens: maxTokens,
@@ -1563,8 +1719,10 @@ export class AgentOrchestrator implements IAgentRunner {
       });
       let text = "";
       let thinking = "";
+      metrics.startProvider(providerRef?.provider, providerRef?.model, retryRequest.reasoning_effort);
       try {
         for await (const event of abortableStream(provider.streamChat(retryRequest, signal), signal)) {
+          metrics.providerEvent(event);
           if (event.type === "token") text += event.text;
           else if (event.type === "thinking_token") thinking += event.text;
           else if (event.type === "usage") {
@@ -1574,6 +1732,8 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       } catch {
         return sanitizeAssistantText(originalText);
+      } finally {
+        metrics.finishProvider();
       }
       const candidate =
         stripThinkTags(text).trim().length > 0
@@ -1583,12 +1743,7 @@ export class AgentOrchestrator implements IAgentRunner {
     };
 
     const retryAfterInternalDump = async (originalText: string): Promise<string> =>
-      retryWithCorrection(originalText, [
-        "The previous response leaked internal skill content or an internal gate report.",
-        "Answer the user's actual question directly.",
-        "Do not print skill bodies, skill file listings, XML wrappers, internal notes, or gate reports.",
-        "Use the project evidence and tool results already present in the conversation.",
-      ]);
+      retryWithCorrection(originalText, SKILL_OUTPUT_CORRECTION);
 
     for (let turn = 0; stepLimit === 0 || turn < stepLimit || toolBudgetExhausted; turn += 1) {
       // Run ownership also routes results for stateless callers without a session.
@@ -1600,10 +1755,12 @@ export class AgentOrchestrator implements IAgentRunner {
           messages.push(...pending.filter((message) => !knownIds.has(message.id)));
         }
       }
+      refreshSkillState();
       const finalStep = toolBudgetExhausted || (stepLimit > 0 && turn === stepLimit - 1);
       if (signal?.reason instanceof TurnTimeLimitError || timeBudgetReached(metrics.elapsedMs(), wallLimitMs)) return stopForTime();
       const requestedMode = this.consumeModeSwitch();
       if (requestedMode) applyModeSwitch(requestedMode, turn);
+      tools = refreshToolCatalog();
       const spentTokens = totals.prompt_tokens + totals.completion_tokens;
       if (turn > 0 && this.maxTurnTokens !== undefined && spentTokens >= this.maxTurnTokens) {
         const notice = `Turn used ${spentTokens} tokens, stopping at the limits.turn_tokens budget of ${this.maxTurnTokens}. Send another message to continue, or raise limits.turn_tokens.`;
@@ -1670,9 +1827,11 @@ export class AgentOrchestrator implements IAgentRunner {
           }
         }
       }
+      refreshSkillState();
       const measuredBeforeCompaction = measuredPromptTokens();
-      const turnTools = skillPolicy.filter(tools);
-      const requestBytes = estimateRequestBytes({ system, messages, tools: turnTools });
+      let turnTools = skillPolicy.filter(tools);
+      if (turnContext) turnContext.availableToolNames = new Set(turnTools.map((tool) => tool.name));
+      const requestBytes = estimateRequestBytes({ system, messages, vision: capabilities.vision, tools: turnTools });
       const requestSizeOverLimit =
         this.maxRequestBytes > 0 && requestBytes > this.maxRequestBytes;
       const precomputeThreshold = Math.max(
@@ -1781,7 +1940,7 @@ export class AgentOrchestrator implements IAgentRunner {
             } catch {
               // A deleted session must not break the turn.
             }
-            this.appendSkillReload(sessionId, messages, compactedAt);
+            refreshSkillState();
           }
         }
       }
@@ -1799,10 +1958,13 @@ export class AgentOrchestrator implements IAgentRunner {
         appendSyntheticMessage(messages, `turn-${turn}-final`, FINAL_STEP_REMINDER);
       }
 
+      refreshSkillState();
+      turnTools = skillPolicy.filter(tools);
+      if (turnContext) turnContext.availableToolNames = new Set(turnTools.map((tool) => tool.name));
       sink({
         type: "context_estimate",
         tokens: estimatePromptTokens(),
-        request_bytes: estimateRequestBytes({ system, messages, tools: turnTools }),
+        request_bytes: estimateRequestBytes({ system, messages, vision: capabilities.vision, tools: turnTools }),
         input_budget: inputBudget,
         context_window: contextWindow,
         max_request_bytes: this.maxRequestBytes,
@@ -1934,10 +2096,10 @@ export class AgentOrchestrator implements IAgentRunner {
             // A recovered provider failure restarts the turn only when nothing was
             // streamed yet, so the transcript never contains a half answer.
             const canRetryTurn =
-              event.recoverable === true &&
+              (event.code === "tool_arguments_parse_error" ? toolArgumentRetries < maxToolArgumentRetries && !finalStep : event.recoverable === true &&
               !accumulator.hasOutput() &&
               !contextOverflow &&
-              turnRetries < MAX_TURN_RETRIES;
+              turnRetries < MAX_TURN_RETRIES);
             if (!isAutoHandledProviderError(event.message) && !canRetryTurn) {
               sink(event);
               errorSunk = true;
@@ -2008,6 +2170,15 @@ export class AgentOrchestrator implements IAgentRunner {
           usage: totals,
           finish_reason: "aborted",
         };
+      }
+
+      if (turnErrorCode === "tool_arguments_parse_error" && !contextOverflow && !errorSunk && toolArgumentRetries < maxToolArgumentRetries && !finalStep) {
+        toolArgumentRetries++;
+        const reminder = toolArgumentRecoveryMessage(`${runId}-tool-arguments-${toolArgumentRetries}`);
+        messages.push(reminder);
+        persistConversationMessage(reminder);
+        sink({ type: "retry_scheduled", attempt: toolArgumentRetries, max_attempts: maxToolArgumentRetries, delay_ms: 0, reason: "Invalid tool arguments; requesting valid JSON. No tools from the rejected response were executed." });
+        continue;
       }
 
       if (timeStalled || reasoningStalled) {
@@ -2138,7 +2309,8 @@ export class AgentOrchestrator implements IAgentRunner {
             this.precomputedCompactions.delete(precomputeKey);
             precomputeEpoch += 1;
             messages = forced.messages;
-            this.appendSkillReload(sessionId, messages, Date.now());
+            skillStateDirty = true;
+            refreshSkillState();
             ensureDynamicMessages();
             measuredContext = undefined;
             maxTokens =
@@ -2154,7 +2326,7 @@ export class AgentOrchestrator implements IAgentRunner {
               summary: forced.summary,
               removed_messages: forced.removedMessages,
               tail_start_message_id: forced.tailStartMessageId,
-              request_bytes: estimateRequestBytes({ system, messages, tools: turnTools }),
+              request_bytes: estimateRequestBytes({ system, messages, vision: capabilities.vision, tools: turnTools }),
               max_request_bytes: this.maxRequestBytes,
               input_budget: inputBudget,
               buffer_tokens: bufferTokens,
@@ -2179,7 +2351,7 @@ export class AgentOrchestrator implements IAgentRunner {
             after_tokens: tokens,
             summary_tokens: 0,
             removed_messages: 0,
-            request_bytes: estimateRequestBytes({ system, messages, tools: turnTools }),
+            request_bytes: estimateRequestBytes({ system, messages, vision: capabilities.vision, tools: turnTools }),
             max_request_bytes: this.maxRequestBytes,
             input_budget: inputBudget,
             buffer_tokens: bufferTokens,
@@ -2194,7 +2366,7 @@ export class AgentOrchestrator implements IAgentRunner {
         // reduction level. Levels 1-2 keep call/result pairing; levels 3-4
         // become text-only so a single oversized turn cannot keep the request
         // above the provider's body limit forever.
-        const beforeBytes = estimateRequestBytes({ system, messages, tools: turnTools });
+        const beforeBytes = estimateRequestBytes({ system, messages, vision: capabilities.vision, tools: turnTools });
         const reduced = reduceTranscriptForOverflow(messages, overflowAttempts);
         const afterBytes = estimateRequestBytes({ system, messages: reduced, tools: turnTools });
         if (afterBytes < beforeBytes) {
@@ -2251,6 +2423,7 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       }
 
+      if (turnError) accumulator.discardToolCalls();
       const assistantMessage = accumulator.toMessage(`${runId}-turn-${turn}`);
       let toolUses = assistantMessage.content.filter((block) => block.type === "tool_use");
       if (finalStep && toolUses.length > 0) {
@@ -2283,12 +2456,7 @@ export class AgentOrchestrator implements IAgentRunner {
         }
         if (!turnError && finishReason === "stop" && ultraworkNudges < contract.nudges && !finalStep) {
           ultraworkNudges += 1;
-          const nudge = [
-            "You are not finished yet.",
-            "Verify the result with tools, finish any remaining work, and update the todo list.",
-            "If everything is complete, reply with a short final summary.",
-          ].join(" ");
-          messages.push(makeMessage(`turn-${turn}-continue`, "user", nudge));
+          messages.push(makeMessage(`turn-${turn}-continue`, "user", contract.finalReminder));
           continue;
         }
         if (!turnError && finishReason === "length" && outputLimitContinues < MAX_OUTPUT_LIMIT_CONTINUES && !finalStep) {
@@ -2322,7 +2490,8 @@ export class AgentOrchestrator implements IAgentRunner {
               this.precomputedCompactions.delete(precomputeKey);
               precomputeEpoch += 1;
               messages = compacted.messages;
-              this.appendSkillReload(sessionId, messages, Date.now());
+              skillStateDirty = true;
+              refreshSkillState();
               ensureDynamicMessages();
               measuredContext = undefined;
               maxTokens =
@@ -2338,7 +2507,7 @@ export class AgentOrchestrator implements IAgentRunner {
                 summary: compacted.summary,
                 removed_messages: compacted.removedMessages,
                 tail_start_message_id: persistableTail(compacted.tailStartMessageId),
-                request_bytes: estimateRequestBytes({ system, messages, tools: turnTools }),
+                request_bytes: estimateRequestBytes({ system, messages, vision: capabilities.vision, tools: turnTools }),
                 max_request_bytes: this.maxRequestBytes,
                 input_budget: inputBudget,
                 buffer_tokens: bufferTokens,
@@ -2363,10 +2532,7 @@ export class AgentOrchestrator implements IAgentRunner {
         let finalMessage = assistantMessage;
         if (!turnError) {
           const rawText = textOf(finalMessage);
-          const hasHardDump = /<skill_content\b|<skill_files\b|<available_skills\b|<file\b/i.test(
-            rawText,
-          );
-          const shouldRetryDump = hasHardDump || looksLikeInternalDump(rawText);
+          const shouldRetryDump = looksLikeInternalDump(rawText);
           const cleaned = shouldRetryDump
             ? await retryAfterInternalDump(rawText)
             : sanitizeAssistantText(rawText);
@@ -2457,6 +2623,14 @@ export class AgentOrchestrator implements IAgentRunner {
           detail: display.detail,
           command: typeof call.arguments.command === "string" ? call.arguments.command : undefined,
           arguments_summary: summarizeArguments(call.arguments),
+          worker_ids: call.name === "task_wait"
+            ? Array.isArray(call.arguments.ids)
+              ? call.arguments.ids.filter((id): id is string => typeof id === "string").map((id) => {
+                  const task = this.tasks.get(id);
+                  return task && task.parentSessionId === sessionId ? task.workerId ?? id : id;
+                })
+              : this.subagents.listOwnedWorkers().filter((worker) => ["queued", "preparing", "running"].includes(worker.status)).map((worker) => worker.id)
+            : undefined,
           file_path: filePath,
         });
         return startedAt;
@@ -2465,7 +2639,7 @@ export class AgentOrchestrator implements IAgentRunner {
       const runTool = async (
         block: ToolUseBlock,
         toolStartedAt: number,
-      ): Promise<{ message: Message; skillDocument?: SkillDocument }> => {
+      ): Promise<{ message: Message }> => {
         const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
         const filePath = extractFilePath(call.arguments);
         const readOffset =
@@ -2584,7 +2758,7 @@ export class AgentOrchestrator implements IAgentRunner {
         }
 
         const mutates = this.registry.get(call.name)?.readOnly === false;
-        const captureChange = Boolean(filePath && mutates && mode !== "plan");
+        const captureChange = Boolean(filePath && mutates && mode !== "plan" && call.name !== "move_file");
         const beforeText = captureChange && filePath ? (await readTextFile(filePath)) ?? "" : undefined;
         const hashEditOwnsSnapshot =
           call.name === "hash_edit" && this.hashEditLifecycle?.onBeforeModify !== undefined;
@@ -2604,49 +2778,17 @@ export class AgentOrchestrator implements IAgentRunner {
         const agentRules = activeSpecialist?.permissions?.length
           ? permissionRulesFromConfig(activeSpecialist.permissions)
           : [];
-        const result = await this.registry.run(call, mode, signal, agentRules);
+        const result = await runWithTurnContext(
+          { ...currentTurnContext(), mode, toolCallId: call.id },
+          () => this.registry.run(call, mode, signal, agentRules),
+        );
         if (call.name === "read_file" && readPath && !result.is_error) {
           await readFileCache.remember(readPath, readOffset, readLimit, this.root);
         }
-        let content = typeof result.content === "string" ? result.content : JSON.stringify(result.content);
-        let skillDocument: SkillDocument | undefined;
-        if (call.name === "skill" && !result.is_error) {
-          const skillName =
-            typeof call.arguments.id === "string"
-              ? call.arguments.id
-              : typeof call.arguments.name === "string"
-                ? call.arguments.name
-                : undefined;
-          const document = skillName ? this.skills.get(skillName) : undefined;
-          if (document && !activatedSkills.has(document.name)) {
-            skillDocument = document;
-            activatedSkills.add(document.name);
-            if (document.allowedTools !== undefined) skillPolicy.activate(document.allowedTools);
-            if (
-              !activeSkillDocs.some((entry) => entry.name === document.name) &&
-              !turnSkills.some((entry) => entry.name === document.name)
-            ) {
-              activeSkillDocs.push(document);
-            }
-            sink({
-              type: "skill_activated",
-              name: document.name,
-              allowed_tools: document.allowedTools ?? [],
-              trigger: "tool",
-            });
-          }
-        }
-        sink({
-          type: "tool_end",
-          id: call.id,
-          name: call.name,
-          status: result.is_error ? "error" : "ok",
-          duration_ms: Date.now() - toolStartedAt,
-          file_path: filePath,
-          output: toolOutputPreview(call.name, content, result.is_error),
-        });
+        let content = toolContentText(result.content);
 
-        if (captureChange && filePath && beforeText !== undefined) {
+
+        if (captureChange && filePath && beforeText !== undefined && call.name !== "move_file") {
           const afterText = (await readTextFile(filePath)) ?? "";
           if (afterText !== beforeText) {
             const stats = countLineChanges(beforeText, afterText);
@@ -2662,17 +2804,15 @@ export class AgentOrchestrator implements IAgentRunner {
           }
         }
 
-        if (call.name === "move_file" && mode !== "plan" && typeof call.arguments.destinationPath === "string") {
-          const destination = call.arguments.destinationPath;
-          const destinationText = (await readTextFile(destination)) ?? "";
-          if (destinationText.length > 0) {
-            const stats = countLineChanges("", destinationText);
+        if (call.name === "move_file" && !result.is_error && mode !== "plan") {
+          for (const path of [call.arguments.sourcePath, call.arguments.destinationPath]) {
+            if (typeof path !== "string") continue;
             sink({
               type: "file_change",
-              path: destination,
+              path,
               old_text: "",
-              new_text: destinationText.slice(0, MAX_DIFF_CHARS),
-              additions: stats.additions,
+              new_text: "",
+              additions: 0,
               deletions: 0,
               tool_call_id: call.id,
             });
@@ -2696,9 +2836,29 @@ export class AgentOrchestrator implements IAgentRunner {
           }
         }
 
-        const toolResult = toolResultMessage(call, content, result.is_error, runId);
+        sink({
+          type: "tool_end",
+          id: call.id,
+          name: call.name,
+          status: toolEventStatus(result),
+          outcome: result.outcome ? { ...result.outcome, data: undefined } : undefined,
+          metadata: result.metadata,
+          duration_ms: Date.now() - toolStartedAt,
+          file_path: filePath,
+          output: toolOutputPreview(call.name, toolResultText({ ...result, content }), result.is_error, result.outcome),
+          worker_ids: call.name === "spawn_subagents"
+            ? this.subagents.listWorkers().filter((worker) => worker.parentRunId === runId && worker.parentToolCallId === call.id).map((worker) => worker.id)
+            : undefined,
+        });
+        const toolResult = toolResultMessage(call, { ...result, content }, result.is_error, runId);
+        if (call.name === "read_file" && typeof call.arguments.filePath === "string") await this.skills.refreshPath(call.arguments.filePath, this.root);
+        if (call.name === "skill" || call.name === "read_file") {
+          await recordSkillEvidence(toolResult, call, this.skills.listDocuments(), this.root, explicitlyInvoked);
+          if (toolResult.metadata?.skillLoads) skillStateDirty = true;
+        }
+        contextCheckpoint.decorate(call.id, toolResult);
         if (filePath && mutates && contract.advisor) this.advisor.scheduleReview();
-        return { message: toolResult, skillDocument };
+        return { message: toolResult };
       };
 
       const recordToolResult = (block: ToolUseBlock, message: Message): void => {
@@ -2713,16 +2873,7 @@ export class AgentOrchestrator implements IAgentRunner {
         }
       };
 
-      const concurrencyEnabled =
-        toolUses.length > 1 &&
-        capabilities.tool_calling &&
-        capabilities.parallel_tool_calls &&
-        !this.prefersSequentialTools(providerRef?.provider, providerRef?.model);
-      const isConcurrentSafe = (name: string): boolean =>
-        isConcurrentSafeTool(name) && this.registry.get(name)?.readOnly === true;
-      const batches = concurrencyEnabled
-        ? partitionToolBatches(toolUses, isConcurrentSafe)
-        : toolUses.map((block): ToolBatch => ({ mode: "sequential", calls: [block] }));
+      const batches = this.toolBatches(toolUses, capabilities, providerRef?.provider, providerRef?.model);
 
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
         const batch = batches[batchIndex];
@@ -2749,20 +2900,17 @@ export class AgentOrchestrator implements IAgentRunner {
           break;
         }
         if (batch.mode === "parallel") {
-          const started = batch.calls.map((block) => ({ block, at: startTool(block) }));
-          const outcomes: Array<{ message: Message; skillDocument?: SkillDocument }> = new Array(
-            started.length,
+          const outcomes: Array<{ message: Message }> = new Array(
+            batch.calls.length,
           );
-          await runWithConcurrency(started, MAX_CONCURRENT_TOOLS, async (entry, index) => {
-            outcomes[index] = await runTool(entry.block, entry.at);
+          await runWithConcurrency(batch.calls, this.config?.tools?.max_concurrent ?? 4, async (block, index) => {
+            outcomes[index] = await runTool(block, startTool(block));
           });
           for (const [index, outcome] of outcomes.entries()) {
             recordToolResult(batch.calls[index], outcome.message);
             messages.push(outcome.message);
             persistConversationMessage(outcome.message);
-            if (outcome.skillDocument) {
-              this.activateSkill(sessionId, outcome.skillDocument.name);
-            }
+            refreshSkillState();
           }
           continue;
         }
@@ -2770,11 +2918,13 @@ export class AgentOrchestrator implements IAgentRunner {
         recordToolResult(batch.calls[0], outcome.message);
         messages.push(outcome.message);
         persistConversationMessage(outcome.message);
-        if (outcome.skillDocument) {
-          this.activateSkill(sessionId, outcome.skillDocument.name);
-        }
+        refreshSkillState();
       }
 
+      const checkpointMessages = contextCheckpoint.finishTurn(messages);
+      if (checkpointMessages !== messages) skillStateDirty = true;
+      messages = checkpointMessages;
+      refreshSkillState();
       if (signal?.reason instanceof TurnTimeLimitError) return stopForTime();
       if (!toolBudgetExhausted && toolLimit > 0 && metrics.toolCallCount >= toolLimit) {
         toolBudgetExhausted = true;
@@ -2831,63 +2981,10 @@ export class AgentOrchestrator implements IAgentRunner {
     };
   }
 
-  private activeSkillNames(sessionId: string | undefined): string[] {
-    const names = new Set(this.ephemeralSkills);
-    if (sessionId) {
-      try {
-        for (const skill of this.database.listSessionSkills(sessionId)) names.add(skill.name);
-      } catch {
-        // Fall back to the in-memory set if the session is unavailable.
-      }
-    }
-    return [...names];
-  }
-
-  private activeSkillDocuments(sessionId: string | undefined): SkillDocument[] {
-    return this.activeSkillNames(sessionId)
-      .map((name) => this.skills.get(name))
-      .filter((document): document is SkillDocument => Boolean(document));
-  }
-
-  private appendSkillReload(
-    sessionId: string | undefined,
-    messages: Message[],
-    marker: number,
-  ): void {
-    if (!sessionId) return;
-    const documents = this.activeSkillDocuments(sessionId);
-    if (documents.length === 0) return;
-    if (marker <= (this.lastSkillReload.get(sessionId) ?? 0)) return;
-    messages.push(
-      makeMessage(`skill-reload-${sessionId}-${marker}`, "system", formatSkillReload(documents)),
-    );
-    this.lastSkillReload.set(sessionId, marker);
-  }
-
-  private async reloadSkillsAfterCompaction(
-    sessionId: string | undefined,
-    messages: Message[],
-  ): Promise<void> {
-    if (!sessionId) return;
-    const compaction = this.database.getCompaction(sessionId);
-    if (!compaction) return;
-    this.appendSkillReload(sessionId, messages, compaction.created_at);
-  }
-
-  private activateSkill(sessionId: string | undefined, name: string): boolean {
-    const document = this.skills.get(name);
-    if (!document) return false;
-    const alreadyActive = this.activeSkillNames(sessionId).includes(document.name);
-    if (sessionId) {
-      try {
-        this.database.activateSessionSkill(sessionId, document.name);
-      } catch {
-        this.ephemeralSkills.add(document.name);
-      }
-    } else {
-      this.ephemeralSkills.add(document.name);
-    }
-    return !alreadyActive;
+  private rememberedSkillLoads(sessionId: string | undefined): SkillLoad[] {
+    if (!sessionId) return [];
+    try { return this.database.listSessionSkillLoads(sessionId); }
+    catch { return [...(this.ephemeralSkillLoads.get(sessionId) ?? [])]; }
   }
 
   private rememberPrompt(sessionId: string | undefined, snapshot: PromptSnapshot): void {
@@ -3033,8 +3130,12 @@ export class AgentOrchestrator implements IAgentRunner {
     const skillAccess = resolveSubagentSkillAccess(specialist, input.skills);
     const turnContext = currentTurnContext();
     if (turnContext) {
+      turnContext.workspaceRoot ??= this.root;
       turnContext.skillPolicy = skillAccess.policy;
       turnContext.allowedSkills = skillAccess.allowed;
+      turnContext.userText = input.task;
+      turnContext.forcedSkills = [];
+      turnContext.invokedSkills = new Set();
     }
     if (skillAccess.dropped.length > 0) {
       input.onTranscript(`[skills] not allowed: ${skillAccess.dropped.join(", ")}`);
@@ -3074,48 +3175,74 @@ export class AgentOrchestrator implements IAgentRunner {
       : "";
     messages.push(makeMessage("subagent-task", "user", `${scope}${input.task}`));
     const totals = zeroUsage();
+    if (turnContext) turnContext.onToolUsage = (event) => { accumulateUsage(totals, event); input.onUsage(event); };
+    if (turnContext) turnContext.onToolUsageMissing = () => { totals.cost_incomplete = true; };
+    if (turnContext) turnContext.onToolProgress = ({ name, progress }) => input.onProgress?.(
+      `${toolDisplay(name).label} · ${progress.progress}${progress.total === undefined ? "" : `/${progress.total}`}${progress.message ? ` · ${progress.message}` : ""}`,
+    );
     const workerTokenLimit = this.config?.limits?.worker_tokens ?? 0;
     let workerBudgetWarned = false;
 
+    const effectiveMode = specialist?.readOnly ? "plan" : input.mode ?? "build";
+    const refreshWorkerCatalog = () => {
+      const snapshot = this.registry.snapshot(); if (turnContext) turnContext.toolCatalog = snapshot;
+      let current = this.filterToolsForCapabilities(filterToolsForMode(this.registry.listDefinitions(snapshot.values()), effectiveMode), capabilities).filter((tool) => !SUBAGENT_BLOCKED_TOOLS.has(tool.name));
+      if (!capabilities.tool_calling) current = [];
+      return specialist ? this.specialistAgents.filterTools(specialist, current, this.readOnlyToolNames()) : current;
+    };
+    let tools = refreshWorkerCatalog();
+    const specialistRules = specialist?.permissions?.length
+      ? permissionRulesFromConfig(specialist.permissions)
+      : [];
+    let workerSkillPolicy = new SkillToolPolicy(SKILL_ALWAYS_ALLOWED_TOOLS);
+    const workerPreloads = new Map<string, string>();
+    const refreshWorkerTools = () => {
+      const available = workerSkillPolicy.filter(tools);
+      if (turnContext) {
+        turnContext.allowedToolNames = new Set(available.map((tool) => tool.name));
+        turnContext.availableToolNames = turnContext.allowedToolNames;
+      }
+      return available;
+    };
+    if (turnContext) {
+      turnContext.mode = effectiveMode;
+      turnContext.toolPermissionRules = specialistRules;
+    }
+    refreshWorkerTools();
     if (skillAccess.preload.length > 0) {
       const preloaded: Message[] = [];
       for (const name of skillAccess.preload) {
-        const document = this.skills.get(name);
-        if (!document) continue;
         try {
-          preloaded.push(
-            makeMessage(
-              `subagent-skill-${normalizeSkillName(name)}`,
-              "system",
-              await formatSkillContent(document, this.skillMaxBodyChars),
-            ),
-          );
+          const content = await this.skills.loadContent(name, true);
+          preloaded.push({ ...makeMessage(`subagent-skill-${normalizeSkillName(name)}`, "user", content), metadata: { synthetic: true } });
+          const document = this.skills.get(name);
+          if (document && completeSkillOutput(document, content)) {
+            workerPreloads.set(document.path, document.version!);
+            if (document.allowedTools !== undefined) workerSkillPolicy.activate(document.allowedTools);
+            if (turnContext) turnContext.invokedSkills = new Set([...workerPreloads].map(([path, version]) => skillSourceKey({ path, version })));
+            refreshWorkerTools();
+          }
         } catch (error) {
-          input.onTranscript(
-            `[skills] preload failed for ${name}: ${error instanceof Error ? error.message : String(error)}`,
-          );
+          input.onTranscript(`[skills] preload failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
       if (preloaded.length > 0) messages.unshift(...preloaded);
     }
-
-    const effectiveMode = specialist?.readOnly ? "plan" : input.mode ?? "build";
-    let tools = this.filterToolsForCapabilities(
-      filterToolsForMode(this.registry.listDefinitions(), effectiveMode),
-      capabilities,
-    ).filter((tool) => !SUBAGENT_BLOCKED_TOOLS.has(tool.name));
-    if (!capabilities.tool_calling) tools = [];
-    if (specialist) {
-      tools = this.specialistAgents.filterTools(specialist, tools, this.readOnlyToolNames());
-    }
-    const specialistRules = specialist?.permissions?.length
-      ? permissionRulesFromConfig(specialist.permissions)
-      : [];
-    if (turnContext) {
-      turnContext.mode = effectiveMode;
-      turnContext.allowedToolNames = new Set(tools.map((tool) => tool.name));
-      turnContext.toolPermissionRules = specialistRules;
-    }
+    const workerInvoked = (document: SkillDocument): boolean =>
+      workerPreloads.get(document.path) === document.version ||
+      parseSkillMentions(input.task, this.skills).some((entry) => entry.path === document.path);
+    const refreshWorkerSkills = (): void => {
+      const documents = this.skills.listDocuments();
+      const loads = visibleSkillLoads(messages, documents);
+      workerSkillPolicy = new SkillToolPolicy(SKILL_ALWAYS_ALLOWED_TOOLS);
+      for (const document of documents) {
+        if (!skillEnabled(document) || skillAccess.policy === "none" ||
+          (skillAccess.policy === "listed" && !skillAccess.allowed.includes(skillId(document)))) continue;
+        if (workerPreloads.get(document.path) !== document.version && !loads.some((load) => load.path === document.path && (!(document.autoinvoke === false || document.hidden) || load.invoked))) continue;
+        if (document.allowedTools !== undefined) workerSkillPolicy.activate(document.allowedTools);
+      }
+      refreshWorkerTools();
+    };
     const outputCap = Math.min(capabilities.max_output ?? 32_000, 256_000);
     const requestedMaxTokens = specialist?.thinkingBudget
       ? Math.max(outputCap, specialist.thinkingBudget)
@@ -3141,7 +3268,7 @@ export class AgentOrchestrator implements IAgentRunner {
       }),
       compact: compactPrompt,
       includeClosing: false,
-      tools: tools.map((tool) => tool.name),
+      tools: refreshWorkerTools().map((tool) => tool.name),
     });
     const subagentSystem = subagentSystemParts.map((part) => part.text).join("\n\n");
     const structuredResponseFormat =
@@ -3157,18 +3284,20 @@ export class AgentOrchestrator implements IAgentRunner {
         : undefined;
     for (let turn = 0; turn < MAX_SUBAGENT_TURNS; turn += 1) {
       if (input.signal.aborted) throw new Error("worker aborted");
+      tools = refreshWorkerCatalog();
       for (const instruction of input.drainSteerings()) {
         messages.push(makeMessage(`subagent-steer-${turn}`, "user", `Steering instruction: ${instruction}`));
         input.onTranscript(`steering: ${instruction}`);
       }
 
       const accumulator = new TurnAccumulator();
+      const turnTools = refreshWorkerTools();
       const chatRequest = ChatRequestSchema.parse({
         system: subagentSystem,
         system_parts: subagentSystemParts,
         messages,
-        tools,
-        tool_choice: tools.length > 0 ? "auto" : "none",
+        tools: turnTools,
+        tool_choice: turnTools.length > 0 ? "auto" : "none",
         max_tokens: subagentMaxTokens,
         temperature: structuredResponseFormat ? 0 : undefined,
         response_format: structuredResponseFormat,
@@ -3221,18 +3350,26 @@ export class AgentOrchestrator implements IAgentRunner {
       if (toolUses.length === 0) {
         return this.finishSubagent(input, accumulator.textOutput(), totals, route);
       }
-      for (const block of toolUses) {
-        if (input.signal.aborted) throw new Error("worker aborted");
-        const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
-        input.onTranscript(`[tool] ${call.name}`);
-        input.onProgress?.(`Running ${call.name}`);
-        if (attemptState) attemptState.toolsRan = true;
-        const result = await this.registry.run(call, effectiveMode, input.signal, specialistRules);
-        input.onProgress?.(`Finished ${call.name}`);
-        messages.push(
-          toolResultMessage(call, typeof result.content === "string" ? result.content : JSON.stringify(result.content), result.is_error),
-        );
-        if (input.signal.aborted) throw new Error("worker aborted");
+      for (const batch of this.toolBatches(toolUses, capabilities, providerName, resolvedModel)) {
+        const outcomes: Message[] = new Array(batch.calls.length);
+        await runWithConcurrency(batch.calls, batch.mode === "parallel" ? this.config?.tools?.max_concurrent ?? 4 : 1, async (block, index) => {
+          if (input.signal.aborted) throw new Error("worker aborted");
+          const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
+          input.onTranscript(`[tool] ${call.name}`);
+          input.onProgress?.(`Running ${call.name}`);
+          if (attemptState) attemptState.toolsRan = true;
+          const result = await runWithTurnContext(
+            { ...currentTurnContext(), mode: effectiveMode, toolCallId: call.id },
+            () => this.registry.run(call, effectiveMode, input.signal, specialistRules),
+          );
+          input.onProgress?.(`Finished ${call.name}`);
+          outcomes[index] = toolResultMessage(call, result, result.is_error);
+          if (call.name === "read_file" && typeof call.arguments.filePath === "string") await this.skills.refreshPath(call.arguments.filePath, turnContext?.workspaceRoot ?? this.root);
+          await recordSkillEvidence(outcomes[index]!, call, this.skills.listDocuments(), turnContext?.workspaceRoot ?? this.root, workerInvoked);
+          if (input.signal.aborted) throw new Error("worker aborted");
+        });
+        messages.push(...outcomes);
+        refreshWorkerSkills();
       }
     }
     throw new SubagentTurnLimitError(MAX_SUBAGENT_TURNS);
@@ -3292,8 +3429,9 @@ export class AgentOrchestrator implements IAgentRunner {
   private combineTools(
     requestTools: AgentRunRequest["tools"],
     mode: AgentMode,
+    snapshot?: Iterable<AgentTool>,
   ): ReturnType<ToolRegistry["listDefinitions"]> {
-    const combined = filterToolsForMode(this.registry.listDefinitions(), mode);
+    const combined = filterToolsForMode(this.registry.listDefinitions(snapshot), mode);
     for (const tool of requestTools) {
       const existing = combined.findIndex((entry) => entry.name === tool.name);
       if (existing >= 0) combined[existing] = tool;
@@ -3303,6 +3441,7 @@ export class AgentOrchestrator implements IAgentRunner {
   }
 
   private toolVisible(name: string, mode: AgentMode): boolean {
+    if (this.registry.get(name)?.enabled?.() === false) return false;
     if (name !== "coordinate") return true;
     const policy = this.config?.orchestration?.auto_delegate ?? "off";
     if (policy === "off" || mode === "plan") return false;
@@ -3312,14 +3451,20 @@ export class AgentOrchestrator implements IAgentRunner {
 
   private async collectDiagnostics(filePath: string, newContent: string): Promise<string | undefined> {
     try {
+      const signal = currentTurnContext()?.signal;
+      signal?.throwIfAborted();
       let diagnostics: LSPDiagnostic[] = [];
+      let checked = false;
       if (this.lsp && this.lsp.isReady()) {
-        diagnostics = await this.lsp.notifyFileChanged(filePath, newContent);
+        diagnostics = await this.lsp.notifyFileChanged(filePath, newContent, signal);
+        checked = true;
       }
       if (diagnostics.length === 0 && (filePath.endsWith(".ts") || filePath.endsWith(".tsx"))) {
-        diagnostics = await runTscDiagnostics(this.root, filePath);
+        diagnostics = await runTscDiagnostics(this.root, filePath, signal);
+        checked = true;
       }
-      if (diagnostics.length === 0) return "lsp diagnostics: none";
+      if (!checked) return "Diagnostics unavailable: no checker is configured for this file.";
+      if (diagnostics.length === 0) return "No diagnostics were reported for this file by the completed check.";
       const selfHealingPrompt = await buildSelfHealingPrompt(filePath, diagnostics, this.root);
       if (selfHealingPrompt) return selfHealingPrompt;
       return [
@@ -3327,6 +3472,10 @@ export class AgentOrchestrator implements IAgentRunner {
         ...diagnostics.map((item) => `- ${item.file}:${item.line}:${item.column} ${item.severity}: ${item.message}`),
       ].join("\n");
     } catch (error) {
+      if (error instanceof ToolResultError && error.output.status === "partial") {
+        const { images: _images, artifacts: _artifacts, usage: _usage, metadata: _metadata, text, ...outcome } = error.output;
+        return toolResultText({ content: text ?? "", outcome });
+      }
       return `lsp diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
@@ -3422,6 +3571,8 @@ class TurnAccumulator {
     this.text = "";
   }
 
+  discardToolCalls(): void { this.drafts.clear(); this.ready.clear(); }
+
   reasoningOutput(): string {
     return cleanReasoningAnswer(stripThinkTags(this.thinking));
   }
@@ -3474,6 +3625,7 @@ function lastPlanReminder(
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const text = messageText(messages[index]);
     if (text === enter || text === leave) return text;
+    if (messages[index].metadata?.planReminder === true) return text;
   }
   return undefined;
 }
@@ -3501,14 +3653,14 @@ function appendSyntheticMessage(messages: Message[], id: string, text: string | 
 
 function toolResultMessage(
   call: ToolCall,
-  content: string,
+  content: string | import("../types/schema").ToolResult,
   isError: boolean,
   runId?: string,
 ): Message {
   return {
     id: runId ? `${runId}-tool-${call.id}` : `tool-${call.id}`,
     role: "tool",
-    content: [{ type: "tool_result", tool_use_id: call.id, content, is_error: isError }],
+    content: [typeof content === "string" ? { type: "tool_result", tool_use_id: call.id, content, is_error: isError } : resultBlock(content)],
   };
 }
 
@@ -3578,6 +3730,7 @@ const COMMAND_OUTPUT_TOOLS = new Set([
   "bg_logs",
 ]);
 const CONTENT_OUTPUT_TOOLS = new Set([
+  "inspect_image",
   "read_file",
   "read_skeleton",
   "diff_view",
@@ -3587,12 +3740,14 @@ const CONTENT_OUTPUT_TOOLS = new Set([
   "lsp_hover_type",
 ]);
 
-function toolOutputPreview(name: string, content: string, isError: boolean): string | undefined {
+function toolOutputPreview(name: string, content: string, isError: boolean, outcome?: import("../types/schema").ToolOutcome): string | undefined {
   const command = COMMAND_OUTPUT_TOOLS.has(name);
   const contentPreview = CONTENT_OUTPUT_TOOLS.has(name);
-  if (!isError && !command && !contentPreview) return undefined;
+  const structured = outcome && (outcome.status !== "success" || outcome.data !== undefined || outcome.images?.length || outcome.artifacts?.length || outcome.sources?.length);
+  if (!isError && !command && !contentPreview && !structured) return undefined;
   const text = content.replace(/\r\n/g, "\n").trimEnd();
   if (text.length === 0) return undefined;
+  if (name === "inspect_image") return text;
   const lines = text.split("\n");
   const maxLines = command ? 60 : contentPreview ? 16 : 24;
   const maxChars = command ? 6000 : contentPreview ? 2400 : 3000;

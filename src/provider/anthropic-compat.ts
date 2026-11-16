@@ -1,3 +1,5 @@
+import { prepareToolResults, toolResultImages, withoutToolImages } from "./tool-results";
+import { toolResultText as resultText } from "../tools/result";
 import { z } from "zod";
 
 import type { ModelCapabilities } from "../config/loader";
@@ -7,7 +9,6 @@ import {
   type ChatRequest,
   type FinishReason,
   type StreamEvent,
-  type TextBlock,
   type TokenPricing,
 } from "../types/schema";
 import { ThinkTagStreamParser } from "./openai-compat";
@@ -64,7 +65,7 @@ type AnthropicToolUseBlock = {
 type AnthropicToolResultBlock = {
   type: "tool_result";
   tool_use_id: string;
-  content: string | AnthropicTextBlock[];
+  content: string | Array<AnthropicTextBlock | AnthropicImageBlock>;
   is_error: boolean;
   cache_control?: CacheControl;
 };
@@ -166,6 +167,7 @@ export class AnthropicCompatProvider implements LLMProvider {
     const model = req.model ?? this.model;
     if (!model) throw new Error("ChatRequest.model is required when the provider has no default model");
 
+    req = await prepareToolResults(req, this.capabilities.vision, signal);
     const policy = this.retryPolicy;
     const guard = createRequestGuard(signal, {
       timeoutMs: this.timeoutMs,
@@ -520,7 +522,7 @@ export function buildMessagesPayload(
   model: string,
   capabilities: ModelCapabilities,
 ): Record<string, unknown> {
-  const { system, messages } = toAnthropicMessages(req);
+  const { system, messages } = toAnthropicMessages(capabilities.vision ? req : withoutToolImages(req));
   const payload: Record<string, unknown> = {
     model,
     max_tokens: req.max_tokens,
@@ -610,7 +612,9 @@ export function toAnthropicMessages(req: ChatRequest): { system: AnthropicTextBl
           blocks.push({
             type: "tool_result",
             tool_use_id: block.tool_use_id,
-            content: toolResultContent(block.content),
+            content: toolResultImages(block.content).length
+              ? [{ type: "text", text: resultText(block) }, ...toolResultImages(block.content).map((image) => ({ type: "image" as const, source: image.source }))]
+              : resultText(block),
             is_error: block.is_error,
           });
           break;
@@ -650,10 +654,7 @@ export function toAnthropicMessages(req: ChatRequest): { system: AnthropicTextBl
   return { system, messages };
 }
 
-function toolResultContent(content: string | TextBlock[]): string | AnthropicTextBlock[] {
-  if (typeof content === "string") return content;
-  return content.map((block) => ({ type: "text", text: block.text }));
-}
+
 
 function parseToolArguments(argumentsText: string): Record<string, unknown> | undefined {
   const trimmed = argumentsText.trim();

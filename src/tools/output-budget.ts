@@ -63,9 +63,7 @@ function notice(
 
 function sliceFirstLine(lines: string[], maxBytes: number): string {
   const first = lines[0] ?? "";
-  let sliced = first.slice(0, Math.max(0, maxBytes));
-  if (/[\uD800-\uDBFF]$/.test(sliced)) sliced = sliced.slice(0, -1);
-  return sliced;
+  return new TextDecoder().decode(Buffer.from(first).subarray(0, Math.max(0, maxBytes)), { stream: true });
 }
 
 /** Keeps the beginning of the output, for reads, searches, and pages. */
@@ -141,7 +139,10 @@ export function truncateTail(text: string, options: TruncateOptions = {}): Trunc
   }
   if (kept.length === 0) {
     const line = lines[lines.length - 1] ?? "";
-    const only = line.slice(-maxBytes);
+    const raw = Buffer.from(line);
+    let start = Math.max(0, raw.length - maxBytes);
+    while (start < raw.length && (raw[start]! & 0xc0) === 0x80) start++;
+    const only = raw.subarray(start).toString("utf8");
     kept.push(only);
     bytes = byteLength(only);
   }

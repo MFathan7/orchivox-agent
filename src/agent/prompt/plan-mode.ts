@@ -1,4 +1,5 @@
 import { planDirectory } from "../../tools/plan-directory";
+import { modeContract } from "../modes";
 
 export function planEnterReminder(directory = planDirectory()): string {
   return [
@@ -7,6 +8,8 @@ export function planEnterReminder(directory = planDirectory()): string {
     directory,
     "",
     "Do not modify any other files or ask a subagent to do so.",
+    ...(modeContract("plan").workflowGuidance ?? []),
+    ...(modeContract("plan").shellGuidance ?? []),
     "",
     "You remain in Plan mode until the user switches agents. If the user asks you to implement changes, do not do so. Tell them they need to switch agents.",
     "</system-reminder>",

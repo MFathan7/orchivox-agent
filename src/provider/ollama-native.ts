@@ -1,3 +1,5 @@
+import { prepareToolResults, toolResultImages, withoutToolImages } from "./tool-results";
+import { toolResultText as resultText } from "../tools/result";
 import type { ModelCapabilities } from "../config/loader";
 import {
   computeCostUsd,
@@ -50,9 +52,7 @@ function textOf(message: Message): string {
     .join("\n");
 }
 
-function toolResultText(content: string | TextBlock[]): string {
-  return typeof content === "string" ? content : content.map((block) => block.text).join("\n");
-}
+
 
 /**
  * Ollama's OpenAI-compatible endpoint silently cuts the prompt at the server's
@@ -78,14 +78,22 @@ export function toOllamaMessages(req: ChatRequest): Array<Record<string, unknown
   const system = joinedSystemText(req);
   if (system) messages.push({ role: "system", content: system });
   const toolNames = new Map<string, string>();
+  const pendingImages: string[] = [];
+  const flushImages = () => {
+    if (!pendingImages.length) return;
+    messages.push({ role: "user", content: "Images returned by the preceding tools.", images: [...pendingImages] });
+    pendingImages.length = 0;
+  };
   for (const message of req.messages) {
+    if (message.role !== "tool") flushImages();
     if (message.role === "tool") {
       for (const block of message.content) {
         if (block.type !== "tool_result") continue;
         const toolName = toolNames.get(block.tool_use_id);
+        pendingImages.push(...toolResultImages(block.content).map((image) => image.source.data));
         messages.push({
           role: "tool",
-          content: toolResultText(block.content),
+          content: resultText(block),
           ...(toolName ? { tool_name: toolName } : {}),
         });
       }
@@ -113,6 +121,7 @@ export function toOllamaMessages(req: ChatRequest): Array<Record<string, unknown
       ...(images.length > 0 ? { images } : {}),
     });
   }
+  flushImages();
   return messages;
 }
 
@@ -125,7 +134,7 @@ export function buildOllamaPayload(
   const thinkingOff = effort === "off" || effort === "none";
   return {
     model,
-    messages: toOllamaMessages(req),
+    messages: toOllamaMessages(capabilities.vision ? req : withoutToolImages(req)),
     stream: true,
     ...(capabilities.reasoning && effort ? { think: !thinkingOff } : {}),
     ...(req.tools.length > 0
@@ -210,6 +219,7 @@ export class OllamaNativeProvider implements LLMProvider {
   async *streamChat(req: ChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown> {
     const model = req.model ?? this.model;
     if (!model) throw new Error("ChatRequest.model is required when the provider has no default model");
+    req = await prepareToolResults(req, this.capabilities.vision, signal);
     const payload = buildOllamaPayload(req, model, this.capabilities);
     const guard = createRequestGuard(signal, {
       timeoutMs: this.timeoutMs,

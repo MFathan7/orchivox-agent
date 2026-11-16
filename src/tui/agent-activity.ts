@@ -66,12 +66,21 @@ export function agentActivitySummary(workers: SubagentWorkerState[], tasks: Task
   const { active, failed } = agentActivityCounts(workers, tasks);
   const stalled = workers.filter((worker) => workerIsStalled(worker)).length;
   const merge = tasks.filter(taskNeedsMerge).length;
-  if (active + failed + merge === 0) return "";
+  const dependent = tasks.filter((task) => task.state === "pending" && !task.workerId && task.dependsOn.some((id) => {
+    const dependency = tasks.find((entry) => entry.id === id);
+    return !dependency || dependency.state !== "completed" || taskNeedsMerge(dependency);
+  })).length;
+  if (active + failed + merge + dependent === 0) return "";
   const parts = [
-    active ? `${active} active${stalled ? ` (${stalled} stalled)` : ""}` : "",
-    merge ? `${merge} ${width < 60 ? "merge" : "awaiting merge"}` : "",
     failed ? `${failed} failed` : "",
+    ...(["running", "queued", "preparing", "finalizing"] as const).map((state) => {
+      const count = workers.filter((worker) => worker.status === state).length;
+      return count ? `${count} ${state}` : "";
+    }),
+    merge ? `${merge} ${width < 60 ? "merge" : "awaiting merge"}` : "",
+    dependent ? `${dependent} waiting for dependency` : "",
+    stalled ? `(${stalled} stalled)` : "",
   ].filter(Boolean);
   const hint = width >= 70 ? " · /hub details" : "";
-  return fitDisplayText(`Agents ${parts.join(" · ")}${hint}`, width);
+  return fitDisplayText(`Workers ${parts.join(" · ")}${hint}`, width);
 }

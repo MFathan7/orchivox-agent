@@ -86,6 +86,7 @@ export class TodoEngine {
       description: "Read the current session todo list with status and priority.",
       parameters: z.object({}),
       readOnly: true,
+      concurrency: "shared",
       execute: () => {
         if (this.items.length === 0) return "todo list is empty";
         return this.items

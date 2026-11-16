@@ -50,7 +50,7 @@ export function highlightSelection(node: React.ReactNode, from: number, to: numb
         ? React.createElement(Text, { key, color: theme.background, backgroundColor: theme.selection }, run.text)
         : run.text));
     }
-    if (Array.isArray(child)) return child.map(visit);
+    if (Array.isArray(child)) return React.Children.map(child, visit);
     if (!React.isValidElement<{ children?: React.ReactNode }>(child)) return child;
     if (child.type === Text || child.type === React.Fragment) return React.cloneElement(child, undefined, visit(child.props.children));
     column += displayWidth(rowContent(child).text);

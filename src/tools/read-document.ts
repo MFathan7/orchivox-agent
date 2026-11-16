@@ -103,7 +103,7 @@ function nextHint(extract: DocumentExtract, maxPages: number): string {
 
 export function createReadDocumentTool(options: {
   config?: DocumentsConfig;
-} = {}): AgentTool<typeof ReadDocumentArgsSchema> {
+} = {}): AgentTool<typeof ReadDocumentArgsSchema, string> {
   const config = { ...DEFAULT_CONFIG, ...options.config, image: { ...DEFAULT_CONFIG.image, ...options.config?.image } };
 
   return {
@@ -112,6 +112,7 @@ export function createReadDocumentTool(options: {
       "Read a PDF, DOCX, XLSX, or text document in bounded sections. Use read_file for code and inspect_image for images. For PDFs, pass pages such as 1-5. Large extracts are written to a cache file and returned as a preview plus path; use grep or read_file on that path for the rest.",
     parameters: ReadDocumentArgsSchema,
     readOnly: true,
+    concurrency: "shared",
     async execute(args) {
       const extract = await readDocumentExtract(
         args.filePath,

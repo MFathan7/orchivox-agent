@@ -5,7 +5,8 @@ import type { AgentMode, Message } from "../types/schema";
 import { freezeDebugEnabled, logFreeze } from "../agent/freeze-debug";
 import { modeContract } from "../agent/modes";
 import type { SubagentWorkerState } from "../agent/subagent";
-import type { SkillDocument } from "../agent/skills";
+import type { SkillDiagnostic, SkillDocument } from "../agent/skills";
+import type { SkillDependencyReport } from "../agent/skill-dependencies";
 import type { TaskItem } from "../agent/task-board";
 import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import type { ProviderRouter } from "../provider/router";
@@ -17,9 +18,16 @@ import type { ConfigMode, ConfigRole } from "../config/writer";
 import { AgentHub, type AgentHubTab } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
 import { ChoiceModal } from "./choice-modal";
+import { ThemePicker } from "./theme-picker";
+import { McpMenu, type McpMenuProps } from "./mcp-menu";
 import { CommandPaletteModal, REASONING_LEVELS, reasoningLevelsFor, type ReasoningEffortLevel } from "./command-palette";
 import { PromptComposer, type FileAttachmentRef } from "./composer";
 import { HelpOverlay } from "./help-overlay";
+import { BtwPanel } from "./btw-panel";
+import { QueuePanel, type QueueView } from "./queue-panel";
+import type { PromptSubmitPayload } from "./composer";
+import type { BtwTurn } from "../agent/btw";
+import type { InputAction } from "./input-routing";
 import { installKeyNormalizer } from "./key-normalize";
 import { ReportModal } from "./report-modal";
 import { QuestionModal, type PendingQuestion } from "./question-modal";
@@ -29,6 +37,7 @@ import { SessionTimeTravelModal, type SessionModalTab } from "./session-modal";
 import { SettingsModal, type SettingsMode } from "./settings-modal";
 import { SkillsModal } from "./skills-modal";
 import { WorkspaceTrustPrompt } from "./trust-modal";
+import { COMPACT_LOGO_TEXT, OrchivoxLogo } from "./logo";
 import {
   contextUsagePercent,
   fitSegments,
@@ -44,17 +53,14 @@ import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { RESET_ATTRIBUTES, resetBeforeErase } from "./terminal-protocol";
 import { LiveStatus } from "./spinner";
 import { MotionProvider } from "./motion";
+import type { FrameClock } from "./frame-clock";
 import { agentActivityCounts, agentActivitySummary } from "./agent-activity";
 import { SubagentStatus } from "./subagent-status";
 import {
-  AUTO_THEME,
   DEFAULT_THEME,
   ThemeProvider,
-  THEMES,
-  THEME_ORDER,
   getTheme,
-  isThemeSelection,
-  themeSelectionLabel,
+  type TerminalAppearance,
   type ThemeName,
   type ThemeSelection,
 } from "./theme";
@@ -85,9 +91,7 @@ export interface SyncedOutputHandle {
   isBackpressured: () => boolean;
 }
 
-export type InputAction =
-  | { kind: "command"; command: string; args?: string; raw?: string }
-  | { kind: "submit"; text: string; ultrawork: boolean };
+export type { InputAction } from "./input-routing";
 
 export interface ChatToolDiffView {
   oldText: string;
@@ -109,10 +113,14 @@ export interface ChatToolCallView {
   output?: string;
   diff?: ChatToolDiffView;
   argumentsSummary: string;
+  workerIds?: string[];
   durationMs?: number;
-  status?: "running" | "ok" | "error";
+  status?: "running" | import("../types/schema").ToolEndEvent["status"];
+  outcome?: import("../types/schema").ToolOutcome;
+  metadata?: import("../types/schema").ToolResultBlock["metadata"];
   startedAt?: number;
   lspStatus?: string;
+  progress?: import("../types/tool-output").ToolProgress;
 }
 
 export interface ChatFileChangeView {
@@ -183,6 +191,29 @@ export interface ChatEntryView {
 }
 
 export interface OrchivoxAppProps {
+  mcpMenu?: Pick<McpMenuProps, "servers" | "changing" | "onBrowse" | "onSelectSkill" | "onAuthenticate" | "authServer">;
+  onMcpAction?: McpMenuProps["onAction"];
+  onMcpClose?: () => void;
+  updateNotice?: string;
+  queue?: QueueView;
+  queuedCount?: number;
+  queuePaused?: boolean;
+  queuePauseDetail?: string;
+  onQueueOpen?: () => void;
+  onQueueEdit?: (id: string) => void;
+  onQueueSave?: (payload: PromptSubmitPayload) => boolean;
+  onQueueDiscard?: () => void;
+  onQueueCancel?: (id: string) => void;
+  onQueueResume?: () => void;
+  onQueueStop?: (id: string) => void;
+  onQueueClose?: () => void;
+  btwRunning?: boolean;
+  btw?: { turns: BtwTurn[]; topicId?: string };
+  onBtwSelect?: (topicId: string) => void;
+  onBtwFollowup?: (topicId: string, question: string, attachments?: FileAttachmentRef[]) => boolean;
+  onBtwCancel?: () => void;
+  onBtwClose?: () => void;
+  frameClock?: FrameClock;
   limits?: LimitsConfig;
   onLimitsChange?: (patch: Partial<LimitsConfig>) => void;
   delegation?: DelegationPolicy;
@@ -193,6 +224,8 @@ export interface OrchivoxAppProps {
   onWorkerFallbackChange?: (value: WorkerFallbackMode) => void;
   animations?: boolean;
   onAnimationsChange?: (enabled: boolean) => void;
+  memoryEnabled?: boolean;
+  onMemoryEnabledChange?: (enabled: boolean) => void;
   background?: BackgroundConfig;
   onBackgroundChange?: (patch: Partial<BackgroundConfig>) => void;
   onDraftChange?: (hasDraft: boolean) => void;
@@ -214,7 +247,7 @@ export interface OrchivoxAppProps {
   busy?: boolean;
   mode?: AgentMode;
   onModeChange?: (mode: AgentMode) => void;
-  onSubmit?: (text: string, action: InputAction, attachments?: FileAttachmentRef[]) => void;
+  onSubmit?: (text: string, action: InputAction, attachments?: FileAttachmentRef[]) => boolean | void;
   onAbort?: () => void;
   workers?: SubagentWorkerState[];
   onSteer?: (workerId: string, instruction: string) => void;
@@ -231,6 +264,7 @@ export interface OrchivoxAppProps {
   activeSessionMessages?: Message[];
   currentTheme?: ThemeName;
   themeSelection?: ThemeSelection;
+  terminalAppearance?: TerminalAppearance;
   onThemeChange?: (theme: ThemeSelection) => void;
   reasoningEffort?: ReasoningEffortLevel;
   onReasoningEffortChange?: (effort: ReasoningEffortLevel) => void;
@@ -241,6 +275,7 @@ export interface OrchivoxAppProps {
   onNewSession?: () => void;
   onSessionDeleted?: (sessionId: string) => void;
   onRestoreSnapshot?: (result: RestoreResult) => void;
+  onRequestRestoreSnapshot?: (snapshotId: string) => boolean | void;
   todos?: SidebarTodo[];
   modifiedFiles?: SidebarFile[];
   lspStatus?: string;
@@ -264,6 +299,8 @@ export interface OrchivoxAppProps {
   onDispatchTasks?: () => void;
   onMergeTask?: (id: string) => void;
   skills?: SkillDocument[];
+  skillDiagnostics?: SkillDiagnostic[];
+  skillDependencies?: SkillDependencyReport[];
   activeSkills?: string[];
   skillsOpen?: boolean;
   onSkillsOpenChange?: (open: boolean) => void;
@@ -526,24 +563,6 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const terminalSize = useTerminalSize();
   const theme = getTheme(props.currentTheme ?? DEFAULT_THEME);
   const activeThemeSelection = props.themeSelection ?? props.currentTheme ?? DEFAULT_THEME;
-  const themeChoices = [
-    {
-      id: AUTO_THEME,
-      label: "Auto",
-      description: "Follow the terminal background",
-      current: activeThemeSelection === AUTO_THEME,
-    },
-    ...THEME_ORDER.map((name) => ({
-      id: name,
-      label: THEMES[name].label,
-      description: `${THEMES[name].description} · ${THEMES[name].appearance} background`,
-      current: activeThemeSelection === name,
-    })),
-  ];
-  const initialThemeIndex = Math.max(
-    0,
-    themeChoices.findIndex((choice) => choice.current),
-  );
   const modePalette = theme.modes[mode] ?? theme.modes.build;
   const modeInfo = modeContract(mode);
   const reasoningOptions = props.router
@@ -575,7 +594,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const escTimerRef = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const streaming = busy || Boolean(streamingText);
   const completedTools = (props.liveEntry?.toolCalls ?? []).filter(
-    (call) => call.status === "ok" || call.status === "error",
+    (call) => call.status !== undefined && call.status !== "running",
   ).length;
   const runningCalls = (props.liveEntry?.toolCalls ?? []).filter(
     (call) => call.status === "running",
@@ -584,7 +603,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     runningCalls.length > 1
       ? `Running ${runningCalls.length} tools`
       : runningCalls[0]
-        ? (runningCalls[0].label ?? `Running ${runningCalls[0].name}`)
+        ? runningCalls[0].name === "task_wait" && runningCalls[0].workerIds?.length
+          ? `Waiting for worker ${runningCalls[0].workerIds.join(", ")}`
+          : (runningCalls[0].label ?? `Running ${runningCalls[0].name}`)
         : undefined;
   const runningDetail = runningCalls.length === 1
     ? runningCalls[0].filePath ?? runningCalls[0].command ?? runningCalls[0].detail
@@ -618,12 +639,17 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   };
 
   const reportOpen = Boolean(props.report);
+  const conversationPanelActive = isWorkspaceTrusted && !props.pendingApproval && !props.pendingQuestion && !helpOpen && !reportOpen && !props.mcpMenu;
+  const conversationPanelOpen = Boolean(props.queue || props.btw);
   const hasModalOpen =
     !isWorkspaceTrusted ||
     Boolean(props.pendingApproval) ||
     Boolean(props.pendingQuestion) ||
     helpOpen ||
     reportOpen ||
+    Boolean(props.mcpMenu) ||
+    Boolean(props.btw) ||
+    Boolean(props.queue) ||
     modelsOpen ||
     skillsOpen ||
     settingsOpen ||
@@ -662,6 +688,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
 
     if (hasModalOpen) return;
 
+    if (key.ctrl && input === "q") { props.onQueueOpen?.(); return; }
+
     if ((key as { end?: boolean }).end) {
       setChatOffsetFromBottom(0);
       return;
@@ -698,11 +726,15 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const statusRows = statusText ? countWrappedLines(statusText, innerWidth) : 0;
   const liveStatusRows = streaming && !hasModalOpen && !statusText && !compacting ? 1 : 0;
   const liveStatusGapRows = liveStatusRows > 0 ? 1 : 0;
-  const showSubagentStatus = !hasModalOpen && liveStatusRows === 0;
+  const showSubagentStatus = !hasModalOpen;
   const subagentLineRows = showSubagentStatus && agentActivitySummary(workers, tasks, innerWidth) ? 1 : 0;
   const statusGapRows = statusRows + liveStatusRows + subagentLineRows > 0 ? 1 : 0;
-  const chromeRows = 2 + statusRows + liveStatusRows + liveStatusGapRows + subagentLineRows + statusGapRows;
-  const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerRows);
+  const queueRows = !hasModalOpen && ((props.queuedCount ?? 0) > 0 || props.queuePaused) ? (props.queuePaused && props.queuePauseDetail ? 2 : 1) : 0;
+  const panelStatusRows = conversationPanelOpen && conversationPanelActive ? 1 : 0;
+  const sideStatusRows = !hasModalOpen && props.btwRunning ? 1 : 0;
+  const updateRows = !hasModalOpen && props.updateNotice ? 1 : 0;
+  const chromeRows = 2 + statusRows + liveStatusRows + liveStatusGapRows + subagentLineRows + statusGapRows + queueRows + panelStatusRows + sideStatusRows + updateRows;
+  const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, props.btw || props.queue ? 0 : composerRows);
   const chatWheelStep = 3;
   const chatPageStep = Math.max(1, viewportHeight - 2);
   const { stdin, internal_eventEmitter } = useStdin();
@@ -764,16 +796,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   }
   headerParts.push({
     key: "logo",
-    text: " (◎)",
+    text: ` ${COMPACT_LOGO_TEXT}`,
     dropOrder: 1,
     node: (
-      <Text key="logo" color={theme.border.passive}>
-        {" ("}
-        <Text bold color={theme.accent}>
-          ◎
-        </Text>
-        {")"}
-      </Text>
+      <Text key="logo">{" "}<OrchivoxLogo variant="compact" theme={theme} /></Text>
     ),
   });
   headerParts.push({
@@ -871,7 +897,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
 
   return (
     <ThemeProvider theme={props.currentTheme ?? DEFAULT_THEME}>
-      <MotionProvider enabled={props.animations !== false && !hasModalOpen}>
+      <MotionProvider enabled={props.animations !== false && (!hasModalOpen || Boolean(props.btw && conversationPanelActive && !props.queue))} clock={props.frameClock}>
       <Box flexDirection="column" paddingX={1}>
         <Text wrap="truncate">
           {headerParts
@@ -934,7 +960,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             theme={theme}
             onClose={() => props.onReportClose?.()}
           />
-        ) : modePickerOpen ? (
+        ) : props.mcpMenu ? (
+          <McpMenu {...props.mcpMenu} width={innerWidth} height={viewportHeight} theme={theme}
+            onAction={props.onMcpAction ?? (async () => { throw new Error("MCP controls are unavailable."); })} onClose={() => props.onMcpClose?.()} />
+        ) : conversationPanelOpen ? null : modePickerOpen ? (
           <ChoiceModal
             title="Mode"
             subtitle={`Current: ${mode}`}
@@ -954,15 +983,14 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onCancel={() => setModePickerOpen(false)}
           />
         ) : themePickerOpen ? (
-          <ChoiceModal
-            title="Theme"
-            subtitle={`Current: ${themeSelectionLabel(activeThemeSelection, props.currentTheme ?? DEFAULT_THEME)}`}
-            options={themeChoices}
-            initialIndex={initialThemeIndex}
+          <ThemePicker
+            selection={activeThemeSelection}
+            appearance={props.terminalAppearance ?? theme.appearance}
             width={innerWidth}
+            height={viewportHeight}
             theme={theme}
             onSelect={(id) => {
-              if (isThemeSelection(id)) props.onThemeChange?.(id);
+              props.onThemeChange?.(id);
               setThemePickerOpen(false);
             }}
             onCancel={() => setThemePickerOpen(false)}
@@ -1006,6 +1034,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             height={viewportHeight}
             animations={props.animations}
             onAnimationsChange={props.onAnimationsChange}
+            memoryEnabled={props.memoryEnabled}
+            onMemoryEnabledChange={props.onMemoryEnabledChange}
             preset={approvalsPreset}
             autoDelegate={autoDelegate}
             steps={modeSteps}
@@ -1021,8 +1051,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         ) : skillsOpen ? (
           <SkillsModal
             skills={props.skills ?? []}
+            diagnostics={props.skillDiagnostics}
+            dependencies={props.skillDependencies}
             activeSkills={props.activeSkills}
             width={innerWidth}
+            height={viewportHeight}
             theme={theme}
             onReload={props.onReloadSkills}
             onClose={() => setSkillsOpen(false)}
@@ -1104,11 +1137,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             activeSessionId={props.activeSessionId}
             activeSessionMessages={props.activeSessionMessages}
             initialTab={sessionTab}
+            busy={busy}
             onResumeSession={props.onResumeSession}
             onForkSession={props.onForkSession}
             onNewSession={props.onNewSession}
             onSessionDeleted={props.onSessionDeleted}
             onRestoreSnapshot={props.onRestoreSnapshot}
+            onRequestRestoreSnapshot={props.onRequestRestoreSnapshot}
             onClose={() => setSessionTab(null)}
             height={viewportHeight}
             theme={theme}
@@ -1131,6 +1166,17 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             theme={theme}
           />
         ) : null}
+            {props.queue ? <Box key="queue-panel" flexDirection="column" height={conversationPanelActive ? viewportHeight : 0} overflow="hidden">
+              <QueuePanel {...props.queue} width={innerWidth} height={viewportHeight} theme={theme} active={conversationPanelActive}
+                onEdit={(id) => props.onQueueEdit?.(id)} onSave={(payload) => props.onQueueSave?.(payload) ?? false}
+                onDiscard={() => props.onQueueDiscard?.()} onCancel={(id) => props.onQueueCancel?.(id)}
+                onResume={() => props.onQueueResume?.()} onStop={(id) => props.onQueueStop?.(id)} onClose={() => props.onQueueClose?.()} />
+            </Box> : null}
+            {props.btw ? <Box key="btw-panel" flexDirection="column" height={conversationPanelActive && !props.queue ? viewportHeight : 0} overflow="hidden">
+              <BtwPanel turns={props.btw.turns} topicId={props.btw.topicId} width={innerWidth} height={viewportHeight} theme={theme} active={conversationPanelActive && !props.queue}
+                onSelect={(topicId) => props.onBtwSelect?.(topicId)} onFollowup={(topicId, question, attachments) => props.onBtwFollowup?.(topicId, question, attachments) ?? false}
+                onCancel={() => props.onBtwCancel?.()} onClose={() => props.onBtwClose?.()} />
+            </Box> : null}
           </Box>
         ) : (
           <Box width={innerWidth}>
@@ -1197,8 +1243,14 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           />
         ) : null}
 
+        {panelStatusRows ? <Text color={theme.muted} wrap="truncate">Main · {streaming ? compacting ? "Compacting" : runningLabel ?? (streamingText ? "Answering" : "Thinking") : "Idle"}</Text> : null}
         {statusGapRows > 0 ? <Box height={1} /> : null}
 
+        {queueRows ? <Text color={theme.muted} wrap="truncate">Queued {props.queuedCount ?? 0}{props.queuePaused ? " · paused" : ""} · Ctrl+Q /queue</Text> : null}
+        {queueRows && props.queuePaused && props.queuePauseDetail ? <Text color={theme.status.error} wrap="truncate">Paused: {props.queuePauseDetail.replace(/\s+/g, " ")}</Text> : null}
+        {sideStatusRows ? <Text color={theme.muted} wrap="truncate">Side answer running · /btw to view</Text> : null}
+        {updateRows ? <Text color={theme.status.info} wrap="truncate">{props.updateNotice}</Text> : null}
+        <Box flexDirection="column" height={props.btw || props.queue ? 0 : undefined} overflow={props.btw || props.queue ? "hidden" : undefined}>
         <PromptComposer
             onDraftChange={props.onDraftChange}
             mode={mode}
@@ -1233,6 +1285,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               setChatOffsetFromBottom(0);
               const action = interpretInput(payload.rawText);
               if (action.kind === "command") {
+                if (action.command === "/queue" && props.onQueueOpen) { props.onQueueOpen(); return; }
                 if (action.command === "/help") {
                   setHelpOpen(true);
                   return;
@@ -1281,14 +1334,15 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                   return;
                 }
               }
-              if (payload.ultrawork || (action.kind === "submit" && action.ultrawork)) {
+              if (!streaming && (payload.ultrawork || (action.kind === "submit" && action.ultrawork))) {
                 setMode("ultrawork");
               }
               if (payload.fullText.trim().length > 0) {
-                onSubmit(payload.fullText.trim(), action, payload.attachments);
+                return onSubmit(payload.fullText.trim(), action, payload.attachments);
               }
             }}
           />
+        </Box>
       </Box>
       </MotionProvider>
     </ThemeProvider>

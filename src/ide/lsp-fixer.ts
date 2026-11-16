@@ -5,6 +5,11 @@ import type { LSPClient, LSPDiagnostic } from "./lsp-client";
 import { formatLine, readText, splitLines } from "../tools/hashline-edit";
 import type { AgentTool } from "../tools/registry";
 import { workspaceRoot } from "../tools/workspace";
+import { pathToFileURL } from "node:url";
+import { runToolProcess, ToolProcessTimeoutError } from "../tools/process";
+import { ToolResultError } from "../tools/result";
+import { lspFailure } from "./lsp-status";
+import type { ToolOutput } from "../types/schema";
 
 export { type LSPDiagnostic } from "./lsp-client";
 
@@ -15,7 +20,7 @@ export function parseTscOutput(
 ): LSPDiagnostic[] {
   const diagnostics: LSPDiagnostic[] = [];
   const lines = rawOutput.split("\n");
-  const pattern = /^([^\s()]+?)(?:\((\d+),(\d+)\)|:(\d+):(\d+))\s*[:-]\s*(error|warning)\s*([A-Za-z0-9_-]+)?:\s*(.+)$/;
+  const pattern = /^(.+?)(?:\((\d+),(\d+)\)|:(\d+):(\d+))\s*[:-]\s*(error|warning)\s*([A-Za-z0-9_-]+)?:\s*(.+)$/;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -30,14 +35,7 @@ export function parseTscOutput(
     const code = match[7];
     const message = match[8];
 
-    const normalizedTarget = targetFile ? targetFile.replace(/\\/g, "/") : undefined;
-    const normalizedFile = rawFile.replace(/\\/g, "/");
-
-    if (normalizedTarget) {
-      if (!normalizedFile.endsWith(normalizedTarget) && !normalizedTarget.endsWith(normalizedFile)) {
-        continue;
-      }
-    }
+    if (targetFile && resolve(repoRoot, rawFile.replace(/\\/g, "/")) !== resolve(repoRoot, targetFile.replace(/\\/g, "/"))) continue;
 
     const relFile = isAbsolute(rawFile) ? relative(repoRoot, rawFile) : rawFile;
 
@@ -58,25 +56,26 @@ export function parseTscOutput(
 export async function runTscDiagnostics(
   repoRoot: string = globalThis.process.cwd(),
   targetFile?: string,
+  signal?: AbortSignal,
 ): Promise<LSPDiagnostic[]> {
-  try {
-    const proc = Bun.spawn(["bun", "run", "typecheck"], {
-      cwd: repoRoot,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
-
-    await proc.exited;
-    const combinedOutput = `${stdout}\n${stderr}`;
-    return parseTscOutput(combinedOutput, repoRoot, targetFile);
-  } catch {
-    return [];
+  const sources = [{ uri: `${pathToFileURL(repoRoot).href}#typecheck`, title: "Configured typecheck command" }];
+  let result;
+  try { result = await runToolProcess(["bun", "run", "typecheck"], { cwd: repoRoot, signal }); }
+  catch (error) {
+    throw new ToolResultError({ status: signal?.aborted ? "cancelled" : "error", code: signal?.aborted ? "aborted" : error instanceof ToolProcessTimeoutError ? "typecheck_timeout" : "typecheck_failed", text: error instanceof Error ? error.message : String(error), sources });
   }
+  const output = `${result.output}\n${result.error}`;
+  const all = parseTscOutput(output, repoRoot);
+  const diagnostics = targetFile ? parseTscOutput(output, repoRoot, targetFile) : all;
+  if (result.truncated || (result.code !== 0 && diagnostics.length === 0)) {
+    throw new ToolResultError({
+      status: result.truncated || all.length ? "partial" : "error", code: result.truncated ? "typecheck_output_limit" : "typecheck_failed",
+      text: output, reason: `Typecheck exited with code ${result.code}.${result.truncated ? " Output was truncated." : ""} No clean result can be inferred for the requested scope.`,
+      data: JSON.parse(JSON.stringify({ source: "typecheck", diagnostics, exitCode: result.code })), sources,
+      coverage: { scope: targetFile ? `Configured typecheck, filtered to ${targetFile}` : "Configured typecheck output", complete: false },
+    });
+  }
+  return diagnostics;
 }
 
 export async function formatDiagnosticWithHashlines(
@@ -170,34 +169,63 @@ export class WorkspaceDiagnosticsRunner {
     this.repoRoot = options?.repoRoot ?? globalThis.process.cwd();
   }
 
-  async runDiagnostics(options?: { filePath?: string; runTsc?: boolean }): Promise<LSPDiagnostic[]> {
-    const targetFile = options?.filePath;
-    const shouldRunTsc = options?.runTsc ?? true;
-
-    if (shouldRunTsc) {
-      const tscResults = await runTscDiagnostics(this.repoRoot, targetFile);
-      if (tscResults.length > 0 || !this.lsp) {
-        return tscResults;
-      }
-    }
-
-    if (this.lsp && targetFile) {
+  async runReport(options?: { filePath?: string; runTsc?: boolean; signal?: AbortSignal }): Promise<ToolOutput> {
+    const targetFile = options?.filePath, signal = options?.signal;
+    signal?.throwIfAborted();
+    let compilerFailure: ToolOutput | undefined;
+    if (options?.runTsc ?? true) {
       try {
-        const fullPath = isAbsolute(targetFile) ? targetFile : resolve(this.repoRoot, targetFile);
-        const content = await readText(fullPath);
-        return await this.lsp.notifyFileChanged(fullPath, content);
-      } catch {
-        return [];
+        const diagnostics = await runTscDiagnostics(this.repoRoot, targetFile, signal);
+        return { status: diagnostics.length ? "success" : "empty", text: diagnostics.length ? await formatDiagnosticsReport(diagnostics, this.repoRoot) : "Configured typecheck completed without reported file diagnostics for the requested scope.",
+          data: JSON.parse(JSON.stringify({ source: "typecheck", diagnostics })), sources: [{ uri: `${pathToFileURL(this.repoRoot).href}#typecheck`, title: "Configured typecheck command" }],
+          coverage: { scope: targetFile ? `File diagnostics parsed from typecheck: ${targetFile}` : "File-located diagnostics parsed from configured typecheck", complete: false } };
+      } catch (error) {
+        signal?.throwIfAborted();
+        compilerFailure = error instanceof ToolResultError ? error.output : { status: "error", text: error instanceof Error ? error.message : String(error) };
+        if (compilerFailure.status === "cancelled") throw new ToolResultError(compilerFailure);
+        if (compilerFailure.status === "partial") return compilerFailure;
       }
     }
+    if (this.lsp && targetFile) {
+      const fullPath = resolve(this.repoRoot, targetFile);
+      let content: string;
+      try { content = await readText(fullPath); }
+      catch (error) {
+        signal?.throwIfAborted();
+        throw new ToolResultError({ status: "error", code: "local_read_failed", text: error instanceof Error ? error.message : String(error), sources: [{ uri: pathToFileURL(fullPath).href, title: "Local diagnostic input" }] });
+      }
+      try {
+        const diagnostics = await this.lsp.notifyFileChanged(fullPath, content, signal);
+        signal?.throwIfAborted();
+        return { status: compilerFailure ? "partial" : diagnostics.length ? "success" : "empty", text: diagnostics.length ? await formatDiagnosticsReport(diagnostics, this.repoRoot) : `Language server published no diagnostics for this file.${compilerFailure ? " The compiler check did not complete." : ""}`,
+          ...(compilerFailure ? { reason: `Compiler check failed; showing a file-scoped LSP diagnostic publication only. ${compilerFailure.reason ?? compilerFailure.text ?? ""}` } : {}),
+          data: JSON.parse(JSON.stringify({ source: "lsp", diagnostics, ...(compilerFailure ? { compilerFailure } : {}) })),
+          coverage: { scope: `Language-server publication for ${targetFile}; other files are not covered.`, complete: !compilerFailure },
+          sources: [{ uri: pathToFileURL(fullPath).href, title: "Language-server file diagnostics" }] };
+      } catch (error) {
+        const failure = lspFailure(error, "diagnostics", signal);
+        if (!compilerFailure || failure.kind === "cancelled") throw failure;
+        throw new ToolResultError({ ...failure.output,
+          reason: `Compiler check failed and LSP diagnostics were unavailable. ${failure.message}`,
+          data: JSON.parse(JSON.stringify({ source: "lsp", compilerFailure, lspFailure: { code: failure.output.code, reason: failure.message } })),
+        });
+      }
+    }
+    return compilerFailure ?? { status: "unavailable", code: "diagnostics_unavailable", text: "No diagnostic backend is available for this scope. Enable the configured typecheck or attach an LSP server and select a file." };
+  }
 
-    return [];
+  async runDiagnostics(options?: { filePath?: string; runTsc?: boolean; signal?: AbortSignal }): Promise<LSPDiagnostic[]> {
+    const report = await this.runReport(options);
+    if (!["success", "empty"].includes(report.status)) throw new ToolResultError(report);
+    return (report.data as unknown as { diagnostics: LSPDiagnostic[] }).diagnostics;
   }
 
   async runAndFormat(filePath?: string, runTsc?: boolean): Promise<string> {
-    const diags = await this.runDiagnostics({ filePath, runTsc });
-    return formatDiagnosticsReport(diags, this.repoRoot);
+    const report = await this.runReport({ filePath, runTsc });
+    if (!["success", "empty"].includes(report.status)) throw new ToolResultError(report);
+    return report.text ?? "";
   }
+
 }
 
 export const DiagnosticsCheckArgsSchema = z.object({
@@ -219,12 +247,13 @@ export function createDiagnosticsCheckTool(options?: {
       "Inspect LSP and compiler typecheck diagnostics across the workspace or for a specific file. Returns all errors formatted with hashline code snippets (line:hash| code) so they can be immediately fixed using hash_edit.",
     parameters: DiagnosticsCheckArgsSchema,
     readOnly: true,
-    async execute(args) {
+    concurrency: "shared",
+    async execute(args, context) {
       const root = workspaceRoot(repoRoot);
-      if (root === repoRoot) return runner.runAndFormat(args.filePath, args.runTsc);
+      if (root === repoRoot) return runner.runReport({ filePath: args.filePath, runTsc: args.runTsc, signal: context?.signal });
       // A worker worktree has its own tsconfig and no LSP session of its own.
       const workerRunner = new WorkspaceDiagnosticsRunner({ repoRoot: root });
-      return workerRunner.runAndFormat(args.filePath, args.runTsc);
+      return workerRunner.runReport({ filePath: args.filePath, runTsc: args.runTsc, signal: context?.signal });
     },
   };
 }

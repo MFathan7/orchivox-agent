@@ -12,6 +12,7 @@ export type CodeMode = "read-only" | "full";
 
 export const CODE_MODE_READ_ONLY_TOOLS = [
   "read_file",
+  "read_database",
   "glob_files",
   "grep_search",
   "json_query",
@@ -104,6 +105,8 @@ async function runSandboxScript(
       }
       callCounter += 1;
       const toolName = body.name;
+      try { turnContext?.consumeNestedTool?.(toolName); }
+      catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 }); }
       const invoke = () => registry.run(
         {
           id: `sandbox-${callCounter}`,

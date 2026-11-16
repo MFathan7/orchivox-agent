@@ -675,6 +675,7 @@ export class TaskBoard {
       description: "List this session's tasks and background workers, including state, dependencies, worker ids, worktrees, and output artifacts.",
       parameters: z.object({}),
       readOnly: true,
+      concurrency: "shared",
       execute: () => this.formatActivity(),
     };
   }

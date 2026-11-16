@@ -11,6 +11,8 @@ import {
   type AgentRunResult,
 } from "./api/server";
 import { AgentOrchestrator } from "./agent/orchestrator";
+import { skillSourceKey, visibleSkillLoads } from "./agent/skill-state";
+import { skillEnabled } from "./agent/skill-metadata";
 import { logFreeze, startEventLoopMonitor } from "./agent/freeze-debug";
 import { modeFromQuestionAnswer, modeTransitionReminder } from "./agent/modes";
 import { buildReviewCommand, buildStudyCommand } from "./agent/task-commands";
@@ -23,12 +25,21 @@ import {
   takeAnswer,
 } from "./agent/answer-stream";
 import { formatAppInfo, formatDoctor, getAppInfo, isCompiledExecutable, runUpdate, userArgs } from "./app-info";
+import { updateNotice, UPDATE_CHECK_INTERVAL } from "./installer/update-notice";
+import { fetchUpdateCheck } from "./installer/update";
+import { resolveInstallPaths } from "./installer/paths";
 import { compactMessages, estimateRequestBytes, extractSummary, markPrunedToolResults } from "./agent/compaction";
 import { formatTurnMetrics } from "./agent/turn-metrics";
 import { shouldWarnLargeSession } from "./agent/session-warning";
 import { isPlaceholderTitle, messageText } from "./agent/session-title";
 import { SessionBackgroundJobs } from "./agent/session-background";
+import { InputRouter, inputRoute, type SubmittedInput } from "./tui/input-routing";
+import type { QueueMessage } from "./tui/queue-panel";
+import type { BtwTurn } from "./agent/btw";
+import { InputRunCancelled, SessionViewLease, interruptedRun, mainTurnEvents, mainTurnResult, withRunSignal, type InputRunContext, type InputRunResult } from "./agent/run-lifecycle";
 import type { SkillDocument } from "./agent/skills";
+import { dependencyDiagnostics, type SkillDependencyReport } from "./agent/skill-dependencies";
+import { resetSkillAutocompleteCache } from "./tui/autocomplete";
 import {
   GranularPermissionEngine,
   resolvePermissionRules,
@@ -51,6 +62,7 @@ import {
   clearModeModelSelections,
   saveActiveMode,
   saveBackground,
+  saveMemoryEnabled,
   saveTurnLimits,
   saveDelegationPolicy,
   saveApprovalsPreset,
@@ -68,7 +80,12 @@ import { LSPClient } from "./ide/lsp-client";
 import { RulesLoader } from "./memory/rules-loader";
 import { estimateMessageTokens } from "./memory/hindsight";
 import { MemoryDatabase, type SessionRecord } from "./memory/sqlite";
-import { McpClientManager } from "./mcp/client";
+import { McpClientManager, type McpConnectionReport } from "./mcp/client";
+import { mcpCommand, mcpCatalogView, MCP_CONNECTION_ACTIONS } from "./mcp/commands";
+import type { McpMenuAction } from "./tui/mcp-menu";
+import type { McpCatalogQuery } from "./mcp/catalog";
+import { McpAuthManager } from "./mcp/auth";
+import type { McpAuthAction } from "./tui/mcp-auth";
 import { McpToolServer } from "./mcp/server";
 import { InterceptedProvider, loadStreamRules, type StreamRule } from "./provider/interceptor";
 import { subscribeLearnedLimits } from "./provider/limit-cache";
@@ -83,9 +100,11 @@ import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
 import { runGit } from "./vcs/git";
 import { WorktreeManager } from "./vcs/worktree";
 import { formatElapsed, formatTokenCount } from "./tui/format";
+import { TerminalRenderer } from "./tui/terminal-renderer";
 import {
   installSynchronizedOutput,
   OrchivoxApp,
+  interpretInput,
   type ChatEntryView,
   type InputAction,
   type ThinkingSegmentView,
@@ -101,7 +120,7 @@ import {
   leaveTerminal,
   setTerminalTitle,
 } from "./tui/terminal-protocol";
-import type { FileAttachmentRef } from "./tui/composer";
+import type { FileAttachmentRef, PromptSubmitPayload } from "./tui/composer";
 import { ApprovalQueue } from "./tui/approval-queue";
 import type { PendingQuestion } from "./tui/question-modal";
 import type { QuestionAnswer } from "./tools/question";
@@ -118,7 +137,7 @@ import {
   type ThemeSelection,
 } from "./tui/theme";
 import { detectTerminalAppearance } from "./tui/terminal-appearance";
-import { basename, relative } from "node:path";
+import { basename, relative, join } from "node:path";
 import { WorkspaceTrustManager } from "./security/workspace-trust";
 import { WorkspaceTrustPrompt } from "./tui/trust-modal";
 import type { ReasoningEffortLevel } from "./tui/command-palette";
@@ -166,6 +185,8 @@ export interface RuntimeHandle {
   statePaths: ProjectStatePaths;
   plugins: { loaded: string[]; failed: Array<{ file: string; error: string }> };
   mcpServers: string[];
+  mcpClient: McpClientManager;
+  mcpReady?: Promise<McpConnectionReport>;
   close: () => Promise<void>;
 }
 
@@ -322,7 +343,7 @@ class InterceptingRouter extends ProviderRouter {
 }
 
 export async function bootstrap(
-  options: { repoRoot?: string; configPath?: string; secretsPath?: string } = {},
+  options: { repoRoot?: string; configPath?: string; secretsPath?: string; waitForMcp?: boolean } = {},
 ): Promise<RuntimeHandle> {
   const root = options.repoRoot ?? globalThis.process.cwd();
   await runCleanup().catch(() => undefined);
@@ -381,8 +402,15 @@ export async function bootstrap(
     permissions,
   });
   const plugins = await orchestrator.initialize();
-  const mcpClient = new McpClientManager({ registry: orchestrator.registry });
-  const mcpReport = await mcpClient.connectAll(config.mcp.servers);
+  const mcpClient = new McpClientManager({ registry: orchestrator.registry, skills: orchestrator.skills, auth: new McpAuthManager({ configPath: resolved.configPath }),
+    lifecycle: config.mcp.lifecycle, scope: resolved.configPath, cacheDirectory: join(statePaths.dataDir, "mcp-catalog") });
+  orchestrator.skills.setMcpServerStatus(() => Object.entries(config.mcp.servers).map(([name, server]) => ({
+    name, enabled: server.enabled !== false, connected: mcpClient.listServers().includes(name),
+    transport: server.transport, url: server.url,
+    capabilities: mcpClient.capabilities(name),
+  })));
+  const mcpReady = mcpClient.connectAll(config.mcp.servers);
+  if (options.waitForMcp !== false) await mcpReady;
 
   return {
     config,
@@ -397,10 +425,14 @@ export async function bootstrap(
     snapshots,
     statePaths,
     plugins,
-    mcpServers: mcpReport.connected.map((entry) => entry.server),
+    get mcpServers() { return mcpClient.listServers(); },
+    mcpClient,
+    mcpReady,
     close: async () => {
       unsubscribeLearned();
+      await orchestrator.btw.close();
       orchestrator.closeSideTurns();
+      await orchestrator.closeToolRuntimes();
       await orchestrator.stopAllWorkers();
       await orchestrator.bgProcesses.stopAll();
       await mcpClient.close();
@@ -414,7 +446,7 @@ export async function bootstrap(
 async function startLspClient(config: AppConfig, root: string): Promise<LSPClient | undefined> {
   const entry = Object.values(config.lsp.servers).find((server) => server.enabled !== false);
   if (!entry) return undefined;
-  const client = new LSPClient({ command: entry.command, args: entry.args, env: entry.env });
+  const client = new LSPClient({ command: entry.command, args: entry.args, env: entry.env, requestTimeoutMs: entry.request_timeout_ms });
   try {
     await client.initialize(root);
     return client;
@@ -516,6 +548,7 @@ export async function main(
   const runtime = await bootstrap({
     configPath: options.configPath,
     secretsPath: options.secretsPath,
+    waitForMcp: options.command !== "tui",
   });
 
   if (options.command === "serve") {
@@ -644,6 +677,8 @@ async function runTuiSession(
     skillsOpen: false,
     settingsOpen: false,
     skills: runtime.orchestrator.skills.listDocuments() as SkillDocument[],
+    skillDiagnostics: runtime.orchestrator.skills.listDiagnostics(),
+    skillDependencies: [] as SkillDependencyReport[],
     activeSkills: [] as string[],
     hubTab: "workers" as "workers" | "tasks",
     paletteOpen: false,
@@ -651,6 +686,15 @@ async function runTuiSession(
     hubOpen: false,
     report: undefined as { title: string; text: string } | undefined,
     notice: undefined as string | undefined,
+    updateNotice: undefined as string | undefined,
+    mcpChanging: false,
+    mcpOpen: false,
+    mcpAuthServer: undefined as string | undefined,
+  };
+  const refreshSkillDiagnostics = (): void => {
+    state.skills = runtime.orchestrator.skills.listDocuments();
+    state.skillDependencies = runtime.orchestrator.skills.inspectDependencies({ mode: state.mode });
+    state.skillDiagnostics = [...runtime.orchestrator.skills.listDiagnostics(), ...dependencyDiagnostics(state.skillDependencies)];
   };
   const resetUsageDetails = (): void => {
     state.lastPromptTokens = 0;
@@ -689,6 +733,7 @@ async function runTuiSession(
     state.reasoningEffort = normalizeReasoningForMode(next, state.reasoningByMode[next]);
     if (changed) {
       cancelBackgroundView();
+      if (state.skillsOpen) refreshSkillDiagnostics();
       state.contextTokens = estimateContextTokens(next, state.messages);
       state.contextSource = "estimated";
       runtime.config.active_mode = next;
@@ -710,6 +755,7 @@ async function runTuiSession(
   let pendingQuestion: PendingQuestion | undefined;
   let questionResolver: ((answer: QuestionAnswer) => void) | undefined;
   let activeAbortController: AbortController | undefined;
+  let shuttingDown = false;
 
   runtime.orchestrator.permissions.setApprovalHandler((request) => {
     const decision = approvals.enqueue(request);
@@ -866,7 +912,7 @@ async function runTuiSession(
   const backgroundJobs = new SessionBackgroundJobs({
     config: () => runtime.config.background,
     view: () => ({
-      sessionId: state.sessionId, busy: state.busy || queuedTurns.length > 0, draft: hasComposerDraft,
+      sessionId: state.sessionId, busy: state.busy || inputQueue.active || inputQueue.size > 0, draft: hasComposerDraft,
       blocked: hasOpenInteraction || state.helpOpen || state.modelsOpen || state.skillsOpen || state.settingsOpen || state.paletteOpen || state.hubOpen || state.sessionTab !== null || Boolean(state.report) || Boolean(approvals.current()) || Boolean(pendingQuestion),
       workers: runtime.orchestrator.subagents.listWorkers().some((worker) => worker.parentSessionId === state.sessionId && ["queued", "preparing", "running", "finalizing"].includes(worker.status)),
     }),
@@ -947,6 +993,7 @@ async function runTuiSession(
 
   const applyThemeSelection = (next: ThemeSelection): void => {
     const choice = resolveThemeChoice(next, state.terminalAppearance);
+    if (choice.warning) { setNotice(`Cannot apply ${next} on a ${state.terminalAppearance} terminal. Current theme kept.`, 9000); return; }
     state.themeSelection = choice.selection;
     state.currentTheme = choice.theme;
     if (choice.selection === next) {
@@ -996,22 +1043,136 @@ async function runTuiSession(
     state.notice = themeChoice.warning;
   }
 
-  // A prompt sent while the agent is still working is kept and runs next, so
-  // typing Enter never swallows the user's message.
-  const queuedTurns: Array<{
-    text: string;
-    display?: string;
-    agent?: string;
-    attachments?: FileAttachmentRef[];
-    task?: AgentRunRequest["task"];
-    context?: string;
-  }> = [];
+  let btwOpen = false;
+  let btwTurns: BtwTurn[] = [];
+  let btwTopicId: string | undefined;
+  let queueOpen = false;
+  let queueEdit: QueueMessage | undefined;
+  const queueOperation = <T>(operation: () => T): T | undefined => {
+    try { return operation(); }
+    catch (error) {
+      setNotice(`Could not update the queue: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      rerender();
+      return undefined;
+    }
+  };
+  const openQueue = (): void => {
+    queueOperation(() => {
+      inputQueue.refresh();
+      queueOpen = true;
+      btwOpen = false;
+      rerender();
+    });
+  };
+  const leaveBtwSession = (): void => {
+    if (state.sessionId) runtime.orchestrator.btw.cancel(state.sessionId);
+    btwOpen = false;
+    btwTurns = [];
+    btwTopicId = undefined;
+  };
+  const openBtw = (): void => {
+    btwTurns = state.sessionId ? runtime.orchestrator.btw.history(state.sessionId) : [];
+    btwTopicId = btwTurns.at(-1)?.topicId;
+    btwOpen = true;
+    rerender();
+  };
+  const sendBtw = (question: string, topicId?: string, attachments?: FileAttachmentRef[]): boolean => {
+    if (attachments?.some((attachment) => attachment.error)) {
+      setNotice("A side-question attachment could not be loaded. Fix it before sending.", 8000);
+      rerender();
+      return false;
+    }
+    const sessionId = ensureSession("Interactive Session");
+    const images = (attachments ?? []).filter((attachment) => attachment.kind === "image" && attachment.base64 && attachment.mimeType)
+      .map((attachment) => ({ type: "image" as const, path: attachment.filePath,
+        source: { type: "base64" as const, media_type: attachment.mimeType!, data: attachment.base64! } }));
+    const result = runtime.orchestrator.btw.start({ sessionId, question, topicId, images,
+      activity: JSON.stringify({ mainBusy: state.busy || inputQueue.active,
+        visibleNarration: state.liveEntry?.thinkingSegments?.filter((segment) => segment.kind === "text").map((segment) => segment.text),
+        visibleAnswer: state.liveEntry?.text,
+        tools: state.liveEntry?.toolCalls?.map((call) => ({ name: call.name, status: call.status, output: call.output })),
+      }),
+    });
+    if (!result.accepted) {
+      setNotice(result.error ?? "Could not start the side question.", 8000);
+      rerender();
+      return false;
+    }
+    btwTurns = runtime.orchestrator.btw.history(sessionId);
+    btwTopicId = result.topicId;
+    btwOpen = true;
+    rerender();
+    return true;
+  };
+  const inputRouter = new InputRouter<FileAttachmentRef>({
+    store: runtime.database.inputQueueStore<SubmittedInput<FileAttachmentRef>>(),
+    sessionId: () => ensureSession("Interactive Session"),
+    blocked: () => state.busy || state.mcpChanging,
+    run: async ({ text, action, attachments, agent, task, context }, item, run) => {
+      run.assertCurrent();
+      if (item.sessionId !== state.sessionId) throw new InputRunCancelled("interrupted");
+      const lease = new SessionViewLease({ id: item.sessionId, epoch: state.sessionEpoch },
+        () => ({ id: state.sessionId, epoch: state.sessionEpoch, closed: shuttingDown }), run);
+      return lease.run(async () => {
+        if (action.kind === "command") {
+          return handleCommand(action.command, action.args ?? "", action.raw ?? text, attachments, text, item.sessionId, run);
+        }
+        if (action.ultrawork) setActiveMode("ultrawork");
+        return executeTurn(text, undefined, agent, attachments, { task, context, run });
+      }, () => {
+        state.busy = false;
+        state.liveEntry = undefined;
+        state.streamingText = "";
+        activeAbortController = undefined;
+        cancelCompaction();
+      });
+    },
+    control: async ({ text, action }) => {
+      if (action.kind === "command") {
+        await handleCommand(action.command, action.args ?? "", action.raw ?? text);
+      }
+    },
+    side: ({ text, action, attachments }) => {
+      if (action.kind !== "command") return false;
+      if (!(action.args ?? "").trim()) { openBtw(); return true; }
+      const raw = action.raw ?? text;
+      const context = text.startsWith(raw) ? text.slice(raw.length) : "";
+      return sendBtw(`${action.args}${context}`, undefined, attachments);
+    },
+    onQueued: (position) => {
+      setNotice(`Queued #${position}. Uses the mode and model active when it starts.`, 6000);
+    },
+    onError: (error) => {
+      pushEntry("system", `input failed: ${error instanceof Error ? error.message : String(error)}`);
+    },
+    onChange: () => rerender(),
+  });
+  const inputQueue = inputRouter.work;
+  const executeMcpCommand = async (args: string, signal?: AbortSignal): Promise<string> => {
+    const action = args.trim().split(/\s+/, 1)[0];
+    const changes = MCP_CONNECTION_ACTIONS.has(action) || action === "skill";
+    if (changes && state.mcpChanging) throw new Error("MCP connections are already being updated.");
+    if (changes) { state.mcpChanging = true; rerender(); }
+    try {
+      return await mcpCommand(args, { manager: runtime.mcpClient, servers: runtime.config.mcp.servers, configPath: runtime.configPath, mode: state.mode, root: process.cwd(), signal,
+        busy: state.busy || inputQueue.active || runtime.orchestrator.subagents.listWorkers().some((worker) => ["queued", "preparing", "running", "finalizing"].includes(worker.status)) || btwTurns.some((turn) => turn.status === "running") });
+    } finally {
+      if (changes) { state.mcpChanging = false; void inputQueue.drain(); }
+      refreshSkillDiagnostics();
+      if (!shuttingDown) rerender();
+    }
+  };
 
   const resetToWelcome = (): void => {
+    cancelCompaction();
+    queueEdit = undefined;
+    queueOpen = false;
+    leaveBtwSession();
     cancelBackgroundView();
-    queuedTurns.length = 0;
+    inputQueue.clear();
     state.sessionId = undefined;
     state.sessionEpoch += 1;
+    inputQueue.switchSession(`draft-${state.sessionEpoch}`);
     state.entries = [];
     state.messages = [];
     state.liveEntry = undefined;
@@ -1037,10 +1198,86 @@ async function runTuiSession(
 
   const reloadSkills = async (): Promise<void> => {
     state.skills = await runtime.orchestrator.skills.load(true);
+    refreshSkillDiagnostics();
+    resetSkillAutocompleteCache();
     rerender();
   };
 
-  const view = () => ({
+  const abortMainTurn = (): void => {
+    const cancelled = inputQueue.cancelActive();
+    cancelBackgroundView();
+    if (questionResolver) {
+      const resolve = questionResolver;
+      questionResolver = undefined;
+      pendingQuestion = undefined;
+      resolve({ selected: [], cancelled: true });
+    }
+    approvals.cancelAll("Cancelled by user.");
+    if (activeAbortController || cancelled) {
+      activeAbortController?.abort();
+      pushEntry("system", "process cancelled by user.");
+      rerender();
+    }
+  };
+  const staleQueueNotice = (): void => setNotice("This message is already processing or is no longer queued. Its active prompt was not changed.", 8000);
+  const discardQueueEdit = (): boolean => queueOperation(() => {
+    if (queueEdit?.editToken) inputQueue.cancelEdit(queueEdit.id, queueEdit.editToken);
+    queueEdit = undefined;
+    rerender();
+    return true;
+  }) ?? false;
+  const captureView = (): SessionViewLease => new SessionViewLease({ id: state.sessionId, epoch: state.sessionEpoch },
+    () => ({ id: state.sessionId, epoch: state.sessionEpoch, closed: shuttingDown }));
+  const view = () => {
+    const viewLease = captureView();
+    return ({
+    queuedCount: inputQueue.size,
+    queuePaused: inputQueue.paused,
+    queuePauseDetail: inputQueue.pauseDetail,
+    queue: queueOpen ? { items: inputQueue.items, editing: queueEdit, paused: inputQueue.paused,
+      pauseReason: inputQueue.pauseReason, pauseDetail: inputQueue.pauseDetail, stoppingId: inputQueue.stopping ? inputQueue.runningItem?.id : undefined,
+      canStopId: !inputQueue.stopping ? inputQueue.runningItem?.id : undefined } : undefined,
+    onQueueOpen: openQueue,
+    onQueueEdit: (id: string) => queueOperation(() => {
+      const item = inputQueue.beginEdit(id);
+      if (item) queueEdit = item;
+      else staleQueueNotice();
+      rerender();
+    }),
+    onQueueSave: (payload: PromptSubmitPayload) => queueOperation(() => {
+      if (!viewLease.isCurrent()) return false;
+      const action = interpretInput(payload.rawText);
+      if (inputRoute(action) !== "work") {
+        setNotice("Send UI commands and /btw from the main input. A queued edit must remain a work request.", 8000);
+        rerender();
+        return false;
+      }
+      if (!queueEdit?.editToken) return false;
+      const input = { ...queueEdit.input, text: payload.fullText, action, attachments: payload.attachments };
+      const saved = inputQueue.saveEdit(queueEdit.id, queueEdit.editToken, input);
+      if (saved) queueEdit = undefined;
+      else staleQueueNotice();
+      rerender();
+      return saved;
+    }) ?? false,
+    onQueueDiscard: discardQueueEdit,
+    onQueueCancel: (id: string) => queueOperation(() => {
+      if (!inputQueue.cancel(id)) staleQueueNotice();
+      else if (queueEdit?.id === id) queueEdit = undefined;
+      rerender();
+    }),
+    onQueueResume: () => queueOperation(() => {
+      if (!inputQueue.resume()) setNotice("Wait for the active request to stop before resuming the queue.", 8000);
+    }),
+    onQueueStop: (id: string) => { if (inputQueue.runningItem?.id === id) abortMainTurn(); else staleQueueNotice(); },
+    onQueueClose: () => { if (discardQueueEdit()) { queueOpen = false; rerender(); } },
+    btw: btwOpen ? { turns: btwTurns, topicId: btwTopicId } : undefined,
+    btwRunning: btwTurns.some((turn) => turn.status === "running"),
+    onBtwSelect: (topicId: string) => { btwTopicId = topicId; rerender(); },
+    onBtwFollowup: (topicId: string, question: string, attachments?: FileAttachmentRef[]) => viewLease.isCurrent() && sendBtw(question, topicId, attachments),
+    onBtwCancel: () => { if (state.sessionId) runtime.orchestrator.btw.cancel(state.sessionId); },
+    onBtwClose: () => { btwOpen = false; rerender(); },
+    frameClock: terminalRenderer.clock,
     projectName,
     branch,
     mcpCount: runtime.mcpServers.length,
@@ -1056,7 +1293,7 @@ async function runTuiSession(
     entries: state.entries,
     streamingText: state.streamingText,
     liveEntry: state.liveEntry,
-    busy: state.busy,
+    busy: state.busy || inputQueue.active,
     mode: state.mode,
     workers: runtime.orchestrator.subagents.listWorkers(),
     router: runtime.router,
@@ -1066,6 +1303,8 @@ async function runTuiSession(
     activeSessionMessages: state.messages,
     currentTheme: state.currentTheme,
     themeSelection: state.themeSelection,
+    updateNotice: state.updateNotice,
+    terminalAppearance: state.terminalAppearance,
     statusMessage: state.notice,
     onStatusMessage: setNotice,
     helpOpen: state.helpOpen,
@@ -1074,6 +1313,24 @@ async function runTuiSession(
       rerender();
     },
     report: state.report,
+    mcpMenu: state.mcpOpen ? { changing: state.mcpChanging, authServer: state.mcpAuthServer, servers: Object.entries(runtime.config.mcp.servers).map(([name, config]) => ({
+      name, transport: config.transport, command: config.command, args: config.args, url: config.url, enabled: config.enabled,
+      status: !config.enabled ? "disabled" as const : runtime.mcpClient.status(name).phase,
+      tools: runtime.mcpClient.toolNames(name),
+      cachedTools: runtime.mcpClient.status(name).cachedTools,
+      stale: runtime.mcpClient.status(name).stale,
+      catalogRevision: runtime.mcpClient.status(name).revision,
+      capabilities: runtime.mcpClient.listServers().includes(name) ? runtime.mcpClient.capabilities(name) : runtime.mcpClient.status(name).cachedCapabilities,
+      auth: runtime.mcpClient.authStatus(name, config),
+      error: runtime.mcpClient.failure(name) ? runtime.mcpClient.listServers().includes(name) ? "Catalog refresh failed. Reconnect to refresh." : "Connection failed. Check server availability and credentials." : undefined,
+    })), onBrowse: (query: McpCatalogQuery, signal: AbortSignal) => mcpCatalogView(query, { manager: runtime.mcpClient, mode: state.mode, root: process.cwd(), signal }),
+      onSelectSkill: (server: string, uri: string, signal: AbortSignal) => executeMcpCommand(`skill ${server} ${uri}`, signal),
+      onAuthenticate: (server: string, action: McpAuthAction, storage?: "native" | "session", signal?: AbortSignal) => executeMcpCommand([action, server, storage].filter(Boolean).join(" "), signal) } : undefined,
+    onMcpClose: () => { state.mcpOpen = false; state.mcpAuthServer = undefined; rerender(); },
+    onMcpAction: async (action: McpMenuAction) => {
+      const args = [action.kind, action.name, action.config ? JSON.stringify(action.config) : undefined].filter(Boolean).join(" ");
+      await executeMcpCommand(args);
+    },
     onReportClose: () => {
       state.report = undefined;
       rerender();
@@ -1090,8 +1347,11 @@ async function runTuiSession(
     },
     skillsOpen: state.skillsOpen,
     skills: state.skills,
+    skillDiagnostics: state.skillDiagnostics,
+    skillDependencies: state.skillDependencies,
     activeSkills: state.activeSkills,
     onSkillsOpenChange: (open: boolean) => {
+      if (open) refreshSkillDiagnostics();
       state.skillsOpen = open;
       rerender();
     },
@@ -1106,6 +1366,15 @@ async function runTuiSession(
     approvalsPreset: runtime.config.approvals.preset ?? "safer",
     autoDelegate: state.autoDelegate,
     animations: runtime.config.ui.animations,
+    memoryEnabled: runtime.config.memory.enabled,
+    onMemoryEnabledChange: (enabled: boolean) => {
+      runtime.config.memory.enabled = enabled;
+      void saveMemoryEnabled(runtime.configPath, enabled).catch((error) => {
+        setNotice(`Could not save memory setting: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      });
+      setNotice(`Long-term memory: ${enabled ? "On" : "Off"}. Saved notes are kept.`, 6000);
+      rerender();
+    },
     workerTimeoutSeconds: runtime.config.orchestration.worker_timeout_seconds,
     onWorkerTimeoutChange: (seconds: number) => {
       runtime.config.orchestration.worker_timeout_seconds = seconds;
@@ -1208,6 +1477,7 @@ async function runTuiSession(
     onMergeTask: (id: string) => {
       setNotice(`merging ${id}...`, 10000);
       void runtime.orchestrator.tasks.merge(id).then((message) => {
+        if (!viewLease.isCurrent()) return;
         setNotice(message, 12000);
       });
     },
@@ -1279,19 +1549,27 @@ async function runTuiSession(
       rerender();
     },
     onResumeSession: (sessionId: string) => {
-      if (state.busy) {
+      if (state.busy || inputQueue.active) {
         setNotice("Cancel the running turn before switching sessions.", 8000);
         return;
       }
+      leaveBtwSession();
       cancelBackgroundView();
       state.sessionId = sessionId;
       state.sessionEpoch += 1;
+      queueEdit = undefined;
+      queueOpen = false;
+      inputQueue.switchSession(sessionId);
       state.liveEntry = undefined;
       state.modifiedFiles.clear();
       const msgs = runtime.database.loadMessages(sessionId);
       const history = runtime.database.loadFullMessages(sessionId);
       state.messages = msgs;
-      state.activeSkills = runtime.database.listSessionSkills(sessionId).map((skill) => skill.name);
+      const invokedSkills = new Set(runtime.database.listSessionSkillLoads(sessionId).filter((load) => load.invoked).map(skillSourceKey));
+      state.activeSkills = visibleSkillLoads(msgs, runtime.orchestrator.skills.listDocuments().filter(skillEnabled)).filter((load) => {
+        const document = runtime.orchestrator.skills.get(load.id);
+        return document && (!(document.autoinvoke === false || document.hidden) || load.invoked || invokedSkills.has(skillSourceKey(load)));
+      }).map((load) => load.id);
       state.entries = buildTranscriptEntries(history, runtime.database.getCompaction(sessionId));
       const recap = runtime.database.getRecap(sessionId);
       if (recap) state.entries.push({ id: `recap-${sessionId}`, role: "system", kind: "recap", text: `Recap: ${recap.text}` });
@@ -1318,13 +1596,17 @@ async function runTuiSession(
       void handleCommand("/new");
     },
     onForkSession: (forked: SessionRecord) => {
-      if (state.busy) {
+      if (state.busy || inputQueue.active) {
         setNotice("Cancel the running turn before forking the session.", 8000);
         return;
       }
+      leaveBtwSession();
       cancelBackgroundView();
       state.sessionId = forked.id;
       state.sessionEpoch += 1;
+      queueEdit = undefined;
+      queueOpen = false;
+      inputQueue.switchSession(forked.id);
       setTerminalTitle(forked.title);
       setActiveMode(forked.mode);
       state.liveEntry = undefined;
@@ -1344,18 +1626,29 @@ async function runTuiSession(
       state.contextInputBudget = 0;
       state.contextBufferTokens = 0;
       warnLargeSession(forked.id, forked.totalTokens, msgs);
-      state.activeSkills = runtime.database.listSessionSkills(forked.id).map((skill) => skill.name);
+      const invokedSkills = new Set(runtime.database.listSessionSkillLoads(forked.id).filter((load) => load.invoked).map(skillSourceKey));
+      state.activeSkills = visibleSkillLoads(msgs, runtime.orchestrator.skills.listDocuments().filter(skillEnabled)).filter((load) => {
+        const document = runtime.orchestrator.skills.get(load.id);
+        return document && (!(document.autoinvoke === false || document.hidden) || load.invoked || invokedSkills.has(skillSourceKey(load)));
+      }).map((load) => load.id);
       state.entries = buildTranscriptEntries(history, runtime.database.getCompaction(forked.id));
       state.counter = state.entries.length;
       pushEntry("system", `session forked to: ${forked.title}`);
       rerender();
     },
     onRestoreSnapshot: (result: RestoreResult) => {
+      if (!viewLease.isCurrent()) return;
       pushEntry("system", `restored snapshot ${result.snapshotId}: ${result.restoredFiles.length} file(s) restored`);
       rerender();
     },
+    onRequestRestoreSnapshot: (snapshotId: string) => {
+      if (!viewLease.isCurrent()) return false;
+      const text = `/restore ${snapshotId}`;
+      return inputRouter.submit({ text, action: interpretInput(text) });
+    },
     onSessionDeleted: (sessionId: string) => {
       if (state.sessionId !== sessionId) return;
+      inputQueue.cancelActive();
       activeAbortController?.abort();
       if (questionResolver) {
         const resolve = questionResolver;
@@ -1370,12 +1663,14 @@ async function runTuiSession(
     },
     pendingApproval: approvals.current(),
     onApprovalDecision: (decision: ApprovalDecision) => {
+      if (!viewLease.isCurrent()) return;
       const current = approvals.current();
       if (current) approvals.resolve(current.id, decision);
       rerender();
     },
     pendingQuestion,
     onQuestionAnswer: (answer: QuestionAnswer) => {
+      if (!viewLease.isCurrent()) return;
       const request = pendingQuestion;
       const resolver = questionResolver;
       pendingQuestion = undefined;
@@ -1416,6 +1711,7 @@ async function runTuiSession(
       approvals.cancelForWorker(workerId, "worker stopped");
       setNotice(`stopping ${workerId}...`, 5000);
       void runtime.orchestrator.stopWorker(workerId).then((stopped) => {
+        if (!viewLease.isCurrent()) return;
         refreshSessionUsage();
         pushEntry(
           "system",
@@ -1429,27 +1725,14 @@ async function runTuiSession(
       approvals.cancelAll("all workers stopped");
       setNotice("stopping all workers...", 5000);
       void runtime.orchestrator.stopAllWorkers().then(() => {
+        if (!viewLease.isCurrent()) return;
         refreshSessionUsage();
         pushEntry("system", "stopped all workers");
         rerender();
       });
       rerender();
     },
-    onAbort: () => {
-      cancelBackgroundView();
-      if (questionResolver) {
-        const resolve = questionResolver;
-        questionResolver = undefined;
-        pendingQuestion = undefined;
-        resolve({ selected: [], cancelled: true });
-      }
-      approvals.cancelAll("Cancelled by user.");
-      if (activeAbortController) {
-        activeAbortController.abort();
-        pushEntry("system", "process cancelled by user.");
-        rerender();
-      }
-    },
+    onAbort: abortMainTurn,
     todos: runtime.orchestrator.todos.list().map((t) => ({
       id: t.id,
       task: t.task,
@@ -1467,10 +1750,11 @@ async function runTuiSession(
       rerender();
     },
     onExitWorkspace: () => {
-      instance.unmount();
+      void shutdown();
     },
     onSubmit: (text: string, action: InputAction, attachments?: FileAttachmentRef[]) => {
-      void handleInput(text, action, attachments);
+      if (!viewLease.isCurrent()) return false;
+      return handleInput(text, action, attachments);
     },
     onDraftChange: (hasDraft: boolean) => {
       hasComposerDraft = hasDraft;
@@ -1485,21 +1769,41 @@ async function runTuiSession(
       backgroundJobs.refresh();
     },
   });
-
-  const synced = installSynchronizedOutput({ onFrame: (frame) => void relay?.broadcast(frame) });
+  };
+  const synced = installSynchronizedOutput({});
+  const terminalRenderer = new TerminalRenderer({ output: synced, onFrame: (frame) => void relay?.broadcast(frame) });
   let instance: ReturnType<typeof render>;
-  instance = render(React.createElement(OrchivoxApp, view()));
+  instance = render(React.createElement(OrchivoxApp, view()), { stdout: terminalRenderer.stdout, debug: true });
   const rerender = (): void => {
+    if (shuttingDown) return;
     backgroundJobs.refresh();
     instance.rerender(React.createElement(OrchivoxApp, view()));
   };
   const unsubscribeCapabilities = runtime.router.onCapabilitiesChanged(rerender);
-  const unsubscribeSubagentResults = runtime.orchestrator.onSubagentResult((worker, text, message) => {
+  const unsubscribeMcpAuth = runtime.mcpClient.onAuthChange(rerender);
+  const unsubscribeMcpLifecycle = runtime.mcpClient.subscribe(() => { refreshSkillDiagnostics(); rerender(); });
+  const renderStreamFrame = (): void => {
+    const startedAt = performance.now();
+    rerender();
+    const duration = performance.now() - startedAt;
+    if (duration >= 50) logFreeze("render", {
+      ms: Math.round(duration), entries: state.entries.length,
+      live_chars: state.streamingText.length, live_tools: state.liveEntry?.toolCalls?.length ?? 0,
+    });
+  };
+  const unsubscribeBtw = runtime.orchestrator.btw.subscribe((turn) => {
+    if (shuttingDown || turn.sessionId !== state.sessionId) return;
+    const index = btwTurns.findIndex((entry) => entry.id === turn.id);
+    if (index < 0) btwTurns = [...btwTurns, turn];
+    else btwTurns = btwTurns.map((entry) => entry.id === turn.id ? turn : entry);
+    if (turn.status !== "running") refreshSessionUsage();
+    terminalRenderer.clock.request(renderStreamFrame);
+  });
+  const unsubscribeSubagentResults = runtime.orchestrator.onSubagentResult((worker, _text, message) => {
     if (!state.sessionId || worker.parentSessionId !== state.sessionId) return;
     if (message && !state.messages.some((entry) => entry.id === message.id)) {
       state.messages = [...state.messages, message];
     }
-    pushEntry("system", text);
     rerender();
   });
 
@@ -1529,30 +1833,18 @@ async function runTuiSession(
     targetAgent?: string,
     attachments?: FileAttachmentRef[],
     options: {
-      userEntryPushed?: boolean;
       task?: AgentRunRequest["task"];
       context?: string;
+      run?: InputRunContext;
     } = {},
-  ): Promise<void> => {
-    if (state.busy) {
-      pushEntry("user", displayUserText ?? promptText);
-      queuedTurns.push({
-        text: promptText,
-        display: displayUserText,
-        agent: targetAgent,
-        attachments,
-        task: options.task,
-        context: options.context,
-      });
-      setNotice("queued; it runs when this turn ends", 3000);
-      rerender();
-      return;
-    }
+  ): Promise<InputRunResult> => {
+    options.run?.assertCurrent();
     if (state.sessionId && !runtime.database.getSession(state.sessionId)) {
       resetToWelcome();
       setNotice("The active session was deleted. Starting a new session.", 5000);
+      return { status: "interrupted", reason: "The session was deleted before processing." };
     }
-    if (!options.userEntryPushed) pushEntry("user", displayUserText ?? promptText);
+    pushEntry("user", displayUserText ?? promptText);
     for (const attachment of attachments ?? []) {
       if (attachment.kind === "image" && attachment.error) {
         pushEntry("system", `image skipped: ${attachment.filePath} (${attachment.error})`);
@@ -1562,6 +1854,7 @@ async function runTuiSession(
       ? runtime.database.getSession(state.sessionId)?.mode
       : undefined;
     const sessionId = ensureSession(displayUserText ?? promptText);
+    const lease = new SessionViewLease({ id: sessionId, epoch: state.sessionEpoch }, () => ({ id: state.sessionId, epoch: state.sessionEpoch, closed: shuttingDown }), options.run);
     state.entries = state.entries.filter((entry) => !entry.id.startsWith("recap-"));
     backgroundJobs.beginTurn(sessionId);
     runtime.orchestrator.cancelSideTurns(sessionId);
@@ -1650,49 +1943,13 @@ async function runTuiSession(
       return segment;
     };
     state.liveEntry = liveEntry;
-    activeAbortController = new AbortController();
-    let lastLiveRender = 0;
-    let lastRenderDuration = 0;
-    let renderScheduled: ReturnType<typeof setTimeout> | undefined;
-    let rendering = false;
+    const turnController = new AbortController();
+    activeAbortController = turnController;
+    const turnSignal = options.run ? AbortSignal.any([turnController.signal, options.run.signal]) : turnController.signal;
     const renderFrame = (): void => {
-      if (rendering) return;
-      rendering = true;
-      const startedAt = performance.now();
-      try {
-        rerender();
-      } finally {
-        lastRenderDuration = performance.now() - startedAt;
-        rendering = false;
-        if (lastRenderDuration >= 50) {
-          logFreeze("render", {
-            ms: Math.round(lastRenderDuration),
-            entries: state.entries.length,
-            live_chars: state.streamingText.length,
-            live_tools: liveEntry.toolCalls?.length ?? 0,
-          });
-        }
-      }
+      if (lease.isCurrent()) renderStreamFrame();
     };
-    const renderLive = (force = false): void => {
-      if (renderScheduled) return;
-      if (synced.isBackpressured()) {
-        renderScheduled = setTimeout(() => {
-          renderScheduled = undefined;
-          renderLive(force);
-        }, 100);
-        return;
-      }
-      const now = Date.now();
-      const delay = Math.max(50, Math.min(250, Math.round(lastRenderDuration * 1.5)));
-      if (!force && now - lastLiveRender < delay) return;
-      const wait = force ? 0 : Math.max(0, delay - (now - lastLiveRender));
-      renderScheduled = setTimeout(() => {
-        renderScheduled = undefined;
-        lastLiveRender = Date.now();
-        renderFrame();
-      }, wait);
-    };
+    const renderLive = (_force = false): void => terminalRenderer.clock.request(renderStreamFrame);
     renderFrame();
     try {
       const runContext = [
@@ -1726,9 +1983,12 @@ async function runTuiSession(
       let completionTokens = 0;
       let lastUsage: { prompt_tokens: number; completion_tokens: number; total_tokens?: number } | undefined;
       let sawErrorEvent = false;
+      let fatalError = false;
+      let lastTurnError: string | undefined;
       let titleScheduled = false;
       const turnFiles = new Set<string>();
-      for await (const event of runtime.orchestrator.runStream(request, activeAbortController.signal)) {
+      for await (const event of mainTurnEvents(runtime.orchestrator.runStream(request, turnSignal), turnSignal)) {
+        if (!lease.isCurrent()) return { status: "interrupted", reason: "The session view changed." };
         if (!titleScheduled && (event.type === "token" || event.type === "thinking_token" || event.type === "tool_start")) {
           titleScheduled = true;
           maybeGenerateSessionTitle(sessionId);
@@ -1788,11 +2048,15 @@ async function runTuiSession(
                 : undefined,
               command: event.command,
               argumentsSummary: event.arguments_summary,
+              workerIds: event.worker_ids,
               status: "running",
               startedAt: Date.now(),
             },
           ];
           renderLive(true);
+        } else if (event.type === "tool_progress") {
+          liveEntry.toolCalls = (liveEntry.toolCalls ?? []).map((call) => call.id === event.id && call.status === "running" ? { ...call, progress: event.progress } : call);
+          renderLive();
         } else if (event.type === "tool_end") {
           lastToolEndAt = Date.now();
           liveEntry.toolCalls = (liveEntry.toolCalls ?? []).map((call) =>
@@ -1800,8 +2064,11 @@ async function runTuiSession(
               ? {
                   ...call,
                   status: event.status,
+                  outcome: event.outcome,
+                  metadata: event.metadata,
                   durationMs: event.duration_ms,
                   output: event.output ?? call.output,
+                  workerIds: event.worker_ids ?? call.workerIds,
                 }
               : call,
           );
@@ -1925,6 +2192,8 @@ async function runTuiSession(
           });
           renderLive(true);
         } else if (event.type === "error") {
+          lastTurnError = event.code === "tool_arguments_parse_error" ? `Invalid tool arguments: ${event.message}` : event.message;
+          if (!event.recoverable) fatalError = true;
           const actionable = event.code === "context_overflow";
           const knownLimit =
             /UnsupportedParamsError|does not support (?:the )?(?:parameter|parameters|param|params)|unsupported (?:parameter|parameters|param|params)|maximum context length|requested\s+\d+\s+output tokens/i.test(
@@ -2052,6 +2321,7 @@ async function runTuiSession(
           renderLive();
         }
       }
+      if (!lease.isCurrent()) return { status: "interrupted", reason: "The session view changed." };
       answer = answerStream.text;
       const speedStart = Math.max(lastToolEndAt, firstTokenAt ?? lastToolEndAt);
       const streamedMs = (lastTokenAt ?? 0) - speedStart;
@@ -2063,7 +2333,9 @@ async function runTuiSession(
           : undefined;
       closeThinkingSegment();
       const aborted =
-        finishReason === "aborted" || Boolean(activeAbortController?.signal.aborted);
+        finishReason === "aborted" || turnSignal.aborted;
+      const result = mainTurnResult(finishReason, aborted, fatalError);
+      if (result.status === "failed" && lastTurnError) result.reason = lastTurnError;
       const failedWithoutAnswer =
         answer.trim().length === 0 && (aborted || finishReason === "error");
       const finalToolCalls = finalizeToolCalls(liveEntry.toolCalls);
@@ -2121,7 +2393,7 @@ async function runTuiSession(
           });
         }
       } else {
-        state.lastOutcome =
+        state.lastOutcome = aborted ? "aborted" : result.status === "failed" ? `stopped: ${finishReason ?? "unknown"}` :
           finishReason === "turn_limit"
             ? "stopped at the step limit"
             : `completed: ${finishReason ?? "stop"}`;
@@ -2167,44 +2439,56 @@ async function runTuiSession(
         } catch {
           // Ignore database save error if session not found.
         }
-        recapEligible = !aborted && finishReason !== "error";
+        recapEligible = result.status === "complete";
       }
+      return result;
     } catch (error) {
-      pushEntry("system", `turn failed: ${error instanceof Error ? error.message : String(error)}`);
+      const result = interruptedRun(error, turnSignal);
+      if (lease.isCurrent() && result.status === "failed") pushEntry("system", `turn failed: ${result.reason}`);
+      return lease.isCurrent() ? result : { status: "interrupted", reason: "The session view changed." };
     } finally {
-      activeAbortController = undefined;
-      cancelCompaction();
-      state.liveEntry = undefined;
-      state.streamingText = "";
-      refreshSessionUsage();
-      if (state.sessionId === sessionId) {
-        try {
-          state.messages = runtime.database.loadMessages(sessionId);
-          finishContextMeter(state, sawContextUpdate, () => estimateContextTokens(state.mode, state.messages));
-        } catch {
-          // A deleted session must not break the turn.
+      if (activeAbortController === turnController) activeAbortController = undefined;
+      if (lease.isCurrent()) {
+        terminalRenderer.clock.cancel(renderStreamFrame);
+        cancelCompaction();
+        state.liveEntry = undefined;
+        state.streamingText = "";
+        refreshSessionUsage();
+        if (state.sessionId === sessionId) {
+          try {
+            state.messages = runtime.database.loadMessages(sessionId);
+            finishContextMeter(state, sawContextUpdate, () => estimateContextTokens(state.mode, state.messages));
+          } catch {
+            // A deleted session must not break the turn.
+          }
         }
-      }
-      if (renderScheduled) {
-        clearTimeout(renderScheduled);
-        renderScheduled = undefined;
-      }
-      state.busy = false;
-      backgroundJobs.endTurn(sessionId, recapEligible);
-      renderFrame();
-      const next = queuedTurns.shift();
-      if (next) {
-        void executeTurn(next.text, next.display, next.agent, next.attachments, {
-          userEntryPushed: true,
-          task: next.task,
-          context: next.context,
-        });
+        state.busy = false;
+        backgroundJobs.endTurn(sessionId, recapEligible);
+        renderFrame();
+      } else {
+        try { runtime.database.addSessionUsage(sessionId, 0, undefined, true); } catch { /* The original session may have been deleted. */ }
       }
     }
   };
 
-  const handleCommand = async (command: string, args = "", raw = command): Promise<void> => {
+  const handleCommand = async (command: string, args = "", raw = command, attachments?: FileAttachmentRef[], submittedText = raw, queuedSessionId?: string, run?: InputRunContext): Promise<InputRunResult | void> => {
+    const captured = { id: state.sessionId, epoch: state.sessionEpoch };
+    const lease = new SessionViewLease(captured, () => ({ id: state.sessionId, epoch: state.sessionEpoch, closed: shuttingDown }), run);
+    const callbackLease = new SessionViewLease(captured, () => ({ id: state.sessionId, epoch: state.sessionEpoch, closed: shuttingDown }));
+    const checkSession = (): void => {
+      lease.assertCurrent();
+      if (queuedSessionId && queuedSessionId !== state.sessionId) throw new InputRunCancelled("interrupted");
+    };
+    checkSession();
+    const commandFailed = (prefix: string, error: unknown): InputRunResult => {
+      checkSession();
+      const reason = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
+      pushEntry("system", reason);
+      rerender();
+      return { status: "failed", reason };
+    };
     switch (command) {
+      case "/queue": { openQueue(); break; }
       case "/help": {
         state.helpOpen = true;
         rerender();
@@ -2226,22 +2510,26 @@ async function runTuiSession(
         break;
       }
       case "/study": {
-        const command = await buildStudyCommand(root);
-        await executeTurn(command.prompt, command.display, undefined, undefined, {
+        const command = await withRunSignal(() => buildStudyCommand(root), run?.signal);
+        checkSession();
+        return executeTurn(command.prompt, command.display, undefined, attachments, {
           task: command.task,
           context: command.context,
+          run,
         });
         break;
       }
       case "/review": {
-        const command = await buildReviewCommand(root, args);
+        const command = await withRunSignal(() => buildReviewCommand(root, args), run?.signal);
+        checkSession();
         if (!command.request) {
           setNotice(command.error ?? "Could not review that target.", 8000);
-          break;
+          return { status: "failed", reason: command.error ?? "Could not review that target." };
         }
-        await executeTurn(command.request.prompt, command.request.display, undefined, undefined, {
+        return executeTurn(command.request.prompt, command.request.display, undefined, attachments, {
           task: command.request.task,
           context: command.request.context,
+          run,
         });
         break;
       }
@@ -2358,6 +2646,7 @@ async function runTuiSession(
       }
       case "/about": {
         const info = await getAppInfo();
+        checkSession();
         pushEntry(
           "system",
           [
@@ -2371,25 +2660,26 @@ async function runTuiSession(
         break;
       }
       case "/doctor": {
-        pushEntry("system", await formatDoctor());
+        const report = await formatDoctor();
+        checkSession();
+        pushEntry("system", report);
         break;
       }
       case "/update": {
         setNotice("Checking for updates...");
         try {
           const result = await runUpdate({ check: true });
+          checkSession();
           pushEntry("system", result.output);
         } catch (error) {
-          pushEntry(
-            "system",
-            `update check failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
+          return commandFailed("update check failed", error);
         }
         break;
       }
       case "/stats": {
         const sessionCount = runtime.database.listSessions().length;
         const snapshotHistory = await runtime.snapshots.getHistory();
+        checkSession();
         const snapshotCount = snapshotHistory.entries.length;
         const taskSummary = runtime.orchestrator.tasks.summary();
         const skillCount = runtime.orchestrator.skills.listDocuments().length;
@@ -2487,31 +2777,44 @@ async function runTuiSession(
       case "/undo": {
         try {
           const restored = await runtime.snapshots.undo();
+          checkSession();
           pushEntry("system", `undo: ${restored.snapshotId} restored ${restored.restoredFiles.length} file(s)`);
         } catch (error) {
-          pushEntry("system", `undo failed: ${error instanceof Error ? error.message : String(error)}`);
+          return commandFailed("undo failed", error);
         }
         break;
       }
       case "/redo": {
         try {
           const restored = await runtime.snapshots.redo();
+          checkSession();
           pushEntry("system", `redo: ${restored.snapshotId} restored ${restored.restoredFiles.length} file(s)`);
         } catch (error) {
-          pushEntry("system", `redo failed: ${error instanceof Error ? error.message : String(error)}`);
+          return commandFailed("redo failed", error);
         }
+        break;
+      }
+      case "/restore": {
+        if (!args.trim()) return commandFailed("restore failed", "Choose a snapshot or provide its ID.");
+        try {
+          const restored = await runtime.snapshots.restoreTo(args.trim());
+          checkSession();
+          pushEntry("system", `restored snapshot ${restored.snapshotId}: ${restored.restoredFiles.length} file(s) restored`);
+        } catch (error) { return commandFailed("restore failed", error); }
         break;
       }
       case "/commit": {
         try {
-          const results = await analyzeAndSplitCommits(runtime.router.get("main"));
+          const results = await analyzeAndSplitCommits(runtime.router.get("main"), run?.signal);
+          checkSession();
           pushEntry("system", results.length === 0 ? "nothing to commit" : `created ${results.length} commit(s): ${results.map((entry) => entry.message).join(" | ")}`);
         } catch (error) {
-          pushEntry("system", `commit failed: ${error instanceof Error ? error.message : String(error)}`);
+          return commandFailed("commit failed", error);
         }
         break;
       }
       case "/compact": {
+        const compactSessionId = state.sessionId;
         if (state.busy) {
           setNotice("Cancel the running turn before compacting.", 8000);
           break;
@@ -2520,8 +2823,7 @@ async function runTuiSession(
         try {
           provider = runtime.router.getMode(state.mode);
         } catch (error) {
-          pushEntry("system", `compact failed: ${error instanceof Error ? error.message : String(error)}`);
-          break;
+          return commandFailed("compact failed", error);
         }
         const compactionConfig = runtime.config.compaction;
         const capabilities = runtime.router.capabilitiesForMode(state.mode);
@@ -2532,7 +2834,8 @@ async function runTuiSession(
         try {
           const result = await compactMessages(state.messages, {
             provider,
-            onUsage: (usage) => runtime.database.addSessionUsage(state.sessionId!, usage.prompt_tokens + usage.completion_tokens, usage.cost_usd, usage.cost_incomplete),
+            signal: run?.signal,
+            onUsage: (usage) => { if (compactSessionId) runtime.database.addSessionUsage(compactSessionId, usage.prompt_tokens + usage.completion_tokens, usage.cost_usd, usage.cost_incomplete); },
             contextWindow: capabilities.context_window,
             inputLimit: capabilities.max_input,
             outputLimit: capabilities.max_output,
@@ -2543,10 +2846,12 @@ async function runTuiSession(
             previousSummary: extractSummary(state.messages),
             force: true,
             onStart: () => {
+              if (!lease.isCurrent()) return;
               beginCompaction("manual");
               rerender();
             },
           });
+          checkSession();
           if (!result.didCompact) {
             pushEntry(
               "system",
@@ -2577,14 +2882,28 @@ async function runTuiSession(
             });
           }
         } catch (error) {
-          cancelCompaction();
-          pushEntry("system", `compact failed: ${error instanceof Error ? error.message : String(error)}`);
-          setNotice("Compaction failed", 6000);
+          if (lease.isCurrent()) cancelCompaction();
+          return commandFailed("compact failed", error);
         } finally {
-          refreshSessionUsage();
-          state.busy = false;
-          rerender();
+          if (lease.isCurrent()) {
+            if (run?.signal.aborted) cancelCompaction();
+            refreshSessionUsage();
+            state.busy = false;
+            rerender();
+          }
         }
+        break;
+      }
+      case "/mcp": {
+        if (!args.trim()) { state.mcpOpen = true; state.mcpAuthServer = undefined; break; }
+        const [mcpAction, mcpServer] = args.trim().split(/\s+/);
+        if (mcpAction === "login" && Object.hasOwn(runtime.config.mcp.servers, mcpServer)) { state.mcpOpen = true; state.mcpAuthServer = mcpServer; rerender(); }
+        try {
+          const text = await executeMcpCommand(args);
+          checkSession();
+          if (mcpAction === "login" && state.mcpOpen) setNotice(text, 9000);
+          else state.report = { title: "MCP", text };
+        } catch (error) { setNotice(error instanceof Error ? error.message : String(error), 9000); }
         break;
       }
       case "/plugins": {
@@ -2614,13 +2933,17 @@ async function runTuiSession(
         break;
       }
       case "/new": {
-        if (state.busy) {
+        if (state.busy || inputQueue.active) {
           setNotice("Cancel the running turn before starting a new session.", 8000);
           break;
         }
+        leaveBtwSession();
         cancelBackgroundView();
         state.sessionId = undefined;
         state.sessionEpoch += 1;
+        queueEdit = undefined;
+        queueOpen = false;
+        inputQueue.switchSession(`draft-${state.sessionEpoch}`);
         state.messages = [];
         state.entries = [];
         state.counter = 0;
@@ -2650,6 +2973,7 @@ async function runTuiSession(
           break;
         }
         const report = await runtime.orchestrator.reload();
+        checkSession();
         pushEntry(
           "system",
           [
@@ -2668,6 +2992,7 @@ async function runTuiSession(
           break;
         }
         const report = await runCleanup({ aggressive: true });
+        checkSession();
         const noun = report.removed === 1 ? "entry" : "entries";
         const text = `cleanup removed ${report.removed} ${noun} and freed ${formatBytes(report.freedBytes)}`;
         pushEntry("system", text);
@@ -2692,8 +3017,10 @@ async function runTuiSession(
       default: {
         try {
           const customCmd = await runtime.orchestrator.customCommands.getCommand(command);
+          checkSession();
           if (customCmd) {
-            const executed = await runtime.orchestrator.customCommands.executeCommand(command, args);
+            const executed = await runtime.orchestrator.customCommands.executeCommand(command, args, run?.signal);
+            checkSession();
             if (executed) {
               if (executed.subtask) {
                 const worker = runtime.orchestrator.subagents.spawnOne({
@@ -2701,75 +3028,107 @@ async function runTuiSession(
                   task: executed.prompt,
                   writeIsolation: true,
                   onComplete: (w) => {
+                    if (!callbackLease.isCurrent()) return;
                     pushEntry("system", `subtask ${w.id} (${w.status}): ${w.result?.output.slice(0, 100) ?? ""}`);
                     rerender();
                   },
                 });
                 pushEntry("system", `running /${customCmd.name} as subtask: ${worker.id}`);
               } else {
-                await executeTurn(executed.prompt, raw, executed.agent);
+                return executeTurn(executed.prompt, raw, executed.agent, attachments, { run });
               }
               break;
             }
           }
         } catch (error) {
+          checkSession();
           pushEntry("system", `custom command execution failed: ${error instanceof Error ? error.message : String(error)}`);
-          break;
+          return { status: "failed", reason: error instanceof Error ? error.message : String(error) };
         }
         // Not a builtin and not a custom command: send the line as a normal
         // message instead of rejecting it.
-        await executeTurn(raw, undefined, undefined);
+        return executeTurn(submittedText, raw, undefined, attachments, { run });
       }
     }
     rerender();
   };
 
-  const handleInput = async (
+  const handleInput = (
     text: string,
     action: InputAction,
     attachments?: FileAttachmentRef[],
-  ): Promise<void> => {
-    if (action.kind === "command") {
-      await handleCommand(action.command, action.args ?? "", action.raw ?? text);
-      return;
-    }
-    if (action.ultrawork) setActiveMode("ultrawork");
-    await executeTurn(text, undefined, undefined, attachments);
+  ): boolean => {
+    return inputRouter.submit({ text, action, attachments });
   };
 
-  const cleanupSignals = () => {
+  let shutdownPromise: Promise<void> | undefined;
+  let updateTimer: ReturnType<typeof setInterval> | undefined;
+  const updateAbort = new AbortController();
+  let checkingUpdate = false;
+  const checkUpdates = async (): Promise<void> => {
+    if (checkingUpdate || shuttingDown) return;
+    checkingUpdate = true;
+    try {
+      const info = await getAppInfo();
+      const notice = await updateNotice({ currentVersion: info.version,
+        cachePath: join(resolveInstallPaths().baseDir, "cache", "update-check.json"),
+        check: () => fetchUpdateCheck({ currentVersion: info.version, timeoutMs: 5000, signal: updateAbort.signal }) });
+      if (!shuttingDown) { state.updateNotice = notice; rerender(); }
+    } catch { /* Automatic checks are silent when offline. */ }
+    finally { checkingUpdate = false; }
+  };
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
+    shuttingDown = true;
+    if (updateTimer) clearInterval(updateTimer);
+    updateAbort.abort();
+    activeAbortController?.abort();
+    approvals.cancelAll("Session closed.");
+    if (questionResolver) {
+      const resolve = questionResolver;
+      questionResolver = undefined;
+      pendingQuestion = undefined;
+      resolve({ selected: [], cancelled: true });
+    }
+    unsubscribeBtw();
+    unsubscribeSubagentResults();
+    terminalRenderer.clock.cancel(renderStreamFrame);
+    try { inputQueue.close(); } catch (error) { console.error("Could not checkpoint the queue during shutdown:", error); }
     backgroundJobs.close();
     if (noticeTimer) clearTimeout(noticeTimer);
     clearInterval(activityTimer);
     unsubscribeCapabilities();
+    unsubscribeMcpAuth();
+    unsubscribeMcpLifecycle();
     stopFreezeMonitor();
+    terminalRenderer.dispose();
     synced.uninstall();
     setTerminalTitle(projectName);
     leaveTerminal();
     process.removeListener("SIGINT", cleanupSignals);
     process.removeListener("SIGTERM", cleanupSignals);
     uninstallFatalHandlers();
-    void runtime.close().then(() => {
-      process.exit(0);
-    });
+    instance.unmount();
+    shutdownPromise = (async () => {
+      await inputQueue.drain();
+      await relay?.close();
+      await runtime.close();
+    })();
+    return shutdownPromise;
+  };
+  const cleanupSignals = () => {
+    void shutdown().then(() => process.exit(0), (error) => { console.error(error); process.exit(1); });
   };
   process.on("SIGINT", cleanupSignals);
   process.on("SIGTERM", cleanupSignals);
   rerender();
+  if (runtime.config.updates.check) {
+    void checkUpdates();
+    updateTimer = setInterval(() => { void checkUpdates(); }, UPDATE_CHECK_INTERVAL);
+    updateTimer.unref?.();
+  }
   await instance.waitUntilExit();
-  backgroundJobs.close();
-  if (noticeTimer) clearTimeout(noticeTimer);
-  clearInterval(activityTimer);
-  unsubscribeCapabilities();
-  stopFreezeMonitor();
-  synced.uninstall();
-  setTerminalTitle(projectName);
-  leaveTerminal();
-  process.removeListener("SIGINT", cleanupSignals);
-  process.removeListener("SIGTERM", cleanupSignals);
-  uninstallFatalHandlers();
-  await relay?.close();
-  await runtime.close();
+  await shutdown();
   print("session closed");
   return { close: async () => undefined };
 }

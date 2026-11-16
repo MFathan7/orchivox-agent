@@ -27,6 +27,11 @@ export interface ModePalette {
   secondary: string;
 }
 
+export const ORCHIVOX_BRAND_PALETTES = {
+  light: { C: "#007688", V: "#7642b5", M: "#137554" },
+  dark: { C: "#38dcec", V: "#b77ff5", M: "#67ebc1" },
+} as const;
+
 export interface ThemeStatusPalette {
   success: string;
   warning: string;
@@ -91,6 +96,42 @@ export interface Theme {
 export const THEME_ORDER = THEME_NAMES;
 
 export const THEMES: Record<ThemeName, Theme> = {
+  "orbit-dark": {
+    name: "orbit-dark", label: "Orbit Dark", appearance: "dark",
+    description: "Neutral charcoal with Orchivox cyan",
+    background: "#171c20", text: "#e2e9ec", muted: "#a2afb7",
+    accent: "#38dcec", selection: "#38dcec", focus: "#38dcec",
+    status: { success: "#8ad4ae", warning: "#e6c17a", error: "#f29a9a", info: "#79d3e0" },
+    modes: {
+      plan: { primary: "#79d3e0", secondary: "#b5c5ce" },
+      build: { primary: "#8ad4ae", secondary: "#b5c5ce" },
+      ultrawork: { primary: "#e6c17a", secondary: "#b5c5ce" },
+    },
+    diff: { added: "#8ad4ae", removed: "#f29a9a", hunkHeader: "#79d3e0" },
+    border: { active: "#38dcec", passive: "#4d5b64" },
+    badge: { running: "#79d3e0", ok: "#8ad4ae", error: "#f29a9a", idle: "#a2afb7" },
+    syntax: { keyword: "#c7b1e8", string: "#8ad4ae", comment: "#a2afb7", number: "#e6c17a", type: "#79d3e0" },
+    code: { background: "#22292e", border: "#4d5b64" },
+    tool: { background: "#1d2429", border: "#4d5b64" },
+  },
+  "orbit-light": {
+    name: "orbit-light", label: "Orbit Light", appearance: "light",
+    description: "Neutral white with Orchivox cyan",
+    background: "#f5f8fa", text: "#1c2830", muted: "#52616d",
+    accent: "#006b7b", selection: "#006b7b", focus: "#006b7b",
+    status: { success: "#17663f", warning: "#80550a", error: "#ac303b", info: "#006b7b" },
+    modes: {
+      plan: { primary: "#006b7b", secondary: "#52616d" },
+      build: { primary: "#17663f", secondary: "#52616d" },
+      ultrawork: { primary: "#80550a", secondary: "#52616d" },
+    },
+    diff: { added: "#17663f", removed: "#ac303b", hunkHeader: "#006b7b" },
+    border: { active: "#006b7b", passive: "#bcc8cf" },
+    badge: { running: "#006b7b", ok: "#17663f", error: "#ac303b", idle: "#52616d" },
+    syntax: { keyword: "#684197", string: "#17663f", comment: "#52616d", number: "#80550a", type: "#006b7b" },
+    code: { background: "#e7eef2", border: "#bcc8cf" },
+    tool: { background: "#edf2f5", border: "#bcc8cf" },
+  },
   tokyonight: {
     name: "tokyonight",
     label: "Tokyo Night",
@@ -98,7 +139,7 @@ export const THEMES: Record<ThemeName, Theme> = {
     description: "Cool blue on deep navy",
     background: "#1a1b26",
     text: "#c0caf5",
-    muted: "#7a86b8",
+    muted: "#8b96c9",
     accent: "#7aa2f7",
     selection: "#7aa2f7",
     focus: "#7aa2f7",
@@ -122,7 +163,7 @@ export const THEMES: Record<ThemeName, Theme> = {
     description: "Soft pastel on mocha",
     background: "#1e1e2e",
     text: "#cdd6f4",
-    muted: "#9399b2",
+    muted: "#a0a6c0",
     accent: "#89b4fa",
     selection: "#89b4fa",
     focus: "#89b4fa",
@@ -146,9 +187,9 @@ export const THEMES: Record<ThemeName, Theme> = {
     description: "Warm earth tones",
     background: "#282828",
     text: "#ebdbb2",
-    muted: "#a89984",
+    muted: "#c0b09a",
     accent: "#83a598",
-    selection: "#83a598",
+    selection: "#9abaae",
     focus: "#83a598",
     status: { success: "#b8bb26", warning: "#fabd2f", error: "#fc5c4d", info: "#8ec07c" },
     modes: {
@@ -156,7 +197,7 @@ export const THEMES: Record<ThemeName, Theme> = {
       build: { primary: "#b8bb26", secondary: "#83a598" },
       ultrawork: { primary: "#fabd2f", secondary: "#fc5c4d" },
     },
-    diff: { added: "#b8bb26", removed: "#fc5c4d", hunkHeader: "#83a598" },
+    diff: { added: "#b8bb26", removed: "#ff8170", hunkHeader: "#9abaae" },
     border: { active: "#83a598", passive: "#504945" },
     badge: { running: "#fabd2f", ok: "#b8bb26", error: "#fc5c4d", idle: "#928374" },
     syntax: { keyword: "#e39aad", string: "#b8bb26", comment: "#c0b09a", number: "#fabd2f", type: "#8ec07c" },
@@ -252,7 +293,7 @@ export const THEMES: Record<ThemeName, Theme> = {
       build: { primary: "#15803d", secondary: "#166534" },
       ultrawork: { primary: "#b45309", secondary: "#b91c1c" },
     },
-    diff: { added: "#15803d", removed: "#b91c1c", hunkHeader: "#1d4ed8" },
+    diff: { added: "#126532", removed: "#b91c1c", hunkHeader: "#1d4ed8" },
     border: { active: "#0f766e", passive: "#c9c5bd" },
     badge: { running: "#b45309", ok: "#15803d", error: "#b91c1c", idle: "#6b7280" },
     syntax: { keyword: "#7c3aed", string: "#166534", comment: "#5a6472", number: "#92400e", type: "#155e75" },

@@ -1,7 +1,9 @@
+import { toolOutputWithReferences } from "../tools/result";
 import React from "react";
 import { Box, Text } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
+import { observationRuns, subagentWaitGroups } from "./tool-groups";
 import type { ChatEntryView, ChatToolCallView } from "./app";
 import { diffPreviewRows, diffRows, formatThinkingDuration } from "./diff-view";
 import { formatBytes, formatTokenCount, formatReplyDate } from "./format";
@@ -128,12 +130,15 @@ function statusIcon(status: ChatToolCallView["status"]): string {
 
 function statusColor(status: ChatToolCallView["status"], theme: Theme): string {
   if (status === "running") return theme.badge.running;
-  if (status === "error") return theme.status.error;
+  if (status === "error" || status === "unavailable") return theme.status.error;
+  if (status === "partial") return theme.status.warning;
   return status === "ok" ? theme.status.success : theme.muted;
 }
 
 const COMMAND_TOOL_NAMES = new Set(["shell", "bash", "run_sandbox_script", "execute", "bg_start", "bg_logs"]);
 const HASHLINE_TOOL_NAMES = new Set(["read_file", "grep_search"]);
+const PATH_ONLY_TOOLS = new Set(["read_file", "inspect_image"]);
+const displayableDiff = (oldText: string, newText: string) => !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffd]/u.test(oldText + newText);
 const EDIT_TOOL_NAMES = new Set([
   "hash_edit",
   "write_file",
@@ -165,25 +170,31 @@ function toolCallRows(
   theme: Theme,
   keyPrefix: string,
   diffExpanded = false,
+  presentation: { nested?: boolean; waits?: ChatToolCallView[]; observations?: ChatToolCallView[] } = {},
 ): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
+  const failed = call.status === "error" || call.status === "unavailable" || call.status === "cancelled";
+  const output = PATH_ONLY_TOOLS.has(call.name) && !failed ? undefined : toolOutputWithReferences(call.output, call.outcome);
   const isCommand = COMMAND_TOOL_NAMES.has(call.name) || Boolean(call.command);
   const isEdit = EDIT_TOOL_NAMES.has(call.name) || Boolean(call.diff);
   const action = editAction(call);
+  const diff = call.diff && action !== "move" && displayableDiff(call.diff.oldText, call.diff.newText) ? call.diff : undefined;
   const label = isCommand
     ? "Run command"
     : isEdit
       ? editActionLabel(action)
       : call.label ?? toolDisplay(call.name).label;
   const command = isCommand ? call.command ?? call.detail ?? "" : "";
-  const target = isCommand ? "" : singleLine(call.filePath ?? call.detail ?? "");
-  const additions = call.diff?.additions;
-  const deletions = call.diff?.deletions;
-  const framed = width >= 12;
+  const target = isCommand ? "" : singleLine(call.filePath ?? call.detail ?? (call.name === "task_wait" ? call.workerIds?.join(", ") : undefined) ?? "");
+  const additions = diff?.additions;
+  const deletions = diff?.deletions;
+  const framed = !presentation.nested && width >= 12;
   const safeWidth = Math.max(1, width - (framed ? 4 : 0));
   const innerPad = framed ? 0 : Math.min(2, Math.max(0, safeWidth - 1));
   const bodyWidth = Math.max(1, safeWidth - innerPad);
-  const statusTint = statusColor(call.status, theme);
+  const status = call.status === "error" || presentation.waits?.some((wait) => wait.status === "error") ? "error"
+    : call.status === "running" || presentation.waits?.some((wait) => wait.status === "running") ? "running" : call.status;
+  const statusTint = statusColor(status, theme);
 
   const inlineRow = (key: string, parts: PanelPart[], rowWidth = safeWidth): TranscriptRow => ({
     key,
@@ -209,7 +220,7 @@ function toolCallRows(
       ),
     }));
 
-  const icon = statusIcon(call.status);
+  const icon = statusIcon(status);
   const suffixParts: PanelPart[] = [];
   if (additions !== undefined || deletions !== undefined) {
     suffixParts.push({
@@ -238,7 +249,7 @@ function toolCallRows(
     });
   }
 
-  const stateLabel = call.status === "error" ? "Error" : call.status === "ok" ? "Done" : call.status === "running" ? "Running" : "Pending";
+  const stateLabel = status === "error" ? "Error" : status === "ok" ? "Done" : status === "running" ? "Running" : status === "partial" ? "Partial" : status === "empty" ? "Empty" : status === "cancelled" ? "Cancelled" : status === "unavailable" ? "Unavailable" : "Pending";
   const headerWidth = Math.max(1, safeWidth - (framed ? 2 : 0));
   const fittedLabel = fitDisplayText(singleLine(label), Math.max(1, headerWidth - displayWidth(stateLabel) - 5));
 
@@ -247,7 +258,7 @@ function toolCallRows(
       {
         text: `${icon} `,
         node:
-          call.status === "running" ? (
+          status === "running" ? (
             <Spinner active color={statusTint} />
           ) : (
             <Text color={statusTint} bold>{icon} </Text>
@@ -255,7 +266,7 @@ function toolCallRows(
         color: statusTint,
       },
       { text: fittedLabel, node: <Text bold>{fittedLabel}</Text> },
-      { text: ` · ${stateLabel}`, node: <Text color={call.status === "running" ? theme.muted : statusTint}> · {stateLabel}</Text>, color: statusTint },
+      { text: ` · ${stateLabel}`, node: <Text color={status === "running" ? theme.muted : statusTint}> · {stateLabel}</Text>, color: statusTint },
     ], headerWidth),
   );
 
@@ -288,13 +299,17 @@ function toolCallRows(
     );
   }
 
-  if (call.output) {
+  if (call.progress) {
+    const progress = `${call.progress.progress}${call.progress.total === undefined ? "" : `/${call.progress.total}`}${call.progress.message ? ` · ${call.progress.message}` : ""}`;
+    wrapPreservingWhitespace(progress, bodyWidth).slice(0, 3).forEach((text, index) => rows.push(inlineRow(`${keyPrefix}-progress-${index}`, [{ text: `${" ".repeat(innerPad)}${text}`, color: theme.muted }])));
+  }
+  if (output) {
     if (rows.length > 1) rows.push(blankRow(`${keyPrefix}-output-gap`));
     rows.push(inlineRow(`${keyPrefix}-output-label`, [
       { text: `${" ".repeat(innerPad)}Output`, color: theme.muted },
     ]));
     const outputTint = call.status === "error" ? theme.status.error : theme.muted;
-    if (collapsed && call.status !== "error") {
+    if (collapsed && !failed) {
       const plain = `${" ".repeat(innerPad)}output hidden (Ctrl+O to expand)`;
       rows.push(
         inlineRow(`${keyPrefix}-output-hidden`, [
@@ -303,7 +318,7 @@ function toolCallRows(
       );
     } else {
       const anchored = HASHLINE_TOOL_NAMES.has(call.name)
-        ? parseHashlineOutput(call.output)
+        ? parseHashlineOutput(output)
         : undefined;
       const outputRows: Array<{ key: string; parts: PanelPart[] }> = [];
       if (anchored) {
@@ -321,7 +336,7 @@ function toolCallRows(
           });
         }
       } else {
-        wrapPreservingWhitespace(call.output, bodyWidth).forEach((chunk, rowIndex) => {
+        wrapPreservingWhitespace(output, bodyWidth).forEach((chunk, rowIndex) => {
           outputRows.push({ key: `${keyPrefix}-output-${rowIndex}`, parts: [
             { text: " ".repeat(innerPad) },
             { text: chunk || " ", color: outputTint },
@@ -344,7 +359,7 @@ function toolCallRows(
     }
   }
 
-  if (call.diff) {
+  if (diff) {
     if (collapsed) {
       const plain = `${" ".repeat(innerPad)}diff hidden (Ctrl+O to expand)`;
       rows.push(
@@ -355,10 +370,10 @@ function toolCallRows(
     } else {
       const rendered = diffExpanded
         ? diffRows(
-            call.diff.oldText,
-            call.diff.newText,
-            call.diff.oldLabel ?? `a/${target ?? "file"}`,
-            call.diff.newLabel ?? `b/${target ?? "file"}`,
+            diff.oldText,
+            diff.newText,
+            diff.oldLabel ?? `a/${target ?? "file"}`,
+            diff.newLabel ?? `b/${target ?? "file"}`,
             bodyWidth,
             theme,
             true,
@@ -366,8 +381,8 @@ function toolCallRows(
             { showFileHeader: action === "move" },
           )
         : diffPreviewRows(
-            call.diff.oldText,
-            call.diff.newText,
+            diff.oldText,
+            diff.newText,
             bodyWidth,
             theme,
           );
@@ -381,7 +396,30 @@ function toolCallRows(
     }
   }
 
-  if (!framed) return rows;
+  if (presentation.observations) {
+    const counts = new Map<string, number>();
+    for (const call of presentation.observations) {
+      const state = call.status === "ok" ? "done" : call.status ?? "pending";
+      counts.set(state, (counts.get(state) ?? 0) + 1);
+    }
+    const summary = ["done", "running", "error", "pending"]
+      .filter((state) => counts.has(state)).map((state) => `${counts.get(state)} ${state}`).join(" · ");
+    wrapPreservingWhitespace(summary, safeWidth).forEach((line, index) => {
+      rows.push(inlineRow(`${keyPrefix}-summary-${index}`, [{ text: line, color: theme.muted }]));
+    });
+    for (const [index, call] of presentation.observations.entries()) {
+      rows.push(blankRow(`${keyPrefix}-observation-gap-${index}`));
+      rows.push(...toolCallRows(call, safeWidth, collapsed, theme, `${keyPrefix}-observation-${index}`, diffExpanded, { nested: true }));
+    }
+  }
+  for (const [index, wait] of (presentation.waits ?? []).entries()) {
+    rows.push(blankRow(`${keyPrefix}-wait-gap-${index}`));
+    rows.push(...toolCallRows(wait, safeWidth, collapsed, theme, `${keyPrefix}-wait-${index}`, diffExpanded, { nested: true }));
+  }
+  if (!framed) {
+    if (presentation.nested && suffixParts.length > 0) rows.push(inlineRow(`${keyPrefix}-duration`, suffixParts));
+    return rows;
+  }
   const [header, ...body] = rows;
   const headerRuleWidth = Math.max(0, headerWidth - displayWidth(`${icon} ${fittedLabel} · ${stateLabel}`));
   const footerRuleWidth = Math.max(0, headerWidth - suffixParts.reduce((sum, part) => sum + displayWidth(part.text), 0));
@@ -593,6 +631,35 @@ function assistantRows(
     if (last.key.includes("-gap") || last.key.includes("-spacer")) return;
     rows.push(blankRow(key));
   };
+  const groups = subagentWaitGroups(allCalls);
+  const visibleCalls = new Set(liveCalls);
+  const renderedSpawns = new Set<ChatToolCallView>();
+  const appendTool = (call: ChatToolCallView, key: string): void => {
+    const parent = groups.parents.get(call);
+    if (parent && visibleCalls.has(parent)) return;
+    const target = parent ?? call;
+    if (renderedSpawns.has(target)) return;
+    const waits = groups.waits.get(target)?.filter((wait) => visibleCalls.has(wait));
+    if (waits?.length) renderedSpawns.add(target);
+    addGap(`${key}-gap`);
+    rows.push(...toolCallRows(target, width, options.collapsed, theme, key, options.diffExpanded ?? false, { waits }));
+  };
+  const appendTools = (calls: ChatToolCallView[], key: string): void => {
+    for (const [index, run] of observationRuns(calls).entries()) {
+      const groupKey = `${key}-${run[0].id ?? index}`;
+      if (run.length === 1) { appendTool(run[0], groupKey); continue; }
+      const status = run.some((call) => call.status === "error") ? "error"
+        : run.some((call) => call.status === "running") ? "running"
+        : run.some((call) => call.status === "unavailable") ? "unavailable"
+        : run.some((call) => call.status === "cancelled") ? "cancelled"
+        : run.some((call) => call.status === "partial") ? "partial"
+        : run.every((call) => call.status === "empty") ? "empty"
+        : run.every((call) => call.status === "ok" || call.status === "empty") ? "ok" : undefined;
+      addGap(`${groupKey}-gap`);
+      rows.push(...toolCallRows({ name: "observation_group", label: "Inspecting project", status, argumentsSummary: "" },
+        width, options.collapsed, theme, groupKey, options.diffExpanded ?? false, { observations: run }));
+    }
+  };
 
   const segmented = Boolean(entry.thinkingSegments && entry.thinkingSegments.length > 0);
   // A model that answers inside its reasoning stream would otherwise show the
@@ -606,6 +673,7 @@ function assistantRows(
     !entry.live && flatAnswer.length >= 24 && flatThinking.includes(flatAnswer.slice(0, 200));
   if (segmented) {
     const segments = entry.thinkingSegments ?? [];
+    appendTools(liveCalls.slice(0, Math.max(0, segments[0].toolIndex - hiddenLiveCalls)), `${entry.id}-tool-prefix`);
     segments.forEach((segment, index) => {
       const next = segments[index + 1];
       const visibleSegment = !liveView || segment.completedAt !== undefined;
@@ -654,19 +722,7 @@ function assistantRows(
         liveCalls.length,
         (next ? next.toolIndex : allCalls.length) - hiddenLiveCalls,
       );
-      liveCalls.slice(start, Math.max(start, end)).forEach((call, callIndex) => {
-        addGap(`${entry.id}-tool-gap-${index}-${callIndex}`);
-        rows.push(
-          ...toolCallRows(
-            call,
-            width,
-            options.collapsed,
-            theme,
-            `${entry.id}-tool-${index}-${callIndex}`,
-            options.diffExpanded ?? false,
-          ),
-        );
-      });
+      appendTools(liveCalls.slice(start, Math.max(start, end)), `${entry.id}-tool-${index}`);
     });
   } else if (entry.thinking) {
     if (liveView) {
@@ -699,19 +755,7 @@ function assistantRows(
   }
 
   if (!segmented) {
-    liveCalls.forEach((call, index) => {
-      addGap(`${entry.id}-tool-gap-${index}`);
-      rows.push(
-        ...toolCallRows(
-          call,
-          width,
-          options.collapsed,
-          theme,
-          `${entry.id}-tool-${index}`,
-          options.diffExpanded ?? false,
-        ),
-      );
-    });
+    appendTools(liveCalls, `${entry.id}-tool`);
   }
 
   if (hiddenLiveCalls > 0) {
@@ -735,17 +779,19 @@ function assistantRows(
     (file) => !linkedPaths.has(file.path),
   );
   files.forEach((file, fileIndex) => {
+    const showDiff = displayableDiff(file.oldText, file.newText) && file.oldText !== file.newText;
     rows.push({
       key: `${entry.id}-file-${fileIndex}`,
       node: (
         <Text color={theme.muted} wrap="truncate">
           {file.path}
-          {file.additions !== undefined || file.deletions !== undefined
+          {showDiff && (file.additions !== undefined || file.deletions !== undefined)
             ? ` (+${file.additions ?? 0} -${file.deletions ?? 0})`
             : ""}
         </Text>
       ),
     });
+    if (!showDiff) return;
     if (options.collapsed) {
       rows.push({
         key: `${entry.id}-file-${fileIndex}-hidden`,
@@ -778,7 +824,7 @@ function assistantRows(
     }
   });
 
-  if (entry.diff) {
+  if (entry.diff && displayableDiff(entry.diff.oldText, entry.diff.newText)) {
     if (options.collapsed) {
       rows.push({
         key: `${entry.id}-diff-hidden`,

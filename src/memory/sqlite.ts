@@ -1,3 +1,4 @@
+import { toolResultText } from "../tools/result";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
@@ -10,6 +11,10 @@ import {
 } from "../agent/prompt/instruction-state";
 import type { AgentMode, Message, Role, Usage } from "../types/schema";
 import type { TaskItem, TaskStore } from "../agent/task-board";
+import type { BtwTurn } from "../agent/btw";
+import { btwUsage } from "../agent/btw-usage";
+import { SkillLoadSchema, type SkillLoad } from "../agent/skill-state";
+import { queueChangeAllowed, type InputQueueStore, type QueuedInput, type QueueExpected, type QueuePatch } from "../agent/input-queue";
 
 export interface SessionRecord {
   id: string;
@@ -124,6 +129,25 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+CREATE TABLE IF NOT EXISTS queued_inputs (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  record_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_queued_inputs_session ON queued_inputs(session_id, status, sequence);
+CREATE TABLE IF NOT EXISTS btw_turns (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  topic_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  owner_pid INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  record_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_btw_session ON btw_turns(session_id, created_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_btw_running ON btw_turns(session_id) WHERE status = 'running';
 CREATE TABLE IF NOT EXISTS session_recaps (
   session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   text TEXT NOT NULL,
@@ -137,6 +161,12 @@ CREATE TABLE IF NOT EXISTS session_skills (
   PRIMARY KEY (session_id, skill_name)
 );
 CREATE INDEX IF NOT EXISTS idx_session_skills_session ON session_skills(session_id, activated_at);
+CREATE TABLE IF NOT EXISTS session_skill_loads (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  source_path TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  PRIMARY KEY (session_id, source_path)
+);
 CREATE TABLE IF NOT EXISTS hindsight_notes (
   id TEXT PRIMARY KEY,
   topic TEXT NOT NULL UNIQUE,
@@ -253,6 +283,83 @@ export class MemoryDatabase implements TaskStore {
     if (result.changes === 0) throw new Error(`unknown session "${sessionId}"`);
   }
 
+  inputQueueStore<T>(): InputQueueStore<T> {
+    const decode = (row: { sequence: number; record_json: string }): QueuedInput<T> => ({ ...JSON.parse(row.record_json), sequence: row.sequence });
+    const get = (id: string, sessionId: string): QueuedInput<T> | undefined => {
+      const row = this.db.query("SELECT sequence, record_json FROM queued_inputs WHERE id = ? AND session_id = ?").get(id, sessionId) as { sequence: number; record_json: string } | null;
+      return row ? decode(row) : undefined;
+    };
+    const change = (id: string, sessionId: string, expected: QueueExpected, patch: QueuePatch<T>): QueuedInput<T> | undefined => this.db.transaction(() => {
+      const item = get(id, sessionId);
+      if (!item || !queueChangeAllowed(item, expected)) return;
+      if (expected.head && this.db.query("SELECT id FROM queued_inputs WHERE session_id = ? AND id != ? AND status IN ('pending', 'editing', 'running') AND (sequence < ? OR status = 'running') LIMIT 1").get(sessionId, id, item.sequence)) return;
+      const changed = { ...item, ...patch, updatedAt: Date.now() };
+      this.db.query("UPDATE queued_inputs SET status = ?, record_json = ? WHERE id = ? AND session_id = ?").run(changed.status, JSON.stringify(changed), id, sessionId);
+      return changed;
+    }).immediate();
+    return {
+      get, change,
+      insert: (item) => {
+        this.db.query("INSERT INTO queued_inputs (id, session_id, status, record_json) VALUES (?, ?, ?, ?)").run(item.id, item.sessionId, item.status, JSON.stringify(item));
+        return get(item.id, item.sessionId)!;
+      },
+      list: (sessionId) => {
+        const rows = this.db.query("SELECT sequence, record_json FROM queued_inputs WHERE session_id = ? AND status IN ('pending', 'editing', 'running', 'interrupted') ORDER BY sequence").all(sessionId) as Array<{ sequence: number; record_json: string }>;
+        return rows.map((row) => {
+          const item = decode(row);
+          if ((item.status === "running" || item.status === "editing") && item.ownerPid && item.ownerPid !== process.pid) {
+            try { process.kill(item.ownerPid, 0); }
+            catch (error) {
+              if ((error as { code?: string }).code === "ESRCH") return change(item.id, sessionId, { statuses: [item.status], ownerId: item.ownerId },
+                { status: item.status === "editing" ? "pending" : "interrupted", ownerId: undefined, ownerPid: undefined, editToken: undefined }) ?? item;
+            }
+          }
+          return item;
+        });
+      },
+    };
+  }
+
+  listBtwTurns(sessionId: string): BtwTurn[] {
+    const rows = this.db.query("SELECT record_json, owner_pid FROM btw_turns WHERE session_id = ? ORDER BY created_at, rowid").all(sessionId) as Array<{ record_json: string; owner_pid: number }>;
+    return rows.map((row) => {
+      const turn = JSON.parse(row.record_json) as BtwTurn;
+      if (turn.status === "running" && row.owner_pid !== process.pid) {
+        try { process.kill(row.owner_pid, 0); }
+        catch (error) {
+          if ((error as { code?: string }).code === "ESRCH") {
+            turn.status = "interrupted";
+            turn.updatedAt = Date.now();
+            turn.usage = btwUsage(turn.usage, true);
+            this.finishBtwTurn(turn, turn.usage);
+          }
+        }
+      }
+      return turn;
+    });
+  }
+
+  insertBtwTurn(turn: BtwTurn): void {
+    this.listBtwTurns(turn.sessionId);
+    const running = this.db.query("SELECT id FROM btw_turns WHERE session_id = ? AND status = 'running'").get(turn.sessionId);
+    if (running) throw new Error("A /btw answer is already running in this session.");
+    this.db.query("INSERT INTO btw_turns (id, session_id, topic_id, status, owner_pid, created_at, record_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(turn.id, turn.sessionId, turn.topicId, turn.status, process.pid, turn.createdAt, JSON.stringify(turn));
+  }
+
+  updateBtwTurn(turn: BtwTurn): void {
+    this.db.query("UPDATE btw_turns SET status = ?, record_json = ? WHERE id = ? AND session_id = ? AND status = 'running'")
+      .run(turn.status, JSON.stringify(turn), turn.id, turn.sessionId);
+  }
+
+  finishBtwTurn(turn: BtwTurn, usage: Usage): void {
+    this.db.transaction(() => {
+      const result = this.db.query("UPDATE btw_turns SET status = ?, record_json = ? WHERE id = ? AND session_id = ? AND status = 'running'")
+        .run(turn.status, JSON.stringify({ ...turn, usage }), turn.id, turn.sessionId);
+      if (result.changes) this.addSessionUsage(turn.sessionId, usage.prompt_tokens + usage.completion_tokens, usage.cost_usd, usage.cost_incomplete);
+    })();
+  }
+
   saveRecap(sessionId: string, text: string): void {
     this.db.query("INSERT INTO session_recaps (session_id, text, created_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET text = excluded.text, created_at = excluded.created_at")
       .run(sessionId, text, Date.now());
@@ -330,6 +437,23 @@ export class MemoryDatabase implements TaskStore {
 
   clearSessionSkills(sessionId: string): void {
     this.db.query("DELETE FROM session_skills WHERE session_id = ?").run(sessionId);
+    this.db.query("DELETE FROM session_skill_loads WHERE session_id = ?").run(sessionId);
+  }
+
+  saveSessionSkillLoad(sessionId: string, record: SkillLoad): void {
+    this.db.query("INSERT INTO session_skill_loads (session_id, source_path, record_json) VALUES (?, ?, ?) ON CONFLICT(session_id, source_path) DO UPDATE SET record_json = excluded.record_json")
+      .run(sessionId, record.path, JSON.stringify(SkillLoadSchema.parse(record)));
+  }
+
+  listSessionSkillLoads(sessionId: string): SkillLoad[] {
+    const rows = this.db.query("SELECT record_json FROM session_skill_loads WHERE session_id = ?").all(sessionId) as Array<{ record_json: string }>;
+    return rows.flatMap((row) => {
+      try {
+        const record = SkillLoadSchema.parse(JSON.parse(row.record_json));
+        const backed = record.messageIds.every((id) => this.db.query("SELECT 1 FROM messages WHERE session_id = ? AND id = ?").get(sessionId, id));
+        return backed ? [record] : [];
+      } catch { return []; }
+    });
   }
 
   addSessionUsage(id: string, tokens: number, costUsd?: number, incomplete = false): void {
@@ -393,24 +517,37 @@ export class MemoryDatabase implements TaskStore {
     for (const skill of this.listSessionSkills(sourceSessionId)) {
       this.activateSessionSkill(forked.id, skill.name);
     }
+    for (const record of this.listSessionSkillLoads(sourceSessionId)) {
+      if (record.messageIds.every((id) => idMap.has(id))) {
+        this.saveSessionSkillLoad(forked.id, { ...record, messageIds: record.messageIds.map((id) => idMap.get(id)!) });
+      }
+    }
     return forked;
   }
 
   saveMessage(sessionId: string, message: Message): void {
-    const session = this.getSession(sessionId);
-    if (!session) throw new Error(`unknown session "${sessionId}"`);
-    const createdAt = message.created_at ?? Date.now();
-    const content = stripInlineImages(message.content);
-    const metadata = message.metadata ? JSON.stringify(message.metadata) : null;
-    this.db
-      .query("INSERT INTO messages (id, session_id, role, content_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(message.id, sessionId, message.role, JSON.stringify(content), metadata, createdAt);
-    if (message.metadata?.synthetic !== true) {
+    this.db.transaction(() => {
+      const session = this.getSession(sessionId);
+      if (!session) throw new Error(`unknown session "${sessionId}"`);
+      const createdAt = message.created_at ?? Date.now();
+      const content = stripInlineImages(message.content);
+      const metadata = message.metadata ? JSON.stringify(message.metadata) : null;
       this.db
-        .query("INSERT INTO messages_fts (message_id, session_id, role, content) VALUES (?, ?, ?, ?)")
-        .run(message.id, sessionId, message.role, plainText(content));
-    }
-    this.db.query("UPDATE sessions SET updated_at = ? WHERE id = ?").run(createdAt, sessionId);
+        .query("INSERT INTO messages (id, session_id, role, content_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(message.id, sessionId, message.role, JSON.stringify(content), metadata, createdAt);
+      if (message.metadata?.synthetic !== true) {
+        this.db
+          .query("INSERT INTO messages_fts (message_id, session_id, role, content) VALUES (?, ?, ?, ?)")
+          .run(message.id, sessionId, message.role, plainText(content));
+      }
+      this.db.query("UPDATE sessions SET updated_at = ? WHERE id = ?").run(createdAt, sessionId);
+      const compaction = this.getCompaction(sessionId);
+      if (compaction && !compaction.tail_start_message_id) {
+        const first = this.db.query("SELECT id FROM messages WHERE session_id = ? AND (created_at > ? OR id = ?) ORDER BY created_at ASC, rowid ASC LIMIT 1")
+          .get(sessionId, compaction.created_at, message.id) as { id: string };
+        this.saveCompaction(sessionId, { ...compaction, tail_start_message_id: first.id });
+      }
+    }).immediate();
   }
 
   replaceMessageContent(id: string, content: Message["content"]): void {
@@ -427,7 +564,7 @@ export class MemoryDatabase implements TaskStore {
     const rows = this.loadFullMessages(sessionId);
     const compaction = this.getCompaction(sessionId);
     if (!compaction) return rows;
-    if (!compaction.tail_start_message_id) return [summaryMessage(compaction)];
+    if (!compaction.tail_start_message_id) return [summaryMessage(compaction), ...rows.filter((message) => (message.created_at ?? 0) > compaction.created_at)];
     let index = rows.findIndex((message) => message.id === compaction.tail_start_message_id);
     if (index === -1) return [summaryMessage(compaction)];
     // Never start the tail on a tool result: its call must stay in the context.
@@ -684,12 +821,13 @@ function toTaskItem(row: TaskRow): TaskItem {
 }
 
 function stripInlineImages(content: Message["content"]): Message["content"] {
-  if (!content.some((block) => block.type === "image")) return content;
-  return content.map((block) =>
-    block.type === "image"
-      ? { type: "text" as const, text: `[image: ${block.path ?? block.source.media_type}]` }
-      : block,
-  );
+  return content.map((block) => {
+    if (block.type === "image") return { type: "text" as const, text: `[image: ${block.path ?? block.source.media_type}]` };
+    if (block.type === "tool_result" && Array.isArray(block.content)) {
+      return { ...block, content: block.content.map((part) => part.type === "image" ? { type: "text" as const, text: `[image: ${part.path ?? part.source.media_type}]` } : part) };
+    }
+    return block;
+  });
 }
 
 function plainText(content: Message["content"]): string {
@@ -698,7 +836,7 @@ function plainText(content: Message["content"]): string {
     if (block.type === "text" || block.type === "thinking") parts.push(block.type === "text" ? block.text : block.thinking);
     else if (block.type === "tool_use") parts.push(`${block.name} ${JSON.stringify(block.input)}`);
     else if (block.type === "tool_result") {
-      parts.push(typeof block.content === "string" ? block.content : block.content.map((item) => item.text).join("\n"));
+      parts.push(toolResultText(block));
     }
   }
   return parts.join("\n");

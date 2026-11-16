@@ -21,6 +21,8 @@ export interface SettingsModalProps {
   onWorkerFallbackChange?: (value: WorkerFallbackMode) => void;
   animations?: boolean;
   onAnimationsChange?: (enabled: boolean) => void;
+  memoryEnabled?: boolean;
+  onMemoryEnabledChange?: (enabled: boolean) => void;
   preset: ApprovalPreset;
   autoDelegate: AutoDelegateMode;
   steps: Record<SettingsMode, number>;
@@ -94,7 +96,7 @@ export const WORKER_FALLBACK_DESCRIPTIONS: Record<WorkerFallbackMode, string> = 
 };
 
 interface Row {
-  id: "preset" | "auto_delegate" | "delegation" | keyof typeof TURN_LIMIT_ROWS | "animations" | "worker_timeout" | "worker_fallback" | "titles" | "recap" | "recap_delay" | SettingsMode | "config";
+  id: "preset" | "auto_delegate" | "delegation" | keyof typeof TURN_LIMIT_ROWS | "animations" | "memory" | "worker_timeout" | "worker_fallback" | "titles" | "recap" | "recap_delay" | SettingsMode | "config";
   label: string;
   value: string;
   detail?: string;
@@ -208,6 +210,8 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
       detail: "A separate model request after idle time. Typing or new work cancels it.", editable: Boolean(props.onBackgroundChange) },
     { id: "recap_delay", label: "Recap delay", value: `${props.background?.recap_idle_seconds ?? 240}s`,
       detail: "Wait after the answer and background workers finish.", editable: Boolean(props.onBackgroundChange) },
+    { id: "memory", label: "Long-term memory", value: props.memoryEnabled === true ? "On" : "Off",
+      detail: "Let the agent save and recall project notes. Off keeps saved notes.", editable: Boolean(props.onMemoryEnabledChange) },
     {
       id: "config",
       label: "Config",
@@ -224,6 +228,10 @@ export function SettingsModal(props: SettingsModalProps): React.ReactElement {
   const change = (direction: 1 | -1): void => {
     const row = rows[clamped];
     if (!row?.editable) return;
+    if (row.id === "memory") {
+      props.onMemoryEnabledChange?.(props.memoryEnabled !== true);
+      return;
+    }
     if (row.id === "checkpoint_interval" || row.id === "max_tool_calls" || row.id === "max_wall_seconds") {
       const setting = TURN_LIMIT_ROWS[row.id];
       const current = props.limits?.[row.id] ?? setting.fallback;

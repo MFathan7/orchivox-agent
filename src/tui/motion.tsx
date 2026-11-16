@@ -3,31 +3,31 @@ import { Text, useStdout } from "ink";
 
 import { graphemeClusters, displayWidth } from "./text-wrap";
 import { useTheme } from "./theme";
+import { fallbackFrameClock, type FrameClock } from "./frame-clock";
 
 const MotionContext = React.createContext(true);
+const FrameClockContext = React.createContext(fallbackFrameClock);
+const noSubscription = () => () => undefined;
 
 export function animationsEnabled(enabled: boolean, tty: boolean, env = process.env): boolean {
   return enabled && tty && env.TERM !== "dumb" && env.NO_COLOR === undefined;
 }
 
-export function MotionProvider({ enabled, children }: { enabled: boolean; children: React.ReactNode }) {
+export function MotionProvider({ enabled, children, clock = fallbackFrameClock }: { enabled: boolean; children: React.ReactNode; clock?: FrameClock }) {
   const { stdout } = useStdout();
-  return <MotionContext.Provider value={animationsEnabled(enabled, Boolean(stdout.isTTY))}>{children}</MotionContext.Provider>;
+  return <FrameClockContext.Provider value={clock}><MotionContext.Provider value={animationsEnabled(enabled, Boolean(stdout.isTTY))}>{children}</MotionContext.Provider></FrameClockContext.Provider>;
 }
 
 export function useMotion(): boolean {
   return React.useContext(MotionContext);
 }
 
-export function useAnimationFrame(active: boolean, frames: number): number {
+export function useAnimationFrame(active: boolean, frames: number, frameMs = 100): number {
   const enabled = useMotion();
-  const [frame, setFrame] = React.useState(0);
-  React.useEffect(() => {
-    if (!active || !enabled) return;
-    const timer = setInterval(() => setFrame((value) => (value + 1) % frames), 100);
-    return () => clearInterval(timer);
-  }, [active, enabled, frames]);
-  return active && enabled ? frame : 0;
+  const clock = React.useContext(FrameClockContext);
+  const running = active && enabled;
+  const snapshot = React.useCallback(() => running ? Math.floor(clock.snapshot() / frameMs) % frames : 0, [clock, frameMs, frames, running]);
+  return React.useSyncExternalStore(running ? clock.subscribe : noSubscription, snapshot, snapshot);
 }
 
 export function contrastRatio(foreground: string, background: string): number {
@@ -55,9 +55,9 @@ export function shimmerColor(base: string, highlight: string, background: string
 export function ActivityText({ text, active = true }: { text: string; active?: boolean }) {
   const theme = useTheme();
   const enabled = useMotion();
-  const frame = useAnimationFrame(active, 20);
+  const frame = useAnimationFrame(active, 60, 2000 / 60);
   const width = displayWidth(text);
-  const center = (frame / 19) * (width + 8) - 4;
+  const center = (frame / 59) * (width + 8) - 4;
   let column = 0;
   return <Text>{graphemeClusters(text).map((glyph, index) => {
     const distance = Math.abs(column - center);

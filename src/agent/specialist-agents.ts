@@ -59,6 +59,7 @@ Key behaviors:
       "diff_view",
       "json_query",
       "ast_search",
+      "code_find",
       "ast_declarations",
       "lsp_diagnostics",
       "lsp_references",
@@ -77,7 +78,7 @@ Key principles:
     description: "Documentation and research specialist for external libraries, GitHub repositories, and papers using web search and fetch.",
     roleModel: "fast",
     readOnly: true,
-    allowedTools: ["read_file", "glob_files", "grep_search", "web_search", "web_fetch", "json_query"],
+    allowedTools: ["read_file", "read_document", "read_archive", "read_notebook", "github_read", "glob_files", "grep_search", "web_search", "web_fetch", "json_query"],
     systemPrompt: `You are Librarian, the Documentation, Open Source, and Research Specialist.
 Your expertise lies in researching documentation, analyzing third-party libraries, reading GitHub repositories, and breaking down technical specifications and research papers.
 Key principles:
@@ -91,6 +92,9 @@ Key principles:
     roleModel: "fast",
     readOnly: true,
     allowedTools: [
+      "code_find",
+      "read_archive",
+      "read_notebook",
       "glob_files",
       "grep_search",
       "read_file",
@@ -125,6 +129,10 @@ Key principles:
     readOnly: true,
     thinkingBudget: 16000,
     allowedTools: [
+      "code_find",
+      "ast_search",
+      "read_archive",
+      "read_notebook",
       "read_file",
       "read_document",
       "glob_files",
@@ -148,7 +156,9 @@ Your job is to turn a goal into a WorkPlan that other workers can execute withou
 Read the codebase when it helps you ground the plan. Never edit files.
 Each task must name a suitable agent, include exact file paths and constraints, and state acceptance criteria.
 Prefer the smallest number of independent tasks. Mark read-only tasks with mode "plan" and write_isolation false.
-If the goal is study, review, or planning only, every task must be read-only and no task may edit files. Split substantial independent areas into focused explore tasks; keep small studies in one task. Do not add implementation or documentation tasks to a study.
+Keep investigation, implementation, and focused verification of a coupled change with one owner. One requested worker can own a complete assignment; add workers only for useful independent results with clear file ownership.
+Choose task boundaries by independently verifiable results, clear file ownership, and setup and integration cost. Honor explicit requests for subagents when tools, model routing, and permissions allow them; prompt length, task size, or file count alone must not veto the request. Do not invent extra tasks to create parallelism.
+If the goal is study, review, or planning only, every task must be read-only and no task may edit files. Assign independent questions to focused explore tasks when useful; combine work that needs the same investigation. Do not add implementation or documentation tasks to a study.
 Do not include raw reasoning, hidden thoughts, or a narrative. Return only the WorkPlan JSON.`,
   },
   programmer: {

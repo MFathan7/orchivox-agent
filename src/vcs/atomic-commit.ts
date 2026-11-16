@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { LLMProvider } from "../provider/router";
+import { abortableStream } from "../provider/abortable-stream";
 import { ChatRequestSchema } from "../types/schema";
 import { runGit } from "./git";
 
@@ -35,6 +36,7 @@ export async function analyzeAndSplitCommits(
   signal?: AbortSignal,
   options: { repoRoot?: string; model?: string; maxTokens?: number } = {},
 ): Promise<CommitResult[]> {
+  signal?.throwIfAborted();
   const root = options.repoRoot ?? globalThis.process.cwd();
   const status = (await runGit(root, ["status", "--porcelain"])).stdout;
   if (!status.trim()) return [];
@@ -60,7 +62,7 @@ export async function analyzeAndSplitCommits(
 
   let reply = "";
   let streamError: string | undefined;
-  for await (const event of provider.streamChat(request, signal)) {
+  for await (const event of abortableStream(provider.streamChat(request, signal), signal)) {
     if (event.type === "token") reply += event.text;
     else if (event.type === "error") streamError = event.message;
   }
@@ -71,7 +73,9 @@ export async function analyzeAndSplitCommits(
 
   const results: CommitResult[] = [];
   for (const group of plan.commits) {
+    signal?.throwIfAborted();
     await runGit(root, ["add", "--", ...group.files]);
+    signal?.throwIfAborted();
     await runGit(root, ["commit", "-m", group.message]);
     const commitHash = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
     results.push({ message: group.message, files: group.files, commitHash });

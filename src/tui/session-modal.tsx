@@ -13,6 +13,7 @@ import { useTerminalSize } from "./viewport";
 export type SessionModalTab = "sessions" | "fork" | "timeline";
 
 export interface SessionTimeTravelModalProps {
+  busy?: boolean;
   database: MemoryDatabase;
   snapshots: SnapshotManager;
   activeSessionId?: string;
@@ -23,6 +24,7 @@ export interface SessionTimeTravelModalProps {
   onNewSession?: () => void;
   onSessionDeleted?: (sessionId: string) => void;
   onRestoreSnapshot?: (result: RestoreResult) => void;
+  onRequestRestoreSnapshot?: (snapshotId: string) => boolean | void;
   onClose: () => void;
   height?: number;
   theme?: Theme;
@@ -158,6 +160,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
     }
 
     if (key.ctrl && input === "n") {
+      if (props.busy) { setStatusNotice("Stop the active request before starting a new session."); return; }
       onNewSession?.();
       onClose();
       return;
@@ -196,6 +199,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
       }
 
       if (key.return) {
+        if (props.busy) { setStatusNotice("Stop the active request before switching sessions."); return; }
         let chosenSessionId: string | undefined;
         if (searchHits.length > 0) {
           chosenSessionId = searchHits[sessionIndex]?.sessionId;
@@ -253,6 +257,7 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
       }
 
       if (input === "f" || input === "F" || key.return) {
+        if (props.busy) { setStatusNotice("Stop the active request before forking."); return; }
         const targetMessage = activeMessages[turnIndex];
         if (targetMessage && activeSessionId) {
           try {
@@ -280,7 +285,12 @@ export function SessionTimeTravelModal(props: SessionTimeTravelModalProps) {
 
       if (key.return) {
         const selectedSnap = snapshotHistory.entries[snapshotIndex];
+        if (props.busy) { setStatusNotice("Stop the active request before restoring files."); return; }
         if (selectedSnap) {
+          if (props.onRequestRestoreSnapshot) {
+            if (props.onRequestRestoreSnapshot(selectedSnap.id) !== false) onClose();
+            return;
+          }
           void snapshots.restoreTo(selectedSnap.id).then((result) => {
             onRestoreSnapshot?.(result);
             onClose();

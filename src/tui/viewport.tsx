@@ -4,7 +4,7 @@ import { Box, Text, useInput, useStdin, useStdout } from "ink";
 import type { ChatEntryView, WriteTarget } from "./app";
 import { isMouseSequence, parseMouseClick, parseMousePointerEvents } from "./mouse";
 import { groupToolCalls } from "./tool-groups";
-import { WelcomeBanner } from "./logo";
+import { OrchivoxLogo, WelcomeBanner } from "./logo";
 import { markdownRows } from "./markdown";
 import { enterTerminal, leaveTerminal } from "./terminal-protocol";
 import { getTheme, useActiveTheme, type Theme } from "./theme";
@@ -627,11 +627,13 @@ export function ScrollableChatViewport({
     <Box flexDirection="column" width={width} height={height} flexShrink={0} overflowY="hidden">
       {showWelcome ? (
         height >= 12 && width >= 100 ? (
-          <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} />
+          <WelcomeBanner theme={theme} repoPath={repoPath} branch={branch} width={width} height={height} />
         ) : (
           <Box justifyContent="center">
+            <OrchivoxLogo variant="compact" theme={theme} />
+            <Text>{" "}</Text>
             <Text bold color={theme.accent}>ORCHIVOX</Text>
-            <Text color={theme.muted}> · type a prompt to begin</Text>
+            {width >= 40 ? <Text color={theme.muted}> · type a prompt to begin</Text> : null}
           </Box>
         )
       ) : null}
