@@ -390,7 +390,7 @@ export class BackgroundProcessManager {
     return {
       name: "bg_start",
       description:
-        "Start a long-running process in the background (web server, watcher, local database, mock server) without blocking the agent. Automatically detects listening ports and URLs.",
+        `Start a long-running process in the background (web server, watcher, local database, mock server) without blocking the agent. Automatically detects listening ports and URLs. Use ${this.adapter ? `${this.adapter.label} syntax` : "the shell syntax reported in Environment"}.`,
       parameters: z.object({
         command: z.string().min(1).describe("The shell command to execute in the background."),
         id: z.string().optional().describe("Optional unique identifier for this background process."),

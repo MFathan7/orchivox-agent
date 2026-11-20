@@ -9,6 +9,7 @@ export { MODE_PROMPTS } from "./base";
 export { progressCheckpointMessage } from "./progress";
 export { toolArgumentRecoveryMessage } from "./tool-recovery";
 export { skillAvailabilityHint, SKILL_OUTPUT_CORRECTION } from "./skills";
+export { workerStepBudgetNotice } from "./worker";
 
 export function buildSystemPrompt(options: SystemPromptOptions): string {
   return composeSystemPrompt(options);

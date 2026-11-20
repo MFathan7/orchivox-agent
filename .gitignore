@@ -22,10 +22,18 @@ artifacts/
 /out-tsc/
 
 # Private test suite stays local
-/tests/
+/tests/*
+!/tests/file-mentions.test.ts
+!/tests/markdown-parser.test.ts
+!/tests/prompt-layers.test.ts
+!/tests/subagent-budgets.test.ts
+!/tests/subagent-status.test.ts
+!/tests/synthetic-reminders.test.ts
+!/tests/ui-layouts.test.ts
 
 # Compiled binary (bun build --compile)
 orchivox
+orchivox.exe
 
 # Environment and credentials
 .env

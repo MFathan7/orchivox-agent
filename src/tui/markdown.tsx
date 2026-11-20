@@ -1,10 +1,11 @@
 import React from "react";
 import { Box, Text } from "ink";
 import type { Token } from "marked";
+import { DEFAULT_UI_LAYOUT, type UiLayout } from "../types/ui-layout";
 import type { RenderRow } from "./rows";
 import { displayWidth, graphemeClusters, wrapPreservingWhitespace } from "./text-wrap";
 import { getTheme, useActiveTheme, type Theme } from "./theme";
-import { inlinePlainText, parseInlineSegments, parseMarkdown, pushInlineSegment,
+import { parseInlineSegments, parseMarkdown, pushInlineSegment,
   type InlineSegment, type MarkdownBlock } from "./markdown-parser";
 
 export { decodeEntities, inlinePlainText, normalizeHtml, parseMarkdown, type MarkdownBlock } from "./markdown-parser";
@@ -12,6 +13,22 @@ export { decodeEntities, inlinePlainText, normalizeHtml, parseMarkdown, type Mar
 export interface MarkdownViewProps { content: string; width?: number; theme?: Theme }
 export type TokenKind = "keyword" | "string" | "comment" | "number" | "type" | "text";
 export interface HighlightToken { kind: TokenKind; text: string }
+
+interface MarkdownStyle {
+  tables: "grid" | "ruled" | "plain";
+  code: "fence" | "rail" | "panel" | "indent";
+  bullet: string;
+  tasks: [unchecked: string, checked: string];
+  showHeadingMarkers?: boolean;
+  tight?: boolean;
+}
+
+const MARKDOWN_STYLES: Record<UiLayout, MarkdownStyle> = {
+  orchivox: { tables: "grid", code: "fence", bullet: "- ", tasks: ["○ ", "● "] },
+  reading: { tables: "ruled", code: "rail", bullet: "• ", tasks: ["[ ] ", "[x] "] },
+  review: { tables: "ruled", code: "panel", bullet: "- ", tasks: ["[ ] ", "[x] "], showHeadingMarkers: true },
+  compact: { tables: "plain", code: "indent", bullet: "- ", tasks: ["[ ] ", "[x] "], tight: true },
+};
 
 const LANGUAGE_KEYWORDS: Record<string, string[]> = {
   typescript: ["const", "let", "var", "function", "class", "interface", "type", "enum", "return", "if", "else", "for", "while", "import", "from", "export", "default", "async", "await", "new", "try", "catch", "finally", "throw", "extends", "implements", "typeof", "instanceof", "null", "undefined", "true", "false", "void", "this", "as", "of", "in"],
@@ -115,18 +132,25 @@ function inlineRows(source: string | readonly Token[], width: number, theme: The
 }
 
 function tableRows(block: Extract<MarkdownBlock, { kind: "table" }>, width: number, theme: Theme,
-  key: string): RenderRow[] {
+  key: string, style: MarkdownStyle["tables"]): RenderRow[] {
   const count = block.headers.length;
   if (count === 0) return [];
-  const sourceRows = [block.headers, ...block.rows];
-  const natural = block.headers.map((_header, column) => Math.max(1, ...sourceRows.map((cells) =>
-    Math.max(0, ...inlinePlainText(cells[column]?.tokens ?? []).split("\n").map(displayWidth)))));
+  const grid = style === "grid";
+  const gap = style === "plain" ? "  " : " │ ";
+  const natural = Array<number>(count).fill(1);
+  const sourceRows = [block.headers, ...block.rows].map((cells) => block.headers.map((_, column) => {
+    const segments = parseInlineSegments(cells[column]?.tokens ?? []);
+    for (const line of segments.map((segment) => segment.text).join("").split("\n")) {
+      natural[column] = Math.max(natural[column], displayWidth(line));
+    }
+    return segments;
+  }));
   const widths = natural.map((value) => Math.min(6, value));
-  const separatorWidth = count * 3 + 1;
+  const separatorWidth = (count - 1) * displayWidth(gap) + (grid ? 4 : 0);
   let remaining = width - separatorWidth - widths.reduce((sum, value) => sum + value, 0);
   const rows: RenderRow[] = [];
   if (remaining < 0) {
-    if (width >= 6) {
+    if (grid && width >= 6) {
       const cellWidth = width - 4;
       const border = (left: string, right: string) => left + "─".repeat(cellWidth + 2) + right;
       (block.rows.length ? block.rows : [[]]).forEach((cells, rowIndex) => {
@@ -173,12 +197,12 @@ function tableRows(block: Extract<MarkdownBlock, { kind: "table" }>, width: numb
   }
   const border = (left: string, middle: string, right: string): string =>
     left + widths.map((value) => "─".repeat(value + 2)).join(middle) + right;
-  rows.push({ key: key + "-top", node: <Text color={theme.muted}>{border("┌", "┬", "┐")}</Text> });
+  if (grid) rows.push({ key: key + "-top", node: <Text color={theme.muted}>{border("┌", "┬", "┐")}</Text> });
   sourceRows.forEach((cells, rowIndex) => {
-    const wrapped = widths.map((cellWidth, column) => wrapInlineSegments(parseInlineSegments(cells[column]?.tokens ?? []), cellWidth));
+    const wrapped = widths.map((cellWidth, column) => wrapInlineSegments(cells[column], cellWidth));
     const height = Math.max(1, ...wrapped.map((lines) => lines.length));
     for (let line = 0; line < height; line++) {
-      const parts: React.ReactNode[] = [<Text key="left" color={theme.muted}>│ </Text>];
+      const parts: React.ReactNode[] = grid ? [<Text key="left" color={theme.muted}>│ </Text>] : [];
       for (let column = 0; column < count; column++) {
         const segments = wrapped[column][line] ?? [];
         const spare = Math.max(0, widths[column] - segments.reduce((sum, segment) => sum + displayWidth(segment.text), 0));
@@ -186,57 +210,79 @@ function tableRows(block: Extract<MarkdownBlock, { kind: "table" }>, width: numb
         const left = align === "right" ? spare : align === "center" ? Math.floor(spare / 2) : 0;
         parts.push(<Text key={column} bold={rowIndex === 0} color={theme.text}>
           {" ".repeat(left)}{inlineNode(segments, theme, { bold: rowIndex === 0 })}{" ".repeat(spare - left)}
-          <Text color={theme.muted}>{column + 1 < count ? " │ " : " │"}</Text>
+          <Text color={theme.muted}>{column + 1 < count ? gap : grid ? " │" : ""}</Text>
         </Text>);
       }
       rows.push({ key: key + "-" + rowIndex + "-" + line, node: <Text wrap="truncate">{parts}</Text> });
     }
     const last = rowIndex === sourceRows.length - 1;
-    rows.push({ key: key + "-separator-" + rowIndex, node: <Text color={theme.muted} wrap="truncate">
-      {last ? border("└", "┴", "┘") : border("├", "┼", "┤")}
-    </Text> });
+    if (grid || rowIndex === 0) {
+      const rule = grid ? (last ? border("└", "┴", "┘") : border("├", "┼", "┤"))
+        : widths.map((cellWidth) => "─".repeat(cellWidth)).join(style === "plain" ? gap : "─┼─");
+      rows.push({ key: key + "-separator-" + rowIndex, node: <Text color={theme.muted} wrap="truncate">{rule}</Text> });
+    }
   });
   return rows;
 }
 
+function codeRows(block: Extract<MarkdownBlock, { kind: "code" }>, width: number, theme: Theme, key: string,
+  frame: MarkdownStyle["code"], streaming: boolean): RenderRow[] {
+  const fence = "```";
+  const label = frame === "fence" ? fence + block.language : block.language;
+  const inset = frame === "rail" && width >= 4 ? "│ " : " ".repeat(Math.min(2, Math.max(0, width - 2)));
+  const bodyWidth = Math.max(1, width - displayWidth(inset));
+  const background = frame === "panel" ? theme.code.background : undefined;
+  const rows: RenderRow[] = [];
+  if (label) rows.push({ key: key + "-start", node: <Text color={theme.muted} wrap="truncate">{label}</Text> });
+  block.lines.forEach((line, lineIndex) => {
+    wrapPreservingWhitespace(line, bodyWidth).forEach((chunk, chunkIndex) => {
+      const padding = background ? " ".repeat(Math.max(0, bodyWidth - displayWidth(chunk || " "))) : "";
+      rows.push({
+        key: key + "-" + lineIndex + "-" + chunkIndex,
+        node: <Text wrap="truncate" backgroundColor={background}>
+          <Text color={theme.muted}>{inset}</Text>
+          {chunk ? highlightLine(chunk, block.language).map((token, tokenIndex) =>
+            <Text key={tokenIndex} color={token.kind === "text" ? theme.text : theme.syntax[token.kind]}>{token.text}</Text>) : " "}
+          {padding}
+        </Text>,
+      });
+    });
+  });
+  if (frame === "fence" && !(streaming && block.openFence)) {
+    rows.push({ key: key + "-end", node: <Text color={theme.muted} wrap="truncate">{fence}</Text> });
+  }
+  return rows;
+}
+
 function renderBlocks(blocks: MarkdownBlock[], width: number, theme: Theme, key: string,
-  tight = false): RenderRow[] {
+  style: MarkdownStyle, streaming: boolean, tight = false): RenderRow[] {
   const rows: RenderRow[] = [];
   const safeWidth = Math.max(1, width);
   blocks.forEach((block, index) => {
     const prefix = key + "-" + index;
-    if (rows.length > 0 && !tight && !(blocks[index - 1].kind === "paragraph" && block.kind === "list")) {
+    if (rows.length > 0 && !tight && !style.tight && !(blocks[index - 1].kind === "paragraph" && block.kind === "list")) {
       rows.push({ key: prefix + "-gap", node: <Text> </Text> });
     }
     switch (block.kind) {
-      case "heading":
-        rows.push(...inlineRows(block.tokens, safeWidth, theme, prefix + "-heading",
+      case "heading": {
+        const marker = "#".repeat(block.level) + " ";
+        const tokens: Token[] = style.showHeadingMarkers ? [{ type: "text", raw: marker, text: marker }, ...block.tokens] : block.tokens;
+        rows.push(...inlineRows(tokens, safeWidth, theme, prefix + "-heading",
           { bold: true, color: block.level === 1 ? theme.accent : theme.text }));
         break;
-      case "paragraph": rows.push(...inlineRows(block.tokens, safeWidth, theme, prefix + "-paragraph")); break;
-      case "code": {
-        const fence = String.fromCharCode(96).repeat(3);
-        rows.push({ key: prefix + "-code-start", node: <Text color={theme.muted} wrap="truncate">{fence}{block.language}</Text> });
-        const indent = Math.min(2, Math.max(0, safeWidth - 2));
-        block.lines.forEach((line, lineIndex) => {
-          wrapPreservingWhitespace(line, Math.max(1, safeWidth - indent)).forEach((chunk, chunkIndex) => {
-            rows.push({ key: prefix + "-code-" + lineIndex + "-" + chunkIndex,
-              node: <Text wrap="truncate">{" ".repeat(indent)}{chunk ? highlightLine(chunk, block.language).map((token, tokenIndex) =>
-                <Text key={tokenIndex} color={token.kind === "text" ? theme.text : theme.syntax[token.kind]}>{token.text}</Text>) : " "}</Text>,
-            });
-          });
-        });
-        rows.push({ key: prefix + "-code-end", node: <Text color={theme.muted} wrap="truncate">{fence}</Text> });
-        break;
       }
+      case "paragraph": rows.push(...inlineRows(block.tokens, safeWidth, theme, prefix + "-paragraph")); break;
+      case "code":
+        rows.push(...codeRows(block, safeWidth, theme, prefix + "-code", style.code, streaming));
+        break;
       case "hr": rows.push({ key: prefix + "-hr", node: <Text color={theme.muted}>{"─".repeat(safeWidth)}</Text> }); break;
-      case "table": rows.push(...tableRows(block, safeWidth, theme, prefix + "-table")); break;
+      case "table": rows.push(...tableRows(block, safeWidth, theme, prefix + "-table", style.tables)); break;
       case "list": {
         block.items.forEach((item, itemIndex) => {
-          if (itemIndex > 0 && block.loose) rows.push({ key: prefix + "-item-gap-" + itemIndex, node: <Text> </Text> });
-          const marker = item.checked !== undefined ? item.checked ? "● " : "○ " : block.ordered ? String(block.start + itemIndex) + ". " : "- ";
+          if (itemIndex > 0 && block.loose && !style.tight) rows.push({ key: prefix + "-item-gap-" + itemIndex, node: <Text> </Text> });
+          const marker = item.checked !== undefined ? style.tasks[item.checked ? 1 : 0] : block.ordered ? String(block.start + itemIndex) + ". " : style.bullet;
           const itemRows = renderBlocks(item.blocks, Math.max(1, safeWidth - displayWidth(marker)), theme,
-            prefix + "-item-" + itemIndex, !block.loose);
+            prefix + "-item-" + itemIndex, style, streaming, !block.loose);
           if (itemRows.length === 0) itemRows.push({ key: prefix + "-empty-" + itemIndex, node: <Text> </Text> });
           itemRows.forEach((row, lineIndex) => rows.push({ ...row, node: <Text wrap="truncate">
             <Text color={theme.muted}>{lineIndex === 0 ? marker : " ".repeat(displayWidth(marker))}</Text>{row.node}
@@ -245,7 +291,7 @@ function renderBlocks(blocks: MarkdownBlock[], width: number, theme: Theme, key:
         break;
       }
       case "quote": {
-        const children = renderBlocks(block.blocks, Math.max(1, safeWidth - 2), { ...theme, text: theme.muted }, prefix + "-quote");
+        const children = renderBlocks(block.blocks, Math.max(1, safeWidth - 2), { ...theme, text: theme.muted }, prefix + "-quote", style, streaming);
         for (const row of children) rows.push({ ...row, node: <Text color={theme.muted} wrap="truncate">
           │ {row.node}
         </Text> });
@@ -256,8 +302,9 @@ function renderBlocks(blocks: MarkdownBlock[], width: number, theme: Theme, key:
   return rows;
 }
 
-export function markdownRows(content: string, width: number, theme: Theme): RenderRow[] {
-  return renderBlocks(parseMarkdown(content), width, theme, "md");
+export function markdownRows(content: string, width: number, theme: Theme,
+  { layout = DEFAULT_UI_LAYOUT, streaming = false }: { layout?: UiLayout; streaming?: boolean } = {}): RenderRow[] {
+  return renderBlocks(parseMarkdown(content), width, theme, "md", MARKDOWN_STYLES[layout], streaming);
 }
 
 const lineEstimateCache = new Map<string, number>();

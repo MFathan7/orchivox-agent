@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text, render, useInput, useStdin } from "ink";
 
 import type { AgentMode, Message } from "../types/schema";
+import { DEFAULT_UI_LAYOUT, type UiLayout } from "../types/ui-layout";
 import { freezeDebugEnabled, logFreeze } from "../agent/freeze-debug";
 import { modeContract } from "../agent/modes";
 import type { SubagentWorkerState } from "../agent/subagent";
@@ -29,6 +30,7 @@ import type { PromptSubmitPayload } from "./composer";
 import type { BtwTurn } from "../agent/btw";
 import type { InputAction } from "./input-routing";
 import { installKeyNormalizer } from "./key-normalize";
+import { LAYOUT_PRESETS } from "./layout";
 import { ReportModal } from "./report-modal";
 import { QuestionModal, type PendingQuestion } from "./question-modal";
 import type { QuestionAnswer } from "../tools/question";
@@ -54,8 +56,8 @@ import { RESET_ATTRIBUTES, resetBeforeErase } from "./terminal-protocol";
 import { LiveStatus } from "./spinner";
 import { MotionProvider } from "./motion";
 import type { FrameClock } from "./frame-clock";
-import { agentActivityCounts, agentActivitySummary } from "./agent-activity";
-import { SubagentStatus } from "./subagent-status";
+import { agentActivityCounts } from "./agent-activity";
+import { SubagentStatus, subagentStatusRows } from "./subagent-status";
 import {
   DEFAULT_THEME,
   ThemeProvider,
@@ -224,6 +226,8 @@ export interface OrchivoxAppProps {
   onWorkerFallbackChange?: (value: WorkerFallbackMode) => void;
   animations?: boolean;
   onAnimationsChange?: (enabled: boolean) => void;
+  layout?: UiLayout;
+  onLayoutChange?: (layout: UiLayout) => void;
   memoryEnabled?: boolean;
   onMemoryEnabledChange?: (enabled: boolean) => void;
   background?: BackgroundConfig;
@@ -580,7 +584,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         : contextPercent >= 80
           ? theme.badge.running
           : theme.muted;
+  const layout = props.layout ?? DEFAULT_UI_LAYOUT;
+  const preset = LAYOUT_PRESETS[layout];
   const [sidebarVisible, setSidebarVisible] = React.useState(false);
+  const toggleSidebar = () => setSidebarVisible((visible) => !visible);
   const [isWorkspaceTrusted, setIsWorkspaceTrusted] = React.useState(props.isWorkspaceTrusted ?? true);
   React.useEffect(() => {
     if (props.isWorkspaceTrusted !== undefined) {
@@ -702,7 +709,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     }
 
     if (key.ctrl && input === "b") {
-      setSidebarVisible((prev) => !prev);
+      toggleSidebar();
     }
   });
 
@@ -713,7 +720,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   }));
   const subagentSummary = summarizeSubagents(workers);
 
-  const innerWidth = Math.max(1, terminalSize.columns - 2);
+  const outerPadding = 1;
+  const innerWidth = Math.max(1, terminalSize.columns - outerPadding * 2);
+  const headerRows = preset.contextInFooter ? 0 : 1 + Number(Boolean(preset.divider));
+  const showSidebar = sidebarVisible && innerWidth >= 120;
   const headerProjectLimit =
     innerWidth >= 150 ? 24 : innerWidth >= 100 ? 20 : innerWidth >= 80 ? 16 : innerWidth >= 60 ? 14 : 10;
   const headerModelLimit = innerWidth >= 150 ? 28 : innerWidth >= 100 ? 22 : innerWidth >= 80 ? 16 : 12;
@@ -724,17 +734,26 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const statusText = escArmed ? "Press Esc again to stop the current turn" : statusMessage;
   const compacting = entries.some((entry) => entry.role === "compaction" && entry.compaction?.status === "running");
   const statusRows = statusText ? countWrappedLines(statusText, innerWidth) : 0;
-  const liveStatusRows = streaming && !hasModalOpen && !statusText && !compacting ? 1 : 0;
-  const liveStatusGapRows = liveStatusRows > 0 ? 1 : 0;
-  const showSubagentStatus = !hasModalOpen;
-  const subagentLineRows = showSubagentStatus && agentActivitySummary(workers, tasks, innerWidth) ? 1 : 0;
-  const statusGapRows = statusRows + liveStatusRows + subagentLineRows > 0 ? 1 : 0;
+  const showLiveStatus = streaming && !hasModalOpen && !statusText && !compacting;
+  const liveStatusRows = showLiveStatus ? (preset.activity === "work" ? 2 : 1) : 0;
+  const liveStatusGapRows = preset.divider && liveStatusRows > 0 ? 1 : 0;
+  const agentCounts = agentActivityCounts(workers, tasks);
   const queueRows = !hasModalOpen && ((props.queuedCount ?? 0) > 0 || props.queuePaused) ? (props.queuePaused && props.queuePauseDetail ? 2 : 1) : 0;
   const panelStatusRows = conversationPanelOpen && conversationPanelActive ? 1 : 0;
+  const idleMainRow = !streaming && !hasModalOpen && !panelStatusRows && agentCounts.active > 0 ? 1 : 0;
   const sideStatusRows = !hasModalOpen && props.btwRunning ? 1 : 0;
   const updateRows = !hasModalOpen && props.updateNotice ? 1 : 0;
-  const chromeRows = 2 + statusRows + liveStatusRows + liveStatusGapRows + subagentLineRows + statusGapRows + queueRows + panelStatusRows + sideStatusRows + updateRows;
-  const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, props.btw || props.queue ? 0 : composerRows);
+  const composerHeight = conversationPanelOpen ? 0 : composerRows;
+  const baseChromeRows = headerRows + Number(Boolean(preset.contextInFooter)) + statusRows + liveStatusRows + liveStatusGapRows + idleMainRow + queueRows + panelStatusRows + sideStatusRows + updateRows;
+  const minChatRows = 3;
+  const workerSummaryAndGapRows = 2;
+  const workerDetailSpace = terminalSize.rows - baseChromeRows - composerHeight - minChatRows - workerSummaryAndGapRows;
+  const workerRows = hasModalOpen ? [] : subagentStatusRows({
+    workers, tasks, width: innerWidth, detailLimit: Math.min(4, workerDetailSpace),
+  });
+  const statusGapRows = liveStatusRows < 2 && statusRows + liveStatusRows + workerRows.length > 0 ? 1 : 0;
+  const chromeRows = baseChromeRows + workerRows.length + statusGapRows;
+  const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerHeight);
   const chatWheelStep = 3;
   const chatPageStep = Math.max(1, viewportHeight - 2);
   const { stdin, internal_eventEmitter } = useStdin();
@@ -753,9 +772,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
       stdin.off("data", onData);
     };
   }, [hasModalOpen, chatWheelStep]);
-  const showSidebar = sidebarVisible && innerWidth >= 120;
-  const chatWidth = showSidebar ? Math.max(20, Math.floor(innerWidth * 0.72)) : innerWidth;
-  const sidebarWidth = showSidebar ? Math.max(20, innerWidth - chatWidth) : 0;
+  const chatWidth = showSidebar ? Math.floor(innerWidth * 0.72) : innerWidth;
+  const sidebarWidth = innerWidth - chatWidth;
   const divider = "─".repeat(innerWidth);
   const contextLabel =
     innerWidth < 70
@@ -890,6 +908,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     });
   }
   const headerSelected = fitSegments(headerParts, innerWidth);
+  const workspaceLine = <Text wrap="truncate">
+    {headerParts.filter((part) => headerSelected.has(part.key)).map((part) => part.node)}
+  </Text>;
 
   const runCommand = (command: string): void => {
     onSubmit(command, { kind: "command", command, raw: command });
@@ -898,13 +919,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   return (
     <ThemeProvider theme={props.currentTheme ?? DEFAULT_THEME}>
       <MotionProvider enabled={props.animations !== false && (!hasModalOpen || Boolean(props.btw && conversationPanelActive && !props.queue))} clock={props.frameClock}>
-      <Box flexDirection="column" paddingX={1}>
-        <Text wrap="truncate">
-          {headerParts
-            .filter((part) => headerSelected.has(part.key))
-            .map((part) => part.node)}
-        </Text>
-        <Text color={theme.border.passive}>{divider}</Text>
+      <Box flexDirection="column" paddingX={outerPadding}>
+        {preset.contextInFooter ? null : workspaceLine}
+        {preset.divider ? <Text color={theme.border.passive}>{divider}</Text> : null}
 
         {hasModalOpen ? (
           <Box
@@ -984,15 +1001,14 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           />
         ) : themePickerOpen ? (
           <ThemePicker
+            layout={layout}
             selection={activeThemeSelection}
             appearance={props.terminalAppearance ?? theme.appearance}
             width={innerWidth}
             height={viewportHeight}
             theme={theme}
-            onSelect={(id) => {
-              props.onThemeChange?.(id);
-              setThemePickerOpen(false);
-            }}
+            onSelectLayout={props.onLayoutChange}
+            onSelectColor={props.onThemeChange}
             onCancel={() => setThemePickerOpen(false)}
           />
         ) : reasoningPickerOpen ? (
@@ -1081,11 +1097,10 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         ) : paletteOpen && props.router ? (
           <CommandPaletteModal
             router={props.router}
-            currentTheme={props.currentTheme}
-            themeSelection={props.themeSelection}
+            width={innerWidth}
+            height={viewportHeight}
             reasoningEffort={props.reasoningEffort}
             reasoningLevels={reasoningOptions}
-            onSelectTheme={props.onThemeChange}
             onSelectReasoning={props.onReasoningEffortChange}
             onOpenModels={() => {
               setModelsView("models");
@@ -1103,6 +1118,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 setSkillsOpen(true);
               } else if (action === "open_settings") {
                 setSettingsOpen(true);
+              } else if (action === "open_theme") {
+                setThemePickerOpen(true);
               } else if (action === "open_tasks") {
                 setHubTab("tasks");
                 setHubOpen(true);
@@ -1115,7 +1132,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               } else if (action === "open_fork") {
                 setSessionTab("fork");
               } else if (action === "toggle_sidebar") {
-                setSidebarVisible((prev) => !prev);
+                toggleSidebar();
               } else if (action === "run_commit") {
                 runCommand("/commit");
               } else if (action === "run_compact") {
@@ -1173,7 +1190,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 onResume={() => props.onQueueResume?.()} onStop={(id) => props.onQueueStop?.(id)} onClose={() => props.onQueueClose?.()} />
             </Box> : null}
             {props.btw ? <Box key="btw-panel" flexDirection="column" height={conversationPanelActive && !props.queue ? viewportHeight : 0} overflow="hidden">
-              <BtwPanel turns={props.btw.turns} topicId={props.btw.topicId} width={innerWidth} height={viewportHeight} theme={theme} active={conversationPanelActive && !props.queue}
+              <BtwPanel turns={props.btw.turns} topicId={props.btw.topicId} width={innerWidth} height={viewportHeight} theme={theme} layout={layout} active={conversationPanelActive && !props.queue}
                 onSelect={(topicId) => props.onBtwSelect?.(topicId)} onFollowup={(topicId, question, attachments) => props.onBtwFollowup?.(topicId, question, attachments) ?? false}
                 onCancel={() => props.onBtwCancel?.()} onClose={() => props.onBtwClose?.()} />
             </Box> : null}
@@ -1188,6 +1205,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 width={chatWidth}
                 height={viewportHeight}
                 theme={theme}
+                layout={layout}
                 initiallyCollapsed={false}
                 active={!hasModalOpen}
                 repoPath={globalThis.process.cwd()}
@@ -1195,13 +1213,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 resetKey={props.activeSessionId}
                 offsetFromBottom={chatOffsetFromBottom}
                 onOffsetChange={setChatOffsetFromBottom}
-                topOffset={2}
-                leftOffset={1}
+                topOffset={headerRows}
+                leftOffset={outerPadding}
                 onCopyError={(error) => onStatusMessage?.(error.message)}
               />
             </Box>
             {showSidebar ? (
-              <Box width={sidebarWidth} flexDirection="column">
+              <Box width={sidebarWidth} height={viewportHeight} overflow="hidden" flexDirection="column">
                 <WorkspaceSidebar
                   todos={todos}
                   modifiedFiles={modifiedFiles}
@@ -1215,7 +1233,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           </Box>
         )}
 
-        {showSubagentStatus ? <SubagentStatus workers={workers} tasks={tasks} width={innerWidth} /> : null}
+        <SubagentStatus rows={workerRows} />
 
         {liveStatusGapRows > 0 ? <Box height={1} /> : null}
 
@@ -1223,26 +1241,32 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
           <Text color={theme.badge.running}>Press Esc again to stop the current turn</Text>
         ) : statusMessage ? (
           <Text color={theme.status.info}>{statusMessage}</Text>
-        ) : streaming && !hasModalOpen && !compacting ? (
-          <LiveStatus
-            agentCounts={agentActivityCounts(workers, tasks)}
-            active={streaming}
-            answering={Boolean(streamingText)}
-            startedAt={props.liveEntry?.startedAt}
-            completedTools={completedTools}
-            runningLabel={runningLabel}
-            runningDetail={runningDetail}
-            runningStartedAt={runningStartedAt}
-            step={props.liveEntry?.step}
-            stepLimit={props.liveEntry?.stepLimit}
-            toolLimit={props.liveEntry?.toolLimit}
-            timeLimitSeconds={props.liveEntry?.timeLimitSeconds}
-            contextPercent={contextPercent}
-            requestLabel={requestLabel}
-            width={innerWidth}
-          />
+        ) : showLiveStatus ? (
+          <Box width={chatWidth} height={liveStatusRows}>
+            <LiveStatus
+              agentCounts={agentCounts}
+              active={streaming}
+              answering={Boolean(streamingText)}
+              startedAt={props.liveEntry?.startedAt}
+              completedTools={completedTools}
+              runningLabel={runningLabel}
+              runningDetail={runningDetail}
+              runningTools={runningCalls}
+              canInterrupt={Boolean(onAbort)}
+              runningStartedAt={runningStartedAt}
+              step={props.liveEntry?.step}
+              stepLimit={props.liveEntry?.stepLimit}
+              toolLimit={props.liveEntry?.toolLimit}
+              timeLimitSeconds={props.liveEntry?.timeLimitSeconds}
+              contextPercent={contextPercent}
+              requestLabel={requestLabel}
+              width={chatWidth}
+              indicator={preset.activity}
+            />
+          </Box>
         ) : null}
 
+        {idleMainRow ? <Text color={theme.muted} wrap="truncate">Main · Idle</Text> : null}
         {panelStatusRows ? <Text color={theme.muted} wrap="truncate">Main · {streaming ? compacting ? "Compacting" : runningLabel ?? (streamingText ? "Answering" : "Thinking") : "Idle"}</Text> : null}
         {statusGapRows > 0 ? <Box height={1} /> : null}
 
@@ -1250,12 +1274,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
         {queueRows && props.queuePaused && props.queuePauseDetail ? <Text color={theme.status.error} wrap="truncate">Paused: {props.queuePauseDetail.replace(/\s+/g, " ")}</Text> : null}
         {sideStatusRows ? <Text color={theme.muted} wrap="truncate">Side answer running · /btw to view</Text> : null}
         {updateRows ? <Text color={theme.status.info} wrap="truncate">{props.updateNotice}</Text> : null}
-        <Box flexDirection="column" height={props.btw || props.queue ? 0 : undefined} overflow={props.btw || props.queue ? "hidden" : undefined}>
+        <Box flexDirection="column" width={chatWidth} height={props.btw || props.queue ? 0 : undefined} overflow={props.btw || props.queue ? "hidden" : undefined}>
         <PromptComposer
             onDraftChange={props.onDraftChange}
             mode={mode}
             theme={theme}
-            width={innerWidth}
+            width={chatWidth}
+            appearance={preset.composer}
             maxRows={Math.max(
               1,
               Math.min(
@@ -1337,12 +1362,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
               if (!streaming && (payload.ultrawork || (action.kind === "submit" && action.ultrawork))) {
                 setMode("ultrawork");
               }
-              if (payload.fullText.trim().length > 0) {
-                return onSubmit(payload.fullText.trim(), action, payload.attachments);
-              }
+              return onSubmit(payload.rawText, action, payload.attachments);
             }}
           />
         </Box>
+        {preset.contextInFooter ? workspaceLine : null}
       </Box>
       </MotionProvider>
     </ThemeProvider>

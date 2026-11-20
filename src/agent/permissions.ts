@@ -273,7 +273,7 @@ export function permissionRulesFromConfig(
 ): ToolRulePattern[] {
   const rulesForAction = (action: string): string[] => {
     if (action === "shell") return [...SHELL_TOOL_NAMES];
-    if (action === "execute") return ["execute", "eval", "browser_session", "debug_session", "desktop_control"];
+    if (action === "execute") return ["execute", "eval", "browser_session", "debug_session", "desktop_control", "probe_local_http"];
     if (action === "edit") return [...EDIT_TOOL_NAMES];
     if (action === "read") {
       return [
@@ -296,6 +296,7 @@ export function permissionRulesFromConfig(
         "grep_search",
         "json_query",
         "diff_view",
+        "git_inspect",
         "web_fetch",
         "web_search",
       ];

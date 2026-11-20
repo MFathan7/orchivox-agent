@@ -48,6 +48,8 @@ export function toolGuidanceText(toolNames?: string[]): string {
   if (!active || active.has("read_database")) lines.push(...DATABASE_GUIDANCE);
   if (has("glob_files")) lines.push("- Use glob_files for file names and directory structure; scope a known subsystem instead of guessing file paths.");
   if (has("grep_search")) lines.push("- Use grep_search for known strings, symbol names, or regex. Read its returned paths and ranges; avoid repeated repository-wide searches.");
+  if (has("git_inspect")) lines.push("- Use git_inspect for Git status and staged or unstaged diffs. Select literal paths to narrow a large diff.");
+  if (has("probe_local_http")) lines.push("- Use probe_local_http to check the HTTP status of a local development endpoint.");
   if (has("code_find")) lines.push("- Use code_find when you know the desired behavior but not its location. Semantic mode uses an additional metered model request; lexical mode uses no model. Treat matches as leads and respect its partial-coverage note.");
   if (has("lsp_definition") || has("lsp_references")) lines.push("- When a language server is available, use definition/references for symbol relationships rather than inferring them from text. Inspect references before changing exported symbols. A server error or unavailable operation is a limitation to report, not proof there are no references.");
   if (has("lsp_code_actions")) lines.push("- Prefer lsp_code_actions for server-known fixes, imports, and refactors. Listing actions does not apply them.");

@@ -1,6 +1,7 @@
 import React from "react";
 import { Box, Text, useInput, useStdin } from "ink";
 import type { BtwTurn } from "../agent/btw";
+import { DEFAULT_UI_LAYOUT, type UiLayout } from "../types/ui-layout";
 import { PromptComposer, type FileAttachmentRef } from "./composer";
 import { TranscriptRowIndex } from "./transcript-lines";
 import type { ChatEntryView } from "./app";
@@ -8,7 +9,8 @@ import { formatElapsed, formatTokenCount, formatCost } from "./format";
 import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { useActiveTheme, type Theme } from "./theme";
 import { wrapText } from "./text-wrap";
-import { ActivityText } from "./motion";
+import { LAYOUT_PRESETS } from "./layout";
+import { LiveStatus } from "./spinner";
 
 export interface BtwPanelProps {
   active?: boolean;
@@ -16,6 +18,7 @@ export interface BtwPanelProps {
   topicId?: string;
   width: number;
   height: number;
+  layout?: UiLayout;
   theme?: Theme;
   onSelect: (topicId: string) => void;
   onFollowup: (topicId: string, question: string, attachments?: FileAttachmentRef[]) => boolean;
@@ -25,6 +28,8 @@ export interface BtwPanelProps {
 
 export function BtwPanel(props: BtwPanelProps): React.ReactElement {
   const theme = useActiveTheme(props.theme);
+  const layout = props.layout ?? DEFAULT_UI_LAYOUT;
+  const preset = LAYOUT_PRESETS[layout];
   const topics = [...new Set(props.turns.map((turn) => turn.topicId))];
   const selected = props.topicId && topics.includes(props.topicId) ? props.topicId : topics.at(-1);
   const turns = props.turns.filter((turn) => turn.topicId === selected);
@@ -47,7 +52,7 @@ export function BtwPanel(props: BtwPanelProps): React.ReactElement {
     ];
     entryCache.current.set(turn, entries);
     return entries;
-  }), { width: Math.max(1, props.width), theme, collapsed: false, expandedGroups: new Set<string>(), thinkingExpanded: false }), [props.turns, selected, props.width, theme]);
+  }), { width: Math.max(1, props.width), theme, layout, collapsed: false, expandedGroups: new Set<string>(), thinkingExpanded: false }), [props.turns, selected, props.width, theme, layout]);
   const hintLines = (editing ? active ? ["Ctrl+X stop side answer"] : [] : [
     "←/→ topics · ↑/↓ scroll",
     "Wheel/PgUp/PgDn · End follow",
@@ -99,13 +104,14 @@ export function BtwPanel(props: BtwPanelProps): React.ReactElement {
       {!turns.length ? <Text color={theme.text}>No side conversations yet.</Text> : null}
       {rows.slice(current, current + bodyHeight).map((row) => <React.Fragment key={row.key}>{row.node}</React.Fragment>)}
     </Box>
-    {showActivity ? <ActivityText text={activeTurn?.answer ? "Answering" : "Thinking"} /> : null}
+    {showActivity ? <LiveStatus active answering={Boolean(activeTurn?.answer)} completedTools={0} indicator={preset.activity} width={props.width} /> : null}
     {footerLines.map((line, index) => <Text key={`footer-${index}`} color={theme.muted}>{line}</Text>)}
     {editing && selected ? <PromptComposer width={props.width} maxRows={Math.max(1, Math.min(4, props.height - 8))}
       maxHeight={Math.max(4, props.height - 2 - footerLines.length - hintLines.length)} theme={theme}
+      appearance={preset.composer}
       placeholder="Follow up in this topic" hint="Enter send · Esc cancel edit" onLayoutRows={setComposerRows} streaming disabled={props.active === false}
-      onSubmit={({ fullText, attachments }) => {
-        const accepted = props.onFollowup(selected, fullText, attachments);
+      onSubmit={({ rawText, attachments }) => {
+        const accepted = props.onFollowup(selected, rawText, attachments);
         if (accepted) { setEditing(false); setOffset(undefined); }
         return accepted;
       }} /> : null}

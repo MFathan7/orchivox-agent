@@ -1,32 +1,54 @@
 import React from "react";
-import { Text } from "ink";
+import { Box, Text } from "ink";
 
-import type { SubagentWorkerState } from "../agent/subagent";
+import { workerIsStalled, type SubagentWorkerState } from "../agent/subagent";
 import type { TaskItem } from "../agent/task-board";
-import { agentActivitySummary } from "./agent-activity";
+import { agentActivitySummary, workerActive, workerActivity, workerTitle } from "./agent-activity";
+import { displayWidth, fitDisplayText, singleLine } from "./text-wrap";
 import { useActiveTheme } from "./theme";
 
-export interface SubagentStatusProps {
-  workers: SubagentWorkerState[];
-  width: number;
-  tasks?: TaskItem[];
+interface SubagentStatusRow {
+  id: string;
+  text: string;
 }
 
-/**
- * A calm, one-line activity indicator for background workers. The Agent Hub
- * remains the place for transcripts, task detail, and stop/steer actions.
- */
-export function SubagentStatus({
+export function subagentStatusRows({
   workers,
+  tasks,
   width,
-  tasks = [],
-}: SubagentStatusProps): React.ReactElement | null {
-  const theme = useActiveTheme();
+  detailLimit,
+}: {
+  workers: SubagentWorkerState[];
+  tasks: TaskItem[];
+  width: number;
+  detailLimit: number;
+}): SubagentStatusRow[] {
   const summary = agentActivitySummary(workers, tasks, width);
-  if (!summary) return null;
+  if (!summary) return [];
+
+  const rows = [{ id: "summary", text: summary }];
+  if (width < 30 || detailLimit <= 0) return rows;
+
+  const separator = " · ";
+  const separatorWidth = displayWidth(separator);
+  const now = Date.now();
+  const active = workers.filter(workerActive);
+  for (const worker of active.slice(0, detailLimit)) {
+    const activity = singleLine(workerActivity(worker));
+    const detail = workerIsStalled(worker, now) ? `Stalled${separator}${activity}` : activity;
+    const phase = fitDisplayText(detail, Math.ceil(width * 0.55));
+    const title = fitDisplayText(workerTitle(worker), width - separatorWidth - displayWidth(phase));
+    rows.push({ id: `worker:${worker.id}`, text: `${title}${separator}${phase}` });
+  }
+  return rows;
+}
+
+export function SubagentStatus({ rows }: { rows: SubagentStatusRow[] }): React.ReactElement | null {
+  const theme = useActiveTheme();
+  if (rows.length === 0) return null;
   return (
-    <Text color={theme.text} wrap="truncate">
-      {summary}
-    </Text>
+    <Box flexDirection="column">
+      {rows.map(({ id, text }) => <Text key={id} color={theme.text} wrap="truncate">{text}</Text>)}
+    </Box>
   );
 }

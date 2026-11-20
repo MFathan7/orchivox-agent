@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 
 import { resolveProjectState } from "../runtime-paths";
 import type { AgentMode } from "../types/schema";
-import { formatLine, readText, splitLines } from "../tools/hashline-edit";
+import type { ComposerFrame } from "./layout";
 import {
   AutocompletePopup,
   detectTriggerContext,
@@ -16,7 +16,6 @@ import {
 import { continueList, displayListLine } from "./list-format";
 import { collapsePastedText, expandPastedText, pastedPlaceholderAfter, pastedPlaceholderBefore, type PastedEntry } from "./paste";
 import { useActiveTheme, type Theme } from "./theme";
-import { formatTokenCount } from "./format";
 import { isInputDebugEnabled, writeInputDebug } from "./input-debug";
 import { isMouseSequence } from "./mouse";
 import {
@@ -40,12 +39,10 @@ export interface FileAttachmentRef {
   startLine?: number;
   endLine?: number;
   exists: boolean;
-  tokens: number;
   kind: "text" | "image";
   mimeType?: string;
   base64?: string;
   error?: string;
-  context?: string;
 }
 
 const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
@@ -117,8 +114,6 @@ export function imageMimeType(filePath: string): string | undefined {
 
 export interface PromptSubmitPayload {
   rawText: string;
-  injectedContext?: string;
-  fullText: string;
   ultrawork: boolean;
   attachments: FileAttachmentRef[];
 }
@@ -130,6 +125,8 @@ export interface PromptComposerProps {
   theme?: Theme;
   repoRoot?: string;
   width?: number;
+  bordered?: boolean;
+  appearance?: { frame: ComposerFrame; marker: string };
   maxRows?: number;
   maxHeight?: number;
   placeholder?: string;
@@ -273,26 +270,11 @@ export async function resolveFileAttachments(
     const mimeType = imageMimeType(item.filePath);
     const kind = mimeType ? "image" : "text";
     let exists = false;
-    let tokens = 0;
 
     try {
-      const file = Bun.file(fullPath);
-      exists = await file.exists();
-      if (exists && kind === "text") {
-        if (item.startLine !== undefined) {
-          const content = await file.text();
-          const lines = splitLines(content);
-          const start = Math.max(1, item.startLine);
-          const end = Math.min(lines.length, item.endLine ?? item.startLine);
-          const sliceText = lines.slice(start - 1, end).join("\n");
-          tokens = Math.max(1, Math.ceil(sliceText.length / 4));
-        } else {
-          tokens = Math.max(1, Math.ceil(file.size / 4));
-        }
-      }
+      exists = await Bun.file(fullPath).exists();
     } catch {
       exists = false;
-      tokens = 0;
     }
 
     results.push({
@@ -301,56 +283,12 @@ export async function resolveFileAttachments(
       startLine: item.startLine,
       endLine: item.endLine,
       exists,
-      tokens,
       kind,
       mimeType,
     });
   }
 
   return results;
-}
-
-export async function buildInjectedContext(
-  attachments: FileAttachmentRef[],
-  repoRoot?: string,
-): Promise<string> {
-  const root = repoRoot ?? globalThis.process.cwd();
-  const blocks: string[] = [];
-
-  for (const item of attachments) {
-    if (item.kind === "image") continue;
-    if (item.context !== undefined) { if (item.context) blocks.push(item.context); continue; }
-    if (!item.exists) continue;
-    const fullPath = resolve(root, item.filePath);
-
-    try {
-      const content = await readText(fullPath);
-      const allLines = splitLines(content);
-      const start = Math.max(1, item.startLine ?? 1);
-      const end = Math.min(allLines.length, item.endLine ?? (item.startLine !== undefined ? item.startLine : allLines.length));
-
-      if (start > allLines.length) continue;
-
-      const formattedLines: string[] = [];
-      for (let lineIndex = start - 1; lineIndex < end; lineIndex += 1) {
-        const lineNum = lineIndex + 1;
-        const lineContent = allLines[lineIndex] ?? "";
-        formattedLines.push(formatLine(lineNum, lineContent));
-      }
-
-      const rangeLabel = item.startLine ? `:${item.startLine}${item.endLine ? `-${item.endLine}` : ""}` : "";
-      item.context = [
-        `--- File Context: ${item.filePath}${rangeLabel} (${formattedLines.length} lines) ---`,
-        ...formattedLines,
-      ].join("\n");
-      blocks.push(item.context);
-    } catch {
-      item.context = "";
-      // Skip files that cannot be read.
-    }
-  }
-
-  return blocks.join("\n\n");
 }
 
 export async function loadImageAttachments(
@@ -405,7 +343,7 @@ export async function preparePromptAttachments(text: string, repoRoot?: string, 
 }
 
 function hasAttachmentSnapshot(item: FileAttachmentRef): boolean {
-  return !item.error && (item.kind === "image" ? Boolean(item.base64) : Boolean(item.context));
+  return item.kind === "image" && !item.error && Boolean(item.base64);
 }
 
 export function getLineAndColumn(text: string, cursor: number): { line: number; col: number; lines: string[] } {
@@ -785,16 +723,12 @@ export function PromptComposer(props: PromptComposerProps) {
     try {
       const lower = trimmed.toLowerCase();
       const ultrawork = /^(ulw|ultrawork)\b/.test(lower);
-      const loadedAttachments = await preparePromptAttachments(trimmed, repoRoot, props.initialAttachments);
-      const injectedContext = await buildInjectedContext(loadedAttachments, repoRoot);
-      const fullText = injectedContext.length > 0 ? `${trimmed}\n\n${injectedContext}` : trimmed;
+      const attachments = await preparePromptAttachments(trimmed, repoRoot, props.initialAttachments);
 
       const accepted = onSubmit?.({
         rawText: trimmed,
-        injectedContext: injectedContext.length > 0 ? injectedContext : undefined,
-        fullText,
         ultrawork,
-        attachments: loadedAttachments,
+        attachments,
       });
       if (accepted === false) return;
 
@@ -1166,11 +1100,17 @@ export function PromptComposer(props: PromptComposerProps) {
 
   const modeStyle = theme.modes[mode] ?? theme.modes.build;
   const { line: activeLine, col: activeCol, lines } = getLineAndColumn(text, cursorPos);
-  const totalTokens = attachedFiles.reduce((sum, item) => sum + item.tokens, 0);
-  const imageCount = attachedFiles.filter((item) => item.kind === "image").length;
 
-  const maxPrefixWidth = lines.length > 1 ? String(lines.length).length + 3 : 2;
-  const textWidth = Math.max(8, (width ?? 80) - 4 - maxPrefixWidth);
+  const marker = props.appearance?.marker ?? "❯ ";
+  const frame = props.appearance?.frame ?? (props.bordered === false ? "none" : "box");
+  const boxed = frame === "box";
+  const bottomRule = frame === "rules";
+  const topRule = bottomRule || frame === "top-rule";
+  const rule = topRule ? "─".repeat(width ?? 80) : "";
+  const markerWidth = displayWidth(marker);
+  const maxPrefixWidth = lines.length > 1 ? String(lines.length).length + 3 : markerWidth;
+  const borderRows = boxed ? 2 : Number(topRule) + Number(bottomRule);
+  const textWidth = Math.max(1, (width ?? 80) - 2 - (boxed ? 2 : 0) - maxPrefixWidth);
   const visualRows = buildVisualRows(text, textWidth);
   const cursorSpot = locateCursorRow(visualRows, activeLine, activeCol);
   const attachmentRows = attachedFiles.length > 0 ? 1 : 0;
@@ -1186,7 +1126,7 @@ export function PromptComposer(props: PromptComposerProps) {
             ? "Shift+Tab · / commands · @ files · Enter send"
             : "Shift+Tab mode · / commands · @ files · $ skills · Enter send · Shift+Enter newline (Ctrl+J)");
   const hintRows = wrapText(hintText, Math.max(1, (width ?? 80) - 2)).length;
-  const composerChrome = attachmentRows + 2 + hintRows;
+  const composerChrome = attachmentRows + borderRows + hintRows;
   const popupVisible = autocompleteItems.length > 0 && autocompleteContext !== null;
   const popupRoom = (props.maxHeight ?? Infinity) - composerChrome - 1;
   const screenRows = process.stdout.rows ?? 24;
@@ -1209,8 +1149,7 @@ export function PromptComposer(props: PromptComposerProps) {
   const visibleStart = Math.min(inputScroll, Math.max(0, visualRows.length - maxVisibleRows));
   const visibleRows = visualRows.slice(visibleStart, visibleStart + maxVisibleRows);
 
-  const layoutRows =
-    popupRows + attachmentRows + Math.min(visualRows.length, maxVisibleRows) + 2 + hintRows;
+  const layoutRows = popupRows + Math.min(visualRows.length, maxVisibleRows) + composerChrome;
 
   React.useLayoutEffect(() => {
     onLayoutRows?.(layoutRows);
@@ -1233,37 +1172,34 @@ export function PromptComposer(props: PromptComposerProps) {
       {attachedFiles.length > 0 ? (
         <Box flexDirection="row" gap={1} marginBottom={0} paddingX={1}>
           <Text bold color={theme.accent}>
-            Attached:
+            Files:
           </Text>
           {attachedFiles.slice(0, 3).map((file) => (
             <Text
               key={file.raw}
               color={file.exists ? theme.status.success : theme.status.error}
             >
-              {file.raw.length > 28 ? `${file.raw.slice(0, 25)}...` : file.raw}{" "}
-              {file.kind === "image" ? "(image)" : `(~${file.tokens} tok)`}
+              {file.raw.length > 28 ? `${file.raw.slice(0, 25)}...` : file.raw}
+              {file.kind === "image" ? " (image)" : ""}
             </Text>
           ))}
           {attachedFiles.length > 3 ? (
             <Text color={theme.muted}>+{attachedFiles.length - 3} more</Text>
           ) : null}
-          <Text color={theme.muted}>
-            (~{formatTokenCount(totalTokens)} tokens
-            {imageCount > 0 ? ` + ${imageCount} image${imageCount === 1 ? "" : "s"}` : ""} on Enter)
-          </Text>
         </Box>
       ) : null}
 
+      {topRule ? <Text color={modeStyle.primary} wrap="truncate">{rule}</Text> : null}
       <Box
         flexDirection="column"
-        borderStyle="single"
+        borderStyle={boxed ? "single" : undefined}
         borderColor={modeStyle.primary}
         paddingX={1}
       >
         {text.length === 0 ? (
           <Box>
             <Text color={modeStyle.primary} bold>
-              ❯{" "}
+              {marker}
             </Text>
             <Text color={theme.muted}>{effectivePlaceholder}</Text>
           </Box>
@@ -1278,8 +1214,8 @@ export function PromptComposer(props: PromptComposerProps) {
                   ? `${row.lineIndex + 1} │ `
                   : `${" ".repeat(String(row.lineIndex + 1).length)} │ `
                 : firstOfLine
-                  ? "❯ "
-                  : "  ";
+                  ? marker
+                  : " ".repeat(markerWidth);
             const displayLine = displayListLine(row.text);
 
             if (!isCurrent) {
@@ -1309,6 +1245,7 @@ export function PromptComposer(props: PromptComposerProps) {
           })
         )}
       </Box>
+      {bottomRule ? <Text color={modeStyle.primary} wrap="truncate">{rule}</Text> : null}
 
       <Box paddingX={1}>
         <Text color={theme.muted}>

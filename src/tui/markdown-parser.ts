@@ -4,7 +4,7 @@ import { expandTabs } from "./text-wrap";
 export type MarkdownBlock =
   | { kind: "heading"; level: number; text: string; tokens: Token[] }
   | { kind: "paragraph"; tokens: Token[] }
-  | { kind: "code"; language: string; lines: string[] }
+  | { kind: "code"; language: string; lines: string[]; openFence?: true }
   | { kind: "list"; ordered: boolean; start: number; loose: boolean; items: Array<{ checked?: boolean; blocks: MarkdownBlock[] }> }
   | { kind: "quote"; blocks: MarkdownBlock[] }
   | { kind: "table"; headers: Tokens.TableCell[]; rows: Tokens.TableCell[][]; align: Array<"left" | "center" | "right" | null> }
@@ -19,23 +19,25 @@ export interface InlineSegment {
 }
 
 const lexerOptions = { gfm: true, breaks: false };
-const FILE_REFERENCE = /((?:[\w.-]+\/)*[\w.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|json|md|ya?ml|toml|sh))(?::(\d+))?/g;
+const FILE_REFERENCE = /@?(?:[a-z]:[/\\]|[/\\]{1,2})?(?:[\p{L}\p{N}_.-]+[/\\])*[\p{L}\p{N}_.-]+\.(?:[cm]?jsx?|[cm]?tsx?|py|go|rs|json|md|ya?ml|toml|sh|ps1|cmd|bat|cs|java|c|cpp|h|sql|html|css)(?::\d+(?:-\d+|:\d+)?)?(?![\p{L}\p{N}_/\\-]|\.[\p{L}\p{N}_])/giu;
 const HTML_TAG = /<\/?(?:br|p|div|span|strong|b|em|i|code|pre|li|ul|ol|table|thead|tbody|tr|td|th|h[1-6]|blockquote|a|hr|details|summary|img)\b[^>]*>/gi;
+const NAMED_ENTITIES: Record<string, string> = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
 
 function safeCodePoint(value: number): string {
   return Number.isFinite(value) && value >= 0 && value <= 0x10ffff ? String.fromCodePoint(value) : "";
 }
 
 export function decodeEntities(text: string): string {
-  return text.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"').replace(/&#0*39;|&apos;/gi, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_match, value: string) => safeCodePoint(Number.parseInt(value, 16)))
-    .replace(/&#(\d+);/g, (_match, value: string) => safeCodePoint(Number(value)));
+  return text.replace(/&(nbsp|amp|lt|gt|quot|apos|#x[0-9a-f]+|#\d+);/gi, (_match, entity: string) => {
+    const value = entity.toLowerCase();
+    if (value.startsWith("#x")) return safeCodePoint(Number.parseInt(value.slice(2), 16));
+    if (value.startsWith("#")) return safeCodePoint(Number(value.slice(1)));
+    return NAMED_ENTITIES[value];
+  });
 }
 
-function htmlLineToText(line: string): string {
-  return decodeEntities(line
+function htmlToMarkdown(line: string): string {
+  return line
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)")
     .replace(/<img\b[^>]*alt\s*=\s*["']([^"']*)["'][^>]*\/?>/gi, "[image: $1]")
@@ -47,15 +49,23 @@ function htmlLineToText(line: string): string {
     .replace(/<code\b[^>]*>/gi, "`").replace(/<\/code>/gi, "`")
     .replace(/<(td|th)\b[^>]*>/gi, " | ")
     .replace(/<hr\s*\/?>/gi, "\n---\n")
-    .replace(HTML_TAG, ""));
+    .replace(HTML_TAG, "");
 }
 
 export function normalizeHtml(content: string): string {
   return Lexer.lex(expandTabs(content), lexerOptions).map((token) => {
     if (token.type === "code") return token.raw;
-    if (token.type === "html") return htmlLineToText(token.raw);
+    if (token.type === "html") return decodeEntities(htmlToMarkdown(token.raw));
     return token.raw;
   }).join("");
+}
+
+function hasOpenFence(raw: string): boolean {
+  const fence = /^ {0,3}(`{3,}|~{3,})/.exec(raw)?.[1];
+  if (!fence) return false;
+  const text = raw.trimEnd();
+  const lastBreak = text.lastIndexOf("\n");
+  return lastBreak < 0 || !/^ {0,3}(`{3,}|~{3,})$/.exec(text.slice(lastBreak + 1))?.[1]?.startsWith(fence);
 }
 
 function blocksFromTokens(tokens: readonly Token[]): MarkdownBlock[] {
@@ -72,7 +82,12 @@ function blocksFromTokens(tokens: readonly Token[]): MarkdownBlock[] {
       }
       case "code": {
         const value = token as Tokens.Code;
-        blocks.push({ kind: "code", language: value.lang?.trim().split(/\s+/)[0] ?? "", lines: value.text.split("\n") });
+        blocks.push({
+          kind: "code",
+          language: value.lang?.trim().split(/\s+/)[0] ?? "",
+          lines: value.text.split("\n"),
+          ...(hasOpenFence(value.raw) ? { openFence: true } : {}),
+        });
         break;
       }
       case "list": {
@@ -94,7 +109,7 @@ function blocksFromTokens(tokens: readonly Token[]): MarkdownBlock[] {
       }
       case "hr": blocks.push({ kind: "hr" }); break;
       case "html": {
-        const normalized = htmlLineToText(token.raw);
+        const normalized = htmlToMarkdown(token.raw);
         if (normalized.trim().length === 0) break;
         if (normalized !== token.raw) blocks.push(...blocksFromTokens(Lexer.lex(normalized, lexerOptions)));
         else blocks.push({ kind: "paragraph", tokens: [{ type: "text", raw: token.raw, text: token.raw }] });
@@ -183,7 +198,7 @@ export function parseInlineSegments(source: string | readonly Token[]): InlineSe
               else if (name === "code") style.kind = "code";
               else style.strike = true;
             }
-          } else if (name === "img") append(htmlLineToText(token.raw));
+          } else if (name === "img") append(decodeEntities(htmlToMarkdown(token.raw)));
           break;
         }
         case "escape": append(value.text); break;

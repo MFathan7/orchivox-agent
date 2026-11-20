@@ -33,7 +33,7 @@ import { formatTurnMetrics } from "./agent/turn-metrics";
 import { shouldWarnLargeSession } from "./agent/session-warning";
 import { isPlaceholderTitle, messageText } from "./agent/session-title";
 import { SessionBackgroundJobs } from "./agent/session-background";
-import { InputRouter, inputRoute, type SubmittedInput } from "./tui/input-routing";
+import { InputRouter, inputRoute, queuedInputText, type SubmittedInput } from "./tui/input-routing";
 import type { QueueMessage } from "./tui/queue-panel";
 import type { BtwTurn } from "./agent/btw";
 import { InputRunCancelled, SessionViewLease, interruptedRun, mainTurnEvents, mainTurnResult, withRunSignal, type InputRunContext, type InputRunResult } from "./agent/run-lifecycle";
@@ -74,6 +74,7 @@ import {
   saveModeSteps,
   saveRoleSelection,
   saveTheme,
+  saveUiLayout,
   type ConfigMode,
 } from "./config/writer";
 import { LSPClient } from "./ide/lsp-client";
@@ -141,6 +142,7 @@ import { basename, relative, join } from "node:path";
 import { WorkspaceTrustManager } from "./security/workspace-trust";
 import { WorkspaceTrustPrompt } from "./tui/trust-modal";
 import type { ReasoningEffortLevel } from "./tui/command-palette";
+import type { UiLayout } from "./types/ui-layout";
 import type { SessionModalTab } from "./tui/session-modal";
 import {
   AgentModeSchema,
@@ -991,21 +993,22 @@ async function runTuiSession(
     }
   };
 
-  const applyThemeSelection = (next: ThemeSelection): void => {
+  let appearanceSave: Promise<void> = Promise.resolve();
+  const applyThemeSelection = (next: ThemeSelection, showNotice = true): void => {
     const choice = resolveThemeChoice(next, state.terminalAppearance);
     if (choice.warning) { setNotice(`Cannot apply ${next} on a ${state.terminalAppearance} terminal. Current theme kept.`, 9000); return; }
     state.themeSelection = choice.selection;
     state.currentTheme = choice.theme;
     if (choice.selection === next) {
-      void saveTheme(runtime.configPath, next).catch((error) => {
+      appearanceSave = appearanceSave.then(() => saveTheme(runtime.configPath, next)).catch((error) => {
         setNotice(
           `Could not save theme: ${error instanceof Error ? error.message : String(error)}`,
           6000,
         );
       });
     }
-    const label = themeSelectionLabel(choice.selection, choice.theme);
-    setNotice(choice.warning ? `${label}. ${choice.warning}` : `Theme: ${label}`, choice.warning ? 9000 : 6000);
+    if (showNotice) setNotice(`Theme: ${themeSelectionLabel(choice.selection, choice.theme)}`);
+    else rerender();
   };
 
   const warnedLargeSessions = new Set<string>();
@@ -1108,7 +1111,9 @@ async function runTuiSession(
     store: runtime.database.inputQueueStore<SubmittedInput<FileAttachmentRef>>(),
     sessionId: () => ensureSession("Interactive Session"),
     blocked: () => state.busy || state.mcpChanging,
-    run: async ({ text, action, attachments, agent, task, context }, item, run) => {
+    run: async (input, item, run) => {
+      const { action, attachments, agent, task, context } = input;
+      const text = queuedInputText(input);
       run.assertCurrent();
       if (item.sessionId !== state.sessionId) throw new InputRunCancelled("interrupted");
       const lease = new SessionViewLease({ id: item.sessionId, epoch: state.sessionEpoch },
@@ -1132,12 +1137,11 @@ async function runTuiSession(
         await handleCommand(action.command, action.args ?? "", action.raw ?? text);
       }
     },
-    side: ({ text, action, attachments }) => {
+    side: ({ action, attachments }) => {
       if (action.kind !== "command") return false;
-      if (!(action.args ?? "").trim()) { openBtw(); return true; }
-      const raw = action.raw ?? text;
-      const context = text.startsWith(raw) ? text.slice(raw.length) : "";
-      return sendBtw(`${action.args}${context}`, undefined, attachments);
+      const question = action.args ?? "";
+      if (!question.trim()) { openBtw(); return true; }
+      return sendBtw(question, undefined, attachments);
     },
     onQueued: (position) => {
       setNotice(`Queued #${position}. Uses the mode and model active when it starts.`, 6000);
@@ -1253,7 +1257,7 @@ async function runTuiSession(
         return false;
       }
       if (!queueEdit?.editToken) return false;
-      const input = { ...queueEdit.input, text: payload.fullText, action, attachments: payload.attachments };
+      const input = { ...queueEdit.input, text: payload.rawText, action, attachments: payload.attachments };
       const saved = inputQueue.saveEdit(queueEdit.id, queueEdit.editToken, input);
       if (saved) queueEdit = undefined;
       else staleQueueNotice();
@@ -1366,6 +1370,14 @@ async function runTuiSession(
     approvalsPreset: runtime.config.approvals.preset ?? "safer",
     autoDelegate: state.autoDelegate,
     animations: runtime.config.ui.animations,
+    layout: runtime.config.ui.layout,
+    onLayoutChange: (layout: UiLayout) => {
+      runtime.config.ui.layout = layout;
+      appearanceSave = appearanceSave.then(() => saveUiLayout(runtime.configPath, layout)).catch((error) => {
+        setNotice(`Could not save layout: ${error instanceof Error ? error.message : String(error)}`, 8000);
+      });
+      rerender();
+    },
     memoryEnabled: runtime.config.memory.enabled,
     onMemoryEnabledChange: (enabled: boolean) => {
       runtime.config.memory.enabled = enabled;
@@ -1532,7 +1544,7 @@ async function runTuiSession(
       rerender();
     },
     onThemeChange: (nextTheme: ThemeSelection) => {
-      applyThemeSelection(nextTheme);
+      applyThemeSelection(nextTheme, false);
     },
     reasoningEffort: state.reasoningEffort,
     onReasoningEffortChange: (effort: ReasoningEffortLevel) => {
@@ -3111,6 +3123,7 @@ async function runTuiSession(
     instance.unmount();
     shutdownPromise = (async () => {
       await inputQueue.drain();
+      await appearanceSave;
       await relay?.close();
       await runtime.close();
     })();

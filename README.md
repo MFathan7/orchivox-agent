@@ -111,11 +111,13 @@ In `/settings`, choose a Delegation policy:
 
 - `requested`: delegate only when explicitly requested.
 - `balanced` (default): weigh independent work against setup cost.
-- `eager`: prefer workers for substantial independent parts of a task.
+- `eager`: dispatch independent parts during initial scoping and keep working on a part that can proceed alongside them.
 
 Coordinator **On demand** makes the optional planning tool available. Neither setting guarantees a worker on every request. Small tasks can stay with the main agent.
 
 Configure Fast and Advisor roles in `/models` with Ctrl+R for specialists that require them. They may use the same model as Main. Up to four workers run concurrently by default; excess workers queue.
+
+Set `limits.worker_steps` in `.agent/config.yaml` to adjust the per-worker model step budget (default `40`, `0` disables it). Workers that reach the step or token budget keep their isolated worktree for review.
 
 Use `/hub` to inspect workers. If none appear, `/turn-report` distinguishes worker tools offered from workers actually called. Project settings can override global settings.
 
@@ -126,10 +128,20 @@ Use `/hub` to inspect workers. If none appear, `/turn-report` distinguishes work
 - **Background titles** and **Idle recap** make extra model requests. Disable either in Settings to avoid those requests.
 - **Animations** controls activity indicators. Thought stays collapsed by default; progress narration remains visible.
 
-Use `/theme` to preview nine presets, including **Orbit Dark** and **Orbit Light**.
-Arrow keys or the wheel browse; Enter saves and Esc cancels. Auto follows the
-terminal background. Consecutive reads and searches share one activity box;
-successful file reads and image inspections show paths without output bodies.
+Open `/theme` and press Tab to switch between **Layout** and **Colors**.
+Choose **Orchivox** for framed prompts and tool panels, **Claude Code** for a
+tool timeline and animated status, **Codex** for numbered diffs and a work
+status with active tool details, or **Pi** for a spinner, inline tool progress,
+and a context footer. All four layouts share the same chat width and keyboard shortcuts.
+Press `Ctrl+B` to toggle the sidebar on wide terminals.
+
+Arrow keys or the wheel browse. Enter applies the selection and Esc closes the
+picker. Layout and color are saved separately, so every layout can use any
+compatible palette. **Auto** follows the terminal background. Use
+`/theme <color>` to apply a color directly.
+
+Consecutive reads and searches share an activity group.
+Successful file reads and image inspections show their paths.
 File moves show paths without content diffs; failures remain readable.
 Ctrl+O expands other tool output and code diffs. The worker line separates running work from queued
 or preparing workers; the main status identifies a worker it is waiting for.
@@ -374,4 +386,4 @@ If installed through the standalone installer, remove its Orchivox PATH entry fr
 
 ## Status
 
-Orchivox is at version `1.0.0`.
+Orchivox is at version `1.1.0`.

@@ -30,6 +30,15 @@ export function useAnimationFrame(active: boolean, frames: number, frameMs = 100
   return React.useSyncExternalStore(running ? clock.subscribe : noSubscription, snapshot, snapshot);
 }
 
+export function useElapsedSeconds(startedAt?: number): number | undefined {
+  const enabled = useMotion();
+  const clock = React.useContext(FrameClockContext);
+  const snapshot = React.useCallback(() => startedAt === undefined
+    ? undefined
+    : Math.max(0, Math.floor((Date.now() - startedAt) / 1000)), [startedAt]);
+  return React.useSyncExternalStore(enabled && startedAt !== undefined ? clock.subscribe : noSubscription, snapshot, snapshot);
+}
+
 export function contrastRatio(foreground: string, background: string): number {
   const luminance = (hex: string) => {
     const rgb = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255);

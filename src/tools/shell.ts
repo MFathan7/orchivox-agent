@@ -1,5 +1,6 @@
 import { closeSync, openSync, statSync } from "node:fs";
 import { unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 
@@ -58,8 +59,14 @@ export interface ShellMeta {
 
 export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
   readonly name: string;
-  readonly description =
-    "Run a shell command. The working directory and exported environment persist between calls. Use workdir instead of cd. Set isolatedState: true only for independent commands that do not need persistent cwd/env updates or share writable outputs; workspace files are not isolated. For a dev server or long-running process, use bg_start. Use curl --max-time or --connect-timeout for HTTP probes.";
+  get description(): string {
+    const adapter = this.adapter;
+    const syntax = adapter ? `Use ${adapter.label} syntax.` : "Use the shell syntax reported in Environment.";
+    const compatibility = adapter?.kind === "powershell"
+      ? " Windows PowerShell 5.1 does not support && or ||. Use curl.exe for native curl flags."
+      : "";
+    return `Run a shell command. ${syntax}${compatibility} The working directory and exported environment persist between calls. Use workdir instead of cd. Set isolatedState: true only for independent commands that do not need persistent cwd/env updates or share writable outputs; workspace files are not isolated. For a dev server or long-running process, use bg_start.`;
+  }
   readonly parameters = ShellArgsSchema;
   readonly readOnly = false;
   readonly concurrency = (args: Record<string, unknown>): "shared" | "exclusive" => args.isolatedState === true ? "shared" : "exclusive";
@@ -152,7 +159,7 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
     signal?: AbortSignal,
   ): Promise<string> {
     const tempDir = await ensureRuntimeTempDir(this.defaultDir).catch(
-      () => this.inheritedTmpDir ?? "/tmp",
+      () => this.inheritedTmpDir ?? tmpdir(),
     );
     if (state.env.TMPDIR === undefined || state.env.TMPDIR === this.inheritedTmpDir) {
       state.env.TMPDIR = tempDir;
@@ -252,7 +259,7 @@ export class PersistentShellTool implements AgentTool<typeof ShellArgsSchema> {
       );
     }
 
-    const backgroundNote = hasBackgroundChild(command)
+    const backgroundNote = adapter.kind !== "powershell" && hasBackgroundChild(command)
       ? "\n\n[shell exited; background children may still be running]"
       : "";
     const full = `exit ${exitCode}\n${captured}${backgroundNote}`;
@@ -311,6 +318,7 @@ export function buildPowerShellScript(
     `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
     `Set-Location -LiteralPath ${quote(workdir)}`,
     `$global:LASTEXITCODE = 0`,
+    `. {`,
     `try {`,
     command,
     `  if ($LASTEXITCODE -ne 0) { $__orchivox_exit = $LASTEXITCODE } elseif ($?) { $__orchivox_exit = 0 } else { $__orchivox_exit = 1 }`,
@@ -318,6 +326,7 @@ export function buildPowerShellScript(
     `  Write-Error $_`,
     `  $__orchivox_exit = 1`,
     `}`,
+    `} | Out-Default`,
     `$__orchivox_env = @{}`,
     `Get-ChildItem Env: | ForEach-Object { $__orchivox_env[$_.Name] = $_.Value }`,
     `$__orchivox_json = [ordered]@{ exit = $__orchivox_exit; pwd = (Get-Location).Path; env = $__orchivox_env } | ConvertTo-Json -Compress -Depth 4`,

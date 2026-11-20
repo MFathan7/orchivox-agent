@@ -7,7 +7,7 @@ import type {
   AgentProfile,
   IAgentRunner,
 } from "../api/server";
-import type { AppConfig, CompactionConfig, WebFetchConfig, WebSearchConfig } from "../config/loader";
+import { DEFAULT_WORKER_STEPS, type AppConfig, type CompactionConfig, type WebFetchConfig, type WebSearchConfig } from "../config/loader";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveProjectState } from "../runtime-paths";
@@ -53,11 +53,13 @@ import { createReadDatabaseTool } from "../tools/read-database";
 import { createAstEditTool, createAstSearchTool } from "../ide/structural-search";
 import { createCodeFindTool } from "../ide/code-find";
 import { registerGithubTools } from "../tools/github";
+import { createGitInspectTool } from "../tools/git-inspect";
+import { createLocalHttpProbeTool } from "../tools/local-http";
 import { BrowserTools } from "../tools/browser";
 import { DebugTools } from "../tools/debugger";
 import { RemoteTools } from "../tools/remote";
 import { DesktopTools } from "../tools/desktop";
-import { toolArgumentRecoveryMessage } from "./prompt";
+import { toolArgumentRecoveryMessage, workerStepBudgetNotice } from "./prompt";
 import { createReadArchiveTool } from "../tools/read-archive";
 import { registerNotebookTools } from "../tools/notebook";
 import { applyContextRewinds, ContextCheckpoint, registerContextTools } from "./context-checkpoint";
@@ -219,7 +221,6 @@ export interface PromptSnapshot {
 }
 
 const MAX_OUTPUT_LIMIT_CONTINUES = 2;
-const MAX_SUBAGENT_TURNS = 40;
 class TurnTimeLimitError extends Error {}
 /** Background summary starts when the prompt reaches this share of the budget. */
 const PRECOMPUTE_SHARE = 0.85;
@@ -1025,6 +1026,8 @@ export class AgentOrchestrator implements IAgentRunner {
       );
     }
     this.registry.register(createDiffViewTool());
+    this.registry.register(createGitInspectTool());
+    this.registry.register(createLocalHttpProbeTool());
     this.registry.register(createJsonQueryTool());
     this.registry.register(
       new PersistentShellTool({ cwd: this.root, adapter: this.shellAdapter }),
@@ -3181,9 +3184,14 @@ export class AgentOrchestrator implements IAgentRunner {
       `${toolDisplay(name).label} · ${progress.progress}${progress.total === undefined ? "" : `/${progress.total}`}${progress.message ? ` · ${progress.message}` : ""}`,
     );
     const workerTokenLimit = this.config?.limits?.worker_tokens ?? 0;
+    const workerStepLimit = this.config?.limits?.worker_steps ?? DEFAULT_WORKER_STEPS;
+    const stepWarningAt = Math.floor(workerStepLimit * 0.8);
     let workerBudgetWarned = false;
 
     const effectiveMode = specialist?.readOnly ? "plan" : input.mode ?? "build";
+    const reasoningEffort = capabilities.reasoning
+      ? clampReasoningEffort(effectiveMode === "plan" && role === "fast" ? "low" : "medium", capabilities.reasoning_efforts)
+      : undefined;
     const refreshWorkerCatalog = () => {
       const snapshot = this.registry.snapshot(); if (turnContext) turnContext.toolCatalog = snapshot;
       let current = this.filterToolsForCapabilities(filterToolsForMode(this.registry.listDefinitions(snapshot.values()), effectiveMode), capabilities).filter((tool) => !SUBAGENT_BLOCKED_TOOLS.has(tool.name));
@@ -3282,9 +3290,14 @@ export class AgentOrchestrator implements IAgentRunner {
             },
           }
         : undefined;
-    for (let turn = 0; turn < MAX_SUBAGENT_TURNS; turn += 1) {
+    for (let turn = 0; workerStepLimit === 0 || turn < workerStepLimit; turn += 1) {
       if (input.signal.aborted) throw new Error("worker aborted");
       tools = refreshWorkerCatalog();
+      if (workerStepLimit > 0 && turn === stepWarningAt) {
+        const remaining = workerStepLimit - turn;
+        appendSyntheticMessage(messages, "subagent-step-budget", workerStepBudgetNotice(remaining));
+        input.onTranscript(`[budget] ${remaining} worker model steps remaining.`);
+      }
       for (const instruction of input.drainSteerings()) {
         messages.push(makeMessage(`subagent-steer-${turn}`, "user", `Steering instruction: ${instruction}`));
         input.onTranscript(`steering: ${instruction}`);
@@ -3301,7 +3314,7 @@ export class AgentOrchestrator implements IAgentRunner {
         max_tokens: subagentMaxTokens,
         temperature: structuredResponseFormat ? 0 : undefined,
         response_format: structuredResponseFormat,
-        reasoning_effort: capabilities.reasoning ? "medium" : undefined,
+        reasoning_effort: reasoningEffort,
       });
       input.onProgress?.("Waiting for provider");
       for await (const event of provider.streamChat(chatRequest, input.signal)) {
@@ -3372,7 +3385,7 @@ export class AgentOrchestrator implements IAgentRunner {
         refreshWorkerSkills();
       }
     }
-    throw new SubagentTurnLimitError(MAX_SUBAGENT_TURNS);
+    throw new SubagentTurnLimitError(workerStepLimit);
   }
 
   /**

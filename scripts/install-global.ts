@@ -8,7 +8,7 @@ import { parseInstallArgs, runLocalInstallCommand } from "../src/installer/cli";
 import { resolveInstallPaths } from "../src/installer/paths";
 
 async function buildRuntime(): Promise<void> {
-  const proc = Bun.spawn(["bun", "run", "scripts/build-binary.ts"], {
+  const proc = Bun.spawn([process.execPath, "run", "scripts/build-binary.ts"], {
     cwd: process.cwd(),
     stdout: "pipe",
     stderr: "pipe",
@@ -27,8 +27,8 @@ async function buildRuntime(): Promise<void> {
 }
 
 const parsed = parseInstallArgs(process.argv.slice(2));
-const sourceBinary = join(process.cwd(), "orchivox");
-const extraLinkPaths = process.env.ORCHIVOX_INSTALL_DIR
+const sourceBinary = join(process.cwd(), process.platform === "win32" ? "orchivox.exe" : "orchivox");
+const extraLinkPaths = process.platform === "win32" || process.env.ORCHIVOX_INSTALL_DIR
   ? []
   : [join(homedir(), ".local", "bin", "orchivox")];
 

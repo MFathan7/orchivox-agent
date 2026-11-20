@@ -5,6 +5,7 @@ import { useInput } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
 import { computeLineHash } from "../tools/hashline-edit";
+import type { DiffStyle } from "./layout";
 import { panelRowNode } from "./panel";
 import type { RenderRow } from "./rows";
 import {
@@ -89,6 +90,7 @@ export function collectDiffHunks(oldText: string, newText: string, context = 3):
       if (marker === "-") {
         return { kind: "remove" as const, oldNumber: oldNumber++, text };
       }
+      if (marker === "\\") return { kind: "context" as const, text: raw };
       return { kind: "context" as const, oldNumber: oldNumber++, newNumber: newNumber++, text };
     });
     return {
@@ -132,12 +134,20 @@ function unifiedLine(
   showHash = true,
 ): { marker: string; kind: DisplayLine["kind"]; gutter: string } {
   const number = line.kind === "add" ? line.newNumber : line.oldNumber;
-  const gutter = showHash
+  const gutter = showHash && number !== undefined
     ? `${String(number ?? "").padStart(4)} ${lineHash(line)}`
     : String(number ?? "").padStart(4);
   if (line.kind === "add") return { marker: "+", kind: "add", gutter };
   if (line.kind === "remove") return { marker: "-", kind: "remove", gutter };
   return { marker: " ", kind: "context", gutter };
+}
+
+function diffPrefix(line: DisplayLine, style: DiffStyle, showHash = false): { rail: string; text: string } {
+  if (style === "minimal") return { rail: "", text: `${line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "} ` };
+  const view = unifiedLine(line, style === "hashline" && showHash);
+  return style === "numbered"
+    ? { rail: "", text: `${view.gutter} ${view.marker} ` }
+    : { rail: "▎ ", text: `${view.marker} ${view.gutter} ` };
 }
 
 function fitDiffText(text: string, width: number): string {
@@ -155,6 +165,7 @@ export const DIFF_PREVIEW_LINES = 5;
 export interface DiffRowsOptions {
   /** Show the old/new path header. Defaults to true. */
   showFileHeader?: boolean;
+  style?: DiffStyle;
 }
 
 export function diffRows(
@@ -170,7 +181,8 @@ export function diffRows(
 ): RenderRow[] {
   const hunks = collectDiffHunks(oldText, newText);
   const rows: RenderRow[] = [];
-  const sideBySide = !unified && width >= 100;
+  const style = options.style ?? "hashline";
+  const sideBySide = style === "hashline" && !unified && width >= 100;
   const dividerColor = background ? theme.border.passive : theme.muted;
   const lineColor = (kind: DisplayLine["kind"]): string =>
     kind === "add" ? theme.diff.added : kind === "remove" ? theme.diff.removed : theme.muted;
@@ -212,20 +224,19 @@ export function diffRows(
 
     if (!sideBySide) {
       hunk.lines.forEach((line, lineIndex) => {
-        const view = unifiedLine(line, width >= 60);
-        const firstPrefix = `${view.marker} ${view.gutter}`;
-        const prefixWidth = displayWidth(`▎ ${firstPrefix} `);
-        const textWidth = Math.max(8, width - prefixWidth);
+        const { rail, text } = diffPrefix(line, style, width >= 60);
+        const prefixWidth = displayWidth(rail + text);
+        const textWidth = Math.max(1, width - prefixWidth);
         wrapPreservingWhitespace(line.text, textWidth).forEach((chunk, chunkIndex) => {
-          const prefix = chunkIndex === 0 ? firstPrefix : "  ";
+          const prefix = chunkIndex === 0 ? text : " ".repeat(displayWidth(text));
           rows.push(
             panelRow(
               `diff-${hunkIndex}-${lineIndex}-${chunkIndex}`,
-              <Text color={lineColor(view.kind)} wrap="truncate">
-                <Text color={dividerColor}>▎ </Text>
-                {prefix} {chunk}
+              <Text color={lineColor(line.kind)} wrap="truncate">
+                <Text color={dividerColor}>{rail}</Text>
+                {prefix}{chunk}
               </Text>,
-              `▎ ${prefix} ${chunk}`,
+              rail + prefix + chunk,
             ),
           );
         });
@@ -275,6 +286,7 @@ export function diffPreviewRows(
   theme: Theme,
   background?: string,
   maxLines = DIFF_PREVIEW_LINES,
+  style: DiffStyle = "hashline",
 ): RenderRow[] {
   const changed = collectDiffHunks(oldText, newText)
     .flatMap((hunk) => hunk.lines)
@@ -301,18 +313,17 @@ export function diffPreviewRows(
   };
 
   visible.forEach((line, index) => {
-    const view = unifiedLine(line, false);
-    const prefix = `${view.marker} ${view.gutter}`;
-    const textWidth = Math.max(8, width - displayWidth(`▎ ${prefix} `));
+    const { rail, text: prefix } = diffPrefix(line, style);
+    const textWidth = Math.max(1, width - displayWidth(rail + prefix));
     const text = fitDisplayText(line.text, textWidth);
     rows.push(
       panelRow(
         `diff-preview-${index}`,
-        <Text color={lineColor(view.kind)} wrap="truncate">
-          <Text color={dividerColor}>▎ </Text>
-          {prefix} {text}
+        <Text color={lineColor(line.kind)} wrap="truncate">
+          <Text color={dividerColor}>{rail}</Text>
+          {prefix}{text}
         </Text>,
-        `▎ ${prefix} ${text}`,
+        rail + prefix + text,
       ),
     );
   });

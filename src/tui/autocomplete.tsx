@@ -83,7 +83,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/btw", description: "Ask a side question or open its history" },
   { name: "/queue", description: "Edit, cancel, or resume queued messages" },
   { name: "/review", requiresArgs: true, description: "Review a file or answer a code question" },
-  { name: "/theme", requiresArgs: false, description: "Change or inspect the terminal theme" },
+  { name: "/theme", requiresArgs: false, description: "Choose a layout or color preset" },
   { name: "/mcp", requiresArgs: false, description: "Manage MCP servers, sign-in, resources, and prompts" },
   { name: "/reasoning", requiresArgs: false, description: "Set thinking effort" },
   { name: "/palette", description: "Search actions and settings" },

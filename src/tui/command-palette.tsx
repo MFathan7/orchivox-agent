@@ -4,22 +4,14 @@ import { Box, Text, useInput } from "ink";
 import type { ProviderRole, ProviderRouter } from "../provider/router";
 import { filterFuzzy } from "./autocomplete";
 import { isMouseSequence } from "./mouse";
-import {
-  AUTO_THEME,
-  DEFAULT_THEME,
-  useActiveTheme,
-  type Theme,
-  type ThemeName,
-  type ThemeSelection,
-  THEME_ORDER,
-  THEMES,
-} from "./theme";
+import { displayWidth, fitDisplayText } from "./text-wrap";
+import { useActiveTheme, type Theme } from "./theme";
 
 export type ReasoningEffortLevel = "default" | "off" | "low" | "medium" | "high" | "max" | (string & {});
 
 export interface PaletteItem {
   id: string;
-  category: "model" | "reasoning" | "theme" | "action";
+  category: "model" | "reasoning" | "action";
   section: string;
   title: string;
   subtitle?: string;
@@ -30,12 +22,11 @@ export interface PaletteItem {
 
 export interface CommandPaletteModalProps {
   router: ProviderRouter;
-  currentTheme?: ThemeName;
-  themeSelection?: ThemeSelection;
+  width?: number;
+  height?: number;
   reasoningEffort?: ReasoningEffortLevel;
   reasoningLevels?: string[];
   onSelectReasoning?: (effort: ReasoningEffortLevel) => void;
-  onSelectTheme?: (theme: ThemeSelection) => void;
   onOpenModels?: () => void;
   onAction?: (actionKey: string) => void;
   onClose: () => void;
@@ -71,12 +62,11 @@ export function reasoningLevelsFor(
 export function CommandPaletteModal(props: CommandPaletteModalProps) {
   const {
     router,
-    currentTheme = DEFAULT_THEME,
-    themeSelection,
+    width = 80,
+    height = 18,
     reasoningEffort = "default",
     reasoningLevels,
     onSelectReasoning,
-    onSelectTheme,
     onOpenModels,
     onAction,
     onClose,
@@ -130,38 +120,6 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       });
     }
 
-    const activeSelection = themeSelection ?? currentTheme;
-    list.push({
-      id: "theme-auto",
-      category: "theme",
-      section: "Theme",
-      title: "Auto",
-      subtitle: "Follow the terminal background",
-      badge: activeSelection === AUTO_THEME ? "ACTIVE" : undefined,
-      isCurrent: activeSelection === AUTO_THEME,
-      onExecute: () => {
-        onSelectTheme?.(AUTO_THEME);
-        onClose();
-      },
-    });
-
-    for (const name of THEME_ORDER) {
-      const isCurrent = activeSelection === name;
-      list.push({
-        id: `theme-${name}`,
-        category: "theme",
-        section: "Theme",
-        title: THEMES[name].label,
-        subtitle: isCurrent ? "Current preset" : THEMES[name].description,
-        badge: isCurrent ? "ACTIVE" : undefined,
-        isCurrent,
-        onExecute: () => {
-          onSelectTheme?.(name);
-          onClose();
-        },
-      });
-    }
-
     const actions: Array<{ key: string; title: string; subtitle: string }> = [
       {
         key: "open_models",
@@ -171,6 +129,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
       { key: "open_connect", title: "Provider manager", subtitle: "Add, edit, enable, or delete providers (/connect)" },
       { key: "open_skills", title: "Skills", subtitle: "Inspect installed skills (/skills)" },
       { key: "open_settings", title: "Settings", subtitle: "Approvals, safety, and step limits (/settings)" },
+      { key: "open_theme", title: "Theme", subtitle: "Layout and colors (/theme)" },
       { key: "open_tasks", title: "Task board", subtitle: "Multi-agent tasks and results (/tasks)" },
       { key: "open_sessions", title: "Sessions", subtitle: "Browse, search, fork, and restore (Ctrl+S)" },
       { key: "open_timeline", title: "Snapshot timeline", subtitle: "Inspect and restore file changes" },
@@ -199,7 +158,7 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     }
 
     return list;
-  }, [router, currentTheme, themeSelection, reasoningEffort, levels, onSelectReasoning, onSelectTheme, onOpenModels, onAction, onClose]);
+  }, [router, reasoningEffort, levels, onSelectReasoning, onOpenModels, onAction, onClose]);
 
   const source = React.useMemo(() => {
     const trimmed = query.trim();
@@ -208,7 +167,13 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     return ranked.map((entry) => entry.item);
   }, [items, query]);
 
-  const maxVisible = 10;
+  const contentWidth = Math.max(1, width - 2);
+  const showHeading = height >= 4;
+  const showSearch = height >= 2;
+  const framedSearch = height >= 7 && contentWidth >= 12;
+  const searchHeight = showSearch ? framedSearch ? 3 : 1 : 0;
+  const listHeight = Math.max(1, height - searchHeight - (showHeading ? 2 : 0));
+  const maxVisible = Math.min(10, listHeight);
   const clampedIndex = Math.max(0, Math.min(source.length - 1, selectedIndex));
   const halfWindow = Math.floor(maxVisible / 2);
   let startIndex = Math.max(0, clampedIndex - halfWindow);
@@ -216,6 +181,8 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     startIndex = Math.max(0, source.length - maxVisible);
   }
   const visibleItems = source.slice(startIndex, startIndex + maxVisible);
+  const sectionRows = visibleItems.filter((item, index) => item.section !== visibleItems[index - 1]?.section).length;
+  const showSections = visibleItems.length + sectionRows <= listHeight;
 
   useInput((input, key) => {
     if (isMouseSequence(input)) return;
@@ -261,62 +228,60 @@ export function CommandPaletteModal(props: CommandPaletteModalProps) {
     }
   });
 
-  let lastSection = "";
-
   return (
-    <Box flexDirection="column" paddingX={1}>
-      <Box justifyContent="space-between">
+    <Box flexDirection="column" width={width} paddingX={1}>
+      {showHeading ? <Text wrap="truncate">
         <Text bold color={theme.text}>Palette</Text>
-        <Text color={theme.muted}>{source.length} matches · Esc close</Text>
-      </Box>
-      <Box borderStyle="single" borderColor={theme.border.passive} paddingX={1}>
-        <Text color={theme.accent} bold>❯ </Text>
-        <Text color={theme.text}>{query}</Text>
-        <Text inverse color={theme.accent}> </Text>
-        {query.length === 0 ? (
-          <Text color={theme.muted}>  Type to search models, thinking effort, themes, and actions</Text>
-        ) : null}
-      </Box>
+        <Text color={theme.muted}> · {source.length} matches</Text>
+      </Text> : null}
+      {showSearch ? <Box borderStyle={framedSearch ? "single" : undefined} borderColor={theme.border.passive} paddingX={framedSearch ? 1 : 0} flexShrink={0}>
+        <Text wrap="truncate">
+          <Text color={theme.accent} bold>❯ </Text>
+          <Text color={query ? theme.text : theme.muted}>
+            {fitDisplayText(query || "Search models, effort, and actions", Math.max(0, contentWidth - (framedSearch ? 7 : 3)))}
+          </Text>
+          {query ? <Text inverse color={theme.accent}> </Text> : null}
+        </Text>
+      </Box> : null}
 
-      <Box flexDirection="column" marginTop={0}>
+      <Box flexDirection="column" flexShrink={0}>
         {visibleItems.length === 0 ? (
-          <Text color={theme.muted}>No matches. Try a shorter query.</Text>
+          <Text color={theme.muted} wrap="truncate">{fitDisplayText("No matches. Try a shorter query.", contentWidth)}</Text>
         ) : (
           visibleItems.map((item, index) => {
             const actualIndex = startIndex + index;
             const isSelected = actualIndex === clampedIndex;
-            const showSection = item.section !== lastSection;
-            lastSection = item.section;
+            const showSection = showSections && item.section !== visibleItems[index - 1]?.section;
+            const badge = item.badge ? ` · ${item.badge}` : "";
+            const rowWidth = Math.max(1, contentWidth - 2 - displayWidth(badge));
+            const title = fitDisplayText(item.title, rowWidth);
+            const spare = rowWidth - displayWidth(title);
+            const detail = item.subtitle && spare >= 5 ? fitDisplayText(` · ${item.subtitle}`, spare) : "";
 
             return (
               <Box key={item.id} flexDirection="column">
                 {showSection ? (
-                  <Text bold color={theme.accent}>{item.section}</Text>
+                  <Text bold color={theme.accent} wrap="truncate">{item.section}</Text>
                 ) : null}
-                <Box justifyContent="space-between">
-                  <Box>
-                    <Text color={isSelected ? theme.accent : theme.muted}>{isSelected ? "❯ " : "  "}</Text>
-                    <Text color={isSelected ? theme.text : theme.text} bold={isSelected}>{item.title}</Text>
-                    {item.subtitle ? <Text color={theme.muted}> · {item.subtitle}</Text> : null}
-                  </Box>
-                  {item.badge ? (
+                <Text wrap="truncate">
+                  <Text color={isSelected ? theme.accent : theme.muted}>{isSelected ? "❯ " : "  "}</Text>
+                  <Text color={isSelected ? theme.selection : theme.text} bold={isSelected}>{title}</Text>
+                  <Text color={theme.muted}>{detail}</Text>
+                  {badge ? (
                     <Text color={item.badge === "EMPTY" ? theme.status.error : theme.status.success} bold>
-                      {item.badge}
+                      {badge}
                     </Text>
                   ) : null}
-                </Box>
+                </Text>
               </Box>
             );
           })
         )}
       </Box>
 
-      <Box justifyContent="space-between">
-        <Text color={theme.muted}>Up/Down move · Enter select · Esc close</Text>
-        <Text color={theme.muted}>
-          {source.length === 0 ? "0 of 0" : `${clampedIndex + 1} of ${source.length}`}
-        </Text>
-      </Box>
+      {showHeading ? <Text color={theme.muted} wrap="truncate">
+        {fitDisplayText("↑/↓ move · Enter select · Esc close", contentWidth)}
+      </Text> : null}
     </Box>
   );
 }

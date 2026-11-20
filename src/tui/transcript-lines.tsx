@@ -3,11 +3,13 @@ import React from "react";
 import { Box, Text } from "ink";
 
 import { toolDisplay } from "../agent/tool-display";
-import { observationRuns, subagentWaitGroups } from "./tool-groups";
+import { DEFAULT_UI_LAYOUT, type UiLayout } from "../types/ui-layout";
+import { activitySummary, groupToolCalls, observationRuns, subagentWaitGroups } from "./tool-groups";
 import type { ChatEntryView, ChatToolCallView } from "./app";
 import { diffPreviewRows, diffRows, formatThinkingDuration } from "./diff-view";
 import { formatBytes, formatTokenCount, formatReplyDate } from "./format";
 import { hashlinePanelParts, parseHashlineOutput } from "./hashline-format";
+import { LAYOUT_PRESETS, type DiffStyle, type TranscriptStyle } from "./layout";
 import { markdownRows } from "./markdown";
 import { fitPanelParts, type PanelPart } from "./panel";
 import type { RenderRow } from "./rows";
@@ -16,6 +18,7 @@ import { ActivityText } from "./motion";
 import { type Theme } from "./theme";
 import {
   displayWidth,
+  expandTabs,
   fitDisplayText,
   singleLine,
   wrapPreservingWhitespace,
@@ -30,6 +33,7 @@ export interface TranscriptRow extends RenderRow {
 export interface BuildTranscriptOptions {
   width: number;
   theme: Theme;
+  layout?: UiLayout;
   collapsed: boolean;
   expandedGroups: ReadonlySet<string>;
   thinkingExpanded: boolean;
@@ -102,7 +106,7 @@ function plainTextRows(
   theme: Theme,
   keyPrefix: string,
 ): TranscriptRow[] {
-  const safeWidth = Math.max(8, width);
+  const safeWidth = Math.max(1, width);
   return text.split("\n").flatMap((line, lineIndex) =>
     wrapPreservingWhitespace(line, safeWidth).map((chunk, chunkIndex) => ({
       key: `${keyPrefix}-${lineIndex}-${chunkIndex}`,
@@ -163,15 +167,32 @@ function editActionLabel(action: "edit" | "create" | "delete" | "move"): string 
   return "Edit";
 }
 
+function transcriptDiff(
+  diff: NonNullable<ChatEntryView["diff"]>,
+  width: number,
+  theme: Theme,
+  style: DiffStyle,
+  expanded: boolean,
+  showFileHeader = true,
+): RenderRow[] {
+  return expanded
+    ? diffRows(diff.oldText, diff.newText, diff.oldLabel ?? "old", diff.newLabel ?? "new",
+      width, theme, diff.unified, undefined, { showFileHeader, style })
+    : diffPreviewRows(diff.oldText, diff.newText, width, theme, undefined, undefined, style);
+}
+
 function toolCallRows(
   call: ChatToolCallView,
   width: number,
   collapsed: boolean,
   theme: Theme,
   keyPrefix: string,
-  diffExpanded = false,
-  presentation: { nested?: boolean; waits?: ChatToolCallView[]; observations?: ChatToolCallView[] } = {},
+  diffExpanded: boolean,
+  presentation: { style: TranscriptStyle; nested?: boolean; waits?: ChatToolCallView[]; observations?: ChatToolCallView[] },
 ): TranscriptRow[] {
+  const { style } = presentation;
+  const timeline = style.tools === "timeline";
+  const compact = style.dense === true;
   const rows: TranscriptRow[] = [];
   const failed = call.status === "error" || call.status === "unavailable" || call.status === "cancelled";
   const output = PATH_ONLY_TOOLS.has(call.name) && !failed ? undefined : toolOutputWithReferences(call.output, call.outcome);
@@ -188,7 +209,7 @@ function toolCallRows(
   const target = isCommand ? "" : singleLine(call.filePath ?? call.detail ?? (call.name === "task_wait" ? call.workerIds?.join(", ") : undefined) ?? "");
   const additions = diff?.additions;
   const deletions = diff?.deletions;
-  const framed = !presentation.nested && width >= 12;
+  const framed = style.tools === "panel" && !presentation.nested && width >= 12;
   const safeWidth = Math.max(1, width - (framed ? 4 : 0));
   const innerPad = framed ? 0 : Math.min(2, Math.max(0, safeWidth - 1));
   const bodyWidth = Math.max(1, safeWidth - innerPad);
@@ -220,7 +241,7 @@ function toolCallRows(
       ),
     }));
 
-  const icon = statusIcon(status);
+  const icon = timeline ? "↳" : style.tools === "inline" ? "•" : statusIcon(status);
   const suffixParts: PanelPart[] = [];
   if (additions !== undefined || deletions !== undefined) {
     suffixParts.push({
@@ -252,13 +273,26 @@ function toolCallRows(
   const stateLabel = status === "error" ? "Error" : status === "ok" ? "Done" : status === "running" ? "Running" : status === "partial" ? "Partial" : status === "empty" ? "Empty" : status === "cancelled" ? "Cancelled" : status === "unavailable" ? "Unavailable" : "Pending";
   const headerWidth = Math.max(1, safeWidth - (framed ? 2 : 0));
   const fittedLabel = fitDisplayText(singleLine(label), Math.max(1, headerWidth - displayWidth(stateLabel) - 5));
+  const header = `${icon} ${fittedLabel} · ${stateLabel}`;
+  const progress = compact && status !== "running" ? undefined : call.progress;
+  const counter = progress ? `${progress.progress}${progress.total === undefined ? "" : `/${progress.total}`}` : "";
+  const note = compact ? singleLine(progress?.message ?? "") : progress?.message ?? "";
+  const inlineCounter = compact && counter && displayWidth(`${header} · ${counter}`) <= headerWidth;
+  const statusHeader = inlineCounter ? `${header} · ${counter}` : header;
+  const detail = target || ((compact || timeline) && command && !/[\r\n]/.test(command) ? `$ ${expandTabs(command)}` : "");
+  const inlineDetail = style.tools !== "panel" && detail && displayWidth(`${statusHeader} · ${detail}`) <= headerWidth;
+  const displayedHeader = inlineDetail ? `${statusHeader} · ${detail}` : statusHeader;
+  const inlineNote = inlineCounter && note && displayWidth(`${displayedHeader} · ${note}`) <= headerWidth;
+  const headerWithNote = inlineNote ? `${displayedHeader} · ${note}` : displayedHeader;
+  const inlineSuffix = (timeline || compact) && suffixParts.length > 0 &&
+    displayWidth(headerWithNote + suffixParts.map((part) => part.text).join("")) <= headerWidth;
 
   rows.push(
     inlineRow(keyPrefix, [
       {
         text: `${icon} `,
         node:
-          status === "running" ? (
+          status === "running" && style.animateTools !== false ? (
             <Spinner active color={statusTint} />
           ) : (
             <Text color={statusTint} bold>{icon} </Text>
@@ -267,10 +301,14 @@ function toolCallRows(
       },
       { text: fittedLabel, node: <Text bold>{fittedLabel}</Text> },
       { text: ` · ${stateLabel}`, node: <Text color={status === "running" ? theme.muted : statusTint}> · {stateLabel}</Text>, color: statusTint },
+      ...(inlineCounter ? [{ text: ` · ${counter}`, color: theme.muted }] : []),
+      ...(inlineDetail ? [{ text: ` · ${detail}`, color: theme.text }] : []),
+      ...(inlineNote ? [{ text: ` · ${note}`, color: theme.muted }] : []),
+      ...(inlineSuffix ? suffixParts : []),
     ], headerWidth),
   );
 
-  if (target) {
+  if (target && !inlineDetail) {
     const targetLabel = call.filePath ? "File" : "Target";
     wrapPreservingWhitespace(`${targetLabel}: ${target}`, bodyWidth).forEach((line, index) => {
       rows.push(inlineRow(`${keyPrefix}-target-${index}`, [
@@ -280,7 +318,7 @@ function toolCallRows(
     });
   }
 
-  if (command) {
+  if (command && !inlineDetail) {
     wrapPreservingWhitespace(command, Math.max(1, bodyWidth - 2)).forEach(
       (line, index) => {
         const prompt = index === 0 ? "$ " : "  ";
@@ -299,15 +337,18 @@ function toolCallRows(
     );
   }
 
-  if (call.progress) {
-    const progress = `${call.progress.progress}${call.progress.total === undefined ? "" : `/${call.progress.total}`}${call.progress.message ? ` · ${call.progress.message}` : ""}`;
-    wrapPreservingWhitespace(progress, bodyWidth).slice(0, 3).forEach((text, index) => rows.push(inlineRow(`${keyPrefix}-progress-${index}`, [{ text: `${" ".repeat(innerPad)}${text}`, color: theme.muted }])));
+  const progressDetail = [inlineCounter ? "" : counter, inlineNote ? "" : note].filter(Boolean).join(" · ");
+  if (progressDetail) {
+    wrapPreservingWhitespace(progressDetail, bodyWidth).slice(0, 3).forEach((text, index) => rows.push(inlineRow(`${keyPrefix}-progress-${index}`, [{ text: `${" ".repeat(innerPad)}${text}`, color: theme.muted }])));
   }
   if (output) {
-    if (rows.length > 1) rows.push(blankRow(`${keyPrefix}-output-gap`));
-    rows.push(inlineRow(`${keyPrefix}-output-label`, [
-      { text: `${" ".repeat(innerPad)}Output`, color: theme.muted },
-    ]));
+    const compactPreview = compact && !diffExpanded && !collapsed && (status === "running" || status === "ok");
+    if ((!timeline && !compactPreview) || diffExpanded) {
+      if (rows.length > 1 && !style.dense) rows.push(blankRow(`${keyPrefix}-output-gap`));
+      rows.push(inlineRow(`${keyPrefix}-output-label`, [
+        { text: `${" ".repeat(innerPad)}Output`, color: theme.muted },
+      ]));
+    }
     const outputTint = call.status === "error" ? theme.status.error : theme.muted;
     if (collapsed && !failed) {
       const plain = `${" ".repeat(innerPad)}output hidden (Ctrl+O to expand)`;
@@ -343,7 +384,11 @@ function toolCallRows(
           ] });
         });
       }
-      const visible = toolOutputLines(outputRows, call.status, diffExpanded);
+      const visible = compactPreview
+        ? status === "running" ? outputRows.slice(-1) : outputRows.slice(0, 1)
+        : timeline && !diffExpanded && call.status === "ok"
+          ? outputRows.slice(0, 2)
+          : toolOutputLines(outputRows, call.status, diffExpanded);
       const visibleRows = visible.map((row) => inlineRow(row.key, row.parts));
       const hidden = outputRows.length - visible.length;
       if (hidden > 0) {
@@ -368,26 +413,14 @@ function toolCallRows(
         ]),
       );
     } else {
-      const rendered = diffExpanded
-        ? diffRows(
-            diff.oldText,
-            diff.newText,
-            diff.oldLabel ?? `a/${target ?? "file"}`,
-            diff.newLabel ?? `b/${target ?? "file"}`,
-            bodyWidth,
-            theme,
-            true,
-            undefined,
-            { showFileHeader: action === "move" },
-          )
-        : diffPreviewRows(
-            diff.oldText,
-            diff.newText,
-            bodyWidth,
-            theme,
-          );
+      const rendered = transcriptDiff({
+        ...diff,
+        oldLabel: diff.oldLabel ?? `a/${target || "file"}`,
+        newLabel: diff.newLabel ?? `b/${target || "file"}`,
+        unified: true,
+      }, bodyWidth, theme, style.diff, diffExpanded, false);
       if (rendered.length > 0) {
-        if (rows.length > 1) rows.push(blankRow(`${keyPrefix}-diff-gap`));
+        if (rows.length > 1 && !style.dense && !timeline) rows.push(blankRow(`${keyPrefix}-diff-gap`));
         rows.push(inlineRow(`${keyPrefix}-diff-label`, [
           { text: `${" ".repeat(innerPad)}Changes`, color: theme.muted },
         ]));
@@ -402,34 +435,45 @@ function toolCallRows(
       const state = call.status === "ok" ? "done" : call.status ?? "pending";
       counts.set(state, (counts.get(state) ?? 0) + 1);
     }
-    const summary = ["done", "running", "error", "pending"]
+    const states = timeline
+      ? ["running", "done", "error", "unavailable", "cancelled", "partial", "empty", "pending"]
+      : ["done", "running", "error", "pending"];
+    const statuses = states
       .filter((state) => counts.has(state)).map((state) => `${counts.get(state)} ${state}`).join(" · ");
-    wrapPreservingWhitespace(summary, safeWidth).forEach((line, index) => {
-      rows.push(inlineRow(`${keyPrefix}-summary-${index}`, [{ text: line, color: theme.muted }]));
+    const activity = timeline ? activitySummary(groupToolCalls(presentation.observations)) : "";
+    const summary = [activity, statuses].filter(Boolean).join(" · ");
+    const summaryWidth = timeline ? bodyWidth : safeWidth;
+    wrapPreservingWhitespace(summary, summaryWidth).forEach((line, index) => {
+      rows.push(inlineRow(`${keyPrefix}-summary-${index}`, [
+        { text: timeline ? `${" ".repeat(innerPad)}${line}` : line, color: theme.muted },
+      ]));
     });
-    for (const [index, call] of presentation.observations.entries()) {
-      rows.push(blankRow(`${keyPrefix}-observation-gap-${index}`));
-      rows.push(...toolCallRows(call, safeWidth, collapsed, theme, `${keyPrefix}-observation-${index}`, diffExpanded, { nested: true }));
+  }
+
+  for (const [kind, calls] of [["observation", presentation.observations], ["wait", presentation.waits]] as const) {
+    for (const [index, child] of (calls ?? []).entries()) {
+      const childKey = `${keyPrefix}-${kind}-${child.id ?? index}`;
+      if (!style.dense && !timeline) rows.push(blankRow(`${childKey}-gap`));
+      const childRows = toolCallRows(child, timeline ? bodyWidth : safeWidth, collapsed, theme, childKey, diffExpanded, { style, nested: true });
+      rows.push(...(timeline ? indentedRows(childRows, childKey) : childRows));
     }
   }
-  for (const [index, wait] of (presentation.waits ?? []).entries()) {
-    rows.push(blankRow(`${keyPrefix}-wait-gap-${index}`));
-    rows.push(...toolCallRows(wait, safeWidth, collapsed, theme, `${keyPrefix}-wait-${index}`, diffExpanded, { nested: true }));
-  }
   if (!framed) {
-    if (presentation.nested && suffixParts.length > 0) rows.push(inlineRow(`${keyPrefix}-duration`, suffixParts));
+    if (!inlineSuffix && (presentation.nested || style.tools !== "panel") && suffixParts.length > 0) {
+      rows.push(inlineRow(`${keyPrefix}-duration`, suffixParts));
+    }
     return rows;
   }
-  const [header, ...body] = rows;
-  const headerRuleWidth = Math.max(0, headerWidth - displayWidth(`${icon} ${fittedLabel} · ${stateLabel}`));
+  const [headerRow, ...body] = rows;
+  const headerRuleWidth = Math.max(0, headerWidth - displayWidth(header));
   const footerRuleWidth = Math.max(0, headerWidth - suffixParts.reduce((sum, part) => sum + displayWidth(part.text), 0));
   const rule = (length: number) => length > 0 ? ` ${"─".repeat(length - 1)}` : "";
   const framedRows: TranscriptRow[] = [{
-    ...header,
+    ...headerRow,
     node: <Box height={1} flexShrink={0}>
       <Text color={theme.muted}>┌─ </Text>
       <Box width={headerWidth} height={1} flexShrink={0}>
-        {header.node}<Text color={theme.muted}>{rule(headerRuleWidth)}</Text>
+        {headerRow.node}<Text color={theme.muted}>{rule(headerRuleWidth)}</Text>
       </Box>
       <Text color={theme.muted}>──┐</Text>
     </Box>,
@@ -507,6 +551,7 @@ function compactionRows(
   width: number,
   expanded: boolean,
   theme: Theme,
+  layout: UiLayout,
 ): TranscriptRow[] {
   const running = entry.compaction?.status === "running";
   const label =
@@ -532,7 +577,7 @@ function compactionRows(
 
   if (!running && entry.text) {
     rows.push(
-      ...markdownRows(entry.text, width, theme).map((row, index) => ({
+      ...markdownRows(entry.text, width, theme, { layout }).map((row, index) => ({
         ...row,
         key: `${entry.id}-summary-${index}`,
       })),
@@ -577,13 +622,15 @@ function compactionRows(
   return rows;
 }
 
-function userRows(entry: ChatEntryView, width: number, theme: Theme): TranscriptRow[] {
-  return wrapText(entry.text, Math.max(1, width - 2)).map((line, index) => ({
+function userRows(entry: ChatEntryView, width: number, theme: Theme, layout: UiLayout): TranscriptRow[] {
+  const marker = LAYOUT_PRESETS[layout].transcript.userMarker;
+  const markerWidth = displayWidth(marker);
+  return wrapText(entry.text, Math.max(1, width - markerWidth)).map((line, index) => ({
     key: `${entry.id}-line-${index}`,
     node: (
       <Text wrap="truncate">
         <Text color={theme.accent} bold>
-          ▌{" "}
+          {index === 0 || layout === DEFAULT_UI_LAYOUT ? marker : " ".repeat(markerWidth)}
         </Text>
         <Text color={theme.text} bold>
           {line || " "}
@@ -620,16 +667,33 @@ function assistantRows(
 ): TranscriptRow[] {
   const width = options.width;
   const theme = options.theme;
+  const layout = options.layout ?? DEFAULT_UI_LAYOUT;
+  const style = LAYOUT_PRESETS[layout].transcript;
   const rows: TranscriptRow[] = [];
   const liveView = entry.live && !entry.frozenLive;
   const allCalls = entry.toolCalls ?? [];
   const liveCalls = liveView ? allCalls.slice(-LIVE_TOOL_LIMIT) : allCalls;
   const hiddenLiveCalls = allCalls.length - liveCalls.length;
   const addGap = (key: string): void => {
-    if (rows.length === 0) return;
+    if (style.dense || rows.length === 0) return;
     const last = rows[rows.length - 1];
     if (last.key.includes("-gap") || last.key.includes("-spacer")) return;
     rows.push(blankRow(key));
+  };
+  const appendText = (text: string, key: string, streaming: boolean, plain = false): void => {
+    const marker = style.assistantMarker ?? "";
+    const markerWidth = displayWidth(marker);
+    const textWidth = Math.max(1, width - markerWidth);
+    const lines = plain ? plainTextRows(text, textWidth, theme, key) : markdownRows(text, textWidth, theme, { layout, streaming });
+    lines.forEach((row, index) => {
+      rows.push({
+        key: `${key}-${index}`,
+        node: marker ? <Text wrap="truncate">
+          <Text color={theme.accent}>{index === 0 ? marker : " ".repeat(markerWidth)}</Text>
+          {row.node}
+        </Text> : row.node,
+      });
+    });
   };
   const groups = subagentWaitGroups(allCalls);
   const visibleCalls = new Set(liveCalls);
@@ -642,14 +706,17 @@ function assistantRows(
     const waits = groups.waits.get(target)?.filter((wait) => visibleCalls.has(wait));
     if (waits?.length) renderedSpawns.add(target);
     addGap(`${key}-gap`);
-    rows.push(...toolCallRows(target, width, options.collapsed, theme, key, options.diffExpanded ?? false, { waits }));
+    rows.push(...toolCallRows(target, width, options.collapsed, theme, key, options.diffExpanded ?? false, { style, waits }));
   };
   const appendTools = (calls: ChatToolCallView[], key: string): void => {
     for (const [index, run] of observationRuns(calls).entries()) {
       const groupKey = `${key}-${run[0].id ?? index}`;
       if (run.length === 1) { appendTool(run[0], groupKey); continue; }
-      const status = run.some((call) => call.status === "error") ? "error"
-        : run.some((call) => call.status === "running") ? "running"
+      const running = run.some((call) => call.status === "running");
+      const failed = run.some((call) => call.status === "error");
+      const status = (style.tools === "timeline" && running) ? "running"
+        : failed ? "error"
+        : running ? "running"
         : run.some((call) => call.status === "unavailable") ? "unavailable"
         : run.some((call) => call.status === "cancelled") ? "cancelled"
         : run.some((call) => call.status === "partial") ? "partial"
@@ -657,7 +724,7 @@ function assistantRows(
         : run.every((call) => call.status === "ok" || call.status === "empty") ? "ok" : undefined;
       addGap(`${groupKey}-gap`);
       rows.push(...toolCallRows({ name: "observation_group", label: "Inspecting project", status, argumentsSummary: "" },
-        width, options.collapsed, theme, groupKey, options.diffExpanded ?? false, { observations: run }));
+        width, options.collapsed, theme, groupKey, options.diffExpanded ?? false, { style, observations: run }));
     }
   };
 
@@ -679,9 +746,7 @@ function assistantRows(
       const visibleSegment = !liveView || segment.completedAt !== undefined;
       if (segment.kind === "text") {
         addGap(`${entry.id}-narration-gap-${index}`);
-        rows.push(...markdownRows(segment.text, width, theme).map((row) => ({
-          ...row, key: `${entry.id}-narration-${index}-${row.key}`,
-        })));
+        appendText(segment.text, `${entry.id}-narration-${index}`, Boolean(liveView && segment.completedAt === undefined));
       } else if (visibleSegment && !answerCameFromThinking) {
         addGap(`${entry.id}-thought-gap-${index}`);
         const duration = Math.max(
@@ -802,19 +867,7 @@ function assistantRows(
         ),
       });
     } else {
-      const diff = options.diffExpanded
-        ? diffRows(
-            file.oldText,
-            file.newText,
-            `a/${file.path}`,
-            `b/${file.path}`,
-            width,
-            theme,
-            true,
-            undefined,
-            { showFileHeader: false },
-          )
-        : diffPreviewRows(file.oldText, file.newText, width, theme);
+      const diff = transcriptDiff({ ...file, unified: true }, width, theme, style.diff, options.diffExpanded ?? false, false);
       rows.push(
         ...diff.map((row, index) => ({
           ...row,
@@ -835,17 +888,7 @@ function assistantRows(
         ),
       });
     } else {
-      const diff = options.diffExpanded
-        ? diffRows(
-            entry.diff.oldText,
-            entry.diff.newText,
-            entry.diff.oldLabel ?? "old",
-            entry.diff.newLabel ?? "new",
-            width,
-            theme,
-            entry.diff.unified ?? false,
-          )
-        : diffPreviewRows(entry.diff.oldText, entry.diff.newText, width, theme);
+      const diff = transcriptDiff(entry.diff, width, theme, style.diff, options.diffExpanded ?? false);
       rows.push(
         ...diff.map((row, index) => ({ ...row, key: `${entry.id}-diff-${index}` })),
       );
@@ -864,14 +907,9 @@ function assistantRows(
           </Text>
         ),
       });
-      rows.push(...plainTextRows(live.text, width, theme, `${entry.id}-text`));
+      appendText(live.text, `${entry.id}-text`, true, true);
     } else {
-      rows.push(
-        ...markdownRows(entry.text, width, theme).map((row, index) => ({
-          ...row,
-          key: `${entry.id}-text-${index}`,
-        })),
-      );
+      appendText(entry.text, `${entry.id}-text`, Boolean(entry.live));
     }
     if (
       !entry.live &&
@@ -909,10 +947,11 @@ function buildEntryRows(
   now: number,
 ): TranscriptRow[] {
   const theme = options.theme;
+  const layout = options.layout ?? DEFAULT_UI_LAYOUT;
   if (entry.role === "compaction") {
-    return compactionRows(entry, options.width, options.diffExpanded ?? false, theme);
+    return compactionRows(entry, options.width, options.diffExpanded ?? false, theme, layout);
   }
-  if (entry.role === "user") return userRows(entry, options.width, theme);
+  if (entry.role === "user") return userRows(entry, options.width, theme, layout);
   if (entry.role === "system") return systemRows(entry, options.width, theme);
   return assistantRows(entry, options, now);
 }
@@ -927,6 +966,7 @@ function cacheKey(entry: ChatEntryView, options: BuildTranscriptOptions): string
     options.thinkingExpanded ? 1 : 0,
     options.expandedGroups.has(entry.id) ? 1 : 0,
     options.theme.name,
+    options.layout ?? DEFAULT_UI_LAYOUT,
     entry.frozenLive ? 1 : 0,
     entry.text.length,
   ].join(":");

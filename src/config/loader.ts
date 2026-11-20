@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { CatalogModel } from "../provider/model-catalog";
 import { TokenPricingSchema } from "../types/schema";
 import { AUTO_THEME } from "../types/theme";
+import { DEFAULT_UI_LAYOUT, UI_LAYOUTS } from "../types/ui-layout";
 
 export const CONFIG_PATH = ".agent/config.yaml";
 
@@ -419,6 +420,8 @@ export const PromptConfigSchema = z.object({
 });
 export type PromptConfig = z.infer<typeof PromptConfigSchema>;
 
+export const DEFAULT_WORKER_STEPS = 40;
+
 export const LimitsConfigSchema = z.object({
   // Warn once when a session passes this many tokens. It never blocks work.
   session_tokens: z.number().int().positive().optional(),
@@ -439,6 +442,7 @@ export const LimitsConfigSchema = z.object({
   max_workers_per_turn: z.number().int().positive().default(10),
   // Stop one worker after this many tokens. 0 disables the per-worker budget.
   worker_tokens: z.number().int().nonnegative().default(0),
+  worker_steps: z.number().int().nonnegative().default(DEFAULT_WORKER_STEPS),
   // Explicit request-body cap. 0 disables the preflight byte guard.
   max_request_bytes: z.number().int().nonnegative().default(0),
   // Warn when resuming a session above either size. 0 disables the check.
@@ -629,7 +633,10 @@ export const AppConfigSchema = z.object({
   browser: BrowserConfigSchema.prefault({}),
   debug: DebugConfigSchema.prefault({}),
   updates: z.object({ check: z.boolean().default(true) }).prefault({}),
-  ui: z.object({ animations: z.boolean().default(true) }).prefault({}),
+  ui: z.object({
+    animations: z.boolean().default(true),
+    layout: z.enum(UI_LAYOUTS).default(DEFAULT_UI_LAYOUT),
+  }).prefault({}),
   version: z.number().int().positive().default(1),
   providers: z.record(z.string().min(1), ProviderProfileSchema).default({}),
   roles: RolesConfigSchema.default({}),

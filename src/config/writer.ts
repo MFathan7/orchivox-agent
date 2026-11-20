@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { isMap, isSeq, parseDocument, type Document } from "yaml";
 
 import type { ThemeSelection } from "../types/theme";
+import type { UiLayout } from "../types/ui-layout";
 import type {
   ApprovalPreset,
   BackgroundConfig,
@@ -217,6 +218,13 @@ export async function saveAnimations(configPath: string, enabled: boolean): Prom
   const document = await readDocument(configPath);
   ensureMap(document, "ui");
   document.setIn(["ui", "animations"], enabled);
+  await writeDocument(configPath, document);
+}
+
+export async function saveUiLayout(configPath: string, layout: UiLayout): Promise<void> {
+  const document = await readDocument(configPath);
+  ensureMap(document, "ui");
+  document.setIn(["ui", "layout"], layout);
   await writeDocument(configPath, document);
 }
 

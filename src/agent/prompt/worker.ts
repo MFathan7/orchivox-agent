@@ -30,3 +30,7 @@ export function workerContractPart(options: SystemPromptOptions): PromptPart | u
     stable: true,
   };
 }
+
+export function workerStepBudgetNotice(remaining: number): string {
+  return `<system-reminder>Worker model steps remaining: ${remaining}. Prioritize the acceptance criteria in your current assignment.</system-reminder>`;
+}

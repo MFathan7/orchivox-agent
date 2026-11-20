@@ -3,9 +3,9 @@ import { killProcessTree } from "./process-tree";
 
 export class ToolProcessTimeoutError extends Error {}
 
-export async function runToolProcess(argv: string[], options: { signal?: AbortSignal; cwd?: string; timeoutMs?: number; input?: string; maxBytes?: number } = {}): Promise<{ output: string; error: string; code: number; truncated: boolean }> {
+export async function runToolProcess(argv: string[], options: { signal?: AbortSignal; cwd?: string; timeoutMs?: number; input?: string; maxBytes?: number; env?: NodeJS.ProcessEnv } = {}): Promise<{ output: string; error: string; code: number; truncated: boolean }> {
   options.signal?.throwIfAborted();
-  const child = Bun.spawn(argv, { cwd: options.cwd ?? workspaceRoot(process.cwd()), stdin: options.input === undefined ? "ignore" : "pipe", stdout: "pipe", stderr: "pipe", detached: process.platform !== "win32" });
+  const child = Bun.spawn(argv, { cwd: options.cwd ?? workspaceRoot(process.cwd()), env: options.env, stdin: options.input === undefined ? "ignore" : "pipe", stdout: "pipe", stderr: "pipe", detached: process.platform !== "win32" });
   const stop = () => killProcessTree(child, { force: true });
   let timedOut = false, truncated = false, total = 0;
   const timer = setTimeout(() => { timedOut = true; stop(); }, options.timeoutMs ?? 30_000);

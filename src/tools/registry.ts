@@ -117,8 +117,14 @@ export class ToolRegistry {
   }
 
   snapshot(): ReadonlyMap<string, AgentTool> {
-    return new Map([...this.tools.values()].map((tool) => [tool.name, { ...tool, parameters: tool.parameters, parametersJsonSchema: tool.parametersJsonSchema,
-      execute: tool.execute.bind(tool), ...(tool.enabled ? { enabled: tool.enabled.bind(tool) } : {}) }]));
+    return new Map([...this.tools.values()].map((tool) => [tool.name, {
+      ...tool,
+      description: tool.description,
+      parameters: tool.parameters,
+      parametersJsonSchema: tool.parametersJsonSchema,
+      execute: tool.execute.bind(tool),
+      ...(tool.enabled ? { enabled: tool.enabled.bind(tool) } : {}),
+    }]));
   }
 
   /** Map an old tool name to a canonical tool without exposing it to the model. */

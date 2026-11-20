@@ -1,11 +1,11 @@
 import React from "react";
 import { Box, Text, useInput, useStdin, useStdout } from "ink";
 
+import type { UiLayout } from "../types/ui-layout";
 import type { ChatEntryView, WriteTarget } from "./app";
 import { isMouseSequence, parseMouseClick, parseMousePointerEvents } from "./mouse";
 import { groupToolCalls } from "./tool-groups";
 import { OrchivoxLogo, WelcomeBanner } from "./logo";
-import { markdownRows } from "./markdown";
 import { enterTerminal, leaveTerminal } from "./terminal-protocol";
 import { getTheme, useActiveTheme, type Theme } from "./theme";
 import { displayWidth, fitDisplayText, wrapText } from "./text-wrap";
@@ -66,6 +66,7 @@ export interface ScrollableChatViewportProps {
   height: number;
   theme?: Theme;
   initiallyCollapsed?: boolean;
+  layout?: UiLayout;
   active?: boolean;
   repoPath?: string;
   branch?: string;
@@ -367,6 +368,7 @@ export function ScrollableChatViewport({
   width,
   height,
   theme: themeProp,
+  layout,
   initiallyCollapsed = false,
   active = true,
   repoPath,
@@ -455,11 +457,12 @@ export function ScrollableChatViewport({
   const rowOptions = React.useMemo(() => ({
     width: contentWidth,
     theme,
+    layout,
     collapsed,
     expandedGroups,
     thinkingExpanded,
     diffExpanded,
-  }), [contentWidth, theme, collapsed, expandedGroups, thinkingExpanded, diffExpanded]);
+  }), [contentWidth, theme, layout, collapsed, expandedGroups, thinkingExpanded, diffExpanded]);
   const history = React.useMemo(() => new TranscriptRowIndex(entries, rowOptions), [entries, rowOptions]);
   const rows: TranscriptRow[] = displayedLiveEntry ? buildTranscriptRows([displayedLiveEntry], rowOptions) : [];
   if (history.length > 0 && rows.length > 0 && displayedLiveEntry) {
@@ -478,12 +481,7 @@ export function ScrollableChatViewport({
         </Text>
       ),
     });
-    rows.push(
-      ...markdownRows(streamingText, contentWidth, theme).map((row, index) => ({
-        ...row,
-        key: `streaming-${index}`,
-      })),
-    );
+    rows.push(...buildTranscriptRows([{ id: "streaming", role: "assistant", text: streamingText, live: true }], rowOptions));
   }
 
   const rowCount = history.length + rows.length;
@@ -614,7 +612,7 @@ export function ScrollableChatViewport({
   React.useEffect(() => {
     selectionDrag.current = undefined;
     setSelection(undefined);
-  }, [offsetFromBottom, width, height, resetKey, thinkingExpanded, detailsExpanded]);
+  }, [offsetFromBottom, width, height, layout, resetKey, thinkingExpanded, detailsExpanded]);
 
   React.useEffect(() => {
     setOffsetFromBottom(0);
@@ -716,6 +714,7 @@ export function SplitPaneViewport({
   width,
   height,
   theme: themeProp,
+  layout,
   initiallyCollapsed = false,
   sidebar,
   initialSidebarVisible = true,
@@ -741,6 +740,7 @@ export function SplitPaneViewport({
           width={chatWidth}
           height={height}
           theme={theme}
+          layout={layout}
           initiallyCollapsed={initiallyCollapsed}
           active={active}
         />

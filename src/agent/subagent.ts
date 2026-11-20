@@ -49,7 +49,7 @@ export type SubagentExecutor = (input: SubagentTaskInput) => Promise<SubagentTas
 
 export class SubagentTurnLimitError extends Error {
   constructor(limit: number) {
-    super(`subagent reached the ${limit}-turn limit; the task is not complete`);
+    super(`worker reached the limits.worker_steps budget of ${limit} model steps; the task is not complete`);
     this.name = "SubagentTurnLimitError";
   }
 }
@@ -926,12 +926,14 @@ export class SubagentManager {
           output: worker.transcript.slice(-10).join("\n"),
           error: worker.error,
           usage: worker.usage,
+          worktree_path: worker.worktreePath,
           started_at: startedAt,
           finished_at: Date.now(),
         });
       }
     } finally {
-      if (worker.status === "failed" || worker.status === "aborted") {
+      const budgetReached = worker.error?.code === "turn_limit_exceeded" || worker.error?.code === "token_budget_exceeded";
+      if ((worker.status === "failed" || worker.status === "aborted") && !budgetReached) {
         await this.discardFailedWorktree(worker);
       }
       if (!this.finished.has(worker.id)) worker.updatedAt = Date.now();
