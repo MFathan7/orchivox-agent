@@ -19,6 +19,7 @@ import type { ConfigMode, ConfigRole } from "../config/writer";
 import { AgentHub, type AgentHubTab } from "./agent-hub";
 import { ToolApprovalModal } from "./approval-modal";
 import { ChoiceModal } from "./choice-modal";
+import { UpdatePanel, type UpdateView } from "./update-panel";
 import { ThemePicker } from "./theme-picker";
 import { McpMenu, type McpMenuProps } from "./mcp-menu";
 import { CommandPaletteModal, REASONING_LEVELS, reasoningLevelsFor, type ReasoningEffortLevel } from "./command-palette";
@@ -197,6 +198,8 @@ export interface OrchivoxAppProps {
   onMcpAction?: McpMenuProps["onAction"];
   onMcpClose?: () => void;
   updateNotice?: string;
+  updateView?: UpdateView;
+  onUpdateDecision?: (approved: boolean) => void;
   queue?: QueueView;
   queuedCount?: number;
   queuePaused?: boolean;
@@ -646,12 +649,13 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   };
 
   const reportOpen = Boolean(props.report);
-  const conversationPanelActive = isWorkspaceTrusted && !props.pendingApproval && !props.pendingQuestion && !helpOpen && !reportOpen && !props.mcpMenu;
+  const conversationPanelActive = isWorkspaceTrusted && !props.pendingApproval && !props.pendingQuestion && !props.updateView && !helpOpen && !reportOpen && !props.mcpMenu;
   const conversationPanelOpen = Boolean(props.queue || props.btw);
   const hasModalOpen =
     !isWorkspaceTrusted ||
     Boolean(props.pendingApproval) ||
     Boolean(props.pendingQuestion) ||
+    Boolean(props.updateView) ||
     helpOpen ||
     reportOpen ||
     Boolean(props.mcpMenu) ||
@@ -918,7 +922,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
 
   return (
     <ThemeProvider theme={props.currentTheme ?? DEFAULT_THEME}>
-      <MotionProvider enabled={props.animations !== false && (!hasModalOpen || Boolean(props.btw && conversationPanelActive && !props.queue))} clock={props.frameClock}>
+      <MotionProvider enabled={props.animations !== false && (!hasModalOpen || Boolean(props.updateView && !props.pendingApproval && !props.pendingQuestion) || Boolean(props.btw && conversationPanelActive && !props.queue))} clock={props.frameClock}>
       <Box flexDirection="column" paddingX={outerPadding}>
         {preset.contextInFooter ? null : workspaceLine}
         {preset.divider ? <Text color={theme.border.passive}>{divider}</Text> : null}
@@ -955,6 +959,9 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             onAnswer={props.onQuestionAnswer}
             theme={theme}
           />
+        ) : props.updateView ? (
+          <UpdatePanel view={props.updateView} width={innerWidth} height={viewportHeight} theme={theme}
+            onDecision={(approved) => props.onUpdateDecision?.(approved)} />
         ) : helpOpen ? (
           <HelpOverlay
             theme={theme}

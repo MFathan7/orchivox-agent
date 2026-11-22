@@ -9,6 +9,7 @@ export interface TranscriptStyle {
   assistantMarker?: string;
   tools: "panel" | "timeline" | "inline";
   animateTools?: boolean;
+  pulseMarkers?: boolean;
   dense?: boolean;
   diff: DiffStyle;
 }
@@ -43,7 +44,7 @@ export const LAYOUT_PRESETS: Record<UiLayout, LayoutPreset> = {
     label: "Codex",
     description: "Animated work status and numbered diffs",
     composer: { frame: "top-rule", marker: "› " },
-    transcript: { userMarker: "» ", assistantMarker: "• ", tools: "inline", animateTools: false, diff: "numbered" },
+    transcript: { userMarker: "» ", assistantMarker: "• ", tools: "inline", animateTools: false, pulseMarkers: true, diff: "numbered" },
     activity: "work",
   },
   compact: {

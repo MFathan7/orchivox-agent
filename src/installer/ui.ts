@@ -4,6 +4,7 @@ import { ReadStream as TtyReadStream } from "node:tty";
 
 import { supportsTrueColor, createStyler, type Styler } from "./theme";
 import { InstallerError, type DownloadProgress } from "./types";
+import { INSTALLATION_LOGO_HEIGHT, installationLogo } from "../tui/logo-art";
 
 export interface StepDefinition {
   id: string;
@@ -119,7 +120,7 @@ export class InstallerUI {
   private steps: StepState[] = [];
   private lastStepLines = 0;
   private spinnerTimer?: ReturnType<typeof setInterval>;
-  private spinnerFrame = 0;
+  private frame = 0;
   private lastRenderAt = 0;
   private lastPercent = -1;
   private live = false;
@@ -194,26 +195,10 @@ export class InstallerUI {
     ].join(" ");
   }
 
-  async banner(version: string, platform: string): Promise<void> {
-    if (!this.interactive) {
-      this.writePlain(`Orchivox ${version} for ${platform}`);
-      return;
-    }
-
-    this.stdout.write(`\n${this.styler.accent("◆ ORCHIVOX")}\n`);
-    this.stdout.write(`${this.styler.muted("personal coding agent")}\n`);
-    const rule = "─".repeat(Math.min(this.width, 36));
-    if (this.animations) {
-      for (let index = 2; index <= rule.length; index += 4) {
-        this.stdout.write(`\r${this.styler.muted(rule.slice(0, index))}`);
-        await sleep(8);
-      }
-      this.stdout.write(`\r${this.styler.muted(rule)}\n`);
-    } else {
-      this.stdout.write(`${this.styler.muted(rule)}\n`);
-    }
-    this.stdout.write("\n");
-    this.writeStyled(`Orchivox ${version} for ${platform}`, this.styler.text);
+  banner(version: string, platform: string): void {
+    const heading = `Orchivox ${version} for ${platform}`;
+    if (this.interactive) this.writeStyled(heading, this.styler.bold);
+    else this.writePlain(heading);
   }
 
   intro(version: string, channel: string, size: number): void {
@@ -265,6 +250,7 @@ export class InstallerUI {
       status: completed.includes(step.id) ? "done" : "pending",
     }));
     this.lastStepLines = 0;
+    this.frame = 0;
     this.live = true;
     if (this.interactive) {
       this.stdout.write("\x1b[?25l");
@@ -331,6 +317,7 @@ export class InstallerUI {
     for (const step of this.steps) {
       if (step.status !== "failed") step.status = "done";
     }
+    this.live = false;
     this.stopSpinner();
     if (this.interactive) {
       this.renderSteps();
@@ -338,7 +325,6 @@ export class InstallerUI {
     } else if (this.steps.length > 0) {
       this.stdout.write("Done.\n");
     }
-    this.live = false;
   }
 
   failStep(id: string, detail?: string): void {
@@ -347,12 +333,12 @@ export class InstallerUI {
       step.status = "failed";
       if (detail) step.detail = detail;
     }
+    this.live = false;
     this.stopSpinner();
     if (this.interactive) {
       this.renderSteps();
       this.stdout.write("\x1b[?25h");
     }
-    this.live = false;
   }
 
   failActive(detail?: string): boolean {
@@ -418,16 +404,20 @@ export class InstallerUI {
     if (this.closed) return;
     this.closed = true;
     this.stopSpinner();
+    if (this.live) {
+      this.live = false;
+      this.renderSteps();
+    }
     process.removeListener("SIGINT", this.onSigint);
     if (this.ownedPromptStream) this.promptStream?.destroy();
     if (this.interactive) this.stdout.write("\x1b[?25h");
   }
 
   private startSpinner(): void {
-    if (!this.animations || this.spinnerTimer) return;
+    if (!this.live || !this.animations || this.spinnerTimer) return;
     this.spinnerTimer = setInterval(() => {
       if (!this.live) return;
-      this.spinnerFrame = (this.spinnerFrame + 1) % SPINNER.length;
+      this.frame += 1;
       this.renderSteps();
     }, 120);
     this.spinnerTimer.unref?.();
@@ -444,13 +434,12 @@ export class InstallerUI {
     if (!this.interactive || this.steps.length === 0) return;
     if (this.stdout.writableNeedDrain) return;
     const lines = this.stepLines();
-    if (this.lastStepLines > 0) {
-      this.stdout.write(`\x1b[${this.lastStepLines}A`);
-    }
+    let output = this.lastStepLines > 0 ? `\x1b[${this.lastStepLines}A` : "";
     const count = Math.max(this.lastStepLines, lines.length);
     for (let index = 0; index < count; index += 1) {
-      this.stdout.write(`\x1b[2K${lines[index] ?? ""}\n`);
+      output += `\r\x1b[2K${lines[index] ?? ""}\n`;
     }
+    this.stdout.write(output);
     this.lastStepLines = count;
   }
 
@@ -462,7 +451,7 @@ export class InstallerUI {
     const lines = this.steps.map((step) => {
       const glyph =
         step.status === "active" && this.animations
-          ? SPINNER[this.spinnerFrame]
+          ? SPINNER[this.frame % SPINNER.length]
           : GLYPHS[step.status];
       const label = fitLine(step.label, labelWidth).padEnd(labelWidth, " ");
       const available = Math.max(0, this.width - labelWidth - 4);
@@ -474,14 +463,21 @@ export class InstallerUI {
     const label = `  Steps ${completed}/${this.steps.length} `;
     const railWidth = Math.max(1, Math.min(24, this.width - label.length));
     const filled = Math.floor(completed / this.steps.length * railWidth);
-    lines.push(this.styler.muted(label) + this.styler.accent("━".repeat(filled)) + this.styler.muted("─".repeat(railWidth - filled)));
-    return lines;
+    lines.push(this.styler.muted(label) + this.styler.accent("█".repeat(filled)) + this.styler.muted("░".repeat(railWidth - filled)));
+    if ((this.stdout.rows ?? 24) <= lines.length + INSTALLATION_LOGO_HEIGHT + 1) return lines;
+
+    const frame = this.live && this.animations && this.color ? this.frame : undefined;
+    const colors: Record<string, (glyph: string) => string> = { C: this.styler.accent, V: this.styler.muted, M: this.styler.text };
+    const logo = installationLogo(frame).map(([glyphs, tones]) =>
+      [...glyphs].map((glyph, column) => colors[tones[column]]?.(glyph) ?? glyph).join("").trimEnd(),
+    );
+    return [...logo, "", ...lines];
   }
 
   private paint(line: string, status: StepStatus): string {
     if (status === "active") {
       if (!this.animations) return this.styler.accent(line);
-      const start = Math.floor(this.spinnerFrame / SPINNER.length * line.length);
+      const start = Math.floor((this.frame % SPINNER.length) / SPINNER.length * line.length);
       return this.styler.accent(line.slice(0, start)) + this.styler.text(line.slice(start, start + 5)) + this.styler.accent(line.slice(start + 5));
     }
     if (status === "done") return this.styler.success(line);
@@ -510,10 +506,6 @@ export class InstallerUI {
 
 export function createInstallerUI(options: InstallerUIOptions = {}): InstallerUI {
   return new InstallerUI(options);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function openPromptStream(): { stream: NodeJS.ReadStream; owned: boolean } | undefined {

@@ -25,6 +25,7 @@ import {
   takeAnswer,
 } from "./agent/answer-stream";
 import { formatAppInfo, formatDoctor, getAppInfo, isCompiledExecutable, runUpdate, userArgs } from "./app-info";
+import type { UpdateView } from "./tui/update-panel";
 import { updateNotice, UPDATE_CHECK_INTERVAL } from "./installer/update-notice";
 import { fetchUpdateCheck } from "./installer/update";
 import { resolveInstallPaths } from "./installer/paths";
@@ -755,6 +756,8 @@ async function runTuiSession(
   let branch = "unknown";
   const approvals = new ApprovalQueue();
   let pendingQuestion: PendingQuestion | undefined;
+  let updateView: UpdateView | undefined;
+  let updateDecision: ((approved: boolean) => void) | undefined;
   let questionResolver: ((answer: QuestionAnswer) => void) | undefined;
   let activeAbortController: AbortController | undefined;
   let shuttingDown = false;
@@ -1308,6 +1311,8 @@ async function runTuiSession(
     currentTheme: state.currentTheme,
     themeSelection: state.themeSelection,
     updateNotice: state.updateNotice,
+    updateView,
+    onUpdateDecision: (approved: boolean) => updateDecision?.(approved),
     terminalAppearance: state.terminalAppearance,
     statusMessage: state.notice,
     onStatusMessage: setNotice,
@@ -2678,13 +2683,46 @@ async function runTuiSession(
         break;
       }
       case "/update": {
-        setNotice("Checking for updates...");
+        updateView = { kind: "checking" };
+        rerender();
         try {
-          const result = await runUpdate({ check: true });
+          let target = "";
+          const result = await runUpdate({ signal: run?.signal, interaction: {
+            confirm: (offer) => {
+              checkSession();
+              target = offer.target;
+              return new Promise<boolean>((resolve) => {
+                const finish = (approved: boolean) => {
+                  run?.signal.removeEventListener("abort", cancel);
+                  updateDecision = undefined;
+                  resolve(approved);
+                };
+                const cancel = () => finish(false);
+                updateDecision = finish;
+                run?.signal.addEventListener("abort", cancel, { once: true });
+                updateView = { kind: "offer", offer };
+                rerender();
+              });
+            },
+            stage: (stage) => {
+              updateView = { kind: "installing", target, stage };
+              rerender();
+            },
+            progress: (progress) => {
+              if (updateView?.kind !== "installing" || updateView.stage !== "download") return;
+              updateView = { ...updateView, progress };
+              terminalRenderer.clock.request(renderStreamFrame);
+            },
+          } });
           checkSession();
+          if (result.updated) state.updateNotice = undefined;
           pushEntry("system", result.output);
         } catch (error) {
-          return commandFailed("update check failed", error);
+          return commandFailed("Update failed", error);
+        } finally {
+          updateView = undefined;
+          updateDecision = undefined;
+          rerender();
         }
         break;
       }
@@ -3094,6 +3132,7 @@ async function runTuiSession(
     shuttingDown = true;
     if (updateTimer) clearInterval(updateTimer);
     updateAbort.abort();
+    updateDecision?.(false);
     activeAbortController?.abort();
     approvals.cancelAll("Session closed.");
     if (questionResolver) {

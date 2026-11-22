@@ -30,6 +30,7 @@ artifacts/
 !/tests/subagent-status.test.ts
 !/tests/synthetic-reminders.test.ts
 !/tests/ui-layouts.test.ts
+!/tests/update.test.ts
 
 # Compiled binary (bun build --compile)
 orchivox

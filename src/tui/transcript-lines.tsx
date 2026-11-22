@@ -14,7 +14,7 @@ import { markdownRows } from "./markdown";
 import { fitPanelParts, type PanelPart } from "./panel";
 import type { RenderRow } from "./rows";
 import { Spinner } from "./spinner";
-import { ActivityText } from "./motion";
+import { ActivityText, useAnimationFrame } from "./motion";
 import { type Theme } from "./theme";
 import {
   displayWidth,
@@ -98,6 +98,11 @@ export function toolOutputLines<T>(
 
 function blankRow(key: string): TranscriptRow {
   return { key, node: <Text> </Text> };
+}
+
+function PulsingDot({ text, color, bold }: { text: string; color: string; bold?: boolean }) {
+  const frame = useAnimationFrame(true, 2, 400);
+  return <Text color={color} bold={bold}>{frame === 0 ? text : `·${text.slice(1)}`}</Text>;
 }
 
 function plainTextRows(
@@ -188,7 +193,7 @@ function toolCallRows(
   theme: Theme,
   keyPrefix: string,
   diffExpanded: boolean,
-  presentation: { style: TranscriptStyle; nested?: boolean; waits?: ChatToolCallView[]; observations?: ChatToolCallView[] },
+  presentation: { style: TranscriptStyle; live: boolean; nested?: boolean; waits?: ChatToolCallView[]; observations?: ChatToolCallView[] },
 ): TranscriptRow[] {
   const { style } = presentation;
   const timeline = style.tools === "timeline";
@@ -216,6 +221,7 @@ function toolCallRows(
   const status = call.status === "error" || presentation.waits?.some((wait) => wait.status === "error") ? "error"
     : call.status === "running" || presentation.waits?.some((wait) => wait.status === "running") ? "running" : call.status;
   const statusTint = statusColor(status, theme);
+  const pulse = style.pulseMarkers && presentation.live && status === "running";
 
   const inlineRow = (key: string, parts: PanelPart[], rowWidth = safeWidth): TranscriptRow => ({
     key,
@@ -292,7 +298,9 @@ function toolCallRows(
       {
         text: `${icon} `,
         node:
-          status === "running" && style.animateTools !== false ? (
+          pulse ? (
+            <PulsingDot text={`${icon} `} color={statusTint} bold />
+          ) : status === "running" && style.animateTools !== false ? (
             <Spinner active color={statusTint} />
           ) : (
             <Text color={statusTint} bold>{icon} </Text>
@@ -454,7 +462,9 @@ function toolCallRows(
     for (const [index, child] of (calls ?? []).entries()) {
       const childKey = `${keyPrefix}-${kind}-${child.id ?? index}`;
       if (!style.dense && !timeline) rows.push(blankRow(`${childKey}-gap`));
-      const childRows = toolCallRows(child, timeline ? bodyWidth : safeWidth, collapsed, theme, childKey, diffExpanded, { style, nested: true });
+      const childRows = toolCallRows(child, timeline ? bodyWidth : safeWidth, collapsed, theme, childKey, diffExpanded, {
+        style, live: presentation.live, nested: true,
+      });
       rows.push(...(timeline ? indentedRows(childRows, childKey) : childRows));
     }
   }
@@ -670,7 +680,7 @@ function assistantRows(
   const layout = options.layout ?? DEFAULT_UI_LAYOUT;
   const style = LAYOUT_PRESETS[layout].transcript;
   const rows: TranscriptRow[] = [];
-  const liveView = entry.live && !entry.frozenLive;
+  const liveView = Boolean(entry.live && !entry.frozenLive);
   const allCalls = entry.toolCalls ?? [];
   const liveCalls = liveView ? allCalls.slice(-LIVE_TOOL_LIMIT) : allCalls;
   const hiddenLiveCalls = allCalls.length - liveCalls.length;
@@ -685,11 +695,13 @@ function assistantRows(
     const markerWidth = displayWidth(marker);
     const textWidth = Math.max(1, width - markerWidth);
     const lines = plain ? plainTextRows(text, textWidth, theme, key) : markdownRows(text, textWidth, theme, { layout, streaming });
+    const pulse = style.pulseMarkers && liveView && streaming;
     lines.forEach((row, index) => {
       rows.push({
         key: `${key}-${index}`,
         node: marker ? <Text wrap="truncate">
-          <Text color={theme.accent}>{index === 0 ? marker : " ".repeat(markerWidth)}</Text>
+          {index === 0 && pulse ? <PulsingDot text={marker} color={theme.accent} />
+            : <Text color={theme.accent}>{index === 0 ? marker : " ".repeat(markerWidth)}</Text>}
           {row.node}
         </Text> : row.node,
       });
@@ -706,7 +718,7 @@ function assistantRows(
     const waits = groups.waits.get(target)?.filter((wait) => visibleCalls.has(wait));
     if (waits?.length) renderedSpawns.add(target);
     addGap(`${key}-gap`);
-    rows.push(...toolCallRows(target, width, options.collapsed, theme, key, options.diffExpanded ?? false, { style, waits }));
+    rows.push(...toolCallRows(target, width, options.collapsed, theme, key, options.diffExpanded ?? false, { style, live: liveView, waits }));
   };
   const appendTools = (calls: ChatToolCallView[], key: string): void => {
     for (const [index, run] of observationRuns(calls).entries()) {
@@ -724,7 +736,7 @@ function assistantRows(
         : run.every((call) => call.status === "ok" || call.status === "empty") ? "ok" : undefined;
       addGap(`${groupKey}-gap`);
       rows.push(...toolCallRows({ name: "observation_group", label: "Inspecting project", status, argumentsSummary: "" },
-        width, options.collapsed, theme, groupKey, options.diffExpanded ?? false, { style, observations: run }));
+        width, options.collapsed, theme, groupKey, options.diffExpanded ?? false, { style, live: liveView, observations: run }));
     }
   };
 

@@ -5,7 +5,8 @@ import { createInterface } from "node:readline/promises";
 
 import packageJson from "../package.json";
 import { resolveConfigPaths } from "./config/paths";
-import { InstallerError, type InstallMethod } from "./installer/types";
+import { InstallerError, type DownloadProgress, type InstallMethod } from "./installer/types";
+import type { InstallStage } from "./installer/install";
 import {
   applyUpdate,
   checkUpdate,
@@ -45,7 +46,21 @@ export interface UpdateOptions {
   noAnim?: boolean;
   verbose?: boolean;
   timeoutMs?: number;
+  signal?: AbortSignal;
+  interaction?: {
+    confirm: (offer: UpdateOffer) => Promise<boolean>;
+    stage: (stage: UpdateStage) => void;
+    progress: (progress: DownloadProgress) => void;
+  };
 }
+
+export interface UpdateOffer {
+  current: string;
+  target: string;
+  detail: string;
+}
+
+export type UpdateStage = InstallStage | "sync" | "dependencies" | "build";
 
 export interface UpdateResult {
   output: string;
@@ -72,8 +87,8 @@ function installRoot(executable: string): string {
 }
 
 function entrypointKind(executable: string): AppInfo["entrypoint"] {
-  const name = basename(executable);
-  if (name === "orchivox") return "compiled";
+  const name = basename(executable).toLowerCase();
+  if (name === "orchivox" || name === "orchivox.exe") return "compiled";
   if (name.endsWith(".js") || name.endsWith(".ts")) return "source";
   return "unknown";
 }
@@ -315,6 +330,7 @@ async function runManagedUpdate(
   try {
     manifest = await fetchSignedManifest({
       timeoutMs: options.timeoutMs ?? 30_000,
+      signal: options.signal,
     });
   } catch (error) {
     throw new Error(
@@ -355,6 +371,26 @@ async function runManagedUpdate(
   }
 
   const asset = assetForPlatform(manifest, platform);
+  if (options.interaction) {
+    const approved = await options.interaction.confirm({
+      current,
+      target: manifest.version,
+      detail: `${manifest.channel} · ${formatBytes(asset.size)} download`,
+    });
+    if (!approved) return { output: "Update deferred.", updated: false };
+    options.signal?.throwIfAborted();
+    const installed = readInstallRecord(paths)?.version ?? current;
+    const latestCheck = checkUpdate(manifest, installed);
+    if (!latestCheck.available) return { output: formatUpdateCheck(latestCheck), updated: false };
+    const result = await applyUpdate({
+      manifest, currentVersion: installed, platform, paths, launcherVersion: packageJson.version,
+      signal: options.signal, onProgress: options.interaction.progress, onStage: options.interaction.stage,
+    });
+    return {
+      output: `Updated Orchivox ${installed} → ${result.version}. Restart Orchivox to use the new version.`,
+      updated: true,
+    };
+  }
   if (options.json) {
     const result = await applyUpdate({
       manifest,
@@ -382,7 +418,7 @@ async function runManagedUpdate(
     throw new Error("update requires --yes in non-interactive mode");
   }
   try {
-    await ui.banner(current, platformLabel(platform));
+    ui.banner(current, platformLabel(platform));
     const inactive = ui.inactiveReason();
     if (inactive) ui.info(inactive);
     if (options.verbose) {
@@ -484,7 +520,7 @@ async function runSourceUpdate(
   }
 
   const status = await runGit(root, ["status", "--porcelain"], { allowFailure: true });
-  if (!options.check && status.stdout.trim().length > 0) {
+  if (!options.check && !options.interaction && status.stdout.trim().length > 0) {
     throw new Error(
       `working tree at ${root} is dirty; commit or stash your changes before running \`orchivox update\``,
     );
@@ -561,7 +597,33 @@ async function runSourceUpdate(
     };
   }
 
-  if (!options.yes) {
+  let inspectedCommit: string | undefined;
+  if (options.interaction) {
+    if (status.stdout.trim()) {
+      throw new Error("The checkout has local changes. Commit or stash them before updating.");
+    }
+    if (ahead > 0 && behind > 0) {
+      throw new Error(`The checkout has diverged from ${upstream}. Reconcile the branches before updating.`);
+    }
+    if (behind > 0) {
+      inspectedCommit = (await runGit(root, ["rev-parse", "--verify", upstream])).stdout.trim();
+    }
+    const approved = await options.interaction.confirm({
+      current: behind > 0 ? currentCommit : runningVersion,
+      target: behind > 0 ? inspectedCommit!.slice(0, 8) : sourceVersion!,
+      detail: behind > 0 ? `${behind} new commit(s) on ${upstream}` : "Rebuild from the local checkout",
+    });
+    if (!approved) return { output: "Update deferred.", updated: false };
+    options.signal?.throwIfAborted();
+    if ((await runGit(root, ["status", "--porcelain"])).stdout.trim()) {
+      throw new Error("The checkout has local changes. Run /update again after committing or stashing them.");
+    }
+    const currentRef = (await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
+    const currentHead = (await runGit(root, ["rev-parse", "--short", "HEAD"])).stdout.trim();
+    if (currentRef !== branch || currentHead !== currentCommit) {
+      throw new Error("The checkout changed during confirmation. Run /update again.");
+    }
+  } else if (!options.yes) {
     if (!process.stdin.isTTY) {
       throw new Error("source update requires --yes in non-interactive mode");
     }
@@ -577,9 +639,12 @@ async function runSourceUpdate(
   }
 
   const before = currentCommit;
+  options.signal?.throwIfAborted();
   if (behind > 0) {
-    await runGit(root, ["pull", "--ff-only"], { allowFailure: false });
+    options.interaction?.stage("sync");
+    await runGit(root, inspectedCommit ? ["merge", "--ff-only", inspectedCommit] : ["pull", "--ff-only"], { allowFailure: false });
   }
+  options.interaction?.stage("dependencies");
   let installOutput = "";
   try {
     installOutput = await runCommand("bun", ["install", "--frozen-lockfile"], root);
@@ -589,6 +654,7 @@ async function runSourceUpdate(
 
   let rebuilt = false;
   if (info.entrypoint === "compiled" || options.binary || staleBinary) {
+    options.interaction?.stage("build");
     await runCommand("bun", ["run", "scripts/install-global.ts"], root);
     rebuilt = true;
   }

@@ -358,7 +358,9 @@ orchivox update --check
 orchivox update
 ```
 
-Use `orchivox update --rollback` if an update fails. Inside the app, `/update` checks for a release.
+Use `orchivox update --rollback` if an update fails. Inside the app, `/update`
+checks for an update and offers **Update now** or **Later**. Restart Orchivox
+after installation to use the new version.
 
 The TUI checks for new releases in the background at startup and every six hours,
 using a six-hour cache. A notice shows the update command; installation stays
@@ -386,4 +388,4 @@ If installed through the standalone installer, remove its Orchivox PATH entry fr
 
 ## Status
 
-Orchivox is at version `1.1.0`.
+Orchivox is at version `1.2.0`.

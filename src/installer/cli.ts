@@ -154,7 +154,7 @@ export async function runInstallCommand(
     });
 
   try {
-    await ui.banner(options.launcherVersion ?? "dev", platformName);
+    ui.banner(options.launcherVersion ?? "dev", platformName);
     if (!ui.interactive) {
       ui.info(`Platform: ${platformName}`);
     }
@@ -361,7 +361,7 @@ export async function runLocalInstallCommand(
       );
     }
 
-    await ui.banner(version, platformName);
+    ui.banner(version, platformName);
     if (!ui.interactive) {
       ui.info(`Platform: ${platformName}`);
     }
