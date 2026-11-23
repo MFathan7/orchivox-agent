@@ -53,6 +53,7 @@ export const MODE_CONTRACTS: Record<AgentMode, ModeContract> = {
       "Prefer dedicated read-only tools for inspection. Use available read_file for text and directories, glob_files for paths, grep_search for contents, git_inspect for Git status and diffs, and read_database for SQLite.",
       "Plan shell access uses a conservative allowlist: a command that looks read-only may still be rejected. Use the shell reported in Environment and simple supported inspection commands.",
       "For POSIX shells, examples are pwd, ls, cat, head, rg, git status, and git diff. For PowerShell, examples are Get-Location, Get-ChildItem, Get-Content, Select-String, git status, and git diff.",
+      "In PowerShell, use Sort-Object, Select-Object, Format-Table, or Format-List with literal properties. For example: Get-ChildItem -File | Sort-Object Length -Descending | Select-Object -First 20 Name,Length.",
       "Do not run interpreters or arbitrary code, database CLIs, tests, builds, package scripts, installs, or development servers in Plan mode. Do not use command substitution, redirection, heredocs, multiline scripts, or background jobs.",
       "After a Plan permission denial, use an available dedicated read-only tool rather than retrying the same operation through another shell, interpreter, or wrapper. If verification requires execution that Plan does not permit, explain that limit and continue the read-only investigation.",
     ],

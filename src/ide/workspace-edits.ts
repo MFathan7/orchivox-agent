@@ -41,7 +41,7 @@ export async function applyWorkspaceUpdates(options: {
     if (!move) return;
     for (const [name, callback] of [
       ["notify_move", options.afterMove],
-      ["after_move_source", () => lifecycle.onAfterModify?.(move.from, "")],
+      ["after_move_source", () => lifecycle.onAfterModify?.(move.from, null)],
       ["after_move_destination", () => lifecycle.onAfterModify?.(move.to, expected)],
     ] as const) {
       try { await callback?.(); }

@@ -366,8 +366,8 @@ test("Claude Code, Codex, and Pi show live status through tool updates and cance
     ];
     redraw();
     await rendered("◇ Running 2 tools");
-    expect(screen).toContain("1 read · 1 search · 2 running");
-    expect(screen).toContain("↳ Reading file · Running · src/index.ts");
+    expect(screen).toContain("• Reading file · src/index.ts");
+    expect(screen).toContain("• Searching code · entry point");
     expect(callbacks.size).toBe(1);
     advance();
     await rendered("✦ Running 2 tools");
@@ -457,11 +457,11 @@ test("Claude Code, Codex, and Pi show live status through tool updates and cance
     const codexWideComposerRow = promptRow();
     turn.toolCalls = [read, { ...command, label: "Running command" }];
     redraw();
-    await rendered("└ Running 2 tools · Reading file, Running command");
-    await rendered("· Run command · Running");
+    await rendered("└ Running 2 tools");
+    await rendered("· Running command · $ git status");
     advance(400);
-    await rendered("• Run command · Running");
-    expect(screen).toContain("• Reading file · Running");
+    await rendered("• Running command · $ git status");
+    expect(screen).toContain("• Reading file · 2/5");
     expect(promptRow()).toBe(codexWideComposerRow);
     expect(callbacks.size).toBe(4);
     turn.toolCalls = [{ ...read, status: "ok" }, { ...command, status: "error", output: "The command failed." }];
@@ -527,7 +527,7 @@ test("Claude Code, Codex, and Pi show live status through tool updates and cance
     ];
     redraw();
     await rendered("⠙ Running 2 tools");
-    await rendered("• Run command · Running · 1/5 · $ git status · Scanning");
+    await rendered("• Running command · 1/5 · $ git status · Scanning");
     expect(callbacks.size).toBe(1);
     turn.toolCalls = [
       { ...turn.toolCalls[0], progress: { progress: 4, total: 5, message: "Finishing" } },

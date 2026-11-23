@@ -19,7 +19,7 @@ export interface SubmittedInput<Attachment> {
 const CONTROL_COMMANDS = new Set([
   "/help", "/plan", "/build", "/ultrawork", "/mode", "/theme",
   "/reasoning", "/palette", "/settings", "/models", "/connect",
-  "/sessions", "/fork", "/timeline", "/hub", "/tasks", "/skills",
+  "/sessions", "/fork", "/timeline", "/changes", "/hub", "/tasks", "/skills",
   "/about", "/doctor", "/stats", "/turn-report", "/debug", "/plugins",
   "/collab", "/new", "/clear", "/exit", "/quit", "/queue",
   "/mcp",

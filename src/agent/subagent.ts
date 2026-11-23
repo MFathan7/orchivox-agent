@@ -170,6 +170,7 @@ export class SubagentManager {
   private readonly parentAbortCleanup = new Map<string, () => void>();
   private readonly cleanupPromises = new Map<string, Promise<void>>();
   private readonly settledListeners = new Set<(worker: SubagentWorkerState) => void>();
+  private readonly activityListeners = new Set<(worker: SubagentWorkerState) => void>();
   private readonly finished = new Set<string>();
   private counter = 0;
   private readonly prepare?: (task: SubagentSpawnTask) => Promise<SubagentSpawnTask>;
@@ -221,6 +222,24 @@ export class SubagentManager {
   onSettled(listener: (worker: SubagentWorkerState) => void): () => void {
     this.settledListeners.add(listener);
     return () => this.settledListeners.delete(listener);
+  }
+
+  onActivity(listener: (worker: SubagentWorkerState) => void): () => void {
+    this.activityListeners.add(listener);
+    return () => this.activityListeners.delete(listener);
+  }
+
+  private notifyActivity(worker: SubagentWorkerState): void {
+    for (const listener of this.activityListeners) {
+      try { listener(worker); } catch { /* Worker execution does not depend on observers. */ }
+    }
+  }
+
+  private updatePhase(worker: SubagentWorkerState, phase: string): void {
+    const changed = phase !== worker.phase;
+    worker.phase = phase;
+    worker.updatedAt = worker.lastProgressAt = Date.now();
+    if (changed) this.notifyActivity(worker);
   }
 
   spawnOne(input: {
@@ -313,10 +332,10 @@ export class SubagentManager {
     }
 
     if (this.finished.has(id)) return worker;
-    worker.phase = "Waiting for worker slot";
+    this.updatePhase(worker, "Waiting for worker slot");
     const turnContext = currentTurnContext();
     this.queuedStarts.set(id, () => {
-      worker.phase = "Checking model route";
+      this.updatePhase(worker, "Checking model route");
       const run = () => this.runWorker(worker, { ...input, mode: worker.mode }, controller);
       const pending = turnContext ? runWithTurnContext(turnContext, run) : run();
       void pending.catch(() => {
@@ -426,6 +445,7 @@ export class SubagentManager {
 
     worker.detail = "stop requested";
     worker.updatedAt = Date.now();
+    this.notifyActivity(worker);
     if (!this.stopTimers.has(workerId)) {
       const timer = setTimeout(() => {
         void this.forceStop(worker);
@@ -498,6 +518,7 @@ export class SubagentManager {
     this.controllers.delete(worker.id);
     this.steerings.delete(worker.id);
     worker.updatedAt = Date.now();
+    this.notifyActivity(worker);
 
     try {
       callback?.(worker);
@@ -787,7 +808,7 @@ export class SubagentManager {
 
     if (writeIsolation) {
       worker.status = "preparing";
-      worker.phase = "Preparing worktree";
+      this.updatePhase(worker, "Preparing worktree");
       try {
         worker.worktreePath = await this.worktrees.createWorktree(worker.id);
       } catch (error) {
@@ -805,8 +826,7 @@ export class SubagentManager {
     }
 
     worker.status = "running";
-    worker.phase = "Starting worker";
-    worker.updatedAt = Date.now();
+    this.updatePhase(worker, "Starting worker");
     try {
       // The worker runs inside its own turn context so every tool resolves
       // paths and the shell against the worktree instead of the main checkout.
@@ -862,9 +882,7 @@ export class SubagentManager {
             },
             onProgress: (phase) => {
               if (this.finished.has(worker.id) || controller.signal.aborted) return;
-              worker.phase = phase;
-              worker.lastProgressAt = Date.now();
-              worker.updatedAt = Date.now();
+              this.updatePhase(worker, phase);
             },
           }),
       );

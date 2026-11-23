@@ -702,6 +702,13 @@ const POWERSHELL_READ_ONLY_COMMANDS = new Set([
   "man",
 ]);
 
+const POWERSHELL_INSPECTION_OPTIONS = new Map<string, ReadonlySet<string>>([
+  ["sort-object", new Set(["-property", "-descending", "-unique", "-casesensitive", "-culture"])],
+  ["select-object", new Set(["-property", "-excludeproperty", "-expandproperty", "-first", "-last", "-skip", "-index", "-unique"])],
+  ["format-table", new Set(["-property", "-groupby", "-autosize", "-hidetableheaders", "-wrap"])],
+  ["format-list", new Set(["-property", "-groupby"])],
+]);
+
 const POWERSHELL_DANGEROUS_COMMANDS = new Set([
   "invoke-expression",
   "iex",
@@ -737,8 +744,12 @@ const POWERSHELL_DANGEROUS_COMMANDS = new Set([
   "remove-module",
 ]);
 
-const POWERSHELL_DYNAMIC_PATTERN = /\$\(|\$\{|`|\@\(|[()]/;
+const POWERSHELL_DYNAMIC_PATTERN = /[`()]|\$\{/;
 const POWERSHELL_ASSIGNMENT_PATTERN = /^\s*\$[A-Za-z_][A-Za-z0-9_:]*\s*=/;
+const POWERSHELL_DYNAMIC_DENIAL = {
+  allowed: false,
+  reason: "dynamic evaluation and script blocks are blocked. Use a static pipeline with literal property names for sorting, selecting, or formatting.",
+} as const;
 
 /**
  * Conservative read-only scanner for PowerShell. It allows a small set of
@@ -753,7 +764,7 @@ export function scanReadOnlyPowerShellCommand(command: string): ShellScanResult 
     return { allowed: false, reason: "multi-line commands are not read-only" };
   }
   if (POWERSHELL_DYNAMIC_PATTERN.test(trimmed)) {
-    return { allowed: false, reason: "dynamic command evaluation is not read-only" };
+    return POWERSHELL_DYNAMIC_DENIAL;
   }
   if (POWERSHELL_ASSIGNMENT_PATTERN.test(trimmed)) {
     return { allowed: false, reason: "variable assignment is not read-only" };
@@ -768,7 +779,7 @@ export function scanReadOnlyPowerShellCommand(command: string): ShellScanResult 
     return { allowed: false, reason: "conditional chaining is not read-only" };
   }
   const segments = splitPowerShellSegments(trimmed);
-  if (!segments) return { allowed: false, reason: "unbalanced quotes" };
+  if (!Array.isArray(segments)) return segments;
   if (segments.length === 0) return { allowed: false, reason: "empty command" };
   for (const segment of segments) {
     if (!isReadOnlyPowerShellSegment(segment)) {
@@ -778,7 +789,7 @@ export function scanReadOnlyPowerShellCommand(command: string): ShellScanResult 
   return { allowed: true };
 }
 
-function splitPowerShellSegments(command: string): string[] | undefined {
+function splitPowerShellSegments(command: string): string[] | ShellScanResult {
   const segments: string[] = [];
   let current = "";
   let quote: "'" | '"' | undefined;
@@ -806,15 +817,15 @@ function splitPowerShellSegments(command: string): string[] | undefined {
       current += char;
       continue;
     }
+    if (char === "{" || char === "}") return POWERSHELL_DYNAMIC_DENIAL;
     if (char === ";" || char === "|") {
-      if (char === "|" && command[index + 1] === "|") return undefined;
       if (current.trim()) segments.push(current.trim());
       current = "";
       continue;
     }
     current += char;
   }
-  if (quote) return undefined;
+  if (quote) return { allowed: false, reason: "unbalanced quotes" };
   if (current.trim()) segments.push(current.trim());
   return segments;
 }
@@ -831,6 +842,14 @@ function isReadOnlyPowerShellSegment(segment: string): boolean {
   if (first === "git") {
     const sub = tokens[1]?.toLowerCase();
     return Boolean(sub && PLAN_READ_ONLY_GIT_COMMANDS.has(sub));
+  }
+  const options = POWERSHELL_INSPECTION_OPTIONS.get(first);
+  if (options) {
+    return tokens.slice(1).every((token) => {
+      if (token.startsWith("@")) return false;
+      if (!/^[-\u2013\u2014\u2015]/.test(token)) return true;
+      return options.has(token.split(":", 1)[0].toLowerCase());
+    });
   }
   return POWERSHELL_READ_ONLY_COMMANDS.has(first);
 }

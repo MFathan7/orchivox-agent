@@ -99,6 +99,7 @@ import { formatBytes, runCleanup } from "./cache-cleanup";
 import { cleanupRuntimeTempDir } from "./runtime-temp";
 import { analyzeAndSplitCommits } from "./vcs/atomic-commit";
 import { SnapshotManager, type RestoreResult } from "./vcs/snapshot";
+import { ReplyChanges, revertReplyChanges } from "./vcs/reply-changes";
 import { runGit } from "./vcs/git";
 import { WorktreeManager } from "./vcs/worktree";
 import { formatElapsed, formatTokenCount } from "./tui/format";
@@ -289,7 +290,7 @@ export function buildHashEditLifecycle(deps: { snapshots: SnapshotManager; lsp?:
       await deps.snapshots.captureSnapshot(`before edit ${filePath}`);
     },
     onAfterModify: async (filePath, newContent) => {
-      if (inWorkerWorkspace()) return;
+      if (inWorkerWorkspace() || typeof newContent !== "string") return;
       await deps.lsp?.notifyFileChanged(filePath, newContent);
     },
   };
@@ -1306,6 +1307,32 @@ async function runTuiSession(
     router: runtime.router,
     database: runtime.database,
     snapshots: runtime.snapshots,
+    loadReplyChanges: (id: string) => {
+      if (!viewLease.isCurrent() || !state.sessionId) return undefined;
+      return runtime.database.loadReplyChanges(state.sessionId, id);
+    },
+    onUndoReplyChanges: (id: string) => {
+      const sessionId = state.sessionId;
+      if (!viewLease.isCurrent() || !sessionId) throw new Error("The active session changed.");
+      if (state.busy || inputQueue.active || runtime.orchestrator.subagents.listWorkers().some(({ status }) =>
+        status === "queued" || status === "preparing" || status === "running" || status === "finalizing"
+      )) throw new Error("Wait for the active turn or workers to finish before undoing changes.");
+      const saved = runtime.database.loadReplyChanges(sessionId, id);
+      if (!saved || saved.reverted) throw new Error("These reply changes are no longer available to undo.");
+      revertReplyChanges(runtime.statePaths.root, saved.files, () => runtime.database.markReplyChangesReverted(sessionId, id));
+      state.entries = state.entries.map((entry) => entry.replyChangeId === id ? { ...entry, replyChangesReverted: true } : entry);
+      const text = "The user reverted the recorded workspace changes from a previous reply.";
+      const message: Message = {
+        id: `undo-reply-${crypto.randomUUID()}`,
+        role: "system",
+        content: [{ type: "text", text }],
+        created_at: Date.now(),
+        metadata: { event: "reply_changes_reverted", reply_id: id },
+      };
+      state.messages = [...state.messages, message];
+      try { runtime.database.saveMessage(sessionId, message); } catch { /* The undo status was already saved. */ }
+      rerender();
+    },
     activeSessionId: state.sessionId ?? `draft-${state.sessionEpoch}`,
     activeSessionMessages: state.messages,
     currentTheme: state.currentTheme,
@@ -1823,6 +1850,11 @@ async function runTuiSession(
     }
     rerender();
   });
+  const unsubscribeSubagentActivity = runtime.orchestrator.subagents.onActivity((worker) => {
+    if (state.sessionId && worker.parentSessionId === state.sessionId) {
+      terminalRenderer.clock.request(renderStreamFrame);
+    }
+  });
 
   const activityTimer = setInterval(() => {
     backgroundJobs.refresh();
@@ -2004,7 +2036,8 @@ async function runTuiSession(
       let lastTurnError: string | undefined;
       let titleScheduled = false;
       const turnFiles = new Set<string>();
-      for await (const event of mainTurnEvents(runtime.orchestrator.runStream(request, turnSignal), turnSignal)) {
+      const replyChanges = new ReplyChanges(runtime.statePaths.root);
+      for await (const event of mainTurnEvents(runtime.orchestrator.runStream(request, turnSignal, replyChanges), turnSignal)) {
         if (!lease.isCurrent()) return { status: "interrupted", reason: "The session view changed." };
         if (!titleScheduled && (event.type === "token" || event.type === "thinking_token" || event.type === "tool_start")) {
           titleScheduled = true;
@@ -2414,13 +2447,7 @@ async function runTuiSession(
           finishReason === "turn_limit"
             ? "stopped at the step limit"
             : `completed: ${finishReason ?? "stop"}`;
-        pushEntry("assistant", answer || "(no output)", entryMeta);
-        if (finishReason === "length") {
-          pushEntry(
-            "system",
-            "response truncated after automatic continuation limit; send another message to continue",
-          );
-        }
+        const replyFiles = replyChanges.finish();
         const assistantMsg: Message = {
           id: `assistant-${Date.now().toString(36)}`,
           role: "assistant",
@@ -2451,10 +2478,22 @@ async function runTuiSession(
         };
         state.messages = [...state.messages, assistantMsg];
         if (!sawContextUpdate) state.contextTokens = estimateContextTokens(state.mode, state.messages);
+        let replyChangeCount: number | undefined;
         try {
-          runtime.database.saveMessage(sessionId, assistantMsg);
+          runtime.database.saveMessage(sessionId, assistantMsg, replyFiles);
+          replyChangeCount = replyFiles.length || undefined;
         } catch {
-          // Ignore database save error if session not found.
+          if (replyFiles.length) setNotice("Could not save file changes for review.", 8000);
+        }
+        pushEntry("assistant", answer || "(no output)", {
+          ...entryMeta,
+          ...(replyChangeCount ? { replyChangeId: assistantMsg.id, replyChangeCount } : {}),
+        });
+        if (finishReason === "length") {
+          pushEntry(
+            "system",
+            "response truncated after automatic continuation limit; send another message to continue",
+          );
         }
         recapEligible = result.status === "complete";
       }
@@ -3143,6 +3182,7 @@ async function runTuiSession(
     }
     unsubscribeBtw();
     unsubscribeSubagentResults();
+    unsubscribeSubagentActivity();
     terminalRenderer.clock.cancel(renderStreamFrame);
     try { inputQueue.close(); } catch (error) { console.error("Could not checkpoint the queue during shutdown:", error); }
     backgroundJobs.close();

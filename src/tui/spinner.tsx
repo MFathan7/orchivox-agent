@@ -41,6 +41,11 @@ export function Spinner({
   );
 }
 
+export function PulsingDot({ text, color, bold }: { text: string; color: string; bold?: boolean }) {
+  const frame = useAnimationFrame(true, 2, 400);
+  return <Text color={color} bold={bold}>{frame === 0 ? text : `·${text.slice(1)}`}</Text>;
+}
+
 function PulseStatus({ text }: { text: string }): React.ReactElement {
   const theme = useTheme();
   const enabled = useMotion();
@@ -74,17 +79,31 @@ export interface LiveStatusProps {
   indicator?: ActivityIndicator;
 }
 
-function activeToolDetail(calls: readonly ChatToolCallView[], label?: string): string {
-  if (calls.length === 0) return "";
-  if (calls.length > 1) {
-    const names = calls.map((call) => singleLine(call.label ?? toolDisplay(call.name).label));
-    return [label, names.join(", ")].filter(Boolean).join(" · ");
-  }
-  const call = calls[0];
+function activeToolDetail(call: ChatToolCallView, label = call.label ?? toolDisplay(call.name).label): string {
   const { progress } = call;
   const counter = progress ? `${progress.progress}${progress.total === undefined ? "" : `/${progress.total}`}` : undefined;
-  const target = call.filePath ?? (call.command ? `$ ${call.command}` : call.detail);
+  const target = call.filePath ?? (call.command ? `$ ${call.command}` : call.detail ?? call.workerIds?.join(", "));
   return [label, counter, target, progress?.message].map((part) => singleLine(part ?? "")).filter(Boolean).join(" · ");
+}
+
+export function RunningToolRows({ calls, width, pulse }: {
+  calls: ChatToolCallView[];
+  width: number;
+  pulse: boolean;
+}): React.ReactElement | null {
+  const theme = useTheme();
+  if (!calls.length) return null;
+  const marker = width > 2 ? "• " : "";
+  return (
+    <Box flexDirection="column" width={width}>
+      {calls.map((call, index) => (
+        <Text key={call.id ?? index} color={theme.text} wrap="truncate">
+          {pulse && marker ? <PulsingDot text={marker} color={theme.accent} /> : <Text color={theme.accent}>{marker}</Text>}
+          {fitDisplayText(activeToolDetail(call), width - marker.length)}
+        </Text>
+      ))}
+    </Box>
+  );
 }
 
 function WorkStatus({
@@ -109,7 +128,9 @@ function WorkStatus({
   if (elapsed !== undefined) parts.push({ key: "time", text: ` · ${formatElapsed(elapsed)}`, dropOrder: 2 });
   if (canInterrupt) parts.push({ key: "interrupt", text: " · Esc twice to stop", dropOrder: 1 });
   const fitted = fitSegments(parts, width);
-  const detail = activeToolDetail(runningTools, runningLabel);
+  const detail = runningTools.length === 1
+    ? activeToolDetail(runningTools[0], runningLabel)
+    : runningLabel;
   return <Box flexDirection="column" width={width} flexShrink={0}>
     <Text color={theme.muted} wrap="truncate">
       <ActivityText text={heading} />

@@ -5,6 +5,7 @@ import type { ToolRulePattern } from "./permissions";
 import type { ContextCheckpoint } from "./context-checkpoint";
 import type { AgentTool } from "../tools/registry";
 import type { ToolProgress } from "../types/tool-output";
+import type { ReplyChanges } from "../vcs/reply-changes";
 
 export interface TurnContext {
   mode: AgentMode;
@@ -19,6 +20,7 @@ export interface TurnContext {
   onToolModelRequest?: (request: { provider: string; model: string; startedAt: number; durationMs: number; usage: Usage; retries: number; retryDelayMs: number }) => void;
   consumeNestedTool?: (name: string) => void;
   contextControl?: ContextCheckpoint;
+  replyChanges?: ReplyChanges;
   /** Worker id when this turn runs inside a subagent. */
   workerId?: string;
   /** Directory tools should treat as the project root, set for isolated workers. */

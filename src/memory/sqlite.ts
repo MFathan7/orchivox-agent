@@ -15,6 +15,7 @@ import type { BtwTurn } from "../agent/btw";
 import { btwUsage } from "../agent/btw-usage";
 import { SkillLoadSchema, type SkillLoad } from "../agent/skill-state";
 import { queueChangeAllowed, type InputQueueStore, type QueuedInput, type QueueExpected, type QueuePatch } from "../agent/input-queue";
+import type { ReplyFileChange, SavedReplyChanges } from "../vcs/reply-changes";
 
 export interface SessionRecord {
   id: string;
@@ -129,6 +130,11 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+CREATE TABLE IF NOT EXISTS reply_changes (
+  reply_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  files_json TEXT NOT NULL,
+  reverted INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS queued_inputs (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
@@ -495,7 +501,7 @@ export class MemoryDatabase implements TaskStore {
         id: newId,
         role: msg.role,
         content: msg.content,
-        metadata: msg.metadata,
+        metadata: msg.metadata && { ...msg.metadata, reply_change_count: undefined, reply_changes_reverted: undefined },
         created_at: msg.created_at,
       });
     }
@@ -525,16 +531,21 @@ export class MemoryDatabase implements TaskStore {
     return forked;
   }
 
-  saveMessage(sessionId: string, message: Message): void {
+  saveMessage(sessionId: string, message: Message, replyFiles?: readonly ReplyFileChange[]): void {
     this.db.transaction(() => {
       const session = this.getSession(sessionId);
       if (!session) throw new Error(`unknown session "${sessionId}"`);
       const createdAt = message.created_at ?? Date.now();
       const content = stripInlineImages(message.content);
-      const metadata = message.metadata ? JSON.stringify(message.metadata) : null;
+      const metadata = replyFiles?.length
+        ? JSON.stringify({ ...message.metadata, reply_change_count: replyFiles.length })
+        : message.metadata ? JSON.stringify(message.metadata) : null;
       this.db
         .query("INSERT INTO messages (id, session_id, role, content_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
         .run(message.id, sessionId, message.role, JSON.stringify(content), metadata, createdAt);
+      if (replyFiles?.length) {
+        this.db.query("INSERT INTO reply_changes (reply_id, files_json) VALUES (?, ?)").run(message.id, JSON.stringify(replyFiles));
+      }
       if (message.metadata?.synthetic !== true) {
         this.db
           .query("INSERT INTO messages_fts (message_id, session_id, role, content) VALUES (?, ?, ?, ?)")
@@ -547,6 +558,23 @@ export class MemoryDatabase implements TaskStore {
           .get(sessionId, compaction.created_at, message.id) as { id: string };
         this.saveCompaction(sessionId, { ...compaction, tail_start_message_id: first.id });
       }
+    }).immediate();
+  }
+
+  loadReplyChanges(sessionId: string, replyId: string): SavedReplyChanges | undefined {
+    const row = this.db.query(`SELECT files_json, reverted FROM reply_changes
+      JOIN messages ON messages.id = reply_changes.reply_id WHERE session_id = ? AND reply_id = ?`)
+      .get(sessionId, replyId) as { files_json: string; reverted: number } | null;
+    return row ? { files: JSON.parse(row.files_json) as ReplyFileChange[], reverted: Boolean(row.reverted) } : undefined;
+  }
+
+  markReplyChangesReverted(sessionId: string, replyId: string): void {
+    this.db.transaction(() => {
+      const result = this.db.query(`UPDATE reply_changes SET reverted = 1 WHERE reply_id = ? AND reverted = 0
+        AND EXISTS (SELECT 1 FROM messages WHERE id = reply_id AND session_id = ?)`).run(replyId, sessionId);
+      if (result.changes !== 1) throw new Error("These reply changes are no longer available to undo.");
+      this.db.query(`UPDATE messages SET metadata_json = json_set(metadata_json, '$.reply_changes_reverted', json('true')) WHERE id = ?`)
+        .run(replyId);
     }).immediate();
   }
 

@@ -35,6 +35,7 @@ export const HELP_SECTIONS: HelpSection[] = [
       { keys: "/new", description: "Start a fresh session" },
       { keys: "/fork", description: "Branch the active session" },
       { keys: "/timeline", description: "Inspect snapshot history" },
+      { keys: "/changes, Ctrl+R", description: "Review and undo changes by reply" },
       { keys: "/hub", description: "Inspect subagent workers" },
       { keys: "/tasks", description: "Open the multi-agent task board" },
       { keys: "/skills", description: "Inspect installed skills" },

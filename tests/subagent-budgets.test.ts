@@ -46,14 +46,19 @@ async function runWorker(workerSteps: number, toolSteps: number, isolated: boole
     workerOutputDir: root,
     workerErrorLogPath: root,
   });
+  const activity: string[] = [];
+  const unsubscribe = orchestrator.subagents.onActivity(({ status, phase }) => {
+    activity.push(`${status}: ${phase}`);
+  });
   try {
     const worker = orchestrator.subagents.spawnOne({
       id: "worker-budget", task: "Inspect the assigned scope.", roleModel: "fast",
       mode: isolated ? "build" : "plan", writeIsolation: isolated,
     });
     await orchestrator.subagents.waitForWorkers({ ids: [worker.id], waitFor: "all" });
-    return { worker, requests, removed };
+    return { worker, requests, removed, activity };
   } finally {
+    unsubscribe();
     await orchestrator.closeToolRuntimes();
     database.close();
     const output = join(root, "worker-budget.md");
@@ -76,9 +81,13 @@ test("a worker warns on its last model step and retains isolated work on budget 
 });
 
 test("a read-only Fast worker can run beyond 40 steps with the step budget disabled", async () => {
-  const { worker, requests } = await runWorker(0, 40, false);
+  const { worker, requests, activity } = await runWorker(0, 40, false);
   expect(requests).toHaveLength(41);
   expect(requests.every((request) => request.reasoning_effort === "low")).toBe(true);
   expect(worker.status).toBe("completed");
   expect(worker.result?.output).toBe("Completed verified work.");
+  const toolStart = activity.indexOf("running: Reading plan");
+  expect(toolStart).toBeGreaterThanOrEqual(0);
+  expect(activity[toolStart + 1]).toBe("running: Processing tool results");
+  expect(activity.at(-1)).toStartWith("completed:");
 });

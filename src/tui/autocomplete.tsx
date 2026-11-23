@@ -91,6 +91,7 @@ export const BUILTIN_SLASH_COMMANDS: Array<{
   { name: "/sessions", description: "Open session manager and past conversation search" },
   { name: "/fork", description: "Fork active conversation from a specific turn" },
   { name: "/timeline", description: "Open VCS snapshot history timeline" },
+  { name: "/changes", description: "Review and undo recorded changes by reply" },
   { name: "/hub", description: "Open subagent manager to inspect or stop workers" },
   { name: "/tasks", description: "Open the multi-agent task board" },
   { name: "/skills", description: "Inspect installed skills" },

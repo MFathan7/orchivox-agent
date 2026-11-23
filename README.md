@@ -388,4 +388,4 @@ If installed through the standalone installer, remove its Orchivox PATH entry fr
 
 ## Status
 
-Orchivox is at version `1.2.0`.
+Orchivox is at version `1.2.1`.

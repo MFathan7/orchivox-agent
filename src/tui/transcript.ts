@@ -198,6 +198,9 @@ export function buildTranscriptEntries(
           }
         : {}),
       ...(toolCalls ? { toolCalls } : {}),
+      ...(typeof metadata?.reply_change_count === "number" && metadata.reply_change_count > 0
+        ? { replyChangeId: message.id, replyChangeCount: metadata.reply_change_count, replyChangesReverted: metadata.reply_changes_reverted === true }
+        : {}),
       ...(message.role === "assistant" &&
       (mode ||
         model ||

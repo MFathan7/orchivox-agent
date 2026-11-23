@@ -13,8 +13,8 @@ import { LAYOUT_PRESETS, type DiffStyle, type TranscriptStyle } from "./layout";
 import { markdownRows } from "./markdown";
 import { fitPanelParts, type PanelPart } from "./panel";
 import type { RenderRow } from "./rows";
-import { Spinner } from "./spinner";
-import { ActivityText, useAnimationFrame } from "./motion";
+import { PulsingDot, Spinner } from "./spinner";
+import { ActivityText } from "./motion";
 import { type Theme } from "./theme";
 import {
   displayWidth,
@@ -39,6 +39,7 @@ export interface BuildTranscriptOptions {
   thinkingExpanded: boolean;
   /** Show full edit/create diffs instead of the compact preview. */
   diffExpanded?: boolean;
+  hideRunningTools?: boolean;
   now?: number;
 }
 
@@ -98,11 +99,6 @@ export function toolOutputLines<T>(
 
 function blankRow(key: string): TranscriptRow {
   return { key, node: <Text> </Text> };
-}
-
-function PulsingDot({ text, color, bold }: { text: string; color: string; bold?: boolean }) {
-  const frame = useAnimationFrame(true, 2, 400);
-  return <Text color={color} bold={bold}>{frame === 0 ? text : `·${text.slice(1)}`}</Text>;
 }
 
 function plainTextRows(
@@ -684,6 +680,8 @@ function assistantRows(
   const allCalls = entry.toolCalls ?? [];
   const liveCalls = liveView ? allCalls.slice(-LIVE_TOOL_LIMIT) : allCalls;
   const hiddenLiveCalls = allCalls.length - liveCalls.length;
+  const hideRunningTools = liveView && options.hideRunningTools;
+  const visible = (call: ChatToolCallView): boolean => !hideRunningTools || call.status !== "running";
   const addGap = (key: string): void => {
     if (style.dense || rows.length === 0) return;
     const last = rows[rows.length - 1];
@@ -708,7 +706,7 @@ function assistantRows(
     });
   };
   const groups = subagentWaitGroups(allCalls);
-  const visibleCalls = new Set(liveCalls);
+  const visibleCalls = new Set(liveCalls.filter(visible));
   const renderedSpawns = new Set<ChatToolCallView>();
   const appendTool = (call: ChatToolCallView, key: string): void => {
     const parent = groups.parents.get(call);
@@ -721,7 +719,7 @@ function assistantRows(
     rows.push(...toolCallRows(target, width, options.collapsed, theme, key, options.diffExpanded ?? false, { style, live: liveView, waits }));
   };
   const appendTools = (calls: ChatToolCallView[], key: string): void => {
-    for (const [index, run] of observationRuns(calls).entries()) {
+    for (const [index, run] of observationRuns(calls.filter(visible)).entries()) {
       const groupKey = `${key}-${run[0].id ?? index}`;
       if (run.length === 1) { appendTool(run[0], groupKey); continue; }
       const running = run.some((call) => call.status === "running");
@@ -936,7 +934,7 @@ function assistantRows(
         entry.tokensPerSecond !== undefined && Number.isFinite(entry.tokensPerSecond)
           ? `${entry.tokensPerSecond.toFixed(1)} tok/s`
           : undefined,
-        entry.filesChanged !== undefined
+        entry.filesChanged !== undefined && !entry.replyChangeCount
           ? `${entry.filesChanged} file${entry.filesChanged === 1 ? "" : "s"} changed`
           : undefined,
         entry.turnTokens !== undefined ? `turn total ${formatTokenCount(entry.turnTokens)} tokens` : undefined,
@@ -946,6 +944,14 @@ function assistantRows(
       ].filter(Boolean).join(" · ");
       wrapText(metadata, Math.max(1, width)).forEach((line, index) => rows.push({
         key: `${entry.id}-meta-${index}`, node: <Text color={theme.muted} wrap="truncate">{line}</Text>,
+      }));
+    }
+    if (!entry.live && entry.replyChangeCount) {
+      const label = entry.replyChangesReverted
+        ? "Changes reverted"
+        : `Review ${entry.replyChangeCount} file${entry.replyChangeCount === 1 ? "" : "s"}`;
+      wrapText(`${label} · Ctrl+R review`, Math.max(1, width)).forEach((line, index) => rows.push({
+        key: `${entry.id}-review-${index}`, node: <Text color={theme.muted} wrap="truncate">{line}</Text>,
       }));
     }
   }

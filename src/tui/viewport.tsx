@@ -62,6 +62,7 @@ export interface ScrollableChatViewportProps {
   entries: ChatEntryView[];
   streamingText?: string;
   liveEntry?: ChatEntryView;
+  hideRunningTools?: boolean;
   width: number;
   height: number;
   theme?: Theme;
@@ -365,6 +366,7 @@ export function ScrollableChatViewport({
   entries,
   streamingText,
   liveEntry,
+  hideRunningTools,
   width,
   height,
   theme: themeProp,
@@ -464,7 +466,9 @@ export function ScrollableChatViewport({
     diffExpanded,
   }), [contentWidth, theme, layout, collapsed, expandedGroups, thinkingExpanded, diffExpanded]);
   const history = React.useMemo(() => new TranscriptRowIndex(entries, rowOptions), [entries, rowOptions]);
-  const rows: TranscriptRow[] = displayedLiveEntry ? buildTranscriptRows([displayedLiveEntry], rowOptions) : [];
+  const rows: TranscriptRow[] = displayedLiveEntry
+    ? buildTranscriptRows([displayedLiveEntry], { ...rowOptions, hideRunningTools })
+    : [];
   if (history.length > 0 && rows.length > 0 && displayedLiveEntry) {
     rows.unshift({
       key: `${displayedLiveEntry.id}-spacer`,

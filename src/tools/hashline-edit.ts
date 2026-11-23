@@ -8,10 +8,11 @@ import { currentMode, currentTurnContext } from "../agent/turn-context";
 import type { AgentTool } from "./registry";
 import { truncateHead } from "./output-budget";
 import { redirectPlanPath } from "./plan-path";
+import type { WrittenFile } from "../vcs/reply-changes";
 
 export interface HashlineLifecycle {
   onBeforeModify?: (filePath: string) => Promise<void> | void;
-  onAfterModify?: (filePath: string, newContent: string) => Promise<void> | void;
+  onAfterModify?: (filePath: string, newContent: WrittenFile) => Promise<void> | void;
 }
 
 export class EditRejectedError extends Error {
@@ -407,7 +408,7 @@ export function createDeleteFileTool(lifecycle: HashlineLifecycle = {}): AgentTo
 
       await lifecycle.onBeforeModify?.(args.filePath);
       await unlink(args.filePath);
-      await lifecycle.onAfterModify?.(args.filePath, "");
+      await lifecycle.onAfterModify?.(args.filePath, null);
       return `deleted ${args.filePath}`;
     },
   };
@@ -452,11 +453,8 @@ export function createMoveFileTool(lifecycle: HashlineLifecycle = {}): AgentTool
       await copyFile(args.sourcePath, args.destinationPath, args.overwrite ? 0 : constants.COPYFILE_EXCL);
       await unlink(args.sourcePath);
 
-      await lifecycle.onAfterModify?.(args.sourcePath, "");
-      const bytes = new Uint8Array(await Bun.file(args.destinationPath).arrayBuffer());
-      let content: string | undefined;
-      try { if (!bytes.includes(0)) content = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch {}
-      if (content !== undefined) await lifecycle.onAfterModify?.(args.destinationPath, content);
+      await lifecycle.onAfterModify?.(args.sourcePath, null);
+      await lifecycle.onAfterModify?.(args.destinationPath, await Bun.file(args.destinationPath).bytes());
       return `moved ${args.sourcePath} to ${args.destinationPath}`;
     },
   };

@@ -167,6 +167,7 @@ import {
 import { backgroundRequest, btwRequest, buildSystemParts, progressCheckpointMessage } from "./prompt";
 import { TaskBoard, type TaskSpawnInput, type TaskWorkerOutcome } from "./task-board";
 import { currentTurnContext, runWithTurnContext } from "./turn-context";
+import type { ReplyChanges } from "../vcs/reply-changes";
 import { sleepAbortable } from "../provider/retry";
 import {
   classifyProviderFailure,
@@ -878,7 +879,7 @@ export class AgentOrchestrator implements IAgentRunner {
     return this.execute(request, undefined, () => undefined);
   }
 
-  async *runStream(request: AgentRunRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, unknown> {
+  async *runStream(request: AgentRunRequest, signal?: AbortSignal, replyChanges?: ReplyChanges): AsyncGenerator<StreamEvent, void, unknown> {
     const queue: StreamEvent[] = [];
     let wake: (() => void) | undefined;
     let finished = false;
@@ -886,7 +887,7 @@ export class AgentOrchestrator implements IAgentRunner {
       queue.push(event);
       wake?.();
     };
-    const run = this.execute(request, signal, sink)
+    const run = this.execute(request, signal, sink, replyChanges)
       .then(() => {
         finished = true;
         wake?.();
@@ -963,13 +964,22 @@ export class AgentOrchestrator implements IAgentRunner {
     const lifecycle: HashlineLifecycle = {
       onBeforeModify: async (filePath) => {
         await this.hashEditLifecycle?.onBeforeModify?.(filePath);
+        const turn = currentTurnContext();
+        if (turn?.mode !== "plan") turn?.replyChanges?.beforeWrite(filePath);
       },
       onAfterModify: async (filePath, newContent) => {
+        const turn = currentTurnContext();
+        if (turn?.mode !== "plan") turn?.replyChanges?.afterWrite(filePath, newContent);
+        let text: string;
+        if (newContent instanceof Uint8Array) {
+          if (newContent.includes(0)) return;
+          try { text = new TextDecoder("utf-8", { fatal: true }).decode(newContent); } catch { return; }
+        } else text = newContent ?? "";
         if (this.hashEditLifecycle?.onAfterModify) {
-          await this.hashEditLifecycle.onAfterModify(filePath, newContent);
+          await this.hashEditLifecycle.onAfterModify(filePath, text);
           return;
         }
-        const diagnostics = await this.collectDiagnostics(filePath, newContent);
+        const diagnostics = await this.collectDiagnostics(filePath, text);
         if (diagnostics) this.pendingDiagnostics.set(filePath, diagnostics);
       },
     };
@@ -1079,6 +1089,7 @@ export class AgentOrchestrator implements IAgentRunner {
     request: AgentRunRequest,
     signal: AbortSignal | undefined,
     sink: (event: StreamEvent) => void,
+    replyChanges?: ReplyChanges,
   ): Promise<AgentRunResult> {
     const mode = PROFILE_MODES[request.profile];
     const sessionId = typeof request.metadata?.session_id === "string" ? request.metadata.session_id : undefined;
@@ -1095,7 +1106,7 @@ export class AgentOrchestrator implements IAgentRunner {
     const runSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
     this.activeRuns.add(runId);
     try {
-      return await runWithTurnContext({ mode, sessionId, runId, workspaceRoot: this.root }, () =>
+      return await runWithTurnContext({ mode, sessionId, runId, workspaceRoot: this.root, replyChanges }, () =>
         this.executeInner(request, runSignal, sink, mode),
       );
     } finally {
@@ -3180,9 +3191,17 @@ export class AgentOrchestrator implements IAgentRunner {
     const totals = zeroUsage();
     if (turnContext) turnContext.onToolUsage = (event) => { accumulateUsage(totals, event); input.onUsage(event); };
     if (turnContext) turnContext.onToolUsageMissing = () => { totals.cost_incomplete = true; };
-    if (turnContext) turnContext.onToolProgress = ({ name, progress }) => input.onProgress?.(
-      `${toolDisplay(name).label} · ${progress.progress}${progress.total === undefined ? "" : `/${progress.total}`}${progress.message ? ` · ${progress.message}` : ""}`,
-    );
+    const activeTools = new Map<string, string>();
+    const reportActiveTools = (detail?: string): void => {
+      const current = detail ?? activeTools.values().next().value ?? "Processing tool results";
+      input.onProgress?.(activeTools.size > 1 ? `Running ${activeTools.size} tools · ${current}` : current);
+    };
+    if (turnContext) turnContext.onToolProgress = ({ id, progress }) => {
+      const label = activeTools.get(id);
+      if (label) reportActiveTools(
+        `${label} · ${progress.progress}${progress.total === undefined ? "" : `/${progress.total}`}${progress.message ? ` · ${progress.message}` : ""}`,
+      );
+    };
     const workerTokenLimit = this.config?.limits?.worker_tokens ?? 0;
     const workerStepLimit = this.config?.limits?.worker_steps ?? DEFAULT_WORKER_STEPS;
     const stepWarningAt = Math.floor(workerStepLimit * 0.8);
@@ -3369,13 +3388,15 @@ export class AgentOrchestrator implements IAgentRunner {
           if (input.signal.aborted) throw new Error("worker aborted");
           const call: ToolCall = { id: block.id, name: block.name, arguments: block.input };
           input.onTranscript(`[tool] ${call.name}`);
-          input.onProgress?.(`Running ${call.name}`);
+          activeTools.set(call.id, toolDisplay(call.name).label);
+          reportActiveTools();
           if (attemptState) attemptState.toolsRan = true;
           const result = await runWithTurnContext(
             { ...currentTurnContext(), mode: effectiveMode, toolCallId: call.id },
             () => this.registry.run(call, effectiveMode, input.signal, specialistRules),
           );
-          input.onProgress?.(`Finished ${call.name}`);
+          activeTools.delete(call.id);
+          reportActiveTools();
           outcomes[index] = toolResultMessage(call, result, result.is_error);
           if (call.name === "read_file" && typeof call.arguments.filePath === "string") await this.skills.refreshPath(call.arguments.filePath, turnContext?.workspaceRoot ?? this.root);
           await recordSkillEvidence(outcomes[index]!, call, this.skills.listDocuments(), turnContext?.workspaceRoot ?? this.root, workerInvoked);

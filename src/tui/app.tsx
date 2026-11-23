@@ -13,6 +13,7 @@ import type { ApprovalDecision, ApprovalRequest } from "../agent/permissions";
 import type { ProviderRouter } from "../provider/router";
 import type { MemoryDatabase, SessionRecord } from "../memory/sqlite";
 import type { RestoreResult, SnapshotManager } from "../vcs/snapshot";
+import type { SavedReplyChanges } from "../vcs/reply-changes";
 import type { ApprovalPreset, AutoDelegateMode, WorkerFallbackMode } from "../config/loader";
 import type { BackgroundConfig, DelegationPolicy, LimitsConfig } from "../config/loader";
 import type { ConfigMode, ConfigRole } from "../config/writer";
@@ -33,6 +34,7 @@ import type { InputAction } from "./input-routing";
 import { installKeyNormalizer } from "./key-normalize";
 import { LAYOUT_PRESETS } from "./layout";
 import { ReportModal } from "./report-modal";
+import { ReplyChangesModal } from "./reply-changes";
 import { QuestionModal, type PendingQuestion } from "./question-modal";
 import type { QuestionAnswer } from "../tools/question";
 import { ModelConfigModal } from "./model-modal";
@@ -54,7 +56,7 @@ import {
 } from "./format";
 import { isMouseSequence, parseMouseWheel } from "./mouse";
 import { RESET_ATTRIBUTES, resetBeforeErase } from "./terminal-protocol";
-import { LiveStatus } from "./spinner";
+import { LiveStatus, RunningToolRows } from "./spinner";
 import { MotionProvider } from "./motion";
 import type { FrameClock } from "./frame-clock";
 import { agentActivityCounts } from "./agent-activity";
@@ -189,11 +191,16 @@ export interface ChatEntryView {
   turnCompletionTokens?: number;
   turnRequests?: number;
   filesChanged?: number;
+  replyChangeId?: string;
+  replyChangeCount?: number;
+  replyChangesReverted?: boolean;
   diff?: { oldText: string; newText: string; oldLabel?: string; newLabel?: string; unified?: boolean };
   compaction?: ChatCompactionView;
 }
 
 export interface OrchivoxAppProps {
+  loadReplyChanges?: (id: string) => SavedReplyChanges | undefined;
+  onUndoReplyChanges?: (id: string) => void;
   mcpMenu?: Pick<McpMenuProps, "servers" | "changing" | "onBrowse" | "onSelectSkill" | "onAuthenticate" | "authServer">;
   onMcpAction?: McpMenuProps["onAction"];
   onMcpClose?: () => void;
@@ -513,6 +520,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const [modePickerOpen, setModePickerOpen] = React.useState(false);
   const [reasoningPickerOpen, setReasoningPickerOpen] = React.useState(false);
   const [themePickerOpen, setThemePickerOpen] = React.useState(false);
+  const [replyChangesOpen, setReplyChangesOpen] = React.useState(false);
 
   const helpOpen = props.helpOpen ?? internalHelpOpen;
   const setHelpOpen = (open: boolean) => {
@@ -606,7 +614,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const completedTools = (props.liveEntry?.toolCalls ?? []).filter(
     (call) => call.status !== undefined && call.status !== "running",
   ).length;
-  const runningCalls = (props.liveEntry?.toolCalls ?? []).filter(
+  const runningCalls = (liveEntry?.toolCalls ?? []).filter(
     (call) => call.status === "running",
   );
   const runningLabel =
@@ -666,6 +674,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     settingsOpen ||
     paletteOpen ||
     Boolean(sessionTab) ||
+    replyChangesOpen ||
     hubOpen ||
     modePickerOpen ||
     reasoningPickerOpen ||
@@ -700,6 +709,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
     if (hasModalOpen) return;
 
     if (key.ctrl && input === "q") { props.onQueueOpen?.(); return; }
+    if (key.ctrl && input === "r" && props.loadReplyChanges && props.onUndoReplyChanges) {
+      if (streaming) onStatusMessage?.("Wait for the active turn to finish before reviewing changes.");
+      else setReplyChangesOpen(true);
+      return;
+    }
 
     if ((key as { end?: boolean }).end) {
       setChatOffsetFromBottom(0);
@@ -750,13 +764,19 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
   const composerHeight = conversationPanelOpen ? 0 : composerRows;
   const baseChromeRows = headerRows + Number(Boolean(preset.contextInFooter)) + statusRows + liveStatusRows + liveStatusGapRows + idleMainRow + queueRows + panelStatusRows + sideStatusRows + updateRows;
   const minChatRows = 3;
-  const workerSummaryAndGapRows = 2;
-  const workerDetailSpace = terminalSize.rows - baseChromeRows - composerHeight - minChatRows - workerSummaryAndGapRows;
+  const detailSpace = Math.max(0, terminalSize.rows - baseChromeRows - composerHeight - minChatRows - 2);
+  const activitySlots = hasModalOpen ? 0 : Math.min(4, detailSpace);
+  const parallelTools = streaming && runningCalls.length > 1;
+  const toolRows = parallelTools ? runningCalls.slice(0, activitySlots) : [];
+  const singleTool = runningCalls.length === 1 ? runningCalls[0] : undefined;
+  const workerControlCall = singleTool?.name === "task_wait" || singleTool?.name === "spawn_subagents";
+  const toolSlots = toolRows.length + Number(Boolean(singleTool && !workerControlCall));
   const workerRows = hasModalOpen ? [] : subagentStatusRows({
-    workers, tasks, width: innerWidth, detailLimit: Math.min(4, workerDetailSpace),
+    workers, tasks, width: innerWidth, detailLimit: Math.max(0, activitySlots - toolSlots),
   });
-  const statusGapRows = liveStatusRows < 2 && statusRows + liveStatusRows + workerRows.length > 0 ? 1 : 0;
-  const chromeRows = baseChromeRows + workerRows.length + statusGapRows;
+  const activityRows = toolRows.length + workerRows.length;
+  const statusGapRows = liveStatusRows < 2 && statusRows + liveStatusRows + activityRows > 0 ? 1 : 0;
+  const chromeRows = baseChromeRows + activityRows + statusGapRows;
   const viewportHeight = computeViewportHeight(terminalSize.rows, chromeRows, composerHeight);
   const chatWheelStep = 3;
   const chatPageStep = Math.max(1, viewportHeight - 2);
@@ -984,6 +1004,17 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             theme={theme}
             onClose={() => props.onReportClose?.()}
           />
+        ) : replyChangesOpen && props.loadReplyChanges && props.onUndoReplyChanges ? (
+          <ReplyChangesModal
+            key={props.activeSessionId}
+            entries={entries.filter((entry) => entry.replyChangeId).reverse()}
+            width={innerWidth}
+            height={viewportHeight}
+            theme={theme}
+            load={props.loadReplyChanges}
+            undo={props.onUndoReplyChanges}
+            onClose={() => setReplyChangesOpen(false)}
+          />
         ) : props.mcpMenu ? (
           <McpMenu {...props.mcpMenu} width={innerWidth} height={viewportHeight} theme={theme}
             onAction={props.onMcpAction ?? (async () => { throw new Error("MCP controls are unavailable."); })} onClose={() => props.onMcpClose?.()} />
@@ -1209,6 +1240,7 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 entries={entries}
                 streamingText={streamingText}
                 liveEntry={liveEntry}
+                hideRunningTools={parallelTools}
                 width={chatWidth}
                 height={viewportHeight}
                 theme={theme}
@@ -1272,6 +1304,8 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
             />
           </Box>
         ) : null}
+
+        <RunningToolRows calls={toolRows} width={chatWidth} pulse={preset.transcript.pulseMarkers === true} />
 
         {idleMainRow ? <Text color={theme.muted} wrap="truncate">Main · Idle</Text> : null}
         {panelStatusRows ? <Text color={theme.muted} wrap="truncate">Main · {streaming ? compacting ? "Compacting" : runningLabel ?? (streamingText ? "Answering" : "Thinking") : "Idle"}</Text> : null}
@@ -1358,6 +1392,11 @@ export function OrchivoxApp(props: OrchivoxAppProps) {
                 }
                 if (action.command === "/timeline") {
                   setSessionTab("timeline");
+                  return;
+                }
+                if (action.command === "/changes" && props.loadReplyChanges && props.onUndoReplyChanges) {
+                  if (streaming) onStatusMessage?.("Wait for the active turn to finish before reviewing changes.");
+                  else setReplyChangesOpen(true);
                   return;
                 }
                 if (action.command === "/hub") {
